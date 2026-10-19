@@ -149,6 +149,8 @@ AI client <-stdio JSON-RPC-> godot-mcp <-WebSocket :9333-> addons/godot_mcp (ins
                                  +-> Godot binary (headless fallback)
 ```
 
+Running-game inspection, input, screenshots, GDScript language-server queries, and breakpoint control land in the follow-up pull requests (`godot_game_*`, `godot_code_*`, `godot_debug_*`). The comparison with the other Godot MCP servers is in [docs/feature-parity.md](docs/feature-parity.md).
+
 ## Roadmap
 
 Not implemented yet:
@@ -176,6 +178,9 @@ godot --headless --check-only --path . --script addons/godot_mcp/export_plugin.g
 # End-to-end tests: start a real headless editor with the addon (needs Godot 4.5+).
 # On Windows, put the path in GODOT_PATH; GODOT_CONSOLE_PATH adds editor logs to failures.
 GODOT_PATH=/path/to/godot cargo test --test editor_e2e_test -- --ignored
+
+# Running-game input, inspection, and the remote debugger (needs Godot 4.5+, 4.7 recommended).
+GODOT_PATH=/path/to/godot cargo test --test runtime_e2e_test -- --ignored
 
 # The addon must stay out of exported games: a real pack export (no export templates needed).
 GODOT_PATH=/path/to/godot cargo test --test addon_export_test -- --ignored

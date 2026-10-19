@@ -312,6 +312,41 @@ async fn scene_and_property_tools_behave() {
         .await
         .expect("open main");
 
+    // An already-open scene edited on disk must be reloaded. open_scene used to
+    // report success while get_scene_tree still showed the in-memory copy.
+    std::fs::write(
+        editor.project.join("stale.tscn"),
+        "[gd_scene format=3]\n\n[node name=\"Stale\" type=\"Node2D\"]\n\n[node name=\"Before\" type=\"Node\" parent=\".\"]\n",
+    )
+    .expect("stale scene");
+    let first = call("open_scene", json!({"scene_path": "res://stale.tscn"}))
+        .await
+        .expect("open stale");
+    assert_eq!(first["reloaded"], false, "{first}");
+    std::fs::write(
+        editor.project.join("stale.tscn"),
+        "[gd_scene format=3]\n\n[node name=\"Stale\" type=\"Node2D\"]\n\n[node name=\"FromDisk\" type=\"Node\" parent=\".\"]\n",
+    )
+    .expect("rewrite stale scene");
+    let reloaded = call("open_scene", json!({"scene_path": "res://stale.tscn"}))
+        .await
+        .expect("reload stale");
+    assert_eq!(reloaded["reloaded"], true, "{reloaded}");
+    let stale_tree = call("get_scene_tree", json!({"scene_path": "res://stale.tscn"}))
+        .await
+        .expect("stale tree");
+    assert!(
+        find(&stale_tree["tree"], "FromDisk").is_some(),
+        "in-memory scene was not reloaded: {stale_tree}"
+    );
+    assert!(
+        find(&stale_tree["tree"], "Before").is_none(),
+        "old node survived the reload: {stale_tree}"
+    );
+    call("open_scene", json!({"scene_path": "res://main.tscn"}))
+        .await
+        .expect("return to main");
+
     // Paths in responses are relative to the edited scene.
     let tree = call("get_scene_tree", json!({})).await.expect("tree");
     assert_eq!(tree["tree"]["path"], ".");

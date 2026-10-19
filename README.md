@@ -110,9 +110,9 @@ The plugin picks its port from the project setting `godot_mcp/bridge_port` if yo
 | `godot_get_version` | — | Engine version, from the editor or the Godot binary. |
 | `godot_get_project_info` | Editor | Name, main scene, and features of the open project. |
 | `godot_launch_editor` | — | Launches the editor for `project_path`, or for the project the server runs in. |
-| `godot_run_project` | — | Plays the main scene or a given `res://` scene. With the editor, uses its Play mode (stoppable). Without it, starts a separate game process for `project_path` or the project the server runs in (can't be stopped via MCP). |
-| `godot_stop_project` | Editor | Stops the editor's Play mode. |
-| `godot_get_run_status` | Editor | Whether a scene is playing, and which one. |
+| `godot_run_project` | — | Plays the main scene or a given `res://` scene. With the editor, uses its Play mode. Without it (or with `mode: "process"`), starts a managed game with the remote debugger attached. `godot_stop_project` stops either one. |
+| `godot_stop_project` | — | Stops the editor's Play mode, or a managed process run (`run_id` optional). |
+| `godot_get_run_status` | — | Whether a scene is playing, and the managed process runs. |
 | `godot_get_open_scenes` | Editor | Open scene tabs and the active one. |
 | `godot_open_scene` | Editor | Opens a scene by `res://` path. |
 | `godot_save_scene` | Editor | Saves the active scene. |
@@ -153,10 +153,8 @@ AI client <-stdio JSON-RPC-> godot-mcp <-WebSocket :9333-> addons/godot_mcp (ins
 
 Not implemented yet:
 
-- Runtime log streaming and stack traces (`godot_get_debug_log`, `godot_get_stack_trace`)
-- In-game camera capture (`godot_capture_camera`)
-- Scene creation (`godot_create_scene`) and script read/update/attach tools
-- HTTP/SSE transport and console log capture
+- Scene creation (`godot_create_scene`) and script attach tools
+- HTTP/SSE transport
 
 ## Development
 

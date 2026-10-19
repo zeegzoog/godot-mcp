@@ -155,7 +155,6 @@ Not implemented yet:
 
 - Runtime log streaming and stack traces (`godot_get_debug_log`, `godot_get_stack_trace`)
 - In-game camera capture (`godot_capture_camera`)
-- Scene creation (`godot_create_scene`) and script read/update/attach tools
 - HTTP/SSE transport and console log capture
 
 ## Development

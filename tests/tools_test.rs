@@ -305,6 +305,27 @@ fn launch_editor_schema_no_longer_requires_project_path() {
     );
 }
 
+#[tokio::test]
+async fn create_scene_without_an_editor_writes_a_scene_file() {
+    let project = project_dir();
+    let result = call(
+        "godot_create_scene",
+        json!({
+            "scene_path": "res://scenes/main.tscn",
+            "root_type": "Node2D",
+            "root_name": "Probe",
+            "project_path": project.path(),
+        }),
+    )
+    .await;
+
+    assert!(!result.is_error, "{}", text(&result));
+    let written = std::fs::read_to_string(project.path().join("scenes/main.tscn")).expect("scene");
+    assert!(written.contains("type=\"Node2D\""), "{written}");
+    assert!(written.contains("name=\"Probe\""), "{written}");
+    assert!(written.starts_with("[gd_scene"), "{written}");
+}
+
 #[test]
 fn tool_text_helper_reads_error_flag() {
     let result = ToolResult::error("boom", &["try again"]);

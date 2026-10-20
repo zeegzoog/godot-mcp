@@ -2,7 +2,7 @@
 extends EditorPlugin
 
 const MIN_MAJOR: int = 4
-const MIN_MINOR: int = 8
+const MIN_MINOR: int = 6
 const BRIDGE_SCRIPT_PATH: String = "res://addons/godot_mcp/bridge_server.gd"
 const EXPORT_PLUGIN_PATH: String = "res://addons/godot_mcp/export_plugin.gd"
 

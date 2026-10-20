@@ -131,7 +131,7 @@ To report a vulnerability, follow [SECURITY.md](SECURITY.md). Never open a publi
 | `godot_stop_project` | — | Stops the editor's Play mode, or a managed process run (`run_id` optional). |
 | `godot_get_run_status` | — | Whether a scene is playing, and the managed process runs. |
 | `godot_get_open_scenes` | Editor | Open scene tabs and the active one. |
-| `godot_open_scene` | Editor | Opens a scene by `res://` path. |
+| `godot_open_scene` | Editor | Opens a scene by `res://` path. If that tab is already open and the file on disk has changed, reloads it (pass `discard: true` to drop unsaved bridge edits). |
 | `godot_save_scene` | Editor | Saves the active scene. |
 | `godot_get_scene_tree` | Editor | Node hierarchy of the active scene, or of another open tab via `scene_path`. Paths are relative to the scene root. |
 | `godot_add_node` | Editor | Adds a node of any instantiable `Node` class or global script class (undoable). |

@@ -53,7 +53,7 @@ jobs:
         run: chmod -R a-w .agents
 
       # Pinned to a commit; update the SHA and the version comment together.
-      - uses: anthropics/claude-code-action@6c690188da61cf16ee7debb28383ba67f02abb4c # v1.0.242
+      - uses: anthropics/claude-code-action@58985842b834ed26087302ba27d07bc24ca8697a # v1.0.244
         env:
           STEWARD_BOARD_QUEUE: ${{ runner.temp }}/steward-board-queue.txt
           STEWARD_RUN: ${{ github.run_id }}

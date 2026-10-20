@@ -94,7 +94,7 @@ The server reads its settings from CLI flags, the environment (e.g. the MCP clie
 
 | Variable | Flag | Default | Purpose |
 | --- | --- | --- | --- |
-| `GODOT_PATH` | `--godot-path` | auto-detect | Godot executable. If unset or missing, the server tries a few common install locations, then `godot` on `PATH`. Set it explicitly. |
+| `GODOT_PATH` | `--godot-path` | auto-detect | Godot executable. If unset, the server tries a few common install locations, then `godot` on `PATH`; set it explicitly. A value that points to a missing file is not replaced: tools that run Godot fail and name the path. |
 | `GODOT_DEBUG_PORT` | `--debug-port` | `9333` | Editor bridge port. |
 | `GODOT_MCP_TOKEN` | | generated | Shared secret for the bridge. Normally unnecessary, see [Security](#security). |
 | `GODOT_CONSOLE_PATH` | `--godot-console-path` | | Windows console wrapper. Unused by the server; the editor end-to-end tests use it for editor logs. |

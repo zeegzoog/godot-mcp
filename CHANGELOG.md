@@ -4,6 +4,8 @@ All notable changes to godot-mcp. The server and the Godot addon always ship wit
 version number. The section for a version is used as the text of its GitHub Release, so every
 release needs one (the release workflow fails without it).
 
+From 0.5.0 on, each Godot version has its own release line and branch (`godot-v4.5`, `godot-v4.6`, `godot-v4.7`, …), and each line lists its releases in the `CHANGELOG.md` of its branch. All releases are also on the [Releases page](https://github.com/zeegzoog/godot-mcp/releases). This file keeps the history up to 0.4.0.
+
 ## [Unreleased]
 
 ## [0.4.0] - 2026-10-16

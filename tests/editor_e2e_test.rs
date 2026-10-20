@@ -213,6 +213,14 @@ async fn start_editor_configured(with_undo_hook: bool, project_tail: &str) -> Ed
     }
 }
 
+/// The macOS spelling `ProjectSettings.localize_path` does not convert.
+fn macos_var_spelling(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy().replace('\\', "/");
+    text.strip_prefix("/private/var/")
+        .map(|rest| PathBuf::from(format!("/var/{rest}")))
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
 fn expect_error(result: Result<Value, McpError>, needle: &str) {
     match result {
         Err(McpError::ToolExecution(message)) => assert!(
@@ -493,8 +501,17 @@ async fn scene_and_property_tools_behave() {
         expect_error(call("add_node", json!({"node_type": class})).await, class);
     }
 
-    // A path outside the project is rejected. Absolute paths inside the project,
-    // including the macOS /var symlink, are a separate change.
+    // Godot's localize_path accepts /private/var and misses /var, which is the
+    // same directory on macOS. Callers hand us the /var spelling.
+    let absolute = macos_var_spelling(&editor.project.join("main.tscn"));
+    assert!(
+        absolute.exists(),
+        "aliased project file is missing: {absolute:?}"
+    );
+    let opened = call("open_scene", json!({"scene_path": absolute}))
+        .await
+        .expect("absolute path inside the project");
+    assert_eq!(opened["scene_path"], "res://main.tscn");
     let outside = tempfile::tempdir().expect("outside dir");
     std::fs::write(outside.path().join("x.tscn"), MAIN_SCENE).expect("outside scene");
     expect_error(
@@ -726,4 +743,49 @@ async fn play_with_runtime_disabled_does_not_write_override() {
         .send_command("stop_project", json!({}))
         .await
         .expect("stop");
+}
+
+/// Editor Play opens a debugger session before the game's runtime has registered its message
+/// capture. A game tool called right after Play used to fail with "No game started from the
+/// editor is running"; it now waits for the runtime to say hello.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn a_game_tool_called_right_after_editor_play_waits_for_the_runtime() {
+    use godot_mcp::cli_runner::CliRunner;
+    use godot_mcp::tools::ToolManager;
+    use std::sync::Arc;
+
+    // Editor Play opens a game window. A Linux machine without a display (the CI runner) makes
+    // the game crash at startup, which says nothing about the code under test.
+    if cfg!(target_os = "linux")
+        && std::env::var_os("DISPLAY").is_none()
+        && std::env::var_os("WAYLAND_DISPLAY").is_none()
+    {
+        eprintln!("skipped: editor Play needs a display");
+        return;
+    }
+
+    let editor = start_editor(false).await;
+    let (godot, _) = godot_binaries();
+    let tools = Arc::new(
+        ToolManager::new(BridgeClient::new(editor.port), CliRunner::new(godot))
+            .with_working_dir(editor.project.clone()),
+    );
+    let started = Arc::clone(&tools)
+        .call_tool("godot_run_project", json!({"scene": "res://main.tscn"}))
+        .await;
+    assert!(!started.is_error, "{started:?}");
+
+    let tree = Arc::clone(&tools)
+        .call_tool("godot_game_tree", json!({}))
+        .await;
+    let text = format!("{:?}", tree.content);
+    assert!(
+        !tree.is_error && text.contains("Main"),
+        "the game tree was not read right after Play: {text}"
+    );
+    let stopped = Arc::clone(&tools)
+        .call_tool("godot_stop_project", json!({}))
+        .await;
+    assert!(!stopped.is_error, "{stopped:?}");
 }

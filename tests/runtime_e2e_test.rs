@@ -250,6 +250,61 @@ async fn running_game_accepts_input_and_can_be_inspected() {
         text_of(&logs)
     );
 
+    let paused = call(
+        &tools,
+        "godot_debug_control",
+        json!({"run_id": run_id, "action": "pause", "wait_seconds": 8}),
+    )
+    .await;
+    assert!(!paused.is_error, "{}", text_of(&paused));
+    let state = call(&tools, "godot_debug_state", json!({"run_id": run_id})).await;
+    assert!(!state.is_error, "{}", text_of(&state));
+    let state_json = json_of(&state);
+    assert_eq!(state_json["stopped"], true, "{state_json}");
+    // core:break stops between frames and has no script stack. A line breakpoint does.
+    assert_eq!(state_json["stop"]["reason"], "pause", "{state_json}");
+    let resumed = call(
+        &tools,
+        "godot_debug_control",
+        json!({"run_id": run_id, "action": "resume"}),
+    )
+    .await;
+    assert!(!resumed.is_error, "{}", text_of(&resumed));
+
+    let armed = call(
+        &tools,
+        "godot_debug_breakpoints",
+        json!({"run_id": run_id, "action": "add", "breakpoint": "res://scripts/probe.gd:14"}),
+    )
+    .await;
+    assert!(!armed.is_error, "{}", text_of(&armed));
+    let mut hit = Value::Null;
+    for _ in 0..40 {
+        let state = call(&tools, "godot_debug_state", json!({"run_id": run_id})).await;
+        assert!(!state.is_error, "{}", text_of(&state));
+        let state_json = json_of(&state);
+        if state_json["stopped"] == true && state_json["stop"]["reason"] == "breakpoint" {
+            hit = state_json;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let stack = hit["stack"].as_array().cloned().unwrap_or_default();
+    assert!(
+        stack.iter().any(|frame| frame["function"]
+            .as_str()
+            .unwrap_or("")
+            .contains("_process")),
+        "breakpoint did not stop in _process: {hit}"
+    );
+    let resumed = call(
+        &tools,
+        "godot_debug_control",
+        json!({"run_id": run_id, "action": "resume"}),
+    )
+    .await;
+    assert!(!resumed.is_error, "{}", text_of(&resumed));
+
     let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
     assert!(!stopped.is_error, "{}", text_of(&stopped));
     let override_cfg =
@@ -262,4 +317,51 @@ async fn running_game_accepts_input_and_can_be_inspected() {
         !project.path().join("addons").exists(),
         "the run left runtime files in a project that had no addon"
     );
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn language_server_reports_a_real_script_error() {
+    let project = project();
+    let broken = project.path().join("scripts/broken.gd");
+    std::fs::write(&broken, "extends Node\nfunc broken(\n").unwrap();
+    let tools = manager(project.path());
+    let result = call(
+        &tools,
+        "godot_code_diagnostics",
+        json!({"project_path": project.path(), "script_path": "res://scripts/broken.gd"}),
+    )
+    .await;
+    assert!(!result.is_error, "{}", text_of(&result));
+    let body = json_of(&result);
+    let diagnostics = body["diagnostics"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{}", text_of(&result)));
+    assert!(
+        diagnostics
+            .iter()
+            .any(|item| item["severity"].as_str() != Some("hint")),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn language_server_answers_the_same_script_again() {
+    let project = project();
+    let tools = manager(project.path());
+    for round in 0..3 {
+        let symbols = call(
+            &tools,
+            "godot_code_symbols",
+            json!({"project_path": project.path(), "script_path": "res://scripts/probe.gd"}),
+        )
+        .await;
+        assert!(!symbols.is_error, "round {round}: {}", text_of(&symbols));
+        let body = json_of(&symbols);
+        assert!(
+            body["symbols"].to_string().contains("poke"),
+            "round {round}: {body}"
+        );
+    }
 }

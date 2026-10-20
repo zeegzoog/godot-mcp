@@ -4,6 +4,7 @@ use crate::config::FeedbackMode;
 use crate::error::McpError;
 use crate::godot::GameHub;
 use crate::journal::EvidenceKind;
+use crate::lsp::LspHub;
 use crate::paths::{ensure_project_dir, find_project, is_valid_identifier, resolve_in_project};
 use crate::protocol::{Tool, ToolResult};
 use crate::validation::validate_arguments;
@@ -15,6 +16,7 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
 mod authoring;
+mod code;
 mod feedback;
 mod game;
 
@@ -32,6 +34,7 @@ pub struct ToolManager {
     working_dir: Option<PathBuf>,
     feedback: feedback::FeedbackState,
     games: GameHub,
+    lsp: LspHub,
 }
 
 /// A project directory plus whether it came from the live editor.
@@ -48,7 +51,8 @@ impl ToolManager {
             cli,
             working_dir: std::env::current_dir().ok(),
             feedback: feedback::FeedbackState::new(FeedbackMode::default(), None),
-            games: GameHub::new(godot),
+            games: GameHub::new(godot.clone()),
+            lsp: LspHub::new(godot),
         }
     }
 
@@ -121,6 +125,7 @@ impl ToolManager {
             "godot_resave_resources" => self.handle_bridge_call("resave_resources", args).await,
             name if authoring::handles(name) => authoring::call(&self, name, args).await,
             name if game::handles(name) => game::call(&self, name, args).await,
+            name if code::handles(name) => code::call(&self, name, args).await,
             feedback::NOTE => self.handle_note_feedback(args).await,
             feedback::DRAFT => self.handle_draft_feedback(args).await,
             feedback::SUBMIT => self.handle_submit_feedback(args).await,
@@ -267,7 +272,7 @@ impl ToolManager {
             .await
         {
             Ok(info) => ToolResult::text(format!(
-                "No editor bridge connected. Spawned a managed Godot process (PID: {}, run_id: {}). Stop it with godot_stop_project. Project: '{}'.",
+                "Spawned a managed Godot process (PID: {}, run_id: {}). Stop it with godot_stop_project. Project: '{}'.",
                 info.pid,
                 info.id,
                 path.display()
@@ -830,7 +835,7 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
         ),
         tool(
             "godot_open_scene",
-            "Opens a scene file in the Godot Editor by its res:// path. Reloading an already-open scene from disk drops that scene's undo history.",
+            "Opens a scene file in the Godot Editor by its res:// path. An absolute path inside the project is converted, including both macOS spellings of /var and /private/var. Reloading an already-open scene from disk drops that scene's undo history.",
             json!({
                 "scene_path": {
                     "type": "string",
@@ -910,6 +915,7 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
     ];
     tools.extend(authoring::catalog());
     tools.extend(game::catalog());
+    tools.extend(code::catalog());
     tools.extend(feedback::catalog(feedback_mode));
     tools
 }

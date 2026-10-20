@@ -213,6 +213,14 @@ async fn start_editor_configured(with_undo_hook: bool, project_tail: &str) -> Ed
     }
 }
 
+/// The macOS spelling `ProjectSettings.localize_path` does not convert.
+fn macos_var_spelling(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy().replace('\\', "/");
+    text.strip_prefix("/private/var/")
+        .map(|rest| PathBuf::from(format!("/var/{rest}")))
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
 fn expect_error(result: Result<Value, McpError>, needle: &str) {
     match result {
         Err(McpError::ToolExecution(message)) => assert!(
@@ -493,8 +501,13 @@ async fn scene_and_property_tools_behave() {
         expect_error(call("add_node", json!({"node_type": class})).await, class);
     }
 
-    // open_scene accepts a project file given as an OS path but nothing outside the project.
-    let absolute = editor.project.join("main.tscn");
+    // Godot's localize_path accepts /private/var and misses /var, which is the
+    // same directory on macOS. Callers hand us the /var spelling.
+    let absolute = macos_var_spelling(&editor.project.join("main.tscn"));
+    assert!(
+        absolute.exists(),
+        "aliased project file is missing: {absolute:?}"
+    );
     let opened = call("open_scene", json!({"scene_path": absolute}))
         .await
         .expect("absolute path inside the project");

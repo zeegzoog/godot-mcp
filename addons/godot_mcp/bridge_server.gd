@@ -281,11 +281,37 @@ func to_res_path(raw_path: String) -> String:
     if not path.begins_with("res://"):
         path = ProjectSettings.localize_path(path)
     if not path.begins_with("res://"):
+        # macOS: /var is a symlink to /private/var, and localize_path misses /var.
+        path = _res_path_by_prefix(raw_path.strip_edges().replace("\\", "/"))
+    if not path.begins_with("res://"):
         return ""
     var relative: String = path.trim_prefix("res://")
     if relative.is_empty() or ".." in relative.split("/"):
         return ""
     return "res://" + relative
+
+func _res_path_by_prefix(absolute: String) -> String:
+    if not absolute.begins_with("/"):
+        return ""
+    var project := ProjectSettings.globalize_path("res://").simplify_path().trim_suffix("/")
+    var file := absolute.simplify_path()
+    var files: Array[String] = [file]
+    var roots: Array[String] = [project]
+    if file.begins_with("/var/"):
+        files.append("/private" + file)
+    elif file.begins_with("/private/var/"):
+        files.append(file.trim_prefix("/private"))
+    if project.begins_with("/var/"):
+        roots.append("/private" + project)
+    elif project.begins_with("/private/var/"):
+        roots.append(project.trim_prefix("/private"))
+    for root: String in roots:
+        for item: String in files:
+            if item == root:
+                return "res://"
+            if item.begins_with(root + "/"):
+                return "res://" + item.trim_prefix(root + "/")
+    return ""
 
 func scene_root_or_error(peer: WebSocketPeer, cmd_id: String) -> Node:
     var root: Node = EditorInterface.get_edited_scene_root()

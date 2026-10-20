@@ -5,9 +5,12 @@ const MIN_MAJOR: int = 4
 const MIN_MINOR: int = 8
 const BRIDGE_SCRIPT_PATH: String = "res://addons/godot_mcp/bridge_server.gd"
 const EXPORT_PLUGIN_PATH: String = "res://addons/godot_mcp/export_plugin.gd"
+const RELAY_SCRIPT_PATH: String = "res://addons/godot_mcp/editor/game_relay.gd"
+const OVERRIDE_SCRIPT_PATH: String = "res://addons/godot_mcp/core/runtime_override.gd"
 
 var bridge_node: Node = null
 var export_plugin: EditorExportPlugin = null
+var game_relay: EditorDebuggerPlugin = null
 
 func _enter_tree() -> void:
     var version: Dictionary = Engine.get_version_info()
@@ -42,9 +45,36 @@ func _enter_tree() -> void:
     bridge_node.name = "GodotMcpBridgeServer"
     bridge_node.set("undo_redo", get_undo_redo())
     add_child(bridge_node)
+    _start_game_relay()
     print("[Godot MCP] Plugin activated successfully")
 
+## Called by the editor immediately before Play. Injects the runtime autoload, then the
+## debugger relay removes it once the game has read override.cfg.
+## `godot_mcp/runtime_on_play` = false leaves Play alone.
+func _build() -> bool:
+    if not bool(ProjectSettings.get_setting("godot_mcp/runtime_on_play", true)):
+        return true
+    var script: GDScript = load(OVERRIDE_SCRIPT_PATH)
+    if script != null:
+        script.call("inject")
+    return true
+
+func _start_game_relay() -> void:
+    var script: GDScript = load(RELAY_SCRIPT_PATH)
+    if script == null or not script.can_instantiate():
+        return
+    game_relay = script.new()
+    game_relay.broadcast = Callable(bridge_node, "broadcast_event")
+    bridge_node.set("game_relay", game_relay)
+    add_debugger_plugin(game_relay)
+
 func _exit_tree() -> void:
+    if game_relay != null:
+        remove_debugger_plugin(game_relay)
+        game_relay = null
+    var override_script: GDScript = load(OVERRIDE_SCRIPT_PATH)
+    if override_script != null:
+        override_script.call("restore")
     if export_plugin != null:
         remove_export_plugin(export_plugin)
         export_plugin = null

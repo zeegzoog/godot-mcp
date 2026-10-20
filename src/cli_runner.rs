@@ -18,6 +18,11 @@ impl CliRunner {
         Self { godot_binary }
     }
 
+    /// The Godot executable this runner was configured with.
+    pub fn binary(&self) -> &Path {
+        &self.godot_binary
+    }
+
     /// Retrieve engine version directly via CLI
     pub async fn get_version(&self) -> Result<String> {
         let mut command = Command::new(&self.godot_binary);

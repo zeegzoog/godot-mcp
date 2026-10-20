@@ -632,7 +632,7 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
         ),
         tool(
             "godot_get_scene_tree",
-            "Retrieves the complete node hierarchy of a scene open in Godot Editor. Node paths in the result are relative to the scene root ('.' is the root).",
+            "Retrieves the complete node hierarchy of a scene open in Godot Editor. Node paths in the result are relative to the scene root ('.' is the root). This read does not reload the scene; when the file on disk differs, the result sets stale to true.",
             json!({
                 "scene_path": {
                     "type": "string",
@@ -721,7 +721,7 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
         ),
         tool(
             "godot_open_scene",
-            "Opens a scene file in the Godot Editor by its res:// path (absolute paths inside the project are converted).",
+            "Opens a scene file in the Godot Editor by its res:// path. Reloading an already-open scene from disk drops that scene's undo history.",
             json!({
                 "scene_path": {
                     "type": "string",
@@ -729,11 +729,11 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
                 },
                 "reload": {
                     "type": "boolean",
-                    "description": "When the scene is already open, reload it from disk. Automatic when the file bytes differ from the copy the editor loaded and there are no unsaved bridge edits."
+                    "description": "When the scene is already open, reload it from disk and drop its undo history. Automatic when the file bytes differ and the editor has no unsaved changes."
                 },
                 "discard": {
                     "type": "boolean",
-                    "description": "Reload even if the editor has unsaved changes made through this bridge."
+                    "description": "Reload from disk even when the editor has unsaved changes, whether made by hand or through this bridge. Those changes and the scene's undo history are discarded."
                 }
             }),
             &["scene_path"],

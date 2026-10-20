@@ -37,7 +37,7 @@ const PARAM_TYPES: Dictionary = {
     "get_node_properties": {"node_path": TYPE_STRING},
     "set_node_properties": {"node_path": TYPE_STRING, "properties": TYPE_DICTIONARY},
     "capture_viewport": {"view": TYPE_STRING, "max_dimension": TYPE_FLOAT},
-    "open_scene": {"scene_path": TYPE_STRING},
+    "open_scene": {"scene_path": TYPE_STRING, "reload": TYPE_BOOL, "discard": TYPE_BOOL},
     "run_project": {"scene_path": TYPE_STRING},
     "resave_resources": {"paths": TYPE_ARRAY},
 }
@@ -59,6 +59,17 @@ var peers: Array[WebSocketPeer] = []
 var undo_redo: EditorUndoRedoManager = null
 var port: int = DEFAULT_PORT
 var verbose: bool = false
+## scene res:// path -> hash of the file bytes last loaded or saved by this bridge.
+## Compared by content, not mtime, so an edit in the same second is still detected.
+var _scene_sync_hash: Dictionary = {}
+var _open_scene_paths: PackedStringArray = []
+## Scenes changed through this bridge since the last save. External disk edits of a dirty
+## scene are not reloaded unless the caller passes discard.
+var _scene_dirty: Dictionary = {}
+## UndoRedo.get_version() captured when the scene last matched disk. Godot does not
+## expose EditorUndoRedoManager.is_history_unsaved to GDScript, so a newer version
+## means an edit the editor made (or this bridge made) has not been saved.
+var _scene_undo_version: Dictionary = {}
 
 var _token: String = ""
 var _token_file: String = ""
@@ -83,6 +94,7 @@ func start_server() -> void:
         printerr("[Godot MCP] Failed to start bridge server on port ", port, ": ", error_string(err))
         return
     prepare_token()
+    _index_open_scenes()
     print("[Godot MCP] Bridge server listening on ", LOOPBACK_ADDRESS, ":", port)
 
 ## The MCP server finds the token in <user data dir>/godot-mcp/bridge-<port>.token (readable
@@ -116,6 +128,7 @@ func stop_server() -> void:
     print("[Godot MCP] Bridge server stopped")
 
 func _process(_delta: float) -> void:
+    _track_open_scenes()
     if not server.is_listening():
         return
 
@@ -353,7 +366,19 @@ func get_scene_tree(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> 
             return
         root = EditorInterface.get_open_scene_roots()[idx]
 
-    send_success(peer, cmd_id, {"tree": serialize_node(root, root), "scene_path": scene_path})
+    # A read must not change the editor. When the file on disk differs, say so and
+    # leave the reload to open_scene.
+    var payload := {
+        "tree": serialize_node(root, root),
+        "scene_path": scene_path,
+        "reloaded": false,
+    }
+    if not scene_path.is_empty() and FileAccess.file_exists(scene_path):
+        var decision: Dictionary = _reload_decision(scene_path, false, false)
+        if decision.has("error") or bool(decision.get("reload", false)):
+            payload["stale"] = true
+            payload["warning"] = str(decision.get("error", "The file on disk differs from the open scene. Open it with godot_open_scene to reload; this read leaves the editor unchanged."))
+    send_success(peer, cmd_id, payload)
 
 func get_open_scenes(peer: WebSocketPeer, cmd_id: String) -> void:
     var root: Node = EditorInterface.get_edited_scene_root()
@@ -385,12 +410,23 @@ func open_scene(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void
         send_error(peer, cmd_id, "Scene file does not exist: " + scene_path)
         return
 
-    EditorInterface.open_scene_from_path(scene_path)
-    send_success(peer, cmd_id, {"opened": true, "scene_path": scene_path})
+    var decision: Dictionary = _reload_decision(scene_path, bool(params.get("reload", false)), bool(params.get("discard", false)))
+    if decision.has("error"):
+        send_error(peer, cmd_id, decision["error"])
+        return
+    if bool(decision.get("reload", false)):
+        EditorInterface.reload_scene_from_path(scene_path)
+    else:
+        EditorInterface.open_scene_from_path(scene_path)
+    remember_scene_sync(scene_path)
+    send_success(peer, cmd_id, {"opened": true, "reloaded": bool(decision.get("reload", false)), "scene_path": scene_path})
 
 func save_scene(peer: WebSocketPeer, cmd_id: String) -> void:
     var err: Error = EditorInterface.save_scene()
     if err == OK:
+        var root: Node = EditorInterface.get_edited_scene_root()
+        if root != null and not String(root.scene_file_path).is_empty():
+            remember_scene_sync(String(root.scene_file_path))
         send_success(peer, cmd_id, {"saved": true})
     else:
         send_error(peer, cmd_id, "Failed to save scene: " + error_string(err))
@@ -455,6 +491,7 @@ func add_node(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
         parent_node.add_child(new_node, true)
         new_node.owner = root
 
+    mark_scene_dirty()
     send_success(peer, cmd_id, {
         "name": String(new_node.name),
         "class": new_node.get_class(),
@@ -499,6 +536,7 @@ func remove_node(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> voi
         parent.remove_child(target_node)
         target_node.queue_free()
 
+    mark_scene_dirty()
     send_success(peer, cmd_id, {"removed": true, "path": node_path})
 
 func get_node_properties(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
@@ -676,6 +714,7 @@ func set_node_properties(peer: WebSocketPeer, cmd_id: String, params: Dictionary
     var applied: Dictionary = {}
     for prop_name: String in converted:
         applied[prop_name] = describe_value(target_node.get(prop_name))
+    mark_scene_dirty()
     send_success(peer, cmd_id, {"updated": true, "node_path": node_path, "applied": applied})
 
 # --- Viewport --------------------------------------------------------------------------
@@ -826,6 +865,102 @@ func resave_resources(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -
         "skipped_missing": missing_paths,
         "skipped_invalid": invalid_paths
     })
+
+# --- Scene freshness ------------------------------------------------------------------
+
+func _track_open_scenes() -> void:
+    var open: PackedStringArray = EditorInterface.get_open_scenes()
+    if open == _open_scene_paths:
+        return
+    for scene_path: String in open:
+        if not _scene_sync_hash.has(scene_path):
+            _scene_sync_hash[scene_path] = _file_hash(scene_path)
+        # A scene a person opened is as it was on disk when it first shows up here, so edits
+        # they make afterwards move the undo version past this baseline.
+        if not _scene_undo_version.has(scene_path):
+            var version: int = _undo_version(scene_path)
+            if version >= 0:
+                _scene_undo_version[scene_path] = version
+    var stale: Array = []
+    for key: Variant in _scene_sync_hash:
+        if not open.has(String(key)):
+            stale.append(key)
+    for key: Variant in stale:
+        _scene_sync_hash.erase(key)
+        _scene_dirty.erase(key)
+        _scene_undo_version.erase(key)
+    _open_scene_paths = open
+
+func _file_hash(scene_path: String) -> int:
+    if not FileAccess.file_exists(scene_path):
+        return 0
+    return hash(FileAccess.get_file_as_bytes(scene_path))
+
+func _index_open_scenes() -> void:
+    _track_open_scenes()
+
+func remember_scene_sync(scene_path: String) -> void:
+    _scene_sync_hash[scene_path] = _file_hash(scene_path)
+    _scene_dirty.erase(scene_path)
+    _scene_undo_version[scene_path] = _undo_version(scene_path)
+    if not _open_scene_paths.has(scene_path):
+        _open_scene_paths.append(scene_path)
+
+func mark_scene_dirty() -> void:
+    var root: Node = EditorInterface.get_edited_scene_root()
+    if root != null and not String(root.scene_file_path).is_empty():
+        _scene_dirty[String(root.scene_file_path)] = true
+
+## Reloads an already-open scene when the file bytes differ from the copy the editor
+## loaded. A same-second edit still counts. Unsaved editor changes, including ones made
+## by hand, need discard: true. A reload drops that scene's undo history.
+func _reload_decision(scene_path: String, force: bool, discard: bool) -> Dictionary:
+    var open: bool = EditorInterface.get_open_scenes().has(scene_path)
+    if not open and not force:
+        return {"reload": false}
+    var disk: int = _file_hash(scene_path)
+    var known: bool = _scene_sync_hash.has(scene_path)
+    var changed: bool = known and int(_scene_sync_hash[scene_path]) != disk
+    if not force and not changed:
+        return {"reload": false}
+    if not open:
+        return {"reload": false}
+    if _has_unsaved_changes(scene_path) and not discard:
+        return {"error": "Scene '%s' has unsaved editor changes and the file on disk has changed. Save it, or open it again with discard: true to reload from disk. Reloading drops this scene's undo history." % scene_path}
+    return {"reload": true}
+
+func _has_unsaved_changes(scene_path: String) -> bool:
+    if bool(_scene_dirty.get(scene_path, false)):
+        return true
+    if not _scene_undo_version.has(scene_path):
+        return false
+    var current: int = _undo_version(scene_path)
+    var saved: int = int(_scene_undo_version[scene_path])
+    if current < 0 or saved < 0:
+        return false
+    return current != saved
+
+func _open_scene_root(scene_path: String) -> Node:
+    var open: PackedStringArray = EditorInterface.get_open_scenes()
+    var idx: int = open.find(scene_path)
+    if idx == -1:
+        return null
+    var roots: Array = EditorInterface.get_open_scene_roots()
+    if idx < 0 or idx >= roots.size():
+        return null
+    return roots[idx]
+
+func _undo_version(scene_path: String) -> int:
+    var root: Node = _open_scene_root(scene_path)
+    if root == null or undo_redo == null:
+        return -1
+    if not undo_redo.has_method("get_object_history_id") or not undo_redo.has_method("get_history_undo_redo"):
+        return -1
+    var history_id: int = undo_redo.get_object_history_id(root)
+    var history: UndoRedo = undo_redo.get_history_undo_redo(history_id)
+    if history == null:
+        return -1
+    return history.get_version()
 
 # --- Replies ---------------------------------------------------------------------------
 

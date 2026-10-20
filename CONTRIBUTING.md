@@ -43,7 +43,7 @@ Choose the branch for your pull request:
 | changes shared documentation or CI | `master` |
 
 - Find out which lines a bug affects by running its test on each branch, not by reading the code.
-- Files that differ between lines on purpose: `Cargo.toml` and `Cargo.lock` (version), `addons/godot_mcp/plugin.cfg` (version), `addons/godot_mcp/plugin.gd` (`MIN_MAJOR`, `MIN_MINOR`), `project.godot` (`config/features`), `.github/godot-version` (the Godot build the line is tested against) and `CHANGELOG.md` (the line's releases). Keep every other file identical on all lines unless a Godot version forces a difference.
+- Files that differ between lines on purpose: `Cargo.toml` and `Cargo.lock` (version), `addons/godot_mcp/plugin.cfg` (version), `addons/godot_mcp/plugin.gd` (`MIN_MAJOR`, `MIN_MINOR`), `project.godot` (`config/features`) and `.github/godot-version` (the Godot build the line is tested against). Keep every other file identical on all lines unless a Godot version forces a difference.
 
 ## Development Setup
 
@@ -144,11 +144,11 @@ git cherry-pick -x <commit>    # -x records "(cherry picked from commit <commit>
 
 ## Releases
 
-Maintainers release each line on its own, with the agent skill in `.agents/skills/release/SKILL.md`. In short:
+Maintainers publish releases with the agent skill in `.agents/skills/release/SKILL.md`. In short:
 
-- Every release takes the next version number above the highest one released on any line; lines released together for the same change share it.
-- The version names the line: `0.5.0+godot.4.6`, tagged `v0.5.0+godot.4.6` on branch `godot-v4.6`.
-- A person approves every tag before it is pushed. The release workflow then builds the line's files and publishes the release.
+- One release holds the files of every supported Godot line, named `vX.Y.Z` (for example `v0.5.1`). Every release takes the next version number; all lines take it together, and a line without a change of its own only advances its version.
+- Each line's version names the line: `0.5.1+godot.4.6` on branch `godot-v4.6`, with the line tag `v0.5.1+godot.4.6` marking its sources. The release notes are one `CHANGELOG.md` on `master`.
+- A person approves every tag before it is pushed. The release workflow then builds the files of every line and publishes the release.
 
 ## License
 

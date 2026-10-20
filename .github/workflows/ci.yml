@@ -29,16 +29,6 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-targets
-      - name: CHANGELOG.md documents the current version
-        if: runner.os == 'Linux'
-        run: |
-          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
-          core=${version%%+*}
-          if [ "$core" != "${core%%-*}" ]; then
-            echo "$version is a development version: no changelog section needed"
-          else
-            bash .github/scripts/release-notes.sh "v$version" > /dev/null
-          fi
 
   godot:
     name: Godot addon (headless editor)

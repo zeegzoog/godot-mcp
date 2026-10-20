@@ -731,3 +731,48 @@ async fn play_with_runtime_disabled_does_not_write_override() {
         .await
         .expect("stop");
 }
+
+/// Editor Play opens a debugger session before the game's runtime has registered its message
+/// capture. A game tool called right after Play used to fail with "No game started from the
+/// editor is running"; it now waits for the runtime to say hello.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn a_game_tool_called_right_after_editor_play_waits_for_the_runtime() {
+    use godot_mcp::cli_runner::CliRunner;
+    use godot_mcp::tools::ToolManager;
+    use std::sync::Arc;
+
+    // Editor Play opens a game window. A Linux machine without a display (the CI runner) makes
+    // the game crash at startup, which says nothing about the code under test.
+    if cfg!(target_os = "linux")
+        && std::env::var_os("DISPLAY").is_none()
+        && std::env::var_os("WAYLAND_DISPLAY").is_none()
+    {
+        eprintln!("skipped: editor Play needs a display");
+        return;
+    }
+
+    let editor = start_editor(false).await;
+    let (godot, _) = godot_binaries();
+    let tools = Arc::new(
+        ToolManager::new(BridgeClient::new(editor.port), CliRunner::new(godot))
+            .with_working_dir(editor.project.clone()),
+    );
+    let started = Arc::clone(&tools)
+        .call_tool("godot_run_project", json!({"scene": "res://main.tscn"}))
+        .await;
+    assert!(!started.is_error, "{started:?}");
+
+    let tree = Arc::clone(&tools)
+        .call_tool("godot_game_tree", json!({}))
+        .await;
+    let text = format!("{:?}", tree.content);
+    assert!(
+        !tree.is_error && text.contains("Main"),
+        "the game tree was not read right after Play: {text}"
+    );
+    let stopped = Arc::clone(&tools)
+        .call_tool("godot_stop_project", json!({}))
+        .await;
+    assert!(!stopped.is_error, "{stopped:?}");
+}

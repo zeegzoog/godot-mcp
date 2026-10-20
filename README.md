@@ -8,7 +8,20 @@ A fast, cross-platform [Model Context Protocol](https://modelcontextprotocol.io)
 
 ## Installation
 
-Requirements: **Godot 4.5+** and an MCP client such as Claude Code, Claude Desktop, Cursor, VS Code, or Antigravity. No Rust toolchain needed.
+Requirements: **Godot 4.5 or newer**, the godot-mcp release made for your Godot version, and an MCP client such as Claude Code, Claude Desktop, Cursor, VS Code, or Antigravity. No Rust toolchain needed.
+
+### Pick the release for your Godot version
+
+Each godot-mcp release is built for one Godot minor version: its tag ends with `+godot.M.N` (for example `v0.5.0+godot.4.6`) and its files with `-godotM.N`. Install the newest release for your version.
+
+| Your Godot | Branch | Release to install |
+| --- | --- | --- |
+| 4.7.x | `godot-v4.7` | the newest release whose tag ends with `+godot.4.7` |
+| 4.6.x | `godot-v4.6` | the newest release whose tag ends with `+godot.4.6` |
+| 4.5.x | `godot-v4.5` | the newest release whose tag ends with `+godot.4.5` |
+| 4.8 (pre-release) | `master` | none; build from source |
+
+Release 0.4.0 is one build for Godot 4.5 and newer, and its file names have no `-godotM.N` suffix.
 
 ### Option A: let your AI assistant install it
 
@@ -18,10 +31,10 @@ Open your Godot project in the assistant and paste:
 Install the Godot MCP server (https://github.com/zeegzoog/godot-mcp) for this Godot project. Use the GitHub release, not a local clone of that repository.
 
 1. Detect the OS and CPU architecture (Windows, Linux, or macOS; x86_64 or arm64).
-2. Ask me for the full path to my Godot executable. Never guess it: Windows builds are portable, version-named files (e.g. Godot_v4.5-stable_win64.exe) stored wherever I put them. Run `<path> --version` to confirm it works.
-3. Download the server archive for this platform and godot-mcp-addon.zip from https://github.com/zeegzoog/godot-mcp/releases/latest, e.g.:
-   gh release download --repo zeegzoog/godot-mcp --pattern "godot-mcp-<target-triple>.*"
-   gh release download --repo zeegzoog/godot-mcp --pattern "godot-mcp-addon.zip"
+2. Ask me for the full path to my Godot executable. Never guess it: Windows builds are portable, version-named files (e.g. Godot_v4.5-stable_win64.exe) stored wherever I put them. Run `<path> --version` to confirm it works, and note its major.minor version (4.6.3.stable.official → 4.6).
+3. Pick the release for that Godot version: list them with `gh release list --repo zeegzoog/godot-mcp --limit 50` and take the newest one whose tag ends with `+godot.<major.minor>`. If there is none, take v0.4.0 (one build for Godot 4.5 and newer). Download the server archive for this platform and the addon archive from that release, e.g.:
+   gh release download <tag> --repo zeegzoog/godot-mcp --pattern "godot-mcp-<target-triple>*"
+   gh release download <tag> --repo zeegzoog/godot-mcp --pattern "godot-mcp-addon*"
    Extract the server to a permanent folder outside the project: %LOCALAPPDATA%\godot-mcp\ (Windows), ~/.local/share/godot-mcp/ (Linux), ~/Library/Application Support/godot-mcp/ (macOS).
 4. Copy addons/godot_mcp from the addon archive into <project>/addons/godot_mcp and enable it in project.godot:
    [editor_plugins]
@@ -32,15 +45,17 @@ Install the Godot MCP server (https://github.com/zeegzoog/godot-mcp) for this Go
 
 ### Option B: install manually
 
-**1. Download** the server for your platform and the addon from the [latest release](https://github.com/zeegzoog/godot-mcp/releases/latest):
+**1. Download** the server for your platform and the addon from the release for your Godot version (see [the table above](#pick-the-release-for-your-godot-version)) on the [Releases page](https://github.com/zeegzoog/godot-mcp/releases). `M.N` is your Godot version, e.g. `4.6`; release 0.4.0 uses the same names without `-godotM.N`.
 
 | Platform | Asset |
 | --- | --- |
-| Windows x86_64 | `godot-mcp-x86_64-pc-windows-msvc.zip` |
-| Linux x86_64 | `godot-mcp-x86_64-unknown-linux-gnu.tar.gz` |
-| macOS Apple Silicon | `godot-mcp-aarch64-apple-darwin.tar.gz` |
-| macOS Intel | `godot-mcp-x86_64-apple-darwin.tar.gz` |
-| Godot addon (required, any platform) | `godot-mcp-addon.zip` |
+| Windows x86_64 | `godot-mcp-x86_64-pc-windows-msvc-godotM.N.zip` |
+| Linux x86_64 | `godot-mcp-x86_64-unknown-linux-gnu-godotM.N.tar.gz` |
+| macOS Apple Silicon | `godot-mcp-aarch64-apple-darwin-godotM.N.tar.gz` |
+| macOS Intel | `godot-mcp-x86_64-apple-darwin-godotM.N.tar.gz` |
+| Godot addon (required, any platform) | `godot-mcp-addon-godotM.N.zip` |
+
+The addon warns in the editor's Output panel when your Godot is newer than the release was made for, and refuses to start in an older Godot.
 
 **2. Enable the plugin.** Copy `addons/godot_mcp` from the addon archive into your project's `addons/` folder, open the project, and enable **Godot MCP Bridge** in **Project → Project Settings → Plugins**. The bridge listens on port `9333`. The addon is editor-only and leaves itself out of exported games while the plugin is enabled; if you export with it disabled, add `addons/godot_mcp/*` to the export preset's exclude filter.
 
@@ -79,7 +94,7 @@ The server reads its settings from CLI flags, the environment (e.g. the MCP clie
 
 | Variable | Flag | Default | Purpose |
 | --- | --- | --- | --- |
-| `GODOT_PATH` | `--godot-path` | auto-detect | Godot executable. If unset or missing, the server tries a few common install locations, then `godot` on `PATH`. Set it explicitly. |
+| `GODOT_PATH` | `--godot-path` | auto-detect | Godot executable. If unset, the server tries a few common install locations, then `godot` on `PATH`; set it explicitly. A value that points to a missing file is not replaced: tools that run Godot fail and name the path. |
 | `GODOT_DEBUG_PORT` | `--debug-port` | `9333` | Editor bridge port. |
 | `GODOT_MCP_TOKEN` | | generated | Shared secret for the bridge. Normally unnecessary, see [Security](#security). |
 | `GODOT_CONSOLE_PATH` | `--godot-console-path` | | Windows console wrapper. Unused by the server; the editor end-to-end tests use it for editor logs. |
@@ -98,6 +113,8 @@ The plugin picks its port from the project setting `godot_mcp/bridge_port` if yo
 - Every command must carry a random token. The plugin writes it when the editor starts to `<user data dir>/godot-mcp/bridge-<port>.token` (readable by your user only), and the server reads it from there. This also keeps web pages in your browser from driving the editor. Both processes must therefore run as the same OS user. If they can't (containers, Flatpak, different users), set the same `GODOT_MCP_TOKEN` for both instead.
 - `godot_create_script` only writes `.gd` files inside the project, never overwrites without `overwrite: true`, and accepts only plain identifiers for `class_name` and `extends_class`.
 - Node paths are resolved inside the edited scene only; the scene root can't be removed.
+
+To report a vulnerability, follow [SECURITY.md](SECURITY.md). Never open a public issue for it.
 
 ## Tools
 
@@ -159,30 +176,7 @@ Not implemented yet:
 
 ## Development
 
-For contributors to godot-mcp itself:
-
-```bash
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets
-
-# GDScript check. The repo root is a minimal Godot project (the addon declares no class_name).
-godot --headless --path . --import    # first run, or after adding scripts
-godot --headless --check-only --path . --script addons/godot_mcp/plugin.gd
-godot --headless --check-only --path . --script addons/godot_mcp/bridge_server.gd
-godot --headless --check-only --path . --script addons/godot_mcp/export_plugin.gd
-
-# End-to-end tests: start a real headless editor with the addon (needs Godot 4.5+).
-# On Windows, put the path in GODOT_PATH; GODOT_CONSOLE_PATH adds editor logs to failures.
-GODOT_PATH=/path/to/godot cargo test --test editor_e2e_test -- --ignored
-
-# The addon must stay out of exported games: a real pack export (no export templates needed).
-GODOT_PATH=/path/to/godot cargo test --test addon_export_test -- --ignored
-```
-
-CI runs all of the above on every push and pull request.
-
-**Releasing:** add a section for the version to [CHANGELOG.md](CHANGELOG.md) (it becomes the release text), bump the version in `Cargo.toml` and `addons/godot_mcp/plugin.cfg` together (`tests/version_sync_test.rs` fails if they differ), commit, and push a `vX.Y.Z` tag once CI is green. The release workflow builds all four platforms and attaches the archives plus `godot-mcp-addon.zip` to a GitHub Release.
+To contribute — set up, choose the branch for your Godot version, run the checks and open a pull request — read [CONTRIBUTING.md](CONTRIBUTING.md). AI agents start with [AGENTS.md](AGENTS.md). Releases are described in [CONTRIBUTING.md](CONTRIBUTING.md#releases).
 
 ## License
 

@@ -1097,7 +1097,13 @@ func connect_signal(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> 
     if not method_name.is_valid_identifier():
         send_error(peer, cmd_id, "Method name must be an identifier")
         return
+    if not target.has_method(method_name):
+        send_error(peer, cmd_id, "Node '%s' has no method '%s'; attach a script that defines it first" % [str(params.get("target_path", ".")), method_name])
+        return
     var callable := Callable(target, method_name)
+    if source.is_connected(signal_name, callable):
+        send_error(peer, cmd_id, "Signal '%s' is already connected to '%s'" % [signal_name, method_name])
+        return
     if undo_redo != null:
         undo_redo.create_action("Connect Signal", UndoRedo.MERGE_DISABLE, root)
         undo_redo.add_do_method(source, "connect", signal_name, callable, CONNECT_PERSIST)
@@ -1132,6 +1138,13 @@ func create_resource(peer: WebSocketPeer, cmd_id: String, params: Dictionary) ->
     if resource_path.is_empty():
         send_error(peer, cmd_id, "resource_path must be a res:// path")
         return
+    # Saving over a file would replace it, also one the editor has open, without a way back.
+    if FileAccess.file_exists(resource_path):
+        send_error(peer, cmd_id, "File already exists: " + resource_path)
+        return
+    if not (resource_path.ends_with(".tres") or resource_path.ends_with(".res")):
+        send_error(peer, cmd_id, "resource_path must end in .tres or .res")
+        return
     if not ClassDB.class_exists(resource_class) or not ClassDB.can_instantiate(resource_class) or not ClassDB.is_parent_class(resource_class, "Resource"):
         send_error(peer, cmd_id, "Unknown resource class: " + resource_class)
         return
@@ -1143,17 +1156,61 @@ func create_resource(peer: WebSocketPeer, cmd_id: String, params: Dictionary) ->
     EditorInterface.get_resource_filesystem().update_file(resource_path)
     send_success(peer, cmd_id, {"resource_path": resource_path, "class_name": resource_class})
 
+const SETTING_KEY_CHARS: String = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_/.-"
+
+func _is_setting_key(key: String) -> bool:
+    if key.is_empty() or not key.contains("/") or key.begins_with("/") or key.ends_with("/") or key.contains("//"):
+        return false
+    for character: String in key:
+        if not SETTING_KEY_CHARS.contains(character):
+            return false
+    return true
+
+## The value to store for a setting that already exists, or an error. The value must have the
+## type the setting has: a wrong type would be written to project.godot and fail at the next load.
+func _coerce_setting(current: Variant, value: Variant) -> Dictionary:
+    match typeof(current):
+        TYPE_STRING:
+            if value is String:
+                return {"value": value}
+        TYPE_BOOL:
+            if value is bool:
+                return {"value": value}
+        TYPE_INT:
+            if (value is float or value is int) and not value is bool and is_equal_approx(floorf(float(value)), float(value)):
+                return {"value": int(value)}
+        TYPE_FLOAT:
+            if (value is float or value is int) and not value is bool:
+                return {"value": float(value)}
+    return {"error": "This setting expects a %s; a value of another type is not stored. Change settings of other types in the editor's Project Settings." % type_string(typeof(current)).to_lower()}
+
 func set_project_setting(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
     var key: String = str(params.get("key", ""))
-    if key.is_empty() or not key.contains("/"):
-        send_error(peer, cmd_id, "key must look like application/config/name")
+    if not _is_setting_key(key):
+        send_error(peer, cmd_id, "key must start with a section and use only letters, digits and _ / . -, like application/config/name")
         return
-    ProjectSettings.set_setting(key, params.get("value"))
+    var value: Variant = params.get("value")
+    if not (value is String or value is bool or value is int or value is float):
+        send_error(peer, cmd_id, "value must be a string, number or boolean")
+        return
+    var previous: Variant = null
+    if ProjectSettings.has_setting(key):
+        previous = ProjectSettings.get_setting(key)
+        var coerced: Dictionary = _coerce_setting(previous, value)
+        if coerced.has("error"):
+            send_error(peer, cmd_id, "'%s': %s" % [key, coerced["error"]])
+            return
+        value = coerced["value"]
+    ProjectSettings.set_setting(key, value)
     var err: Error = ProjectSettings.save()
     if err != OK:
+        ProjectSettings.set_setting(key, previous)
         send_error(peer, cmd_id, "Failed to save project settings: " + error_string(err))
         return
-    send_success(peer, cmd_id, {"key": key, "saved": true})
+    var reported: Variant = previous
+    if previous != null and not (previous is String or previous is bool or previous is int or previous is float):
+        reported = str(previous)
+    send_success(peer, cmd_id, {"key": key, "saved": true, "previous": reported})
 
 func get_project_settings(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
     var prefix: String = str(params.get("prefix", ""))

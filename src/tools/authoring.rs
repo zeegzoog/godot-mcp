@@ -8,6 +8,7 @@ use crate::error::McpError;
 use crate::paths::resolve_in_project;
 use crate::protocol::{Tool, ToolResult};
 use serde_json::{Value, json};
+use std::io::{ErrorKind, Write};
 use std::path::Path;
 
 pub fn handles(name: &str) -> bool {
@@ -27,19 +28,19 @@ pub fn catalog() -> Vec<Tool> {
     vec![
         tool(
             "godot_create_scene",
-            "Creates a .tscn and opens it in the editor when the bridge is connected. Undo is the editor's. Headless writes the file directly.",
+            "Creates a .tscn with one root node and opens it in the editor when the bridge is connected. Refuses to replace an existing scene. Without the editor, writes the file directly.",
             json!({"scene_path": s("res:// path ending in .tscn"), "root_type": s("Default Node2D."), "root_name": s("Default Root."), "project_path": s("")}),
             &["scene_path"],
         ),
         tool(
             "godot_attach_script",
-            "Attaches a script to a node in the edited scene (undoable). Pass an empty script_path to detach.",
+            "Attaches a script to a node in the edited scene (undoable). The script must exist in the project. Pass an empty script_path to detach.",
             json!({"node_path": s(""), "script_path": s("res:// path, or empty to detach.")}),
             &["node_path"],
         ),
         tool(
             "godot_connect_signal",
-            "Connects a signal inside the edited scene with CONNECT_PERSIST (undoable).",
+            "Connects a signal inside the edited scene with CONNECT_PERSIST (undoable). The target must already have the method (attach its script first); a connection that exists is refused.",
             json!({"node_path": s(""), "signal_name": s(""), "target_path": s("Default: the same node."), "method": s("")}),
             &["node_path", "signal_name", "method"],
         ),
@@ -51,7 +52,7 @@ pub fn catalog() -> Vec<Tool> {
         ),
         tool(
             "godot_create_resource",
-            "Creates a Resource .tres of a built-in class. Uses the editor when connected.",
+            "Creates a Resource .tres of a built-in class. Never replaces an existing file. Uses the editor when connected; without it, writes an empty resource as text.",
             json!({"resource_path": s(""), "class_name": s("For example StandardMaterial3D."), "project_path": s("")}),
             &["resource_path", "class_name"],
         ),
@@ -63,7 +64,7 @@ pub fn catalog() -> Vec<Tool> {
         ),
         tool(
             "godot_set_project_setting",
-            "Sets one project setting and saves it. Uses the live editor when connected.",
+            "Sets one project setting and saves it. Uses the live editor when connected. The value must be a string, number or boolean, and of the type the setting already has.",
             json!({"key": s("For example application/config/name."), "value": {"description": "String, number, or boolean."}, "project_path": s("")}),
             &["key", "value"],
         ),
@@ -129,15 +130,16 @@ async fn write_scene(tools: &ToolManager, args: &Value) -> ToolResult {
         Ok(file) => file,
         Err(problem) => return ToolResult::error(problem, &[]),
     };
-    if file.exists() {
-        return ToolResult::error(format!("Scene already exists: {}", file.display()), &[]);
-    }
-    if let Some(parent) = file.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
     let body = format!("[gd_scene format=3]\n\n[node name=\"{root_name}\" type=\"{root_type}\"]\n");
-    if std::fs::write(&file, body).is_err() {
-        return ToolResult::error(format!("Failed to write {}", file.display()), &[]);
+    match create_new_file(&file, &body) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            return ToolResult::error(
+                format!("Scene already exists: {}", file.display()),
+                &["Pick another scene_path, or edit the existing scene with the node tools"],
+            );
+        }
+        Err(_) => return ToolResult::error(format!("Failed to write {}", file.display()), &[]),
     }
     ToolResult::text(format!(
         "Created {scene_path} ({root_type}). The editor was closed, so this was written as text."
@@ -172,12 +174,18 @@ async fn create_resource(tools: &ToolManager, args: &Value) -> ToolResult {
                 Ok(file) => file,
                 Err(problem) => return ToolResult::error(problem, &[]),
             };
-            if let Some(parent) = file.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
             let body = format!("[gd_resource type=\"{class_name}\" format=3]\n");
-            if std::fs::write(&file, body).is_err() {
-                return ToolResult::error(format!("Failed to write {}", file.display()), &[]);
+            match create_new_file(&file, &body) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                    return ToolResult::error(
+                        format!("Resource already exists: {}", file.display()),
+                        &["Pick another resource_path; an existing resource is never replaced"],
+                    );
+                }
+                Err(_) => {
+                    return ToolResult::error(format!("Failed to write {}", file.display()), &[]);
+                }
             }
             ToolResult::text(format!(
                 "Created {path} ({class_name}) as text. Open the editor to let Godot import it."
@@ -246,45 +254,177 @@ async fn get_settings(tools: &ToolManager, args: &Value) -> ToolResult {
     }
 }
 
+/// Writes a new file and fails with `AlreadyExists` instead of replacing one, also when the file
+/// appears between a check and the write.
+fn create_new_file(file: &Path, body: &str) -> std::io::Result<()> {
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut created = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(file)?;
+    created.write_all(body.as_bytes())
+}
+
+/// A setting key is a path of letters, digits and `_ . -` that starts with a section, like
+/// `application/config/name`. Nothing else may reach `project.godot`, where a `]` or a line
+/// break in a key would start a new section or a new entry.
+fn is_setting_key(key: &str) -> bool {
+    key.contains('/')
+        && !key.starts_with('/')
+        && !key.ends_with('/')
+        && !key.contains("//")
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '/' | '.' | '-'))
+}
+
+/// A string as `project.godot` stores it: quoted, with every character that would end the
+/// value or the line escaped.
+fn godot_string(text: &str) -> String {
+    let mut quoted = String::with_capacity(text.len() + 2);
+    quoted.push('"');
+    for character in text.chars() {
+        match character {
+            '\\' => quoted.push_str("\\\\"),
+            '"' => quoted.push_str("\\\""),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\t' => quoted.push_str("\\t"),
+            other if other.is_control() => {
+                quoted.push_str(&format!("\\u{:04x}", u32::from(other)));
+            }
+            other => quoted.push(other),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
+/// What an entry of `project.godot` holds, as far as a plain value can replace it.
+#[derive(Clone, Copy, PartialEq)]
+enum StoredKind {
+    Text,
+    Flag,
+    Whole,
+    Fraction,
+    Structured,
+}
+
+impl StoredKind {
+    fn of(stored: &str) -> Self {
+        let stored = stored.trim();
+        if stored.len() >= 2 && stored.starts_with('"') && stored.ends_with('"') {
+            Self::Text
+        } else if stored == "true" || stored == "false" {
+            Self::Flag
+        } else if stored.parse::<i64>().is_ok() {
+            Self::Whole
+        } else if stored.parse::<f64>().is_ok() {
+            Self::Fraction
+        } else {
+            Self::Structured
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Text => "string",
+            Self::Flag => "bool",
+            Self::Whole => "int",
+            Self::Fraction => "float",
+            Self::Structured => "structured value",
+        }
+    }
+}
+
+/// The text to store for `value`. A setting that already exists keeps its type: a value of
+/// another type would be written to `project.godot` and fail at the next load.
+fn render_setting(value: &Value, stored: Option<StoredKind>) -> Result<String, String> {
+    let mismatch = |kind: StoredKind| {
+        format!(
+            "This setting expects a {}; a value of another type is not stored. Change settings of other types in the editor's Project Settings.",
+            kind.name()
+        )
+    };
+    match value {
+        Value::String(text) => match stored {
+            None | Some(StoredKind::Text) => Ok(godot_string(text)),
+            Some(kind) => Err(mismatch(kind)),
+        },
+        Value::Bool(flag) => match stored {
+            None | Some(StoredKind::Flag) => Ok(flag.to_string()),
+            Some(kind) => Err(mismatch(kind)),
+        },
+        Value::Number(number) => match stored {
+            None if number.is_f64() => Ok(format!("{:?}", number.as_f64().unwrap_or_default())),
+            None => Ok(number.to_string()),
+            Some(StoredKind::Whole) => number
+                .as_i64()
+                .or_else(|| {
+                    number
+                        .as_f64()
+                        .filter(|float| float.fract() == 0.0 && float.abs() < 9.0e15)
+                        .map(|float| float as i64)
+                })
+                .map(|whole| whole.to_string())
+                .ok_or_else(|| mismatch(StoredKind::Whole)),
+            Some(StoredKind::Fraction) => Ok(format!("{:?}", number.as_f64().unwrap_or_default())),
+            Some(kind) => Err(mismatch(kind)),
+        },
+        _ => Err("value must be a string, number or boolean".to_string()),
+    }
+}
+
 fn write_setting(path: &Path, key: &str, value: &Value) -> Result<(), String> {
+    if !is_setting_key(key) {
+        return Err(
+            "key must start with a section and use only letters, digits and _ / . -, like application/config/name"
+                .to_string(),
+        );
+    }
     let Some((section, name)) = key.split_once('/') else {
         return Err(format!(
             "'{key}' must contain a section, like application/config/name"
         ));
     };
-    let rendered = match value {
-        Value::Bool(flag) => flag.to_string(),
-        Value::Number(number) => number.to_string(),
-        Value::String(text) => format!("\"{}\"", text.replace('"', "\\\"")),
-        other => return Err(format!("unsupported setting value {other}")),
-    };
     let original = std::fs::read_to_string(path).unwrap_or_default();
     let mut lines: Vec<String> = original.lines().map(str::to_string).collect();
     let header = format!("[{section}]");
-    let assignment = format!("{name}={rendered}");
-    if let Some(start) = lines.iter().position(|line| line.trim() == header) {
-        let end = lines
+    let prefix = format!("{name}=");
+    let range = lines
+        .iter()
+        .position(|line| line.trim() == header)
+        .map(|start| {
+            let end = lines
+                .iter()
+                .enumerate()
+                .skip(start + 1)
+                .find(|(_, line)| line.trim().starts_with('['))
+                .map_or(lines.len(), |(index, _)| index);
+            (start, end)
+        });
+    let existing = range.and_then(|(start, end)| {
+        lines[start..end]
             .iter()
-            .enumerate()
-            .skip(start + 1)
-            .find(|(_, line)| line.trim().starts_with('['))
-            .map(|(index, _)| index)
-            .unwrap_or(lines.len());
-        if let Some(index) = lines[start..end]
-            .iter()
-            .position(|line| line.trim_start().starts_with(&format!("{name}=")))
-        {
-            lines[start + index] = assignment;
-        } else {
-            lines.insert(end, assignment);
-        }
-    } else {
-        if !lines.is_empty() && !lines.last().is_some_and(|line| line.is_empty()) {
+            .position(|line| line.trim_start().starts_with(&prefix))
+            .map(|offset| start + offset)
+    });
+    let stored =
+        existing.map(|index| StoredKind::of(lines[index].trim_start().trim_start_matches(&prefix)));
+    let assignment = format!("{prefix}{}", render_setting(value, stored)?);
+    match (existing, range) {
+        (Some(index), _) => lines[index] = assignment,
+        (None, Some((_, end))) => lines.insert(end, assignment),
+        (None, None) => {
+            if !lines.is_empty() && !lines.last().is_some_and(|line| line.is_empty()) {
+                lines.push(String::new());
+            }
+            lines.push(header);
             lines.push(String::new());
+            lines.push(assignment);
         }
-        lines.push(header);
-        lines.push(String::new());
-        lines.push(assignment);
     }
     std::fs::write(path, lines.join("\n") + "\n").map_err(|err| err.to_string())
 }
@@ -318,6 +458,27 @@ fn read_settings(text: &str, prefix: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_string_setting_is_one_escaped_line() {
+        assert_eq!(godot_string("plain"), r#""plain""#);
+        assert_eq!(godot_string("a\"b\\c"), r#""a\"b\\c""#);
+        assert_eq!(godot_string("one\ntwo\r\t"), r#""one\ntwo\r\t""#);
+        assert_eq!(godot_string("bell\u{7}"), r#""bell\u0007""#);
+        assert_eq!(godot_string("мир"), "\"мир\"");
+    }
+
+    #[test]
+    fn a_setting_key_is_a_clean_path_with_a_section() {
+        for good in ["application/config/name", "custom/a-b.c_d/e1"] {
+            assert!(is_setting_key(good), "{good}");
+        }
+        for bad in [
+            "", "name", "/a", "a/", "a//b", "a/b c", "a/b]", "a/b\n[x", "a/b=c",
+        ] {
+            assert!(!is_setting_key(bad), "{bad:?}");
+        }
+    }
 
     #[test]
     fn project_setting_roundtrip() {

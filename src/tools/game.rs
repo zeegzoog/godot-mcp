@@ -446,19 +446,64 @@ impl ToolManager {
     }
 }
 
+/// The debugger session can connect before the runtime registers its capture. Never
+/// send input or a mutating request until hello confirms that the destination is ready.
+async fn ready_editor_session(tools: &ToolManager) -> Result<i64, McpError> {
+    let wait = async {
+        loop {
+            let status = tools.bridge.send_command("game_status", json!({})).await?;
+            // The relay orders active sessions newest first. Do not fall back to an
+            // older game while a newer game is still starting.
+            if let Some(session) = status
+                .get("sessions")
+                .and_then(Value::as_array)
+                .and_then(|sessions| sessions.first())
+            {
+                if session
+                    .get("hello")
+                    .and_then(Value::as_str)
+                    .is_some_and(|hello| !hello.is_empty())
+                {
+                    if let Some(id) = session
+                        .get("session")
+                        .and_then(Value::as_i64)
+                        .filter(|id| *id >= 0)
+                    {
+                        return Ok(id);
+                    }
+                }
+            }
+            let state = tools
+                .bridge
+                .send_command("get_run_status", json!({}))
+                .await?;
+            if state.get("running").and_then(Value::as_bool) != Some(true) {
+                return Err(McpError::Process(
+                    "No game started from the editor is running.".into(),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(20), wait).await.map_err(|_| {
+        McpError::Process("timed out waiting for the editor game's runtime hello; check the game for startup errors and ensure the matching Godot MCP addon is enabled".into())
+    })?
+}
+
 async fn editor_runtime(
     tools: &ToolManager,
     method: &str,
     params: Value,
 ) -> Result<Value, McpError> {
     let mut events = tools.bridge.subscribe_events();
+    let session = ready_editor_session(tools).await?;
     let id = NEXT_EDITOR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let payload = serde_json::to_string(&json!({"id": id, "method": method, "params": params}))?;
     tools
         .bridge
         .send_command(
             "game_send",
-            json!({"command": "mcp:request", "data": [payload], "session": -1}),
+            json!({"command": "mcp:request", "data": [payload], "session": session}),
         )
         .await?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
@@ -483,6 +528,9 @@ async fn editor_runtime(
             }
         };
         if event.get("event").and_then(Value::as_str) != Some("game.message") {
+            continue;
+        }
+        if event.pointer("/data/session").and_then(Value::as_i64) != Some(session) {
             continue;
         }
         if event.pointer("/data/message").and_then(Value::as_str) != Some("mcp:reply") {

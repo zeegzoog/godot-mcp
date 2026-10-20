@@ -270,7 +270,7 @@ impl ToolManager {
             .await
         {
             Ok(info) => ToolResult::text(format!(
-                "No editor bridge connected. Spawned a managed Godot process (PID: {}, run_id: {}). Stop it with godot_stop_project. Project: '{}'.",
+                "Spawned a managed Godot process (PID: {}, run_id: {}). Stop it with godot_stop_project. Project: '{}'.",
                 info.pid,
                 info.id,
                 path.display()

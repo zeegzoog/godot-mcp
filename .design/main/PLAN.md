@@ -1,13 +1,13 @@
 # Implementation Plan
 
-**Version:** 1.2.0
+**Version:** 1.3.0
 **Generated:** 2026-10-20
-**Based on:** .design/main/INDEX.md v1.3.0
+**Based on:** .design/main/INDEX.md v1.4.0
 **Status:** Active
 
 ## Overview
 
-The registry was bootstrapped from existing code (godot-mcp 0.3.0 plus unreleased changes at commit 94e4540), so Phases 0 and 1 describe what is already implemented and verified. Phase 2 closes the gaps the first analysis found: a shipped-artifact hygiene gap, a stale comment, an unverified security property, and contributor guidance for the specification-driven workflow. Phase 3 adds the agent feedback channel: tools that let an agent record what is missing or broken and hand the maintainers a scrubbed report as text or as an approved issue submission. Phase 4 splits the product into one release line per Godot minor version (4.5, 4.6, 4.7) with the development line on `master` targeting Godot 4.8, rewrites the release procedure around carrying changes between lines and releasing each line on its own, and fills the security policy and contributor guide. Roadmap concepts wait in the Backlog until their open questions are answered.
+The registry was bootstrapped from existing code (godot-mcp 0.3.0 plus unreleased changes at commit 94e4540), so Phases 0 and 1 describe what is already implemented and verified. Phase 2 closes the gaps the first analysis found: a shipped-artifact hygiene gap, a stale comment, an unverified security property, and contributor guidance for the specification-driven workflow. Phase 3 adds the agent feedback channel: tools that let an agent record what is missing or broken and hand the maintainers a scrubbed report as text or as an approved issue submission. Phase 4 splits the product into one release line per Godot minor version (4.5, 4.6, 4.7) with the development line on `master` targeting Godot 4.8, rewrites the release procedure around carrying changes between lines and releasing each line on its own, and fills the security policy and contributor guide. Phase 5 adds repository stewardship: a portable agent skill that triages, plans, fixes, answers, reviews, merges and closes issues and pull requests within autonomy limits, keeps a Kanban board, and announces when a release is due and what it holds for each Godot line, installed in this repository with its profile, workflows, forms and guide changes. Roadmap concepts wait in the Backlog until their open questions are answered.
 
 ## Phase 0 — Requirements (Layer 1: Concept)
 
@@ -57,6 +57,16 @@ The registry was bootstrapped from existing code (godot-mcp 0.3.0 plus unrelease
 - [x] **Community Health Files (GitHub)** ([l2-community-health-files.md](specifications/l2-community-health-files.md)) [L2]
 - [x] Amendments: Release & Distribution 1.1.0, Quality Assurance 1.1.0, CI & Release Pipeline 1.1.0, Test Suite 1.2.0, Godot Editor Addon 1.1.0
 - [x] Gated on approval: repository settings, publishing the branches, the first line releases
+
+## Phase 5 — Repository Stewardship (Layers 1 and 2)
+
+*The stewardship concept first, then the portable skill and its installation here. Requires Phase 4 (release lines, release skill, contributor guide). See [TASKS.md](TASKS.md).*
+
+- [ ] **Issue & Pull Request Stewardship** ([l1-repository-stewardship.md](specifications/l1-repository-stewardship.md)) [L1]
+- [ ] **Repo Steward Skill (GitHub)** ([l2-repo-steward-skill.md](specifications/l2-repo-steward-skill.md)) [L2]
+- [ ] **Repo Steward for godot-mcp** ([l2-repo-steward-godot-mcp.md](specifications/l2-repo-steward-godot-mcp.md)) [L2]
+- [ ] Amendments: Community Health Files 1.1.0 (concept and GitHub), Test Suite 1.3.0
+- [ ] Gated on approval: pushing to `master`, labels and the board on GitHub, the first acting run; maintainer-only settings
 
 ## Backlog
 

@@ -1,6 +1,6 @@
 # Community Health Files (GitHub)
 
-**Version:** 1.0.1
+**Version:** 1.1.0
 **Status:** Stable
 **Layer:** implementation
 **Implements:** l1-community-health.md
@@ -14,6 +14,7 @@ How the security policy and the contributor guide are realized on GitHub: `SECUR
 - [l1-community-health.md](l1-community-health.md) - Parent concept.
 - [l2-release-branches.md](l2-release-branches.md) - The line table and the carrying procedure both files describe.
 - [l2-test-suite.md](l2-test-suite.md) - The verification commands the contributor guide lists.
+- [l2-repo-steward-godot-mcp.md](l2-repo-steward-godot-mcp.md) - The issue forms, the pull request template and the facts of the Issues and Pull Requests section. [ADDED]
 
 ## 1. Motivation
 
@@ -36,7 +37,7 @@ GitHub shows these files only under fixed names and takes the security policy fr
 | CH-2 Private first | `SECURITY.md` § Reporting a Vulnerability: the reporting link as the only channel; never issues, pull requests or `godot_note_feedback` / `godot_submit_feedback`; what to include (godot-mcp version string, Godot version, OS, steps, impact, proof of concept if any); targets 7 / 14 / 90 days; coordinated disclosure through a GitHub Security Advisory; credit in the advisory unless declined. |
 | CH-3 Supported versions are the line table | `SECURITY.md` § Supported Versions holds the line table of [l2-release-branches.md](l2-release-branches.md) §5.1 in the form of §5.1 below. |
 | CH-4 Scope stated | `SECURITY.md` § Scope: in-scope and out-of-scope lists as in the parent, each item one line, the in-scope items naming the guarantee in plain words (loopback-only bridge, bridge token, project-confined paths, no argument or code injection, scrubbed feedback). |
-| CH-5 Complete contribution path | `CONTRIBUTING.md` sections in the order of the parent §5.2. |
+| CH-5 Complete contribution path | `CONTRIBUTING.md` sections in the order of the parent §5.2. [MODIFIED] § Issues and Pull Requests takes its labels, timings and autonomy from `.github/steward.yml` and its wording from [l2-repo-steward-godot-mcp.md](l2-repo-steward-godot-mcp.md) §5.9; § For AI Agents keeps "Never push, tag or publish a release without the explicit approval of your user", with the exception for the actions the repo-steward skill's autonomy settings allow (its defaults, as adjusted in `.github/steward.yml`). The issue forms and the pull request template appear on the new issue and new pull request pages next to the agent feedback template; blank issues stay enabled. |
 | CH-6 Written for people and agents | Both files: imperative bullets, copyable commands in fenced blocks with a language tag, tables for every mapping, no images; `CONTRIBUTING.md` § For AI Agents points to `AGENTS.md`. |
 | CH-7 One owner per fact | `CONTRIBUTING.md` owns setup, verification commands, test placement, commit and pull request rules; `README.md` § Development shrinks to a link, its Releasing paragraph to a link to `CONTRIBUTING.md` § Releases. `AGENTS.md` keeps its inline command list (agents need it loaded) and states that it mirrors `CONTRIBUTING.md` § Verification. `README.md` § Security owns the user-facing description of the security measures; `SECURITY.md` links to it instead of restating it. |
 | CH-8 Updated by the change that dates them | The release skill's cut and retire procedures (E, F) and its preflight step name the sections of §5.3 in the parent to update; `AGENTS.md` § Completion Protocol gets one checklist item: "Security policy and contributor guide still true after this change". Both files are shared files: changed on `master` and carried to every line. |
@@ -50,11 +51,11 @@ Columns: Godot · Branch · Security fixes · Install. One row per release line 
 
 | Row | Security fixes | Install |
 | --- | --- | --- |
-| Release line, e.g. `4.6.x` · `godot-v4.6` | yes, in the next 4.6 release | the newest release whose tag ends with `+godot.4.6` |
+| Release line, e.g. `4.6.x` · `godot-v4.6` | yes, in the next release | the files ending in `-godot4.6` of the latest release |
 | Development line, e.g. `4.8 (pre-release)` · `master` | fixed here first; no releases | build from source |
 | Unsupported: `0.4.0 and older` (one build for 4.5 and newer) | no | the release for your Godot version |
 
-Until the first line releases are published, the Install cell of every release line reads "0.4.0, the last release before the lines", and the unsupported row reads "0.3.0 and older".
+The Install cell of every release line names the files ending in `-godotM.N` of the latest release; the unsupported row reads "0.4.0 and older".
 
 ### 5.2 Contributor Guide: Branch Decision Table
 
@@ -73,7 +74,9 @@ SECURITY.md                        security policy (root)
 CONTRIBUTING.md                    contributor guide (root)
 README.md                          links both; Development and Releasing reduced to links
 AGENTS.md                          links CONTRIBUTING.md; one completion checklist item
-.github/ISSUE_TEMPLATE/config.yml  contact link to private vulnerability reporting
+.github/ISSUE_TEMPLATE/config.yml  contact link to private vulnerability reporting; blank issues enabled
+.github/ISSUE_TEMPLATE/*.yml       bug and feature forms (content: l2-repo-steward-godot-mcp.md §5.8)
+.github/pull_request_template.md   pull request description (content: l2-repo-steward-godot-mcp.md §5.8)
 ```
 
 ### 5.4 Repository Setting (Maintainer)
@@ -108,3 +111,5 @@ Private vulnerability reporting: Settings → Code security → Private vulnerab
 | --- | --- | --- | --- |
 | 1.0.0 | 2026-10-20 | Agent (magic.spec) | Created with the community health concept; files, sections, links, the reporting setting and update steps. Promoted to Stable after Post-Update Review. |
 | 1.0.1 | 2026-10-20 | Agent (magic.spec) | [MODIFIED] The Install cell names the release by the tag suffix instead of the title. |
+| 1.0.2 | 2026-10-20 | Agent (magic.spec) | [MODIFIED] The Install cell names the files of the latest release, which holds every line. |
+| 1.1.0 | 2026-10-20 | Agent (magic.spec) | [MODIFIED] CH-5 row and files for the Issues and Pull Requests section, the issue forms, the pull request template and the steward exception in § For AI Agents. Stable → RFC by the parent's amendment (C12) → Stable after Post-Update Review. |

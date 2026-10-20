@@ -313,4 +313,8 @@ async fn running_game_accepts_input_and_can_be_inspected() {
         !override_cfg.contains("godot_mcp: temporary runtime autoload"),
         "override.cfg was left injected: {override_cfg}"
     );
+    assert!(
+        !project.path().join("addons").exists(),
+        "the run left runtime files in a project that had no addon"
+    );
 }

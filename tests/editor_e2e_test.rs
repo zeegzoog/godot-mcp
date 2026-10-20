@@ -277,6 +277,24 @@ async fn bridge_is_loopback_only_and_requires_the_token() {
         .expect("authorized call");
     assert_eq!(info["name"], "MCP E2E Fixture");
 
+    // Other OS users cannot read the token file (it is not written when GODOT_MCP_TOKEN is set).
+    #[cfg(unix)]
+    if std::env::var_os("GODOT_MCP_TOKEN").is_none() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = token_path(editor.port).expect("token path");
+        let mode = std::fs::metadata(&path)
+            .expect("token file")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode,
+            0o600,
+            "token file {} has mode {mode:o}",
+            path.display()
+        );
+    }
+
     // Not reachable through any non-loopback address of this host.
     let lan_ip = std::net::UdpSocket::bind("0.0.0.0:0")
         .and_then(|socket| {

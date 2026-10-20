@@ -7,7 +7,7 @@ editor bridge from before that series is present.
 
 Comparison of this Rust server with the three Godot MCP servers it was measured against.
 A cell is **implemented** only when the behavior exists in this tree and a test or a
-real Godot 4.7.2 run checked it. **Partial** means the code is in the tree but the
+real Godot 4.8.beta1 run checked it. **Partial** means the code is in the tree but the
 check was narrower than the feature. **Documented-only** means a reference describes
 it and this server does not do it. **Unsupported** means it was left out on purpose.
 
@@ -17,7 +17,7 @@ it and this server does not do it. **Unsupported** means it was left out on purp
 | --- | --- | --- | --- | --- |
 | Path / remote | `github.com/zeegzoog/godot-mcp`, fork `github.com/theromis/godot-mcp` | `github.com/shin2344234/godot-mcp` `@shin2344234/godot-mcp` 0.1.2, commit `7116e47` | commit `1209744` | commit `6325306` |
 | Runtime | Native binary. No Node.js. | Node.js 22, TypeScript | Node.js, TypeScript | Node.js, TypeScript (fork of Coding-Solo plus a large interactive layer) |
-| Godot | 4.5+ editor plugin. Runtime protocol checked on 4.7.2. | 4.7+ (docs say 4.7.2) | Godot 4 CLI | Godot 4 CLI, same operations script family as Coding-Solo |
+| Godot | This branch's plugin requires 4.8 (`MIN_MINOR = 8`). Editor, export, and runtime checks below used `4.8.beta1.official.4d10419ca`. | 4.7+ (docs say 4.7.2) | Godot 4 CLI | Godot 4 CLI, same operations script family as Coding-Solo |
 | Editor transport | WebSocket `127.0.0.1:9333`, shared token | WebSocket editor bridge | None. Each tool spawns `godot --headless --script` | TCP client to a long-lived Godot process, plus one-shot CLI |
 | Game transport | Godot remote debugger (`--remote-debug tcp://127.0.0.1:<port>`), `mcp:` messages. Editor Play is relayed by `EditorDebuggerPlugin` | Same debugger protocol. This is the architecture this server follows | stdout of the CLI process | Custom input receiver script inside the played scene, not `EngineDebugger` |
 | Edits | `EditorUndoRedoManager` while the editor is connected. Headless fallback writes `.tscn` / `.tres` / `project.godot` text for a few tools | Undoable editor ops, headless Godot for the rest | CLI script mutates files, no undo | CLI script, undo only where Godot's editor is actually open |
@@ -53,19 +53,19 @@ Tool names are the MCP names. Solo and Vollkorn do not use a `godot_` prefix.
 | Launch editor | implemented `godot_launch_editor` | implemented `godot_editor_launch` (waits for the plugin) | implemented `launch_editor` | implemented `launch_editor` | `godot --editor` | Existing. Does not wait for the bridge |
 | Run / stop / status | implemented. `mode: "process"` attaches the debugger. `godot_stop_project` stops editor Play or a process run | implemented `godot_run_start`, `godot_run_stop` | partial `run_project`, `stop_project` (process kill, no live protocol) | partial, same plus interactive session | `--remote-debug`, `EditorInterface.play_*` | Reuse `CliRunner` only for validate/launch. Games go through `GameHub` |
 | Run logs, errors, stacks | partial `godot_run_output`. Debugger `error` frames and stdout/stderr. Verified the probe's `push_error` text. Stack triples are parsed, not separately asserted | implemented `godot_run_output` | partial `get_debug_output` (stdout) | partial `get_debug_output`, `get_runtime_errors` | `DebuggerMarshalls::OutputError` | JS layout. Errors do not pause the game unless `break_on_errors` |
-| Live scene tree | implemented `godot_game_tree`. Verified on a headless 4.7.2 process run | implemented | unsupported | partial `find_nodes`, `game_state` via the input-receiver script | `EngineDebugger` `mcp:request` | JS runtime, not Vollkorn's receiver |
+| Live scene tree | implemented `godot_game_tree`. Verified on a headless 4.8.beta1 process run | implemented | unsupported | partial `find_nodes`, `game_state` via the input-receiver script | `EngineDebugger` `mcp:request` | JS runtime, not Vollkorn's receiver |
 | Live properties read | implemented `godot_game_get`. Verified script vars after input | implemented | unsupported | partial `get_node_properties` is the editor/CLI scene, `game_state` is runtime | `Node.get` | Same |
 | Live property write | partial `godot_game_set`. Refuses `script` and `_` names. Not in the e2e | implemented `godot_game_edit` op `set` | unsupported | partial `set_property` | `Node.set`. Not saved | No eval. No arbitrary property names that escape the node |
 | Live method call | implemented `godot_game_call`. Caller must pass `permit`. Denylist: quit, set_script, call, callv, call_deferred, rpc, rpc_id, free. Verified `poke` returned 4 | implemented inside `godot_game_edit`. `godot_game_eval` is opt-in | unsupported | partial `call_method`, `evaluate_expression` (unrestricted) | `Node.callv` | Permit list. No `godot_game_eval` |
 | Signals | partial. Editor: `godot_list_signals`, `godot_connect_signal` (CONNECT_PERSIST, undo). Runtime: `godot_game_signals`, `godot_game_observe` (connects, waits frames, disconnects). Observe returned without error; a signal fired during the watch window was not asserted | implemented `godot_signal_*` and runtime observe | unsupported | partial `connect_signal`, `subscribe_signals`, `wait_for_signal` | `Node.connect` | Editor connections are undoable. Runtime observation is temporary |
 | Snapshot | partial `godot_game_snapshot` (scene, frame, paused, children). Not in the e2e | implemented as part of tree/time | unsupported | partial `game_state` | `SceneTree` | Small on purpose |
-| Keyboard, mouse, touch, gamepad, wait | implemented `godot_game_input`. Verified on headless 4.7.2: key `A`, left click, touch, joy button A, left stick X, one-frame wait. Events hit the game's `_input`, not the editor | implemented, richer (actions, drag, click-on-node) | unsupported | implemented `send_key`, `send_mouse_*`, `send_joypad_*`, `send_input` through `input_receiver.gd` | `Input.parse_input_event` + `Input.flush_buffered_events` inside the game | JS path. Vollkorn's receiver never sees the editor's input map the same way and is easier to leave stuck |
+| Keyboard, mouse, touch, gamepad, wait | implemented `godot_game_input`. Verified on headless 4.8.beta1: key `A`, left click, touch, joy button A, left stick X, one-frame wait. Events hit the game's `_input`, not the editor | implemented, richer (actions, drag, click-on-node) | unsupported | implemented `send_key`, `send_mouse_*`, `send_joypad_*`, `send_input` through `input_receiver.gd` | `Input.parse_input_event` + `Input.flush_buffered_events` inside the game | JS path. Vollkorn's receiver never sees the editor's input map the same way and is easier to leave stuck |
 | Release stuck input | implemented `godot_game_input_release`. Verified held counts return to 0. The runtime also releases on `_exit_tree` | implemented (release steps; recording layer is separate) | unsupported | partial; no single release-all in the tool list | same `Input` events with `pressed = false`, axes to 0 | Required. No tool leaves a button down without a matching release path |
 | Frame wait | implemented `godot_game_wait` and a `wait` input step | implemented `godot_game_time` (also pause, speed, physics ticks, wait for node/signal) | unsupported | partial `wait_for_node`, `wait_for_signal` | `_process` on the autoload (`PROCESS_MODE_ALWAYS`) | Frames only. Time-scale and suspend are a later gap |
 | Game screenshot | partial `godot_game_screenshot`. PNG magic, IHDR size, and non-empty buffer required before an MCP image. Headless returns an error and no image (verified). A windowed capture was not run | implemented, including editor viewports and image diff | unsupported | implemented `game_screenshot`, `capture_screenshot` (writes a file) | `Viewport.get_texture().get_image().save_png_to_buffer` | Image content only for real PNG bytes |
 | Editor screenshot | partial `godot_capture_viewport` (pre-existing). Needs a window | `godot_game_screenshot` can target the editor view | unsupported | `capture_screenshot` | editor viewport | Left as the existing tool |
 | Breakpoints, pause, step, stack, variables | partial. Process runs only. Verified pause (`reason: pause`, no script stack, which matches `core:break`) and a line breakpoint whose stack contained `_process`. Step into/over/out and variable decode are implemented (`src/godot/debug_ctl.rs`) and not driven by the e2e | implemented `godot_debug_*`, plus evaluate | unsupported | unsupported as a real debugger. `pause_game` sets `SceneTree.paused` | `core:breakpoint`, `core:break`, `step`/`next`/`out`/`continue`, `get_stack_dump`, `get_stack_frame_vars` | Client of Godot's debugger. Editor Play stays on the editor's debugger; the relay does not receive `debug_enter` |
-| GDScript LSP | partial. `godot_code_diagnostics` verified against a broken script (Godot 4.7.2 headless `--lsp-port`). Complete, symbols, definition, references are implemented (`src/lsp/`) and not in the e2e | implemented `godot_code_diagnostics`, `godot_code_symbols`, `godot_code_lookup`, `godot_code_rename` | unsupported | unsupported | Godot's GDScript language server, TCP, `Content-Length` only | Client. No language server of our own. Rename is not ported |
+| GDScript LSP | partial. `godot_code_diagnostics` verified against a broken script (Godot 4.8.beta1 headless `--lsp-port`). Complete, symbols, definition, references are implemented (`src/lsp/`) and not in the e2e | implemented `godot_code_diagnostics`, `godot_code_symbols`, `godot_code_lookup`, `godot_code_rename` | unsupported | unsupported | Godot's GDScript language server, TCP, `Content-Length` only | Client. No language server of our own. Rename is not ported |
 | Create / open / save scene | implemented. `godot_create_scene` (editor pack, or text if the editor is closed — text path unit-tested). `godot_open_scene` reloads an already-open scene when the file bytes differ (editor e2e: node `Before` replaced by `FromDisk`). `godot_save_scene` pre-existing. Absolute paths inside the project are accepted; on macOS `/var` and `/private/var` are treated as the same directory | implemented, plus inherit, save-as, close, batch | implemented `create_scene`, `save_scene` via CLI | implemented, plus more node ops | `PackedScene.pack`, `EditorInterface.reload_scene_from_path` | Reload compares a content hash, not mtime, so a same-second edit counts. Unsaved bridge edits need `discard: true` |
 | Nodes add / remove / properties | implemented (pre-existing), undoable | implemented, plus rename, reparent, duplicate, instance, groups | partial `add_node` | implemented, plus those extras | `EditorUndoRedoManager` | Kept. Rename/reparent/duplicate not added |
 | Script attach | partial `godot_attach_script` (undoable, editor only). Not in the e2e | implemented `godot_script_attach` | unsupported | implemented `attach_script` | `Node.script` via undo | Editor only. Creating the file stays `godot_create_script` |
@@ -80,7 +80,7 @@ Tool names are the MCP names. Solo and Vollkorn do not use a `godot_` prefix.
 
 | Area | Files |
 | --- | --- |
-| Tool catalog and handlers | `src/tools.rs`, `src/tools/parity.rs` |
+| Tool catalog and handlers | `src/tools.rs`, `src/tools/game.rs`, `src/tools/code.rs`, `src/tools/authoring.rs` |
 | Remote debugger session, variant codec | `src/godot/debug_session.rs`, `src/godot/variant.rs` |
 | Breakpoints, pause, step, stack | `src/godot/debug_ctl.rs` |
 | Process runs, `override.cfg` autoload, logs | `src/godot/runs.rs` |
@@ -88,7 +88,7 @@ Tool names are the MCP names. Solo and Vollkorn do not use a `godot_` prefix.
 | Editor bridge commands, stale-scene reload | `addons/godot_mcp/bridge_server.gd` |
 | In-game runtime | `addons/godot_mcp/runtime/mcp_runtime.gd`, `addons/godot_mcp/runtime/ops/rt_*.gd` |
 | Editor Play relay | `addons/godot_mcp/editor/game_relay.gd`, `addons/godot_mcp/core/runtime_override.gd` |
-| Behavior tests | `src/godot/variant.rs`, `src/godot/debug_session.rs`, `src/lsp/framing.rs`, `src/tools/parity.rs`, `tests/tools_test.rs`, `tests/runtime_e2e_test.rs`, `tests/editor_e2e_test.rs` |
+| Behavior tests | `src/godot/variant.rs`, `src/godot/debug_session.rs`, `src/lsp/framing.rs`, `src/tools/game.rs`, `src/tools/authoring.rs`, `tests/tools_test.rs`, `tests/runtime_e2e_test.rs`, `tests/editor_e2e_test.rs`, `tests/addon_export_test.rs` |
 
 ## Errors and limits
 
@@ -112,9 +112,9 @@ Tool names are the MCP names. Solo and Vollkorn do not use a `godot_` prefix.
 - Debugger stepping works on process runs this server launched. Editor Play uses Godot's
   own debugger; the plugin only relays `mcp:*`.
 - LSP frames are `Content-Length` only. Godot rejects a `Content-Type` header.
-- Plugin requires Godot 4.5+. The debugger layouts were checked against the shin2344234
-  notes for 4.7.2 and against a 4.7.2 binary. 4.5 and 4.6 were not re-run for the new
-  runtime. macOS is what the e2e ran. Windows process-group flags exist; they were not run.
+- This branch's plugin requires Godot 4.8 (`MIN_MINOR = 8` in `plugin.gd`). The checks
+  below used `4.8.beta1.official.4d10419ca` on macOS. Release lines 4.5, 4.6, and 4.7
+  were not re-run. Windows process-group flags exist; they were not run.
 - `get_method_argument_type` is not a Node method in 4.7. Argument types come from
   `get_method_list()`.
 
@@ -126,7 +126,7 @@ and `scene:runtime_node_select_set_type`, LSP framing has no `Content-Type`, too
 validation, `godot_game_call` refuses a method that is not permitted and refuses `quit`,
 PNG dimension check, offline `project.godot` setting write, offline `.tscn` create.
 
-Godot 4.7.2 stable (`4.7.2.stable.official.ed1daf0bf`):
+Godot 4.8.beta1 (`4.8.beta1.official.4d10419ca`), the build named in `.github/godot-version`:
 
 - `cargo test --test runtime_e2e_test -- --ignored` — process run, live tree, keyboard,
   mouse, touch, joy button, joy axis, wait, property readback, permitted call, observe,
@@ -144,38 +144,34 @@ GUT/GdUnit4 were not added: they need those addons installed in a fixture projec
 
 ## Verification
 
-These checks were run on the combined series, not on this documentation commit
-by itself. Godot was 4.7.2 stable (`4.7.2.stable.official.ed1daf0bf`). Godot
-4.5.1 was available and was not used.
+These checks were run with every pull request in this series combined on current `master`.
+Godot was `4.8.beta1.official.4d10419ca`, the build named in `.github/godot-version`.
+An earlier pre-split tree had been checked on 4.7.2; that run is not this branch.
 
-`cargo fmt --all` was applied. `cargo clippy --all-targets --all-features -- -D warnings`
+`cargo fmt --all -- --check` and `cargo clippy --all-targets --all-features -- -D warnings`
 finished with no warnings.
 
-`cargo test --offline` (ignored Godot tests excluded): 199 passed, 0 failed.
-Ignored and not part of that count: `addon_export_test` (2), `editor_e2e_test` (3),
-`runtime_e2e_test` (2).
+`cargo test --all-targets` (ignored Godot tests excluded): 206 passed, 0 failed.
+The ignored tests were then run with `GODOT_PATH` set to that 4.8.beta1 binary:
 
-`GODOT_PATH=/path/to/godot cargo test --offline --test runtime_e2e_test -- --ignored --test-threads=1`
-
-- `language_server_reports_a_real_script_error` passed.
-- `running_game_accepts_input_and_can_be_inspected` passed (keyboard, mouse, touch, joy
+- `runtime_e2e_test`: `language_server_reports_a_real_script_error` and
+  `running_game_accepts_input_and_can_be_inspected` passed (keyboard, mouse, touch, joy
   button, joy axis, property readback, permitted call, observe, headless screenshot
   rejection, release-all, error text, pause, breakpoint in `_process`, resume, stop,
   `override.cfg` restored).
+- `editor_e2e_test`: `bridge_is_loopback_only_and_requires_the_token`,
+  `scene_and_property_tools_behave` (including the stale-open-scene reload), and
+  `undo_and_resource_refresh_behave` passed.
+- `addon_export_test`: `should_skip_matches_the_addon_folder_and_nothing_else` and
+  `exported_pack_contains_the_game_but_not_the_addon` passed.
 
-`GODOT_PATH=... cargo test --offline --test editor_e2e_test -- --ignored --test-threads=1`
+`godot --headless --check-only --path . --script` reported no script error for
+`plugin.gd`, `bridge_server.gd`, `export_plugin.gd`, `editor/game_relay.gd`,
+`core/runtime_override.gd`, `runtime/mcp_runtime.gd`, and each `runtime/ops/rt_*.gd`.
 
-- `bridge_is_loopback_only_and_requires_the_token` passed.
-- `scene_and_property_tools_behave` passed, including the stale-open-scene reload.
-- `undo_and_resource_refresh_behave` passed.
-
-`godot --headless --path . --check-only --script` parsed the addon scripts used here,
-including `bridge_server.gd`, `mcp_runtime.gd`, and the `rt_*.gd` ops. The first check of
-`mcp_runtime.gd` failed because `preload(...).call(...)` is not a static call; the exit
-path now calls `release_all` on a script variable. That re-check reported no script error.
-
-Not run: `addon_export_test`, a windowed game screenshot, editor Play (`game_relay.gd`),
-step into/over/out, LSP completion/symbols/definition/references, GUT/GdUnit4.
+Not run: a windowed game screenshot, editor Play (`game_relay.gd` against a played
+scene), step into/over/out, LSP completion/symbols/definition/references, GUT/GdUnit4.
+Release lines `godot-v4.7`, `godot-v4.6`, and `godot-v4.5` were not checked.
 
 ## Remaining gaps
 

@@ -767,10 +767,8 @@ func get_run_status(peer: WebSocketPeer, cmd_id: String) -> void:
 func is_importable(res_path: String) -> bool:
     return res_path.get_extension().to_lower() in IMPORTED_EXTENSIONS or FileAccess.file_exists(res_path + ".import")
 
-## EditorFileSystem.is_importing() does not exist in Godot 4.5, so it is only called where it
-## is available. Calling it unguarded raises a script error that never sends a reply.
 func is_import_running(fs: EditorFileSystem) -> bool:
-    return fs.has_method("is_importing") and bool(fs.call("is_importing"))
+    return fs.is_importing()
 
 func resave_resources(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
     var fs: EditorFileSystem = EditorInterface.get_resource_filesystem()

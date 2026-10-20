@@ -1,15 +1,15 @@
 ; Minimal Godot project for developing and validating the addons/godot_mcp
 ; plugin in isolation. Not a game — opening this in the Godot Editor and
 ; enabling the plugin lets you exercise the live WebSocket bridge directly
-; against this repo, and gives `--path .` a real project context so the
-; addon's `class_name` declarations resolve during headless script checks.
+; against this repo, and gives `--path .` a real project context for the
+; headless script checks of the addon.
 
 config_version=5
 
 [application]
 
 config/name="Godot MCP (addon dev project)"
-config/features=PackedStringArray("4.5")
+config/features=PackedStringArray("4.8")
 
 [editor_plugins]
 

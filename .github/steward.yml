@@ -1,0 +1,30 @@
+# Profile of the repo-steward skill (.agents/skills/repo-steward) for godot-mcp.
+# Only the keys that differ from the skill's defaults are set; `profile.sh list` shows all.
+# The planning ecosystem and the paths readiness ignores are detected, not configured.
+
+project:
+  guides: AGENTS.md CONTRIBUTING.md SECURITY.md
+
+board:
+  title: godot-mcp issues and pull requests
+  # The Godot lines an item affects, for example "4.8 4.7 4.6".
+  text_fields: Lines
+
+triage:
+  priority_examples: .github/steward-priorities.md
+
+review:
+  # Places where a contributor's change runs code while the project builds.
+  sensitive_paths: .github/ build.rs .cargo/
+
+limits:
+  allowed_bots: dependabot[bot]
+
+release:
+  procedure: .agents/skills/release/SKILL.md, procedure C
+  skip_subjects: chore(release) chore(line)
+  # Every release contains every Godot line listed here, each built from its own branch.
+  targets_file: .github/lines
+  target_branch: godot-v{t}
+  target_tag: v{version}+godot.{t}
+  target_build_file: .github/godot-version

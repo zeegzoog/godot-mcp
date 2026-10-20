@@ -1,6 +1,6 @@
 # Test Suite
 
-**Version:** 1.2.0
+**Version:** 1.3.0
 **Status:** Stable
 **Layer:** implementation
 **Implements:** l1-quality-assurance.md
@@ -51,6 +51,7 @@ tests/
 ├── detach_test.rs             launched processes do not hold the server's stderr
 ├── server_test.rs             frame and result helpers, catalog shape
 ├── version_sync_test.rs       server version == addon version; line identity files agree
+├── steward_test.rs            repo-steward: readiness on a fixture repository, workflow least privilege
 ├── editor_e2e_test.rs         (ignored) real headless editor: security, scene/property tools, undo, resave
 └── addon_export_test.rs       (ignored) export policy unit check + real pack export without the addon
 examples/
@@ -71,6 +72,7 @@ Unit tests live next to the code in `src/paths.rs`, `src/validation.rs`, `src/cl
 | Export exclusion | `tests/addon_export_test.rs` |
 | Process independence | `tests/detach_test.rs` |
 | Release line identity (version string, minimum engine version, engine build) | `tests/version_sync_test.rs` |
+| Repo steward scripts and workflows (readiness, least privilege, tracked skill) [ADDED] | `tests/steward_test.rs` |
 
 ## 6. Implementation Notes
 
@@ -88,6 +90,7 @@ Unit tests live next to the code in `src/paths.rs`, `src/validation.rs`, `src/cl
 | `[DETACH]` | `tests/detach_test.rs` | Process detachment |
 | `[FRAMES]` | `tests/server_test.rs` | Frame helper tests |
 | `[VERSION]` | `tests/version_sync_test.rs` | Version and line identity sync |
+| `[STEWARD]` | `tests/steward_test.rs` | Repo steward readiness and workflow guards |
 | `[E2E]` | `tests/editor_e2e_test.rs` | Real-editor tests |
 | `[EXPORT]` | `tests/addon_export_test.rs` | Export tests |
 | `[GUIDE]` | `AGENTS.md` | Verification checklist |
@@ -100,3 +103,4 @@ Unit tests live next to the code in `src/paths.rs`, `src/validation.rs`, `src/cl
 | 1.1.0 | 2026-10-16 | Agent (magic.spec) | [ADDED] The feedback channel's test file, its unit-test locations, routing row and reference. |
 | 1.1.1 | 2026-10-16 | Agent (magic.run) | [ADDED] The stand-in GitHub client helper and its example target. |
 | 1.2.0 | 2026-10-20 | Agent (magic.spec) | [MODIFIED] QA-3, QA-6, QA-7 rows per release line; [ADDED] line identity checks in the version sync test and its routing row. Stable → RFC → Stable after Post-Update Review. |
+| 1.3.0 | 2026-10-20 | Agent (magic.spec) | [ADDED] The repo steward's test file, its routing row and reference. Stable → RFC → Stable after Post-Update Review. |

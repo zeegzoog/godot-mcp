@@ -16,9 +16,9 @@ Each godot-mcp release is built for one Godot minor version: its title ends with
 
 | Your Godot | Branch | Release to install |
 | --- | --- | --- |
-| 4.7.x | `godot-v4.7` | 0.4.0, the last release before the lines |
-| 4.6.x | `godot-v4.6` | 0.4.0, the last release before the lines |
-| 4.5.x | `godot-v4.5` | 0.4.0, the last release before the lines |
+| 4.7.x | `godot-v4.7` | the newest release titled "for Godot 4.7" |
+| 4.6.x | `godot-v4.6` | the newest release titled "for Godot 4.6" |
+| 4.5.x | `godot-v4.5` | the newest release titled "for Godot 4.5" |
 | 4.8 (pre-release) | `master` | none; build from source |
 
 Release 0.4.0 is one build for Godot 4.5 and newer, and its file names have no `-godotM.N` suffix.

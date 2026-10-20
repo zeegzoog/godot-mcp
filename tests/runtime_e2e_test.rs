@@ -318,3 +318,50 @@ async fn running_game_accepts_input_and_can_be_inspected() {
         "the run left runtime files in a project that had no addon"
     );
 }
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn language_server_reports_a_real_script_error() {
+    let project = project();
+    let broken = project.path().join("scripts/broken.gd");
+    std::fs::write(&broken, "extends Node\nfunc broken(\n").unwrap();
+    let tools = manager(project.path());
+    let result = call(
+        &tools,
+        "godot_code_diagnostics",
+        json!({"project_path": project.path(), "script_path": "res://scripts/broken.gd"}),
+    )
+    .await;
+    assert!(!result.is_error, "{}", text_of(&result));
+    let body = json_of(&result);
+    let diagnostics = body["diagnostics"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{}", text_of(&result)));
+    assert!(
+        diagnostics
+            .iter()
+            .any(|item| item["severity"].as_str() != Some("hint")),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn language_server_answers_the_same_script_again() {
+    let project = project();
+    let tools = manager(project.path());
+    for round in 0..3 {
+        let symbols = call(
+            &tools,
+            "godot_code_symbols",
+            json!({"project_path": project.path(), "script_path": "res://scripts/probe.gd"}),
+        )
+        .await;
+        assert!(!symbols.is_error, "round {round}: {}", text_of(&symbols));
+        let body = json_of(&symbols);
+        assert!(
+            body["symbols"].to_string().contains("poke"),
+            "round {round}: {body}"
+        );
+    }
+}

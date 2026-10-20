@@ -119,15 +119,21 @@ const UNDO_HOOK: &str = r#"        "__test_undo":
 "#;
 
 async fn start_editor(with_undo_hook: bool) -> Editor {
+    start_editor_configured(with_undo_hook, "").await
+}
+
+async fn start_editor_configured(with_undo_hook: bool, project_tail: &str) -> Editor {
     let (godot, console) = godot_binaries();
     let dir = tempfile::tempdir().expect("project dir");
     let project = dir.path().to_path_buf();
 
     std::fs::write(
         project.join("project.godot"),
-        "config_version=5\n\n[application]\n\nconfig/name=\"MCP E2E Fixture\"\n\
-         run/main_scene=\"res://main.tscn\"\nconfig/features=PackedStringArray(\"4.5\")\n\n\
-         [editor_plugins]\n\nenabled=PackedStringArray(\"res://addons/godot_mcp/plugin.cfg\")\n",
+        format!(
+            "config_version=5\n\n[application]\n\nconfig/name=\"MCP E2E Fixture\"\n\
+             run/main_scene=\"res://main.tscn\"\nconfig/features=PackedStringArray(\"4.5\")\n\n\
+             [editor_plugins]\n\nenabled=PackedStringArray(\"res://addons/godot_mcp/plugin.cfg\")\n{project_tail}"
+        ),
     )
     .expect("project.godot");
     std::fs::write(project.join("main.tscn"), MAIN_SCENE).expect("main.tscn");
@@ -685,4 +691,43 @@ async fn undo_and_resource_refresh_behave() {
         .await
         .expect("full scan");
     assert_eq!(scan["mode"], "full_scan");
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn play_with_runtime_disabled_does_not_write_override() {
+    let editor = start_editor_configured(false, "\n[godot_mcp]\n\nruntime_on_play=false\n").await;
+    let bridge = &editor.bridge;
+    bridge
+        .send_command("run_project", json!({}))
+        .await
+        .expect("play");
+    let override_path = editor.project.join("override.cfg");
+    let mut running = false;
+    for _ in 0..40 {
+        let text = std::fs::read_to_string(&override_path).unwrap_or_default();
+        assert!(
+            !text.contains("godot_mcp: temporary runtime autoload"),
+            "play wrote override.cfg while runtime_on_play is off: {text}"
+        );
+        let status = bridge
+            .send_command("get_run_status", json!({}))
+            .await
+            .expect("status");
+        if status["running"] == true {
+            running = true;
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    assert!(running, "editor play did not start:\n{}", editor.log_text());
+    let text = std::fs::read_to_string(&override_path).unwrap_or_default();
+    assert!(
+        !text.contains("godot_mcp: temporary runtime autoload"),
+        "play wrote override.cfg while runtime_on_play is off: {text}"
+    );
+    bridge
+        .send_command("stop_project", json!({}))
+        .await
+        .expect("stop");
 }

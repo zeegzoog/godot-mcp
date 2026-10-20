@@ -4,6 +4,8 @@ This document establishes the architectural principles, development workflow, an
 
 The contribution workflow — branches per Godot version, carrying changes between them, commit and pull request rules — is in [CONTRIBUTING.md](CONTRIBUTING.md). The verification commands below are the same as its Verification section; change both together.
 
+Work on this repository's issues and pull requests — triage, replies, reviews, merges, the board and release readiness — follows the repo-steward skill, [.agents/skills/repo-steward/SKILL.md](.agents/skills/repo-steward/SKILL.md); its autonomy settings bound what an agent posts, closes or merges without asking.
+
 ## Mission & Scope
 
 The primary objective of this project is to build an uncompromising, ultra-fast, cross-platform Model Context Protocol (MCP) server providing AI agents with full, reliable control over the Godot Game Engine (4.x+) across Windows, Linux, and macOS.

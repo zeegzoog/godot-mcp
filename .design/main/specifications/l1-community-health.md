@@ -1,6 +1,6 @@
 # Community Health Files
 
-**Version:** 1.0.0
+**Version:** 1.1.0
 **Status:** Stable
 **Layer:** concept
 
@@ -15,6 +15,7 @@ Defines the two policy documents a security reporter or a contributor meets firs
 - [l1-editor-bridge.md](l1-editor-bridge.md) - Guarantees the security policy names as its scope.
 - [l1-tool-catalog.md](l1-tool-catalog.md) - Write and launch safety, part of the security scope.
 - [l1-agent-feedback.md](l1-agent-feedback.md) - The public feedback channel the security policy keeps vulnerabilities out of.
+- [l1-repository-stewardship.md](l1-repository-stewardship.md) - How issues and pull requests are handled once opened, which the contributor guide describes. [ADDED]
 - [l2-community-health-files.md](l2-community-health-files.md) - Implementation of this concept.
 
 ## 1. Motivation
@@ -36,7 +37,7 @@ Both documents exist only as headings. A reporter without a private channel eith
 - **CH-2 Private first.** The security policy names exactly one private reporting channel and tells readers never to report a vulnerability publicly — not in issues, pull requests or the agent feedback channel. It lists what a report should contain and states the response targets, how disclosure is coordinated and how reporters are credited.
 - **CH-3 Supported versions are the line table.** The security policy's supported-versions table is the line table (RL-10): which lines receive security fixes, where a fix is released, and which versions are unsupported (retired lines, releases from before the lines).
 - **CH-4 Scope stated.** The security policy says what counts as a vulnerability in this project — reaching the editor bridge without its secret or from another machine, writing or reading outside the project directory, passing arguments or code to the engine through tool input, leaking secrets or private paths through a feedback report — and what does not: defects in Godot itself (reported to Godot), attacks that need code already running as the same operating-system user, and an AI client doing what its user allowed.
-- **CH-5 Complete contribution path.** The contributor guide takes a contributor from a first question to a merged change: where to ask, how to report a bug or propose a feature, how to set up and run the checks, which branch a change targets (RL-6), that a test comes first (QA-1), what a commit and a pull request must contain, how a change reaches other lines, and under which license a contribution is accepted.
+- **CH-5 Complete contribution path.** The contributor guide takes a contributor from a first question to a merged change: where to ask, how to report a bug or propose a feature, what happens to an issue or pull request once it is opened and who answers it, how to set up and run the checks, which branch a change targets (RL-6), that a test comes first (QA-1), what a commit and a pull request must contain, how a change reaches other lines, and under which license a contribution is accepted.
 - **CH-6 Written for people and agents.** Each instruction is one imperative sentence or bullet; commands are complete and copyable; mappings (line to branch to Godot version, check to command) are tables; no step depends on an image, tone or unstated context; a term is defined once, where it is first used. Rules specific to AI agents are linked to the agent guide, not restated.
 - **CH-7 One owner per fact.** Each fact has one owning document and the others link to it. A command sequence an agent must have inline (the agent guide, the release procedure) may repeat the contributor guide's; a change to one updates every copy in the same change.
 - **CH-8 Updated by the change that dates them.** A change that makes either document wrong — a line cut or retired, the reporting channel, the response targets, the checks, the branch model, a toolchain or engine minimum — updates the document in the same change. Both documents are identical on every line.
@@ -65,6 +66,7 @@ Both documents exist only as headings. A reporter without a private channel eith
 | Making a Change | Test first, where each kind of test goes, coding standards (link to the agent guide) |
 | Verification | The full pipeline, as copyable commands |
 | Commits and Pull Requests | Commit message format, one logical change per pull request, what the description states, what never to commit |
+| Issues and Pull Requests | [ADDED] That an AI assistant triages, answers and reviews on the maintainers' behalf and says so in every message; what the labels and priorities mean; when an unanswered request for information closes an issue and how to reopen it; how to reach a person; that the maintainers decide on accepting features and on releases; where the board is |
 | Carrying Changes Between Lines | How a merged change reaches older lines, who does it |
 | Planning and Specifications | That the planning directory is shared and maintained on the default branch, how maintainers use the planning workflow, what contributors need to know without it |
 | For AI Agents | Read and follow the agent guide; the commands here are the same |
@@ -81,6 +83,7 @@ Both documents exist only as headings. A reporter without a private channel eith
 | Verification commands, toolchain or engine minimum change | — | Development Setup, Verification |
 | Branch model or carrying procedure changes | How Fixes Are Released | Branches and Godot Versions, Carrying Changes Between Lines |
 | Commit or pull request conventions change | — | Commits and Pull Requests |
+| Stewardship settings change (labels, timings, autonomy, the board) | — | Issues and Pull Requests [ADDED] |
 
 ## 7. Drawbacks & Alternatives
 
@@ -102,3 +105,4 @@ Both documents exist only as headings. A reporter without a private channel eith
 | Version | Date | Author | Description |
 | --- | --- | --- | --- |
 | 1.0.0 | 2026-10-20 | Agent (magic.spec) | Created from the request to fill the security policy and the contributor guide following GitHub's guidance, readable by people and AI agents, and to keep them current. Promoted to Stable after Post-Update Review. |
+| 1.1.0 | 2026-10-20 | Agent (magic.spec) | [ADDED] CH-5 and the contributor guide's Issues and Pull Requests section, with its update trigger, for the AI-assisted handling of issues and pull requests. Stable → RFC → Stable after Post-Update Review. |

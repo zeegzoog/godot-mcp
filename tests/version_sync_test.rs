@@ -115,10 +115,12 @@ fn ci_godot_build_belongs_to_the_line() {
 }
 
 #[test]
-fn release_workflow_tag_filter_avoids_the_plus_sign() {
-    // In a GitHub Actions filter pattern `+` means "one or more of the preceding character",
-    // so `v*.*.*+godot.*` is an invalid pattern: GitHub then rejects the whole workflow file
-    // and no tag ever starts a release. The `+` of the tag is matched by `*` instead.
+fn release_workflow_starts_on_release_tags_only() {
+    // A release is published from a plain `vX.Y.Z` tag. The tags of the release lines
+    // (`vX.Y.Z+godot.M.N`) only anchor each line's sources and must not start one.
+    // In a GitHub Actions filter pattern `+` is a quantifier of the preceding character, so it is
+    // valid after a character class (`[0-9]+`) and invalid after `*`: GitHub then rejects the
+    // whole workflow file and no tag ever starts a release.
     let workflow = read(".github/workflows/release.yml");
     let patterns: Vec<&str> = workflow
         .lines()
@@ -131,8 +133,45 @@ fn release_workflow_tag_filter_avoids_the_plus_sign() {
     );
     for pattern in patterns {
         assert!(
-            !pattern.contains('+'),
-            "release.yml tag filter \"v{pattern} contains `+`, which GitHub reads as a quantifier"
+            !pattern.contains("godot"),
+            "release.yml tag filter \"v{pattern} would also match line tags"
+        );
+        for (at, _) in pattern.match_indices('+') {
+            assert!(
+                pattern[..at].ends_with(']'),
+                "release.yml tag filter \"v{pattern} has a `+` that does not follow a character class"
+            );
+        }
+    }
+}
+
+#[test]
+fn supported_lines_are_listed_and_the_development_line_is_not() {
+    let (major, minor) = line();
+    let lines = read(".github/lines");
+    let listed: Vec<&str> = lines
+        .lines()
+        .map(|line| line.split('#').next().unwrap_or("").trim())
+        .filter(|line| !line.is_empty())
+        .collect();
+
+    assert!(
+        !listed.is_empty(),
+        ".github/lines lists no Godot line, so a release would contain nothing"
+    );
+    for entry in &listed {
+        let valid = entry
+            .split_once('.')
+            .is_some_and(|(a, b)| a.parse::<u32>().is_ok() && b.parse::<u32>().is_ok());
+        assert!(
+            valid,
+            ".github/lines has {entry:?}, which is not a Godot M.N"
+        );
+    }
+    if env!("CARGO_PKG_VERSION").contains("-dev") {
+        assert!(
+            !listed.contains(&format!("{major}.{minor}").as_str()),
+            "the development line {major}.{minor} must not be listed in .github/lines: it is never released"
         );
     }
 }

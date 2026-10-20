@@ -40,6 +40,13 @@ const PARAM_TYPES: Dictionary = {
     "open_scene": {"scene_path": TYPE_STRING, "reload": TYPE_BOOL, "discard": TYPE_BOOL},
     "run_project": {"scene_path": TYPE_STRING},
     "resave_resources": {"paths": TYPE_ARRAY},
+    "create_scene": {"scene_path": TYPE_STRING, "root_type": TYPE_STRING, "root_name": TYPE_STRING},
+    "attach_script": {"node_path": TYPE_STRING, "script_path": TYPE_STRING},
+    "connect_signal": {"node_path": TYPE_STRING, "signal_name": TYPE_STRING, "method": TYPE_STRING, "target_path": TYPE_STRING},
+    "list_signals": {"node_path": TYPE_STRING},
+    "create_resource": {"resource_path": TYPE_STRING, "class_name": TYPE_STRING},
+    "set_project_setting": {"key": TYPE_STRING},
+    "get_project_settings": {"prefix": TYPE_STRING},
     "game_send": {"command": TYPE_STRING},
 }
 
@@ -263,6 +270,20 @@ func dispatch_command(peer: WebSocketPeer, cmd_id: String, cmd_type: String, par
             get_run_status(peer, cmd_id)
         "resave_resources":
             resave_resources(peer, cmd_id, params)
+        "create_scene":
+            create_scene(peer, cmd_id, params)
+        "attach_script":
+            attach_script(peer, cmd_id, params)
+        "connect_signal":
+            connect_signal(peer, cmd_id, params)
+        "list_signals":
+            list_signals(peer, cmd_id, params)
+        "create_resource":
+            create_resource(peer, cmd_id, params)
+        "set_project_setting":
+            set_project_setting(peer, cmd_id, params)
+        "get_project_settings":
+            get_project_settings(peer, cmd_id, params)
         "game_send":
             game_send(peer, cmd_id, params)
         "game_status":
@@ -995,6 +1016,219 @@ func _undo_version(scene_path: String) -> int:
     return history.get_version()
 
 # --- Replies ---------------------------------------------------------------------------
+
+# --- Authoring ------------------------------------------------------------------------
+
+func create_scene(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
+    var scene_path: String = to_res_path(str(params.get("scene_path", "")))
+    var root_type: String = str(params.get("root_type", "Node"))
+    var root_name: String = str(params.get("root_name", "Root"))
+    if scene_path.is_empty() or not scene_path.ends_with(".tscn"):
+        send_error(peer, cmd_id, "scene_path must be a res:// path ending in .tscn")
+        return
+    if FileAccess.file_exists(scene_path):
+        send_error(peer, cmd_id, "Scene already exists: " + scene_path)
+        return
+    var created: Dictionary = instantiate_node(root_type)
+    if created.has("error"):
+        send_error(peer, cmd_id, created["error"])
+        return
+    var root: Node = created["node"]
+    root.name = root_name if not root_name.is_empty() else "Root"
+    var packed := PackedScene.new()
+    var pack_err: Error = packed.pack(root)
+    root.free()
+    if pack_err != OK:
+        send_error(peer, cmd_id, "Failed to pack scene: " + error_string(pack_err))
+        return
+    var save_err: Error = ResourceSaver.save(packed, scene_path)
+    if save_err != OK:
+        send_error(peer, cmd_id, "Failed to save scene: " + error_string(save_err))
+        return
+    EditorInterface.get_resource_filesystem().update_file(scene_path)
+    EditorInterface.open_scene_from_path(scene_path)
+    remember_scene_sync(scene_path)
+    send_success(peer, cmd_id, {"created": true, "scene_path": scene_path, "root_type": root_type})
+
+func attach_script(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
+    var root: Node = scene_root_or_error(peer, cmd_id)
+    if root == null:
+        return
+    var node_path: String = str(params.get("node_path", "."))
+    var target: Node = find_scene_node(root, node_path)
+    if target == null:
+        send_error(peer, cmd_id, "Node not found at path: " + node_path)
+        return
+    var script_path: String = str(params.get("script_path", ""))
+    var script: Script = null
+    if not script_path.is_empty() and script_path != "null":
+        script_path = to_res_path(script_path)
+        if script_path.is_empty() or not FileAccess.file_exists(script_path):
+            send_error(peer, cmd_id, "Script file does not exist: " + str(params.get("script_path", "")))
+            return
+        script = load(script_path) as Script
+        if script == null:
+            send_error(peer, cmd_id, "File is not a script: " + script_path)
+            return
+    if undo_redo != null:
+        undo_redo.create_action("Attach Script", UndoRedo.MERGE_DISABLE, root)
+        undo_redo.add_do_property(target, "script", script)
+        undo_redo.add_undo_property(target, "script", target.get_script())
+        undo_redo.commit_action()
+    else:
+        target.set_script(script)
+    mark_scene_dirty()
+    send_success(peer, cmd_id, {"node_path": node_path, "script_path": script_path})
+
+func connect_signal(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
+    var root: Node = scene_root_or_error(peer, cmd_id)
+    if root == null:
+        return
+    var source: Node = find_scene_node(root, str(params.get("node_path", ".")))
+    var target: Node = find_scene_node(root, str(params.get("target_path", ".")))
+    var signal_name: String = str(params.get("signal_name", ""))
+    var method_name: String = str(params.get("method", ""))
+    if source == null or target == null:
+        send_error(peer, cmd_id, "Signal source or target node was not found in the edited scene")
+        return
+    if not source.has_signal(signal_name):
+        send_error(peer, cmd_id, "Node has no signal '%s'" % signal_name)
+        return
+    if not method_name.is_valid_identifier():
+        send_error(peer, cmd_id, "Method name must be an identifier")
+        return
+    if not target.has_method(method_name):
+        send_error(peer, cmd_id, "Node '%s' has no method '%s'; attach a script that defines it first" % [str(params.get("target_path", ".")), method_name])
+        return
+    var callable := Callable(target, method_name)
+    if source.is_connected(signal_name, callable):
+        send_error(peer, cmd_id, "Signal '%s' is already connected to '%s'" % [signal_name, method_name])
+        return
+    if undo_redo != null:
+        undo_redo.create_action("Connect Signal", UndoRedo.MERGE_DISABLE, root)
+        undo_redo.add_do_method(source, "connect", signal_name, callable, CONNECT_PERSIST)
+        undo_redo.add_undo_method(source, "disconnect", signal_name, callable)
+        undo_redo.commit_action()
+    else:
+        source.connect(signal_name, callable, CONNECT_PERSIST)
+    mark_scene_dirty()
+    send_success(peer, cmd_id, {"signal": signal_name, "method": method_name})
+
+func list_signals(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
+    var root: Node = scene_root_or_error(peer, cmd_id)
+    if root == null:
+        return
+    var node: Node = find_scene_node(root, str(params.get("node_path", ".")))
+    if node == null:
+        send_error(peer, cmd_id, "Node not found")
+        return
+    var signals: Array = []
+    for info: Dictionary in node.get_signal_list():
+        var signal_name := str(info.get("name", ""))
+        var connections: Array = []
+        for connection: Dictionary in node.get_signal_connection_list(signal_name):
+            var callable: Callable = connection.get("callable", Callable())
+            connections.append(callable.get_method() if callable.is_valid() else "")
+        signals.append({"name": signal_name, "connections": connections})
+    send_success(peer, cmd_id, {"signals": signals})
+
+func create_resource(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
+    var resource_path: String = to_res_path(str(params.get("resource_path", "")))
+    var resource_class: String = str(params.get("class_name", ""))
+    if resource_path.is_empty():
+        send_error(peer, cmd_id, "resource_path must be a res:// path")
+        return
+    # Saving over a file would replace it, also one the editor has open, without a way back.
+    if FileAccess.file_exists(resource_path):
+        send_error(peer, cmd_id, "File already exists: " + resource_path)
+        return
+    if not (resource_path.ends_with(".tres") or resource_path.ends_with(".res")):
+        send_error(peer, cmd_id, "resource_path must end in .tres or .res")
+        return
+    if not ClassDB.class_exists(resource_class) or not ClassDB.can_instantiate(resource_class) or not ClassDB.is_parent_class(resource_class, "Resource"):
+        send_error(peer, cmd_id, "Unknown resource class: " + resource_class)
+        return
+    var resource: Resource = ClassDB.instantiate(resource_class)
+    var save_err: Error = ResourceSaver.save(resource, resource_path)
+    if save_err != OK:
+        send_error(peer, cmd_id, "Failed to save resource: " + error_string(save_err))
+        return
+    EditorInterface.get_resource_filesystem().update_file(resource_path)
+    send_success(peer, cmd_id, {"resource_path": resource_path, "class_name": resource_class})
+
+const SETTING_KEY_CHARS: String = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_/.-"
+
+func _is_setting_key(key: String) -> bool:
+    if key.is_empty() or not key.contains("/") or key.begins_with("/") or key.ends_with("/") or key.contains("//"):
+        return false
+    for character: String in key:
+        if not SETTING_KEY_CHARS.contains(character):
+            return false
+    return true
+
+## The value to store for a setting that already exists, or an error. The value must have the
+## type the setting has: a wrong type would be written to project.godot and fail at the next load.
+func _coerce_setting(current: Variant, value: Variant) -> Dictionary:
+    match typeof(current):
+        TYPE_STRING:
+            if value is String:
+                return {"value": value}
+        TYPE_BOOL:
+            if value is bool:
+                return {"value": value}
+        TYPE_INT:
+            if (value is float or value is int) and not value is bool and is_equal_approx(floorf(float(value)), float(value)):
+                return {"value": int(value)}
+        TYPE_FLOAT:
+            if (value is float or value is int) and not value is bool:
+                return {"value": float(value)}
+    return {"error": "This setting expects a %s; a value of another type is not stored. Change settings of other types in the editor's Project Settings." % type_string(typeof(current)).to_lower()}
+
+func set_project_setting(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
+    var key: String = str(params.get("key", ""))
+    if not _is_setting_key(key):
+        send_error(peer, cmd_id, "key must start with a section and use only letters, digits and _ / . -, like application/config/name")
+        return
+    var value: Variant = params.get("value")
+    if not (value is String or value is bool or value is int or value is float):
+        send_error(peer, cmd_id, "value must be a string, number or boolean")
+        return
+    var previous: Variant = null
+    if ProjectSettings.has_setting(key):
+        previous = ProjectSettings.get_setting(key)
+        var coerced: Dictionary = _coerce_setting(previous, value)
+        if coerced.has("error"):
+            send_error(peer, cmd_id, "'%s': %s" % [key, coerced["error"]])
+            return
+        value = coerced["value"]
+    ProjectSettings.set_setting(key, value)
+    var err: Error = ProjectSettings.save()
+    if err != OK:
+        ProjectSettings.set_setting(key, previous)
+        send_error(peer, cmd_id, "Failed to save project settings: " + error_string(err))
+        return
+    var reported: Variant = previous
+    if previous != null and not (previous is String or previous is bool or previous is int or previous is float):
+        reported = str(previous)
+    send_success(peer, cmd_id, {"key": key, "saved": true, "previous": reported})
+
+func get_project_settings(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
+    var prefix: String = str(params.get("prefix", ""))
+    var values: Dictionary = {}
+    var count := 0
+    for info: Dictionary in ProjectSettings.get_property_list():
+        var key := str(info.get("name", ""))
+        if not key.contains("/"):
+            continue
+        if not prefix.is_empty() and not key.begins_with(prefix):
+            continue
+        if not ProjectSettings.has_setting(key):
+            continue
+        values[key] = str(ProjectSettings.get_setting(key))
+        count += 1
+        if count >= 200:
+            break
+    send_success(peer, cmd_id, {"settings": values, "truncated": count >= 200})
 
 # --- Running game ---------------------------------------------------------------------
 

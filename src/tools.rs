@@ -15,6 +15,7 @@ use std::sync::{Arc, OnceLock};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
+mod authoring;
 mod code;
 mod feedback;
 mod game;
@@ -122,6 +123,7 @@ impl ToolManager {
             "godot_create_script" => self.handle_create_script(args).await,
             "godot_validate_script" => self.handle_validate_script(args).await,
             "godot_resave_resources" => self.handle_bridge_call("resave_resources", args).await,
+            name if authoring::handles(name) => authoring::call(&self, name, args).await,
             name if game::handles(name) => game::call(&self, name, args).await,
             name if code::handles(name) => code::call(&self, name, args).await,
             feedback::NOTE => self.handle_note_feedback(args).await,
@@ -911,6 +913,7 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
             &[],
         ),
     ];
+    tools.extend(authoring::catalog());
     tools.extend(game::catalog());
     tools.extend(code::catalog());
     tools.extend(feedback::catalog(feedback_mode));

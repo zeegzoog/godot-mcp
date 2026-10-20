@@ -306,6 +306,138 @@ fn launch_editor_schema_no_longer_requires_project_path() {
 }
 
 #[tokio::test]
+async fn create_scene_without_an_editor_writes_a_scene_file() {
+    let project = project_dir();
+    let result = call(
+        "godot_create_scene",
+        json!({
+            "scene_path": "res://scenes/main.tscn",
+            "root_type": "Node2D",
+            "root_name": "Probe",
+            "project_path": project.path(),
+        }),
+    )
+    .await;
+
+    assert!(!result.is_error, "{}", text(&result));
+    let written = std::fs::read_to_string(project.path().join("scenes/main.tscn")).expect("scene");
+    assert!(written.contains("type=\"Node2D\""), "{written}");
+    assert!(written.contains("name=\"Probe\""), "{written}");
+    assert!(written.starts_with("[gd_scene"), "{written}");
+}
+
+#[tokio::test]
+async fn create_resource_without_an_editor_never_replaces_a_file() {
+    let project = project_dir();
+    let args = |class: &str| {
+        json!({
+            "resource_path": "res://made.tres",
+            "class_name": class,
+            "project_path": project.path(),
+        })
+    };
+    let first = call("godot_create_resource", args("Curve")).await;
+    assert!(!first.is_error, "{}", text(&first));
+    let written = std::fs::read_to_string(project.path().join("made.tres")).expect("resource");
+    assert!(written.contains("type=\"Curve\""), "{written}");
+
+    let second = call("godot_create_resource", args("Gradient")).await;
+    assert!(second.is_error, "{}", text(&second));
+    assert!(
+        text(&second).contains("already exists"),
+        "{}",
+        text(&second)
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("made.tres")).expect("resource again"),
+        written,
+        "the second call replaced the file"
+    );
+}
+
+#[tokio::test]
+async fn project_setting_without_an_editor_cannot_add_lines_to_project_godot() {
+    let project = project_dir();
+    let project_file = project.path().join("project.godot");
+    std::fs::write(
+        &project_file,
+        "config_version=5\n\n[application]\n\nconfig/name=\"Old\"\nrun/max_fps=30\nrun/low=true\n",
+    )
+    .expect("project.godot");
+    let set = |key: &str, value: Value| {
+        call(
+            "godot_set_project_setting",
+            json!({"key": key, "value": value, "project_path": project.path()}),
+        )
+    };
+
+    // A value with quotes, a backslash and line breaks stays one value on one line.
+    let sneaky = "x\"\n[autoload]\nEvil=\"*res://evil.gd\"\\\n";
+    let stored = set("application/config/name", json!(sneaky)).await;
+    assert!(!stored.is_error, "{}", text(&stored));
+    let after = std::fs::read_to_string(&project_file).expect("project.godot");
+    assert!(
+        after.lines().all(|line| line.trim() != "[autoload]") && !after.contains("\nEvil="),
+        "a value added lines to project.godot:\n{after}"
+    );
+    assert!(
+        after.contains(r#"config/name="x\"\n[autoload]\nEvil=\"*res://evil.gd\"\\\n""#),
+        "{after}"
+    );
+
+    // A key that is not a plain path of letters, digits and _ / . - is refused and changes nothing.
+    for bad_key in [
+        "application/x]\n[autoload",
+        "application/a=b",
+        "application/two words",
+        "noslash",
+        "/leading",
+        "trailing/",
+        "double//slash",
+    ] {
+        let refused = set(bad_key, json!("v")).await;
+        assert!(refused.is_error, "key {bad_key:?}: {}", text(&refused));
+    }
+
+    // A value of another type than the setting has is refused too; the right type is stored.
+    for (key, value) in [
+        ("application/config/name", json!(5)),
+        ("application/run/max_fps", json!("fast")),
+        ("application/run/max_fps", json!(2.5)),
+        ("application/run/low", json!(1)),
+    ] {
+        let refused = set(key, value.clone()).await;
+        assert!(refused.is_error, "{key} = {value}: {}", text(&refused));
+        assert!(text(&refused).contains("expects"), "{}", text(&refused));
+    }
+    let structure = set("application/config/name", json!({"a": 1})).await;
+    assert!(structure.is_error, "{}", text(&structure));
+    assert!(
+        text(&structure).contains("string, number or boolean"),
+        "{}",
+        text(&structure)
+    );
+    let unchanged = std::fs::read_to_string(&project_file).expect("project.godot");
+    assert_eq!(unchanged, after, "a refused call changed project.godot");
+
+    let fps = set("application/run/max_fps", json!(60)).await;
+    assert!(!fps.is_error, "{}", text(&fps));
+    let low = set("application/run/low", json!(false)).await;
+    assert!(!low.is_error, "{}", text(&low));
+    let added = set("custom/new/ratio", json!(0.5)).await;
+    assert!(!added.is_error, "{}", text(&added));
+    let end = std::fs::read_to_string(&project_file).expect("project.godot");
+    assert!(
+        end.contains("run/max_fps=60\n") && end.contains("run/low=false\n"),
+        "{end}"
+    );
+    assert!(
+        end.contains("[custom]") && end.contains("new/ratio=0.5\n"),
+        "{end}"
+    );
+}
+
+#[tokio::test]
 async fn game_call_requires_an_explicit_permit_before_any_game_is_running() {
     let refused = call(
         "godot_game_call",

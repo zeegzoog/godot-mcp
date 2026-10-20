@@ -789,3 +789,242 @@ async fn a_game_tool_called_right_after_editor_play_waits_for_the_runtime() {
         .await;
     assert!(!stopped.is_error, "{stopped:?}");
 }
+
+/// The authoring commands on a real editor: what they create, what they refuse, and that
+/// nothing they refuse touches a file that is already there.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn authoring_tools_create_what_they_should_and_refuse_the_rest() {
+    let editor = start_editor(false).await;
+    let bridge = &editor.bridge;
+    let call = |command: &'static str, params: Value| async move {
+        bridge.send_command(command, params).await
+    };
+
+    // A new scene is created, opened and refused a second time.
+    let created = call(
+        "create_scene",
+        json!({"scene_path": "res://made.tscn", "root_type": "Node2D", "root_name": "Made"}),
+    )
+    .await
+    .expect("create scene");
+    assert_eq!(created["created"], true, "{created}");
+    let tree = call("get_scene_tree", json!({}))
+        .await
+        .expect("tree of the new scene");
+    assert_eq!(tree["tree"]["name"], "Made", "{tree}");
+    let on_disk = std::fs::read_to_string(editor.project.join("made.tscn")).expect("made.tscn");
+    expect_error(
+        call("create_scene", json!({"scene_path": "res://made.tscn"})).await,
+        "already exists",
+    );
+    assert_eq!(
+        std::fs::read_to_string(editor.project.join("made.tscn")).expect("made.tscn again"),
+        on_disk,
+        "creating a scene that exists changed the file"
+    );
+    expect_error(
+        call("create_scene", json!({"scene_path": "res://notes.txt"})).await,
+        ".tscn",
+    );
+    expect_error(
+        call("create_scene", json!({"scene_path": "../outside.tscn"})).await,
+        ".tscn",
+    );
+
+    // A script is attached and detached; a missing one and one outside the project are refused.
+    call(
+        "attach_script",
+        json!({"node_path": ".", "script_path": "res://script.gd"}),
+    )
+    .await
+    .expect("attach");
+    call(
+        "attach_script",
+        json!({"node_path": ".", "script_path": ""}),
+    )
+    .await
+    .expect("detach");
+    expect_error(
+        call(
+            "attach_script",
+            json!({"node_path": ".", "script_path": "res://missing.gd"}),
+        )
+        .await,
+        "does not exist",
+    );
+    expect_error(
+        call(
+            "attach_script",
+            json!({"node_path": ".", "script_path": "../outside.gd"}),
+        )
+        .await,
+        "does not exist",
+    );
+
+    // A signal is connected once, listed, and refused when it is unknown, already connected, or
+    // aimed at a method the target does not have (that would fail whenever the signal fires).
+    expect_error(
+        call(
+            "connect_signal",
+            json!({"node_path": ".", "signal_name": "ready", "method": "on_ready"}),
+        )
+        .await,
+        "has no method",
+    );
+    std::fs::write(
+        editor.project.join("listener.gd"),
+        "extends Node2D
+
+func on_ready() -> void:
+	pass
+",
+    )
+    .expect("listener.gd");
+    call(
+        "attach_script",
+        json!({"node_path": ".", "script_path": "res://listener.gd"}),
+    )
+    .await
+    .expect("attach the listener");
+    call(
+        "connect_signal",
+        json!({"node_path": ".", "signal_name": "ready", "method": "on_ready"}),
+    )
+    .await
+    .expect("connect");
+    expect_error(
+        call(
+            "connect_signal",
+            json!({"node_path": ".", "signal_name": "ready", "method": "on_ready"}),
+        )
+        .await,
+        "already connected",
+    );
+    expect_error(
+        call(
+            "connect_signal",
+            json!({"node_path": ".", "signal_name": "nonsense", "method": "on_ready"}),
+        )
+        .await,
+        "no signal",
+    );
+    expect_error(
+        call(
+            "connect_signal",
+            json!({"node_path": ".", "signal_name": "ready", "method": "not an identifier"}),
+        )
+        .await,
+        "identifier",
+    );
+    let signals = call("list_signals", json!({"node_path": "."}))
+        .await
+        .expect("list signals");
+    let ready = signals["signals"]
+        .as_array()
+        .and_then(|all| all.iter().find(|entry| entry["name"] == "ready"))
+        .unwrap_or_else(|| panic!("no ready signal: {signals}"));
+    assert!(
+        ready["connections"].to_string().contains("on_ready"),
+        "{signals}"
+    );
+
+    // A resource is created once. A second call must not overwrite it, and neither a class
+    // that is not a Resource nor a path that is not a resource file is accepted.
+    let made = call(
+        "create_resource",
+        json!({"resource_path": "res://mat.tres", "class_name": "StandardMaterial3D"}),
+    )
+    .await
+    .expect("create resource");
+    assert_eq!(made["class_name"], "StandardMaterial3D", "{made}");
+    let material = std::fs::read_to_string(editor.project.join("mat.tres")).expect("mat.tres");
+    assert!(material.contains("StandardMaterial3D"), "{material}");
+    expect_error(
+        call(
+            "create_resource",
+            json!({"resource_path": "res://mat.tres", "class_name": "Curve"}),
+        )
+        .await,
+        "already exists",
+    );
+    assert_eq!(
+        std::fs::read_to_string(editor.project.join("mat.tres")).expect("mat.tres again"),
+        material,
+        "creating a resource over an existing file replaced it"
+    );
+    expect_error(
+        call(
+            "create_resource",
+            json!({"resource_path": "res://main.tscn", "class_name": "Curve"}),
+        )
+        .await,
+        "already exists",
+    );
+    expect_error(
+        call(
+            "create_resource",
+            json!({"resource_path": "res://new.gd", "class_name": "Curve"}),
+        )
+        .await,
+        ".tres",
+    );
+    expect_error(
+        call(
+            "create_resource",
+            json!({"resource_path": "res://node.tres", "class_name": "Node2D"}),
+        )
+        .await,
+        "Unknown resource class",
+    );
+
+    // Project settings: a scalar is saved and the old value comes back; a structure, or a value
+    // of the wrong type for an existing setting, is refused and changes nothing.
+    let set = call(
+        "set_project_setting",
+        json!({"key": "application/config/name", "value": "Renamed"}),
+    )
+    .await
+    .expect("set name");
+    assert_eq!(set["saved"], true, "{set}");
+    assert_eq!(set["previous"], "MCP E2E Fixture", "{set}");
+    let read = call(
+        "get_project_settings",
+        json!({"prefix": "application/config/name"}),
+    )
+    .await
+    .expect("get name");
+    assert!(read["settings"].to_string().contains("Renamed"), "{read}");
+    expect_error(
+        call(
+            "set_project_setting",
+            json!({"key": "application/config/name", "value": {"a": 1}}),
+        )
+        .await,
+        "string, number or boolean",
+    );
+    expect_error(
+        call(
+            "set_project_setting",
+            json!({"key": "application/config/name", "value": 5}),
+        )
+        .await,
+        "expects",
+    );
+    expect_error(
+        call("set_project_setting", json!({"key": "noslash", "value": 1})).await,
+        "section",
+    );
+    call(
+        "set_project_setting",
+        json!({"key": "custom/test/flag", "value": true}),
+    )
+    .await
+    .expect("new key");
+    let project_file =
+        std::fs::read_to_string(editor.project.join("project.godot")).expect("project.godot");
+    assert!(
+        project_file.contains("name=\"Renamed\"") && project_file.contains("flag=true"),
+        "{project_file}"
+    );
+}

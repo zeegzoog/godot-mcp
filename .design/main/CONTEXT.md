@@ -1,6 +1,6 @@
 # Project Context
 
-**Generated:** 2026-10-16
+**Generated:** 2026-10-20
 
 ## Active Technologies
 
@@ -12,7 +12,6 @@
 .
 ├── .agents/
 │   ├── rules/
-│   ├── skills/
 │   └── workflows/
 ├── .design/
 │   ├── .version
@@ -24,18 +23,20 @@
 ├── .gitattributes
 ├── .github/
 │   ├── ISSUE_TEMPLATE/
+│   ├── godot-version
 │   ├── scripts/
 │   └── workflows/
 ├── .gitignore
 ├── .magic/
 ├── .markdownlint.json
-├── .vscode/
 ├── AGENTS.md
 ├── CHANGELOG.md
+├── CONTRIBUTING.md
 ├── Cargo.lock
 ├── Cargo.toml
 ├── LICENSE
 ├── README.md
+├── SECURITY.md
 ├── addons/
 │   └── godot_mcp/
 ├── examples/
@@ -73,7 +74,7 @@
 
 ## Recent Changes
 
-### Workspace Phase Journal
+# Workspace Phase Journal
 
 Internal journal of finished phases. User-facing release notes are in the root `CHANGELOG.md`.
 

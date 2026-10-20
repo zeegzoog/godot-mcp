@@ -1,6 +1,6 @@
 [package]
 name = "godot-mcp"
-version = "0.4.0"
+version = "0.5.0-dev+godot.4.8"
 edition = "2024"
 rust-version = "1.85"
 authors = ["Oleg Alexandrov <alexandrovoleg.ru@gmail.com>"]
@@ -10,7 +10,7 @@ readme = "README.md"
 repository = "https://github.com/zeegzoog/godot-mcp"
 
 [dependencies]
-tokio = { version = "1.53.3", features = [
+tokio = { version = "1.54.0", features = [
     "fs",
     "io-std",
     "io-util",

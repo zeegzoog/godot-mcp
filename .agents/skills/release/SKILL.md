@@ -86,7 +86,7 @@ Work on the line's branch or its worktree. The examples release line 4.6 as 0.5.
        base=$(git merge-base "$branch" "$newer")
        git log --no-merges --since="$since" --format='%H %s' "$base..$newer" -- . ':!.design' |
            while read -r sha subject; do
-               case "$subject" in "chore(release)"*) continue ;; esac
+               case "$subject" in "chore(release)"*|"chore(line)"*) continue ;; esac
                git cherry "$branch" "$newer" "$base" | grep -qx -- "- $sha" && continue
                git log "$branch" --format=%h --grep="cherry picked from commit $sha" | grep -q . && continue
                echo "$newer ${sha:0:9} $subject"
@@ -94,7 +94,7 @@ Work on the line's branch or its worktree. The examples release line 4.6 as 0.5.
    done
    ```
 
-   For each listed commit, either carry it now (procedure B) or write down why it does not apply to this line. The list goes into the approval request (step 6).
+   Release commits and the commits that set up another line are skipped by the filter. For each listed commit, either carry it now (procedure B) or write down why it does not apply to this line, for example that it uses an API this line's Godot version does not have. The list goes into the approval request (step 6).
 
 3. **Choose the version number.** The highest `X.Y.Z` released so far, on any line:
 

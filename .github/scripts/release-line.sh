@@ -49,5 +49,5 @@ latest=false
 
 echo "line=$line"
 echo "suffix=-godot$line"
-echo "title=godot-mcp $core for Godot $line"
+echo "title=godot-mcp $core (Godot $line)"
 echo "latest=$latest"

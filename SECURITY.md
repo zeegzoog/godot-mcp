@@ -4,17 +4,17 @@ godot-mcp lets an AI assistant drive a live Godot editor, so a flaw in it can le
 
 ## Supported Versions
 
-Each godot-mcp release is built for one Godot minor version. Every supported Godot version has its own release line, kept on its own branch, and receives security fixes.
+Each godot-mcp release holds the files for every supported Godot minor version. Every supported Godot version has its own release line, kept on its own branch, and receives security fixes.
 
 | Godot | Branch | Security fixes | Install |
 | --- | --- | --- | --- |
-| 4.7.x | `godot-v4.7` | Yes, in the next 4.7 release | The newest release whose tag ends with `+godot.4.7` |
-| 4.6.x | `godot-v4.6` | Yes, in the next 4.6 release | The newest release whose tag ends with `+godot.4.6` |
-| 4.5.x | `godot-v4.5` | Yes, in the next 4.5 release | The newest release whose tag ends with `+godot.4.5` |
+| 4.7.x | `godot-v4.7` | Yes, in the next release | The files ending in `-godot4.7` of the latest release |
+| 4.6.x | `godot-v4.6` | Yes, in the next release | The files ending in `-godot4.6` of the latest release |
+| 4.5.x | `godot-v4.5` | Yes, in the next release | The files ending in `-godot4.5` of the latest release |
 | 4.8 (pre-release) | `master` | Fixed here first; no releases | Build from source |
-| 0.4.0 and older | — | No | The release for your Godot version |
+| 0.4.0 and older | — | No | The latest release |
 
-- A release for Godot 4.6 has a tag and a version that end in `+godot.4.6`, and is titled "godot-mcp X.Y.Z (Godot 4.6)".
+- The files for Godot 4.6 end in `-godot4.6`, and the version they report ends in `+godot.4.6`.
 - To find the version you run, read `version=` in `addons/godot_mcp/plugin.cfg` of your project.
 
 ## Reporting a Vulnerability
@@ -22,7 +22,7 @@ Each godot-mcp release is built for one Godot minor version. Every supported God
 - Report it privately at <https://github.com/zeegzoog/godot-mcp/security/advisories/new>. Only the maintainers can see the report.
 - Do not report a vulnerability in a public issue, a pull request, or through the godot-mcp feedback tools (`godot_note_feedback`, `godot_draft_feedback`, `godot_submit_feedback`): their reports become public issues.
 - Include in the report:
-  - the godot-mcp version (for example `0.5.0+godot.4.6`), the Godot version and the operating system;
+  - the godot-mcp version (for example `0.5.1+godot.4.6`), the Godot version and the operating system;
   - what an attacker can do, and what they need for it (network access, a local account, a crafted project, a crafted prompt);
   - the steps to reproduce it, and a proof of concept if you have one;
   - whether the problem is already known publicly.
@@ -62,8 +62,8 @@ The security measures themselves are described in the [Security section of the R
 
 1. The fix lands first on the newest line it affects (`master`, when the development line is affected).
 2. It is carried to every older supported line it affects.
-3. Each affected line gets a new release, whose notes list the fix under "Security".
-4. The advisory names the fixed release of each line.
+3. The next release holds the fixed files of every affected line (and the unchanged files of the others); its notes list the fix under "Security".
+4. The advisory names the fixed release.
 
 ## For AI Agents
 

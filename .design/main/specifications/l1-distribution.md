@@ -1,6 +1,6 @@
 # Release & Distribution
 
-**Version:** 1.0.0
+**Version:** 1.1.0
 **Status:** Stable
 **Layer:** concept
 
@@ -11,6 +11,7 @@ Defines how godot-mcp reaches its users: what a release contains, which platform
 ## Related Specifications
 
 - [l1-quality-assurance.md](l1-quality-assurance.md) - The verification gate every release must pass.
+- [l1-release-lines.md](l1-release-lines.md) - Releases are made per Godot release line; every rule here applies to each line.
 - [l1-editor-bridge.md](l1-editor-bridge.md) - BR-10: the addon never ships inside exported games.
 - [l2-ci-release-pipeline.md](l2-ci-release-pipeline.md) - Implementation of this concept.
 
@@ -21,7 +22,8 @@ Users install a prebuilt binary plus an addon folder, often through an AI assist
 ## 2. Constraints & Assumptions
 
 - Versioning follows Semantic Versioning; the project is pre-1.0, so minor versions may carry breaking changes, which the release notes must call out.
-- Release notes live in the repository changelog, one section per version, written for users; the section text is the published release description.
+- [ADDED] Each release belongs to one Godot release line, and its version string names that line (RL-3); version numbers follow one sequence across all lines (RL-8).
+- Release notes live in the repository changelog, one section per version, written for users; the section text is the published release description. [MODIFIED] Each line keeps its own changelog sections.
 - Supported platforms: Windows x86_64, Linux x86_64, macOS x86_64, macOS arm64.
 - Development-time scaffolding (planning artifacts, agent engines) is not part of any shipped artifact.
 
@@ -38,32 +40,38 @@ Users install a prebuilt binary plus an addon folder, often through an AI assist
 
 ## 5. Detailed Design
 
-### 5.1 Release Flow
+### 5.1 Release Flow [MODIFIED]
+
+One pass per line being released (the line's branch, its own changelog and manifests):
 
 ```mermaid
 graph TD
-    A[Changes merged on master, CI green] --> B[Write changelog section for X.Y.Z]
+    A[Changes on the line's branch, CI green] --> B[Write the line's changelog section for its version]
     B --> C[Bump server and addon versions together]
     C --> D[Commit the bump]
     D --> E{Human approves tag?}
     E -->|no| F[Stop]
-    E -->|yes| G[Push tag vX.Y.Z]
-    G --> H[Verify: tag = manifest, notes exist, fmt/lint/test]
+    E -->|yes| G[Push tag v + version string]
+    G --> H[Verify: tag = manifest, line rules, notes exist, fmt/lint/test]
     H --> I[Package addon archive + publish notes]
     H --> J[Build 4 platform binaries]
     I --> K[Release published]
     J --> K
 ```
 
-### 5.2 Release Assets
+### 5.2 Release Assets [MODIFIED]
+
+Every file name carries the line (`M.N`, e.g. `4.6`), so a downloaded file still says which Godot version it is for:
 
 | Asset | Content |
 | --- | --- |
-| `godot-mcp-x86_64-pc-windows-msvc.zip` | Server executable |
-| `godot-mcp-x86_64-unknown-linux-gnu.tar.gz` | Server executable |
-| `godot-mcp-x86_64-apple-darwin.tar.gz` | Server executable |
-| `godot-mcp-aarch64-apple-darwin.tar.gz` | Server executable |
-| `godot-mcp-addon.zip` | `addons/godot_mcp` only |
+| `godot-mcp-x86_64-pc-windows-msvc-godotM.N.zip` | Server executable |
+| `godot-mcp-x86_64-unknown-linux-gnu-godotM.N.tar.gz` | Server executable |
+| `godot-mcp-x86_64-apple-darwin-godotM.N.tar.gz` | Server executable |
+| `godot-mcp-aarch64-apple-darwin-godotM.N.tar.gz` | Server executable |
+| `godot-mcp-addon-godotM.N.zip` | `addons/godot_mcp` only |
+
+Releases 0.1.0 to 0.4.0, made before the lines existed, keep their original file names.
 
 ## 7. Drawbacks & Alternatives
 
@@ -85,3 +93,4 @@ graph TD
 | Version | Date | Author | Description |
 | --- | --- | --- | --- |
 | 1.0.0 | 2026-10-16 | Agent (magic.analyze first-time) | Reverse-engineered from the release workflow and the release skill at 94e4540. DS-4 and DS-8 added to keep the specification-driven workflow out of user-facing notes and source archives. |
+| 1.1.0 | 2026-10-20 | Agent (magic.spec) | [ADDED] Releases per Godot release line: line in the version string, one numbering, per-line changelog; [MODIFIED] release flow per line and asset names with the line. Stable → RFC → Stable after Post-Update Review. |

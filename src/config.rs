@@ -140,8 +140,27 @@ impl Config {
     /// like, so there is no single standard install location to hardcode.
     /// The scan below is a best-effort convenience for a handful of common
     /// locations — it is not a substitute for configuring `GODOT_PATH`.
+    ///
+    /// A configured path is always used as given, even when the file is missing: replacing it
+    /// with another installed Godot could silently run a different engine version than the one
+    /// the user chose. Tools that need the engine then fail naming that path. An empty value is
+    /// treated as unset.
     pub fn resolve_godot_path(&self) -> PathBuf {
-        if let Some(path) = self.godot_path.as_ref().filter(|p| p.exists()) {
+        if let Some(path) = self
+            .godot_path
+            .as_ref()
+            .filter(|p| !p.as_os_str().is_empty())
+        {
+            // A bare command name is looked up on PATH when it is run, so only a path with a
+            // directory part can be judged missing here.
+            let has_directory = path.parent().is_some_and(|dir| !dir.as_os_str().is_empty());
+            if has_directory && !path.exists() {
+                warn!(
+                    "GODOT_PATH points to '{}', which does not exist. Tools that run Godot \
+                     will fail until it is fixed.",
+                    path.display()
+                );
+            }
             return path.clone();
         }
 
@@ -291,6 +310,29 @@ mod tests {
         let mut full = vec!["godot-mcp"];
         full.extend_from_slice(args);
         Config::try_parse_from(full).expect("valid arguments")
+    }
+
+    #[test]
+    fn a_configured_godot_path_is_used_even_when_the_file_is_missing() {
+        // Silently substituting another installed Godot could run a different version than the
+        // one the user chose; the tools report the missing file instead.
+        let missing = std::env::temp_dir()
+            .join("godot-mcp-test")
+            .join("no-such-godot");
+        let config = parse(&["--godot-path", missing.to_str().expect("utf-8 path")]);
+        assert_eq!(config.resolve_godot_path(), missing);
+    }
+
+    #[test]
+    fn a_bare_command_name_is_kept_so_the_operating_system_can_look_it_up_on_path() {
+        let config = parse(&["--godot-path", "godot-4.6"]);
+        assert_eq!(config.resolve_godot_path(), PathBuf::from("godot-4.6"));
+    }
+
+    #[test]
+    fn an_empty_godot_path_means_unset_and_still_resolves_to_something_runnable_by_name() {
+        let config = parse(&["--godot-path", ""]);
+        assert_ne!(config.resolve_godot_path(), PathBuf::from(""));
     }
 
     #[test]

@@ -2,7 +2,7 @@
 extends EditorPlugin
 
 const MIN_MAJOR: int = 4
-const MIN_MINOR: int = 5
+const MIN_MINOR: int = 8
 const BRIDGE_SCRIPT_PATH: String = "res://addons/godot_mcp/bridge_server.gd"
 const EXPORT_PLUGIN_PATH: String = "res://addons/godot_mcp/export_plugin.gd"
 
@@ -13,9 +13,13 @@ func _enter_tree() -> void:
     var version: Dictionary = Engine.get_version_info()
     var major: int = version["major"]
     var minor: int = version["minor"]
+    # Each godot-mcp release is built for one Godot minor version: an older editor may lack the
+    # APIs this build calls, a newer one usually still works but has a better-matching release.
     if major < MIN_MAJOR or (major == MIN_MAJOR and minor < MIN_MINOR):
-        printerr("[Godot MCP] Requires Godot %d.%d or newer, but this is Godot %s. The bridge was not started." % [MIN_MAJOR, MIN_MINOR, version["string"]])
+        printerr("[Godot MCP] This godot-mcp build is for Godot %d.%d, but this is Godot %s. Install the godot-mcp release for your Godot version. The bridge was not started." % [MIN_MAJOR, MIN_MINOR, version["string"]])
         return
+    if major > MIN_MAJOR or minor > MIN_MINOR:
+        push_warning("[Godot MCP] This godot-mcp build is for Godot %d.%d, but this is Godot %s. Install the godot-mcp release for Godot %d.%d." % [MIN_MAJOR, MIN_MINOR, version["string"], major, minor])
 
     # Registered before the bridge so that the addon stays out of exports even when the
     # bridge fails to start.

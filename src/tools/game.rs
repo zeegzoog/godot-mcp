@@ -325,11 +325,7 @@ async fn debug_control(tools: &ToolManager, args: &Value) -> ToolResult {
         Ok(run) => run,
         Err(error) => return runtime_error(&error),
     };
-    let wait = Duration::from_secs(
-        args.get("wait_seconds")
-            .and_then(Value::as_u64)
-            .unwrap_or(10),
-    );
+    let wait = debug_wait(args);
     let debug = run.debug_ctl();
     let action = str_arg(args, "action").unwrap_or("");
     let result = match action {
@@ -357,19 +353,43 @@ async fn debug_state(tools: &ToolManager, args: &Value) -> ToolResult {
         );
     };
     let frame = args.get("frame").and_then(Value::as_i64).unwrap_or(0);
-    let stack = debug.stack().await.unwrap_or_default();
-    let variables = debug.variables(frame).await.unwrap_or_default();
-    ToolResult::text(
-        serde_json::to_string_pretty(&json!({
-            "stopped": true,
-            "stop": stop_json(stop),
-            "stack": stack,
-            "frame": frame,
-            "variables": variables,
-            "breakpoints": debug.list_breakpoints(),
-        }))
-        .unwrap_or_default(),
-    )
+    // A stack or variables that could not be read are reported, not shown as empty.
+    let (stack, stack_error) = match debug.stack().await {
+        Ok(stack) => (stack, None),
+        Err(error) => (Vec::new(), Some(error.to_string())),
+    };
+    let (variables, variables_error) = match debug.variables(frame).await {
+        Ok(variables) => (variables, None),
+        Err(error) => (Vec::new(), Some(error.to_string())),
+    };
+    let mut state = json!({
+        "stopped": true,
+        "stop": stop_json(stop),
+        "stack": stack,
+        "frame": frame,
+        "variables": variables,
+        "breakpoints": debug.list_breakpoints(),
+    });
+    if let Some(error) = stack_error {
+        state["stack_error"] = json!(error);
+    }
+    if let Some(error) = variables_error {
+        state["variables_error"] = json!(error);
+    }
+    ToolResult::text(serde_json::to_string_pretty(&state).unwrap_or_default())
+}
+
+/// Longest a debug call waits for the game to stop.
+const MAX_WAIT_SECONDS: u64 = 300;
+
+/// The wait a caller asked for in `wait_seconds`, ten seconds by default. It is bounded:
+/// a deadline built from an unbounded duration overflows and panics inside the tool call.
+fn debug_wait(args: &Value) -> Duration {
+    let seconds = args
+        .get("wait_seconds")
+        .and_then(Value::as_u64)
+        .unwrap_or(10);
+    Duration::from_secs(seconds.min(MAX_WAIT_SECONDS))
 }
 
 fn stop_json(stop: crate::godot::StopInfo) -> Value {
@@ -532,6 +552,19 @@ fn base64_decode(text: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_wait_the_caller_names_is_bounded() {
+        assert_eq!(debug_wait(&json!({})), Duration::from_secs(10));
+        assert_eq!(
+            debug_wait(&json!({"wait_seconds": 3})),
+            Duration::from_secs(3)
+        );
+        // Adding an unbounded duration to an Instant panics inside the tool call.
+        let longest = debug_wait(&json!({"wait_seconds": u64::MAX}));
+        assert_eq!(longest, Duration::from_secs(MAX_WAIT_SECONDS));
+        let _ = tokio::time::Instant::now() + longest;
+    }
 
     #[test]
     fn png_magic_is_rejected_when_absent() {

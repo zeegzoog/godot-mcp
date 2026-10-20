@@ -44,6 +44,7 @@ pub struct BridgeResponse {
 }
 
 type Pending = Arc<StdMutex<HashMap<String, oneshot::Sender<Result<Value>>>>>;
+type EventSubs = Arc<StdMutex<Vec<mpsc::UnboundedSender<Value>>>>;
 
 #[derive(Debug)]
 struct Connection {
@@ -68,6 +69,7 @@ pub struct BridgeClient {
     port: u16,
     command_timeout: Duration,
     state: Arc<Mutex<State>>,
+    events: EventSubs,
 }
 
 impl BridgeClient {
@@ -76,7 +78,15 @@ impl BridgeClient {
             port,
             command_timeout: DEFAULT_COMMAND_TIMEOUT,
             state: Arc::default(),
+            events: EventSubs::default(),
         }
+    }
+
+    /// Unsolicited editor messages (`{"type":"event",...}`), such as the game debugger relay.
+    pub fn subscribe_events(&self) -> mpsc::UnboundedReceiver<Value> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        lock(&self.events).push(tx);
+        rx
     }
 
     /// Overrides how long a command may wait for the editor's answer.
@@ -183,6 +193,7 @@ impl BridgeClient {
             websocket,
             queue,
             pending.clone(),
+            self.events.clone(),
             alive.clone(),
         ));
 
@@ -220,6 +231,7 @@ async fn run_connection(
     websocket: WebSocketStream<TcpStream>,
     mut queue: mpsc::UnboundedReceiver<String>,
     pending: Pending,
+    events: EventSubs,
     alive: Arc<AtomicBool>,
 ) {
     let (mut sink, mut stream) = websocket.split();
@@ -237,7 +249,7 @@ async fn run_connection(
                 }
             },
             incoming = stream.next() => match incoming {
-                Some(Ok(Message::Text(text))) => deliver(&pending, text.as_str()),
+                Some(Ok(Message::Text(text))) => deliver(&pending, &events, text.as_str()),
                 Some(Ok(Message::Ping(data))) => {
                     let _ = sink.send(Message::Pong(data)).await;
                 }
@@ -254,7 +266,13 @@ async fn run_connection(
     debug!("Godot Editor bridge connection closed");
 }
 
-fn deliver(pending: &Pending, text: &str) {
+fn deliver(pending: &Pending, events: &EventSubs, text: &str) {
+    if let Ok(value) = serde_json::from_str::<Value>(text) {
+        if value.get("type").and_then(Value::as_str) == Some("event") {
+            lock(events).retain(|subscriber| subscriber.send(value.clone()).is_ok());
+            return;
+        }
+    }
     let response: BridgeResponse = match serde_json::from_str(text) {
         Ok(response) => response,
         Err(err) => {

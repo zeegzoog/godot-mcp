@@ -47,6 +47,7 @@ const PARAM_TYPES: Dictionary = {
     "create_resource": {"resource_path": TYPE_STRING, "class_name": TYPE_STRING},
     "set_project_setting": {"key": TYPE_STRING},
     "get_project_settings": {"prefix": TYPE_STRING},
+    "game_send": {"command": TYPE_STRING},
 }
 
 ## Fields accepted when a vector-like value is given as a JSON object.
@@ -64,6 +65,7 @@ const OBJECT_FIELDS: Dictionary = {
 var server: TCPServer = TCPServer.new()
 var peers: Array[WebSocketPeer] = []
 var undo_redo: EditorUndoRedoManager = null
+var game_relay: EditorDebuggerPlugin = null
 var port: int = DEFAULT_PORT
 var verbose: bool = false
 ## scene res:// path -> hash of the file bytes last loaded or saved by this bridge.
@@ -282,6 +284,10 @@ func dispatch_command(peer: WebSocketPeer, cmd_id: String, cmd_type: String, par
             set_project_setting(peer, cmd_id, params)
         "get_project_settings":
             get_project_settings(peer, cmd_id, params)
+        "game_send":
+            game_send(peer, cmd_id, params)
+        "game_status":
+            game_status(peer, cmd_id)
         _:
             send_error(peer, cmd_id, "Unknown command type: " + cmd_type)
 
@@ -896,6 +902,12 @@ func _track_open_scenes() -> void:
     for scene_path: String in open:
         if not _scene_sync_hash.has(scene_path):
             _scene_sync_hash[scene_path] = _file_hash(scene_path)
+        # A scene a person opened is as it was on disk when it first shows up here, so edits
+        # they make afterwards move the undo version past this baseline.
+        if not _scene_undo_version.has(scene_path):
+            var version: int = _undo_version(scene_path)
+            if version >= 0:
+                _scene_undo_version[scene_path] = version
     var stale: Array = []
     for key: Variant in _scene_sync_hash:
         if not open.has(String(key)):
@@ -1134,6 +1146,36 @@ func get_project_settings(peer: WebSocketPeer, cmd_id: String, params: Dictionar
         if count >= 200:
             break
     send_success(peer, cmd_id, {"settings": values, "truncated": count >= 200})
+
+# --- Running game ---------------------------------------------------------------------
+
+func game_send(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
+    if game_relay == null:
+        send_error(peer, cmd_id, "The game relay is not active. Update the Godot MCP addon and restart the editor.")
+        return
+    var command: String = str(params.get("command", ""))
+    var data: Variant = params.get("data", [])
+    if not data is Array:
+        send_error(peer, cmd_id, "game_send data must be an array")
+        return
+    var session_id := int(params.get("session", -1))
+    var sent: Dictionary = game_relay.call("send", session_id, command, data)
+    if sent.has("error"):
+        send_error(peer, cmd_id, str(sent["error"]))
+        return
+    send_success(peer, cmd_id, sent.get("result", {}))
+
+func game_status(peer: WebSocketPeer, cmd_id: String) -> void:
+    if game_relay == null:
+        send_success(peer, cmd_id, {"sessions": []})
+        return
+    send_success(peer, cmd_id, game_relay.call("status"))
+
+func broadcast_event(event_name: String, data: Dictionary) -> void:
+    var payload := JSON.stringify({"type": "event", "event": event_name, "data": data})
+    for peer: WebSocketPeer in peers:
+        if peer.get_ready_state() == WebSocketPeer.STATE_OPEN:
+            peer.send_text(payload)
 
 func send_success(peer: WebSocketPeer, cmd_id: String, result: Dictionary) -> void:
     send_json(peer, cmd_id, {

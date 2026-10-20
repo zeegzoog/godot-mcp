@@ -73,7 +73,7 @@ Before submitting or committing changes, agents must execute and pass the comple
    cargo test --all-targets
    ```
 
-   Includes `tests/version_sync_test.rs`: the version in `addons/godot_mcp/plugin.cfg` must always equal `Cargo.toml` — bump both together — and every file naming the line's Godot version must agree with the version's `+godot.M.N`. New behaviour needs a test first: protocol and tool behaviour in `tests/stdio_protocol_test.rs` / `tests/tools_test.rs` (helpers in `tests/common/`), bridge client in `tests/bridge_client_test.rs`, keeping the addon out of exports in `tests/addon_export_test.rs`, launched processes staying independent of the server in `tests/detach_test.rs`.
+   Includes `tests/version_sync_test.rs`: the version in `addons/godot_mcp/plugin.cfg` must always equal `Cargo.toml` — bump both together — and every file naming the line's Godot version must agree with the version's `+godot.M.N`. New behaviour needs a test first: protocol and tool behaviour in `tests/stdio_protocol_test.rs` / `tests/tools_test.rs` (helpers in `tests/common/`), bridge client in `tests/bridge_client_test.rs`, keeping the addon out of exports in `tests/addon_export_test.rs`, launched processes staying independent of the server in `tests/detach_test.rs`, and a running game in `tests/runtime_e2e_test.rs`.
 
 4. **GDScript Syntax Check**:
 
@@ -84,6 +84,14 @@ Before submitting or committing changes, agents must execute and pass the comple
    godot --headless --check-only --path . --script addons/godot_mcp/plugin.gd
    godot --headless --check-only --path . --script addons/godot_mcp/bridge_server.gd
    godot --headless --check-only --path . --script addons/godot_mcp/export_plugin.gd
+   godot --headless --check-only --path . --script addons/godot_mcp/editor/game_relay.gd
+   godot --headless --check-only --path . --script addons/godot_mcp/core/runtime_override.gd
+   godot --headless --check-only --path . --script addons/godot_mcp/runtime/mcp_runtime.gd
+   godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_input.gd
+   godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_live.gd
+   godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_output.gd
+   godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_result.gd
+   godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_view.gd
    ```
 
 5. **Editor End-to-End Tests** (whenever `addons/godot_mcp/` changed; needs the Godot build named in `.github/godot-version`, ignored by default):
@@ -94,6 +102,12 @@ Before submitting or committing changes, agents must execute and pass the comple
    ```
 
    Set `GODOT_CONSOLE_PATH` as well on Windows to get editor logs in failure output (the editor is started from the console binary when it is set, and `.env` values fill in variables you did not export, so set both when testing a specific Godot version). A `.env` file with double-quoted Windows paths does not load (see `.env.example`) — export the variables instead.
+
+6. **Running game** (whenever the running-game tools, the debugger client, or the GDScript language-server client changed; same Godot build, ignored by default):
+
+   ```bash
+   GODOT_PATH=/path/to/godot cargo test --test runtime_e2e_test -- --ignored
+   ```
 
 ## Tool Invocation Protocols for AI Agents
 
@@ -113,7 +127,9 @@ When interacting with a Godot project, agents must adhere to the following workf
 
 4. **Runtime Monitoring**:
    - After `godot_run_project`, check `godot_get_run_status` and stop the run with `godot_stop_project` when done.
-   - Runtime log capture (`godot_get_debug_log`) and in-game camera capture (`godot_capture_camera`) are on the roadmap, not implemented — do not call them.
+   - Read logs and errors with `godot_run_output`. Inspect the live tree with `godot_game_tree` before `godot_game_set` or `godot_game_call`.
+   - Capture the game with `godot_game_screenshot`. A headless game returns an error and no image; do not treat that error as a picture.
+   - `godot_game_call` runs only a method named in `permit`.
 
 5. **Feedback to the Maintainers**:
    - When godot-mcp itself blocks or misleads you (a tool fails for a reason its message does not explain, a needed capability has no tool, a description or schema is wrong), record it with `godot_note_feedback` in English: what you tried, what came back, what you expected, one problem per note. Do not note your own mistakes or problems in the user's project.
@@ -127,6 +143,7 @@ Before concluding any development task, every agent MUST verify the following ch
 - [ ] **Technical Language**: All code, identifiers, comments, and technical docs are in English.
 - [ ] **Verification Pipeline**: `cargo clippy`, `cargo fmt --check`, and `cargo test --all-targets` pass; the GDScript syntax check passes for every addon script.
 - [ ] **Editor End-to-End Tests**: If `addons/godot_mcp/` changed, `editor_e2e_test` and `addon_export_test` pass with the Godot build named in `.github/godot-version`, on every branch the change lands on.
+- [ ] **Runtime End-to-End Tests**: If the running game, the debugger client, or the GDScript language-server client changed, `runtime_e2e_test` passes with that same Godot build.
 - [ ] **Tests First**: New behaviour is covered by a test in the matching `tests/` file.
 - [ ] **Version Sync**: The version in `addons/godot_mcp/plugin.cfg` equals the one in `Cargo.toml`.
 - [ ] **Undo/Redo**: Every editor mutation is wrapped in `EditorUndoRedoManager`, and no `.tscn` / `.tres` held by the editor is overwritten on disk behind its back.

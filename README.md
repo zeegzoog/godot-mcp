@@ -139,6 +139,13 @@ To report a vulnerability, follow [SECURITY.md](SECURITY.md). Never open a publi
 | `godot_get_node_properties` | Editor | Reads a node's editor-visible properties as `{type, value}` in Godot's text format. |
 | `godot_set_node_properties` | Editor | Sets properties (undoable), converting values to the property's type: `[10, 20]` or `{"x": 10, "y": 20}` for vectors, `"#ff0000"` for colors, `res://` paths for resources. The whole call is rejected if any property is unknown or unconvertible. |
 | `godot_capture_viewport` | Editor with a window | Screenshot of the 2D or 3D editor viewport as PNG (`view`, `max_dimension` options). Switches the editor to that main screen; doesn't work with `--headless`. |
+| `godot_create_scene` | — | Creates a `.tscn` with one root node (`root_type`, `root_name`) and opens it when the editor is connected. Without the editor it writes the file. Refuses to replace an existing scene. |
+| `godot_attach_script` | Editor | Attaches a script to a node (undoable); an empty `script_path` detaches. The script must exist in the project. |
+| `godot_connect_signal` | Editor | Connects a node's signal to a method inside the edited scene (undoable). The target must already have the method; a connection that exists is refused. |
+| `godot_list_signals` | Editor | Signals of a node in the edited scene and what each is connected to. |
+| `godot_create_resource` | — | Creates a `.tres` of a built-in `Resource` class. With the editor, Godot saves it; without it, an empty resource is written as text. Never replaces an existing file. |
+| `godot_get_project_settings` | — | Reads project settings: live from the editor, else the entries stored in `project.godot`. Filter with `prefix`. |
+| `godot_set_project_setting` | — | Sets one setting (`section/path`) to a string, number or boolean and saves it. A setting that exists keeps its type: a value of another type is refused. |
 | `godot_create_script` | — | Writes a `.gd` file from an `extends` / `class_name` / `_ready()` template into the project (`res://` path; the project is `project_path`, the editor's, or the one the server runs in). Refuses to overwrite unless `overwrite: true`. |
 | `godot_validate_script` | — | Syntax-checks a `.gd` file with `godot --headless --check-only`. |
 | `godot_resave_resources` | Editor | Refreshes the given `res://` files after external edits: assets are re-imported (synchronous), other files re-scanned. Without paths, rescans the whole project (background). |
@@ -172,7 +179,6 @@ Running-game inspection, input, and screenshots are `godot_game_*` tools.
 
 Not implemented yet:
 
-- Scene creation (`godot_create_scene`) and script attach tools
 - HTTP/SSE transport
 
 ## Development

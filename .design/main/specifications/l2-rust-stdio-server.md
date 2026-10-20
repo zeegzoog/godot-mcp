@@ -1,6 +1,6 @@
 # Rust Stdio Server
 
-**Version:** 1.1.0
+**Version:** 1.2.0
 **Status:** Stable
 **Layer:** implementation
 **Implements:** l1-mcp-server.md
@@ -60,8 +60,8 @@ src/
 
 ### 5.2 Godot Binary Resolution
 
-1. `GODOT_PATH` / `--godot-path` when it exists on disk.
-2. Platform scan: Windows — `Godot*.exe` (not `*console*`) up to two levels under Program Files, Program Files (x86) and `%LOCALAPPDATA%\Programs`, lexicographically last wins; macOS — `/Applications/Godot.app` and `Godot_mono.app`; Linux — `/usr/bin/godot`, `/usr/local/bin/godot`, the system Flatpak export.
+1. `GODOT_PATH` / `--godot-path` when set and not empty, always used as given: a path to a missing file is logged as a warning at start and fails the tools that run the engine, naming the path, so another installed engine version is never substituted silently. A bare command name is left to the operating system's `PATH` lookup.
+2. When unset or empty — platform scan: Windows — `Godot*.exe` (not `*console*`) up to two levels under Program Files, Program Files (x86) and `%LOCALAPPDATA%\Programs`, lexicographically last wins; macOS — `/Applications/Godot.app` and `Godot_mono.app`; Linux — `/usr/bin/godot`, `/usr/local/bin/godot`, the system Flatpak export.
 3. `godot` on `PATH`.
 
 ### 5.3 Error Taxonomy
@@ -104,3 +104,4 @@ src/
 | --- | --- | --- | --- |
 | 1.0.0 | 2026-10-16 | Agent (magic.analyze first-time) | Reverse-engineered from the code at 94e4540. |
 | 1.1.0 | 2026-10-16 | Agent (magic.spec) | [ADDED] Two modules and two settings of the feedback channel in the module map and the configuration row; link to its implementation. |
+| 1.2.0 | 2026-10-20 | Agent (magic.spec) | [MODIFIED] A configured engine path is used as given even when the file is missing (was: silently replaced by the platform scan). Reason: with one release line per engine version, running a different installed version is a silent wrong result. |

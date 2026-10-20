@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [master, "godot-v*"]
   pull_request:
 
 permissions:
@@ -11,9 +11,6 @@ permissions:
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
-
-env:
-  GODOT_VERSION: 4.5-stable
 
 jobs:
   rust:
@@ -34,7 +31,14 @@ jobs:
       - run: cargo test --all-targets
       - name: CHANGELOG.md documents the current version
         if: runner.os == 'Linux'
-        run: bash .github/scripts/release-notes.sh "v$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)" > /dev/null
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          core=${version%%+*}
+          if [ "$core" != "${core%%-*}" ]; then
+            echo "$version is a development version: no changelog section needed"
+          else
+            bash .github/scripts/release-notes.sh "v$version" > /dev/null
+          fi
 
   godot:
     name: Godot addon (headless editor)
@@ -44,12 +48,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install Godot ${{ env.GODOT_VERSION }}
+      # Each release line is tested against its own Godot build, named in .github/godot-version.
+      - name: Install the line's Godot build
         run: |
-          curl -fsSL -o godot.zip "https://github.com/godotengine/godot-builds/releases/download/${GODOT_VERSION}/Godot_v${GODOT_VERSION}_linux.x86_64.zip"
+          build=$(tr -d '[:space:]' < .github/godot-version)
+          echo "Godot $build"
+          curl -fsSL -o godot.zip "https://github.com/godotengine/godot-builds/releases/download/${build}/Godot_v${build}_linux.x86_64.zip"
           unzip -q godot.zip -d "$RUNNER_TEMP/godot"
-          chmod +x "$RUNNER_TEMP/godot/Godot_v${GODOT_VERSION}_linux.x86_64"
-          echo "GODOT_PATH=$RUNNER_TEMP/godot/Godot_v${GODOT_VERSION}_linux.x86_64" >> "$GITHUB_ENV"
+          chmod +x "$RUNNER_TEMP/godot/Godot_v${build}_linux.x86_64"
+          echo "GODOT_PATH=$RUNNER_TEMP/godot/Godot_v${build}_linux.x86_64" >> "$GITHUB_ENV"
 
       - name: Import the addon dev project
         run: $GODOT_PATH --headless --path . --import

@@ -197,6 +197,6 @@ When Godot publishes a patch for a line's version (`4.6.4-stable`), or a newer p
 
 - Never force-push, delete a tag or delete a release. A broken release is fixed forward with the next number.
 - Never tag on `master`: `release-line.sh` and the release workflow refuse a development version.
-- The tag format is exactly `vX.Y.Z+godot.M.N`; the release workflow runs only on tags matching `v*.*.*+godot.*`.
+- The tag format is exactly `vX.Y.Z+godot.M.N`; the release workflow starts on tags matching `v*.*.*godot.*` (a filter pattern cannot contain `+`) and `release-line.sh` then enforces the exact form.
 - Keep files other than the identity files identical on every line, unless a Godot version forces a difference.
 - Optional, after a release: refresh the git-ignored local `bin/` copy from `target/release` for local MCP client configs.

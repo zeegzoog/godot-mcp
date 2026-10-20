@@ -113,3 +113,26 @@ fn ci_godot_build_belongs_to_the_line() {
         ".github/godot-version names Godot build {build:?}, which is not part of the line {prefix}"
     );
 }
+
+#[test]
+fn release_workflow_tag_filter_avoids_the_plus_sign() {
+    // In a GitHub Actions filter pattern `+` means "one or more of the preceding character",
+    // so `v*.*.*+godot.*` is an invalid pattern: GitHub then rejects the whole workflow file
+    // and no tag ever starts a release. The `+` of the tag is matched by `*` instead.
+    let workflow = read(".github/workflows/release.yml");
+    let patterns: Vec<&str> = workflow
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("- \"v"))
+        .collect();
+
+    assert!(
+        !patterns.is_empty(),
+        "release.yml has no tag filter starting with v"
+    );
+    for pattern in patterns {
+        assert!(
+            !pattern.contains('+'),
+            "release.yml tag filter \"v{pattern} contains `+`, which GitHub reads as a quantifier"
+        );
+    }
+}

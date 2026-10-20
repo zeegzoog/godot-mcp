@@ -121,8 +121,8 @@ async fn code_at(tools: &ToolManager, args: &Value, op: CodeOp) -> ToolResult {
         Ok(pair) => pair,
         Err(result) => return result,
     };
-    let line = args.get("line").and_then(Value::as_u64).unwrap_or(1) as u32;
-    let character = args.get("character").and_then(Value::as_u64).unwrap_or(1) as u32;
+    let line = position_arg(args, "line");
+    let character = position_arg(args, "character");
     let result = match op {
         CodeOp::Complete => tools.lsp.complete(&project, &file, line, character).await,
         CodeOp::Definition => tools.lsp.definition(&project, &file, line, character).await,
@@ -179,5 +179,29 @@ fn runtime_error(error: &McpError) -> ToolResult {
                 "For breakpoints, the server must launch the process (editor Play uses Godot's own debugger)",
             ],
         ),
+    }
+}
+
+/// A 1-based line or column the caller named, 1 when absent. A number too large for the
+/// protocol's 32 bits is kept at the largest value instead of wrapping around to a small one.
+fn position_arg(args: &Value, key: &str) -> u32 {
+    args.get(key)
+        .and_then(Value::as_u64)
+        .map_or(1, |value| u32::try_from(value).unwrap_or(u32::MAX))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_position_beyond_32_bits_does_not_wrap_to_a_small_one() {
+        assert_eq!(position_arg(&json!({}), "line"), 1);
+        assert_eq!(position_arg(&json!({"line": 7}), "line"), 7);
+        // 2^32 + 5 used to become 5 and point at the wrong place.
+        assert_eq!(
+            position_arg(&json!({"line": (1_u64 << 32) + 5}), "line"),
+            u32::MAX
+        );
     }
 }

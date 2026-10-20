@@ -63,7 +63,8 @@ impl LspHub {
         let client = self.client_for(project).await?;
         let text = tokio::fs::read_to_string(file).await?;
         let uri = path_to_uri(file);
-        lock(&client.diagnostics).remove(&uri);
+        let key = uri_key(&uri);
+        lock(&client.diagnostics).remove(&key);
         client
             .notify(
                 "textDocument/didOpen",
@@ -74,7 +75,7 @@ impl LspHub {
             .await?;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
         let diagnostics = loop {
-            if let Some(items) = lock(&client.diagnostics).get(&uri).cloned() {
+            if let Some(items) = lock(&client.diagnostics).get(&key).cloned() {
                 break items;
             }
             if tokio::time::Instant::now() >= deadline {
@@ -102,8 +103,9 @@ impl LspHub {
                 json!({"textDocument": {"uri": path_to_uri(file)}}),
                 Duration::from_secs(15),
             )
-            .await?;
-        Ok(json!({"symbols": result}))
+            .await;
+        close_quiet(&client, file).await;
+        Ok(json!({"symbols": result?}))
     }
 
     pub async fn complete(
@@ -181,10 +183,9 @@ impl LspHub {
                 }),
             );
         }
-        let result = client
-            .request(method, extra, Duration::from_secs(15))
-            .await?;
-        Ok(json!({"result": result}))
+        let result = client.request(method, extra, Duration::from_secs(15)).await;
+        close_quiet(&client, file).await;
+        Ok(json!({"result": result?}))
     }
 
     async fn open_quiet(&self, client: &ClientInner, file: &Path) -> Result<()> {
@@ -384,6 +385,17 @@ async fn connect_client(port: u16, project: &Path) -> Result<Arc<ClientInner>> {
     Ok(client)
 }
 
+/// Tells the server the document is no longer open, so a script that is queried again later is
+/// opened fresh instead of being opened twice. A failure to say so changes no answer.
+async fn close_quiet(client: &ClientInner, file: &Path) {
+    let _ = client
+        .notify(
+            "textDocument/didClose",
+            json!({"textDocument": {"uri": path_to_uri(file)}}),
+        )
+        .await;
+}
+
 fn dispatch(client: &ClientInner, message: Value) {
     if let Some(method) = message.get("method").and_then(Value::as_str) {
         if message.get("id").is_some() {
@@ -407,7 +419,7 @@ fn dispatch(client: &ClientInner, message: Value) {
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
-            lock(&client.diagnostics).insert(uri, items);
+            lock(&client.diagnostics).insert(uri_key(&uri), items);
         }
         return;
     }
@@ -428,13 +440,64 @@ fn dispatch(client: &ClientInner, message: Value) {
     }
 }
 
+/// The `file://` URI of a path, as an LSP client sends it. On Windows a canonical path starts
+/// with `\\?\`, which is not part of the file's name and would make the URI unusable; reserved
+/// characters and spaces are percent-encoded.
 fn path_to_uri(path: &Path) -> String {
     let absolute = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let mut text = absolute.to_string_lossy().replace('\\', "/");
+    if let Some(rest) = text.strip_prefix("//?/") {
+        text = rest.to_string();
+    }
     if !text.starts_with('/') {
         text.insert(0, '/');
     }
-    format!("file://{text}")
+    let mut encoded = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
+                encoded.push(char::from(byte));
+            }
+            other => encoded.push_str(&format!("%{other:02X}")),
+        }
+    }
+    format!("file://{encoded}")
+}
+
+/// A form of a file URI that is the same for every spelling of one file: Godot publishes
+/// `file:///C%3A/My%20Game/a.gd`, a client may send `file:///C:/My%20Game/a.gd`. Percent escapes
+/// are decoded, a leading slash before a drive letter is dropped, and on Windows the case is
+/// ignored, as the file system does.
+fn uri_key(uri: &str) -> String {
+    let rest = uri.strip_prefix("file://").unwrap_or(uri);
+    let mut bytes = Vec::with_capacity(rest.len());
+    let raw = rest.as_bytes();
+    let mut index = 0;
+    while index < raw.len() {
+        let decoded = (raw[index] == b'%' && index + 2 < raw.len())
+            .then(|| std::str::from_utf8(&raw[index + 1..index + 3]).ok())
+            .flatten()
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match decoded {
+            Some(byte) => {
+                bytes.push(byte);
+                index += 3;
+            }
+            None => {
+                bytes.push(raw[index]);
+                index += 1;
+            }
+        }
+    }
+    let mut text = String::from_utf8_lossy(&bytes).replace('\\', "/");
+    let drive = text.as_bytes();
+    if drive.len() >= 3 && drive[0] == b'/' && drive[1].is_ascii_alphabetic() && drive[2] == b':' {
+        text.remove(0);
+    }
+    if cfg!(windows) {
+        text = text.to_lowercase();
+    }
+    text
 }
 
 fn shift_diagnostics(items: &[Value]) -> Vec<Value> {
@@ -460,5 +523,38 @@ fn bump(position: Option<&mut Value>) {
     }
     if let Some(character) = position.get("character").and_then(Value::as_u64) {
         position["character"] = json!(character + 1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_uri_sent_is_clean_and_the_published_uri_finds_it_again() {
+        // What a Windows canonical path looks like, with a space in it.
+        let sent = path_to_uri(Path::new(r"\\?\C:\Users\Some One\game\a.gd"));
+        assert!(sent.starts_with("file:///C:/"), "{sent}");
+        assert!(!sent.contains(' '), "{sent}");
+        assert!(!sent.contains("?/"), "{sent}");
+        // What Godot publishes for the same file: the colon and the space are escaped.
+        let published = "file:///C%3A/Users/Some%20One/game/a.gd";
+        assert_eq!(uri_key(&sent), uri_key(published));
+        assert_ne!(
+            uri_key(&sent),
+            uri_key("file:///C%3A/Users/Some%20One/game/b.gd")
+        );
+    }
+
+    #[test]
+    fn a_posix_path_keeps_its_leading_slash() {
+        assert_eq!(
+            path_to_uri(Path::new("/home/me/game/a.gd")),
+            "file:///home/me/game/a.gd"
+        );
+        assert_eq!(
+            uri_key("file:///home/me/game/a%2Bb.gd"),
+            uri_key("file:///home/me/game/a+b.gd")
+        );
     }
 }

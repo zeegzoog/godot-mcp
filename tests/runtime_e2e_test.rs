@@ -344,3 +344,24 @@ async fn language_server_reports_a_real_script_error() {
         "{body}"
     );
 }
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn language_server_answers_the_same_script_again() {
+    let project = project();
+    let tools = manager(project.path());
+    for round in 0..3 {
+        let symbols = call(
+            &tools,
+            "godot_code_symbols",
+            json!({"project_path": project.path(), "script_path": "res://scripts/probe.gd"}),
+        )
+        .await;
+        assert!(!symbols.is_error, "round {round}: {}", text_of(&symbols));
+        let body = json_of(&symbols);
+        assert!(
+            body["symbols"].to_string().contains("poke"),
+            "round {round}: {body}"
+        );
+    }
+}

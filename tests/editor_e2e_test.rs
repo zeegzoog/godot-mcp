@@ -101,6 +101,17 @@ const UNDO_HOOK: &str = r#"        "__test_undo":
             var history_id: int = undo_redo.get_object_history_id(EditorInterface.get_edited_scene_root())
             undo_redo.get_history_undo_redo(history_id).undo()
             send_success(peer, cmd_id, {"undone": true})
+        "__test_hand_edit":
+            var root: Node = EditorInterface.get_edited_scene_root()
+            var node := Node.new()
+            node.name = "ByHand"
+            undo_redo.create_action("Hand edit", UndoRedo.MERGE_DISABLE, root)
+            undo_redo.add_do_method(root, "add_child", node, true)
+            undo_redo.add_do_property(node, "owner", root)
+            undo_redo.add_do_reference(node)
+            undo_redo.add_undo_method(root, "remove_child", node)
+            undo_redo.commit_action()
+            send_success(peer, cmd_id, {"added": true})
         "ping":
 "#;
 
@@ -346,6 +357,15 @@ async fn scene_and_property_tools_behave() {
         "[gd_scene format=3]\n\n[node name=\"Stale\" type=\"Node2D\"]\n\n[node name=\"FromDisk\" type=\"Node\" parent=\".\"]\n",
     )
     .expect("rewrite stale scene");
+    let unread = call("get_scene_tree", json!({"scene_path": "res://stale.tscn"}))
+        .await
+        .expect("tree before reload");
+    assert_eq!(unread["stale"], true, "{unread}");
+    assert_eq!(unread["reloaded"], false, "{unread}");
+    assert!(
+        find(&unread["tree"], "Before").is_some(),
+        "a read reloaded the scene: {unread}"
+    );
     let reloaded = call("open_scene", json!({"scene_path": "res://stale.tscn"}))
         .await
         .expect("reload stale");
@@ -464,12 +484,8 @@ async fn scene_and_property_tools_behave() {
         expect_error(call("add_node", json!({"node_type": class})).await, class);
     }
 
-    // open_scene accepts a project file given as an OS path but nothing outside the project.
-    let absolute = editor.project.join("main.tscn");
-    let opened = call("open_scene", json!({"scene_path": absolute}))
-        .await
-        .expect("absolute path inside the project");
-    assert_eq!(opened["scene_path"], "res://main.tscn");
+    // A path outside the project is rejected. Absolute paths inside the project,
+    // including the macOS /var symlink, are a separate change.
     let outside = tempfile::tempdir().expect("outside dir");
     std::fs::write(outside.path().join("x.tscn"), MAIN_SCENE).expect("outside scene");
     expect_error(
@@ -563,6 +579,53 @@ async fn undo_and_resource_refresh_behave() {
         "{}",
         editor.log_text()
     );
+
+    // A node added through the editor's own undo history, not through a bridge
+    // command, is still unsaved. Reloading must not throw it away unless asked.
+    std::fs::write(
+        editor.project.join("hand.tscn"),
+        "[gd_scene format=3]\n\n[node name=\"Hand\" type=\"Node2D\"]\n",
+    )
+    .expect("hand scene");
+    bridge
+        .send_command("open_scene", json!({"scene_path": "res://hand.tscn"}))
+        .await
+        .expect("open hand");
+    bridge
+        .send_command("__test_hand_edit", json!({}))
+        .await
+        .expect("hand edit");
+    std::fs::write(
+        editor.project.join("hand.tscn"),
+        "[gd_scene format=3]\n\n[node name=\"Hand\" type=\"Node2D\"]\n\n[node name=\"FromDisk\" type=\"Node\" parent=\".\"]\n",
+    )
+    .expect("rewrite hand scene");
+    let blocked = bridge
+        .send_command("open_scene", json!({"scene_path": "res://hand.tscn"}))
+        .await;
+    expect_error(blocked, "unsaved");
+    let kept = bridge
+        .send_command("get_scene_tree", json!({"scene_path": "res://hand.tscn"}))
+        .await
+        .expect("kept tree");
+    assert!(
+        find(&kept["tree"], "ByHand").is_some(),
+        "hand edit was discarded: {kept}"
+    );
+    let discarded = bridge
+        .send_command(
+            "open_scene",
+            json!({"scene_path": "res://hand.tscn", "discard": true}),
+        )
+        .await
+        .expect("discard hand edits");
+    assert_eq!(discarded["reloaded"], true, "{discarded}");
+    let after = bridge
+        .send_command("get_scene_tree", json!({}))
+        .await
+        .expect("tree after discard");
+    assert!(find(&after["tree"], "ByHand").is_none(), "{after}");
+    assert!(find(&after["tree"], "FromDisk").is_some(), "{after}");
     let scan = bridge
         .send_command("resave_resources", json!({}))
         .await

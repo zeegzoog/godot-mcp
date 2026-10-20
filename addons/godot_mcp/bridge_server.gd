@@ -73,6 +73,10 @@ var _open_scene_paths: PackedStringArray = []
 ## Scenes changed through this bridge since the last save. External disk edits of a dirty
 ## scene are not reloaded unless the caller passes discard.
 var _scene_dirty: Dictionary = {}
+## UndoRedo.get_version() captured when the scene last matched disk. Godot does not
+## expose EditorUndoRedoManager.is_history_unsaved to GDScript, so a newer version
+## means an edit the editor made (or this bridge made) has not been saved.
+var _scene_undo_version: Dictionary = {}
 
 var _token: String = ""
 var _token_file: String = ""
@@ -292,37 +296,11 @@ func to_res_path(raw_path: String) -> String:
     if not path.begins_with("res://"):
         path = ProjectSettings.localize_path(path)
     if not path.begins_with("res://"):
-        # macOS: /var is a symlink to /private/var, and localize_path misses one of them.
-        path = _res_path_by_prefix(raw_path.strip_edges().replace("\\", "/"))
-    if not path.begins_with("res://"):
         return ""
     var relative: String = path.trim_prefix("res://")
     if relative.is_empty() or ".." in relative.split("/"):
         return ""
     return "res://" + relative
-
-func _res_path_by_prefix(absolute: String) -> String:
-    if not absolute.begins_with("/"):
-        return ""
-    var project := ProjectSettings.globalize_path("res://").simplify_path().trim_suffix("/")
-    var file := absolute.simplify_path()
-    var files: Array[String] = [file]
-    var roots: Array[String] = [project]
-    if file.begins_with("/var/"):
-        files.append("/private" + file)
-    elif file.begins_with("/private/var/"):
-        files.append(file.trim_prefix("/private"))
-    if project.begins_with("/var/"):
-        roots.append("/private" + project)
-    elif project.begins_with("/private/var/"):
-        roots.append(project.trim_prefix("/private"))
-    for root: String in roots:
-        for item: String in files:
-            if item == root:
-                return "res://"
-            if item.begins_with(root + "/"):
-                return "res://" + item.trim_prefix(root + "/")
-    return ""
 
 func scene_root_or_error(peer: WebSocketPeer, cmd_id: String) -> Node:
     var root: Node = EditorInterface.get_edited_scene_root()
@@ -409,34 +387,18 @@ func get_scene_tree(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> 
             return
         root = EditorInterface.get_open_scene_roots()[idx]
 
-    # An already-open scene whose file changed on disk is reloaded before the tree is
-    # read, so a successful open does not keep reporting the previous in-memory scene.
-    # Unsaved bridge edits are kept; the reply then says the tree may be stale.
-    var reloaded := false
-    var warning := ""
-    if not scene_path.is_empty() and FileAccess.file_exists(scene_path):
-        var decision: Dictionary = _reload_decision(scene_path, false, false)
-        if decision.has("error"):
-            warning = str(decision["error"])
-        elif bool(decision.get("reload", false)):
-            EditorInterface.reload_scene_from_path(scene_path)
-            remember_scene_sync(scene_path)
-            reloaded = true
-            var reloaded_paths: PackedStringArray = EditorInterface.get_open_scenes()
-            var reloaded_idx: int = reloaded_paths.find(scene_path)
-            if reloaded_idx == -1:
-                send_error(peer, cmd_id, "Scene disappeared while reloading: " + scene_path)
-                return
-            root = EditorInterface.get_open_scene_roots()[reloaded_idx]
-
+    # A read must not change the editor. When the file on disk differs, say so and
+    # leave the reload to open_scene.
     var payload := {
         "tree": serialize_node(root, root),
         "scene_path": scene_path,
-        "reloaded": reloaded,
+        "reloaded": false,
     }
-    if not warning.is_empty():
-        payload["stale"] = true
-        payload["warning"] = warning
+    if not scene_path.is_empty() and FileAccess.file_exists(scene_path):
+        var decision: Dictionary = _reload_decision(scene_path, false, false)
+        if decision.has("error") or bool(decision.get("reload", false)):
+            payload["stale"] = true
+            payload["warning"] = str(decision.get("error", "The file on disk differs from the open scene. Open it with godot_open_scene to reload; this read leaves the editor unchanged."))
     send_success(peer, cmd_id, payload)
 
 func get_open_scenes(peer: WebSocketPeer, cmd_id: String) -> void:
@@ -941,6 +903,7 @@ func _track_open_scenes() -> void:
     for key: Variant in stale:
         _scene_sync_hash.erase(key)
         _scene_dirty.erase(key)
+        _scene_undo_version.erase(key)
     _open_scene_paths = open
 
 func _file_hash(scene_path: String) -> int:
@@ -954,6 +917,7 @@ func _index_open_scenes() -> void:
 func remember_scene_sync(scene_path: String) -> void:
     _scene_sync_hash[scene_path] = _file_hash(scene_path)
     _scene_dirty.erase(scene_path)
+    _scene_undo_version[scene_path] = _undo_version(scene_path)
     if not _open_scene_paths.has(scene_path):
         _open_scene_paths.append(scene_path)
 
@@ -963,7 +927,8 @@ func mark_scene_dirty() -> void:
         _scene_dirty[String(root.scene_file_path)] = true
 
 ## Reloads an already-open scene when the file bytes differ from the copy the editor
-## loaded. A same-second edit still counts. Unsaved bridge edits need discard: true.
+## loaded. A same-second edit still counts. Unsaved editor changes, including ones made
+## by hand, need discard: true. A reload drops that scene's undo history.
 func _reload_decision(scene_path: String, force: bool, discard: bool) -> Dictionary:
     var open: bool = EditorInterface.get_open_scenes().has(scene_path)
     if not open and not force:
@@ -975,9 +940,42 @@ func _reload_decision(scene_path: String, force: bool, discard: bool) -> Diction
         return {"reload": false}
     if not open:
         return {"reload": false}
-    if bool(_scene_dirty.get(scene_path, false)) and not discard:
-        return {"error": "Scene '%s' has unsaved editor changes and the file on disk has changed. Save it, or open it again with discard: true to reload from disk." % scene_path}
+    if _has_unsaved_changes(scene_path) and not discard:
+        return {"error": "Scene '%s' has unsaved editor changes and the file on disk has changed. Save it, or open it again with discard: true to reload from disk. Reloading drops this scene's undo history." % scene_path}
     return {"reload": true}
+
+func _has_unsaved_changes(scene_path: String) -> bool:
+    if bool(_scene_dirty.get(scene_path, false)):
+        return true
+    if not _scene_undo_version.has(scene_path):
+        return false
+    var current: int = _undo_version(scene_path)
+    var saved: int = int(_scene_undo_version[scene_path])
+    if current < 0 or saved < 0:
+        return false
+    return current != saved
+
+func _open_scene_root(scene_path: String) -> Node:
+    var open: PackedStringArray = EditorInterface.get_open_scenes()
+    var idx: int = open.find(scene_path)
+    if idx == -1:
+        return null
+    var roots: Array = EditorInterface.get_open_scene_roots()
+    if idx < 0 or idx >= roots.size():
+        return null
+    return roots[idx]
+
+func _undo_version(scene_path: String) -> int:
+    var root: Node = _open_scene_root(scene_path)
+    if root == null or undo_redo == null:
+        return -1
+    if not undo_redo.has_method("get_object_history_id") or not undo_redo.has_method("get_history_undo_redo"):
+        return -1
+    var history_id: int = undo_redo.get_object_history_id(root)
+    var history: UndoRedo = undo_redo.get_history_undo_redo(history_id)
+    if history == null:
+        return -1
+    return history.get_version()
 
 # --- Replies ---------------------------------------------------------------------------
 

@@ -330,3 +330,96 @@ fn tool_text_helper_reads_error_flag() {
     let value = json!({"result": serde_json::to_value(&result).expect("serialize")});
     assert!(is_tool_error(&value));
 }
+
+#[tokio::test]
+async fn editor_runtime_waits_for_hello_and_targets_the_ready_session() {
+    use common::{MockBridge, Reply};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let polls = Arc::new(AtomicUsize::new(0));
+    let observed = polls.clone();
+    let bridge = MockBridge::start(move |command| {
+        match command["type"].as_str().unwrap_or_default() {
+            "get_run_status" => Reply::Ok(json!({"running": true})),
+            "game_status" => {
+                let poll = observed.fetch_add(1, Ordering::SeqCst);
+                if poll == 0 { Reply::Ok(json!({"sessions": []})) }
+                else { Reply::Ok(json!({"sessions": [{"session": 7, "hello": if poll >= 2 {"{}"} else {""}}]})) }
+            }
+            "game_send" => {
+                if observed.load(Ordering::SeqCst) < 3 {
+                    return Reply::Err("request was sent before the runtime hello".into());
+                }
+                if command["params"]["session"] != 7 {
+                    return Reply::Err("request was not pinned to the ready session".into());
+                }
+                let request: Value = serde_json::from_str(command["params"]["data"][0].as_str().expect("request")).expect("JSON");
+                Reply::OkWithEvent(json!({"sent": true}), json!({
+                    "type": "event", "event": "game.message", "data": {
+                        "session": 7, "message": "mcp:reply",
+                        "data": [json!({"id": request["id"], "result": {"count": 1, "nodes": []}}).to_string()]
+                    }
+                }))
+            }
+            _ => Reply::Err("unexpected command".into())
+        }
+    }).await;
+    let manager = ToolManager::new(
+        BridgeClient::new(bridge.port),
+        CliRunner::new(PathBuf::from("unused-godot")),
+    );
+    let result = Arc::new(manager)
+        .call_tool("godot_game_tree", json!({"run_id": "editor"}))
+        .await;
+    assert!(!result.is_error, "{}", text(&result));
+    assert!(text(&result).contains("count"), "{}", text(&result));
+    assert!(polls.load(Ordering::SeqCst) >= 3);
+}
+
+#[tokio::test]
+async fn editor_runtime_without_a_running_game_does_not_send_input() {
+    use common::{MockBridge, Reply};
+    let bridge = MockBridge::start(
+        |command| match command["type"].as_str().unwrap_or_default() {
+            "game_status" => Reply::Ok(json!({"sessions": []})),
+            "get_run_status" => Reply::Ok(json!({"running": false})),
+            _ => Reply::Err("should not send runtime input".into()),
+        },
+    )
+    .await;
+    let manager = ToolManager::new(
+        BridgeClient::new(bridge.port),
+        CliRunner::new(PathBuf::from("unused-godot")),
+    );
+    let result = Arc::new(manager)
+        .call_tool(
+            "godot_game_input",
+            json!({"run_id":"editor","steps":[{"type":"key","key":"A"}]}),
+        )
+        .await;
+    assert!(result.is_error);
+    assert!(
+        text(&result).contains("No game started from the editor is running"),
+        "{}",
+        text(&result)
+    );
+    assert!(
+        !bridge
+            .received()
+            .iter()
+            .any(|command| command["type"] == "game_send")
+    );
+}
+
+#[tokio::test]
+async fn forced_process_mode_does_not_claim_the_editor_is_offline() {
+    let project = project_dir();
+    let result = manager_in(project.path(), fake_godot(project.path()))
+        .call_tool("godot_run_project", json!({"mode":"process"}))
+        .await;
+    assert!(!result.is_error, "{}", text(&result));
+    assert!(
+        !text(&result).contains("No editor bridge connected"),
+        "{}",
+        text(&result)
+    );
+}

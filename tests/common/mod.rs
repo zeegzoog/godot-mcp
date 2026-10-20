@@ -243,6 +243,7 @@ impl Session {
 /// How the fake editor answers a single command.
 pub enum Reply {
     Ok(Value),
+    OkWithEvent(Value, Value),
     Err(String),
     After(Duration, Value),
     Never,
@@ -353,6 +354,10 @@ where
         match handler(&command) {
             Reply::Ok(result) => {
                 let _ = out_tx.send(success(&id, result));
+            }
+            Reply::OkWithEvent(result, event) => {
+                let _ = out_tx.send(success(&id, result));
+                let _ = out_tx.send(event.to_string());
             }
             Reply::Err(message) => {
                 let _ = out_tx.send(

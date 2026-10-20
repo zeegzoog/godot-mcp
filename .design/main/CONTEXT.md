@@ -24,6 +24,7 @@
 ├── .github/
 │   ├── ISSUE_TEMPLATE/
 │   ├── godot-version
+│   ├── lines
 │   ├── scripts/
 │   └── workflows/
 ├── .gitignore

@@ -1,0 +1,90 @@
+name: Repo steward (AI)
+
+# An unattended AI run of the repo-steward skill: triage, replies, reviews, board and readiness.
+# It starts only on its schedule or by hand, never on an event someone outside the project can
+# cause, and its token can neither push nor merge, so actions that need a maintainer are queued.
+# It does nothing until the repository variable STEWARD_AGENT is set to "on" and one of the
+# secrets ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN exists.
+#
+# Issue and pull request text is written by anyone and may try to steer the agent, so the agent
+# gets no token beyond the job's own, no raw `gh api`, no file-reading or file-writing commands
+# (no git, whose log and show write files with --output), only the skill's scripts by exact name
+# in a directory it cannot write, and every message it posts goes through act.sh, which refuses
+# anything shaped like a credential. Board changes are queued to a file and applied by the last
+# step, which alone holds STEWARD_PROJECT_TOKEN.
+
+on:
+  schedule:
+    - cron: "23 6 * * *"
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: "all, issues, prs, board, readiness, or one item as #<n>"
+        default: all
+      mode:
+        description: "act or report"
+        default: act
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+  actions: read
+
+concurrency:
+  group: repo-steward-agent
+  cancel-in-progress: false
+
+jobs:
+  steward:
+    if: vars.STEWARD_AGENT == 'on'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      # The default branch only: no pull request's code is ever checked out here. No token is
+      # left in .git/config.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The scripts the agent may run must stay the ones on the default branch.
+      - name: Make the skill read-only
+        run: chmod -R a-w .agents
+
+      # Pinned to a commit; update the SHA and the version comment together.
+      - uses: anthropics/claude-code-action@6c690188da61cf16ee7debb28383ba67f02abb4c # v1.0.242
+        env:
+          STEWARD_BOARD_QUEUE: ${{ runner.temp }}/steward-board-queue.txt
+          STEWARD_RUN: ${{ github.run_id }}
+          # On by default in the action; set here so that it stays on: secrets are removed from
+          # the environment of every command the agent runs.
+          CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          display_report: true
+          prompt: |
+            Read .agents/skills/repo-steward/SKILL.md and follow it for this repository with
+            scope ${{ inputs.scope || 'all' }}, --mode ${{ inputs.mode || 'act' }} and --unattended.
+            This run cannot push or merge: queue those actions as the skill says.
+            Write the run report to the file named by $GITHUB_STEP_SUMMARY.
+          claude_args: >-
+            --max-turns 60
+            --allowedTools "Read,Glob,Grep,Bash(gh issue list:*),Bash(gh issue view:*),Bash(gh pr list:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr checks:*),Bash(gh search issues:*),Bash(gh search prs:*),Bash(gh label list:*),Bash(gh run list:*),Bash(gh run view:*),Bash(bash .agents/skills/repo-steward/scripts/act.sh:*),Bash(bash .agents/skills/repo-steward/scripts/api.sh:*),Bash(bash .agents/skills/repo-steward/scripts/board.sh:*),Bash(bash .agents/skills/repo-steward/scripts/context.sh:*),Bash(bash .agents/skills/repo-steward/scripts/labels.sh:*),Bash(bash .agents/skills/repo-steward/scripts/profile.sh:*),Bash(bash .agents/skills/repo-steward/scripts/readiness.sh:*)"
+            --disallowedTools "Read(//proc/**),Read(//sys/**),Read(//home/runner/work/_temp/**),Read(//home/runner/.config/**),Read(./.git/**)"
+
+      - name: Apply the queued board changes
+        if: always()
+        env:
+          STEWARD_PROJECT_TOKEN: ${{ secrets.STEWARD_PROJECT_TOKEN }}
+          QUEUE: ${{ runner.temp }}/steward-board-queue.txt
+        run: |
+          if [ -z "$STEWARD_PROJECT_TOKEN" ]; then
+            echo "No STEWARD_PROJECT_TOKEN: board changes wait for the next attended run."
+          elif [ -f "$QUEUE" ]; then
+            bash .agents/skills/repo-steward/scripts/board.sh apply "$QUEUE"
+          else
+            echo "No board changes queued."
+          fi

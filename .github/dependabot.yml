@@ -1,0 +1,28 @@
+# Keeps the pinned workflow actions and the Rust dependencies current. Each update arrives as a
+# pull request that the CI checks and the repo steward review; a major version needs a person.
+# A release must be 14 days old before it is proposed, so that a compromised release is usually
+# noticed and withdrawn before it reaches the workflows or the build.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 14
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions:
+        patterns: ["*"]
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 14
+    commit-message:
+      prefix: "build(deps)"
+    groups:
+      cargo-minor-and-patch:
+        update-types: ["minor", "patch"]

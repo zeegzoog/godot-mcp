@@ -10,6 +10,10 @@
 //! and string-keyed objects. Decoding also accepts the math and packed types a game may
 //! send back (stack variables, error payloads).
 
+// The decoder reads bytes from another process, so a panic here would take the server down:
+// no unwrap or expect outside the tests.
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
 use serde_json::{Map, Number, Value};
 
 const NIL: u32 = 0;
@@ -89,11 +93,28 @@ impl<'a> Reader<'a> {
         }
     }
 
+    /// Bytes left after the current position.
+    fn remaining(&self) -> usize {
+        self.buf.len().saturating_sub(self.pos)
+    }
+
+    /// How many elements to reserve room for. The count comes from the peer, so it is capped by
+    /// what the data can hold (every element takes at least four bytes); a count that promises
+    /// more fails later on the missing data instead of reserving memory for it.
+    fn capacity_for(&self, count: usize) -> usize {
+        count.min(self.remaining() / 4)
+    }
+
+    fn take<const N: usize>(&mut self) -> Result<[u8; N], VariantError> {
+        self.need(N)?;
+        let mut out = [0_u8; N];
+        out.copy_from_slice(&self.buf[self.pos..self.pos + N]);
+        self.pos += N;
+        Ok(out)
+    }
+
     fn u32(&mut self) -> Result<u32, VariantError> {
-        self.need(4)?;
-        let v = u32::from_le_bytes(self.buf[self.pos..self.pos + 4].try_into().unwrap());
-        self.pos += 4;
-        Ok(v)
+        Ok(u32::from_le_bytes(self.take()?))
     }
 
     fn i32(&mut self) -> Result<i32, VariantError> {
@@ -101,17 +122,11 @@ impl<'a> Reader<'a> {
     }
 
     fn i64(&mut self) -> Result<i64, VariantError> {
-        self.need(8)?;
-        let v = i64::from_le_bytes(self.buf[self.pos..self.pos + 8].try_into().unwrap());
-        self.pos += 8;
-        Ok(v)
+        Ok(i64::from_le_bytes(self.take()?))
     }
 
     fn u64(&mut self) -> Result<u64, VariantError> {
-        self.need(8)?;
-        let v = u64::from_le_bytes(self.buf[self.pos..self.pos + 8].try_into().unwrap());
-        self.pos += 8;
-        Ok(v)
+        Ok(u64::from_le_bytes(self.take()?))
     }
 
     fn f32(&mut self) -> Result<f32, VariantError> {
@@ -274,7 +289,7 @@ fn read_value(reader: &mut Reader<'_>, depth: usize) -> Result<Value, VariantErr
             if flags & 2 != 0 {
                 subnames += 1;
             }
-            let mut parts = Vec::with_capacity(names + subnames);
+            let mut parts = Vec::with_capacity(reader.capacity_for(names + subnames));
             for _ in 0..names + subnames {
                 parts.push(reader.str()?);
             }
@@ -335,7 +350,7 @@ fn read_value(reader: &mut Reader<'_>, depth: usize) -> Result<Value, VariantErr
         ARRAY => {
             read_container_type(reader, (header >> 16) & 3)?;
             let count = (reader.u32()? & 0x7fff_ffff) as usize;
-            let mut items = Vec::with_capacity(count);
+            let mut items = Vec::with_capacity(reader.capacity_for(count));
             for _ in 0..count {
                 items.push(read_value(reader, depth + 1)?);
             }
@@ -406,7 +421,7 @@ fn read_packed(
     mut item: impl FnMut(&mut Reader<'_>) -> Result<Value, VariantError>,
 ) -> Result<Value, VariantError> {
     let count = reader.u32()? as usize;
-    let mut items = Vec::with_capacity(count);
+    let mut items = Vec::with_capacity(reader.capacity_for(count));
     for _ in 0..count {
         items.push(item(reader)?);
     }
@@ -477,7 +492,7 @@ fn write_number(number: &Number, out: &mut Vec<u8>) {
         return;
     }
     if let Some(n) = number.as_u64() {
-        if n <= u64::try_from(i32::MAX).unwrap() {
+        if i32::try_from(n).is_ok() {
             write_u32(out, INT);
             write_u32(out, n as u32);
             return;
@@ -516,11 +531,8 @@ impl PacketReader {
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<Value>, VariantError> {
         self.pending.extend_from_slice(chunk);
         let mut out = Vec::new();
-        loop {
-            if self.pending.len() < 4 {
-                break;
-            }
-            let size = u32::from_le_bytes(self.pending[..4].try_into().unwrap()) as usize;
+        while let Some(prefix) = self.pending.first_chunk::<4>() {
+            let size = u32::from_le_bytes(*prefix) as usize;
             if size > MAX_PACKET {
                 return Err(VariantError(format!(
                     "debugger packet too large ({size} bytes)"
@@ -544,6 +556,7 @@ impl PacketReader {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -598,6 +611,35 @@ mod tests {
         let huge = ((MAX_PACKET as u32) + 1).to_le_bytes();
         let err = reader.push(&huge).expect_err("too large");
         assert!(err.0.contains("too large"), "{err}");
+    }
+
+    /// A peer chooses the element counts. A twelve-byte packet must not make the decoder
+    /// reserve memory for billions of elements; it has to fail on the missing data instead.
+    #[test]
+    fn counts_larger_than_the_data_fail_without_reserving_memory() {
+        for (type_id, count) in [
+            (ARRAY, 0x7fff_ffff_u32),
+            (PACKED_INT64_ARRAY, 0xffff_ffff),
+            (PACKED_STRING_ARRAY, 0xffff_ffff),
+            (PACKED_COLOR_ARRAY, 0xffff_ffff),
+        ] {
+            let mut buf = Vec::new();
+            write_u32(&mut buf, type_id);
+            write_u32(&mut buf, count);
+            let err = decode_variant(&buf).expect_err("the data ends right after the count");
+            assert!(err.0.contains("ends early"), "type {type_id}: {err}");
+        }
+    }
+
+    #[test]
+    fn node_path_name_counts_larger_than_the_data_fail_without_reserving_memory() {
+        let mut buf = Vec::new();
+        write_u32(&mut buf, NODE_PATH);
+        write_u32(&mut buf, 0x8000_0000 | 0x7fff_ffff);
+        write_u32(&mut buf, 0xffff_ffff);
+        write_u32(&mut buf, 0);
+        let err = decode_variant(&buf).expect_err("no names follow");
+        assert!(err.0.contains("ends early"), "{err}");
     }
 
     #[test]

@@ -742,6 +742,16 @@ async fn a_game_tool_called_right_after_editor_play_waits_for_the_runtime() {
     use godot_mcp::tools::ToolManager;
     use std::sync::Arc;
 
+    // Editor Play opens a game window. A Linux machine without a display (the CI runner) makes
+    // the game crash at startup, which says nothing about the code under test.
+    if cfg!(target_os = "linux")
+        && std::env::var_os("DISPLAY").is_none()
+        && std::env::var_os("WAYLAND_DISPLAY").is_none()
+    {
+        eprintln!("skipped: editor Play needs a display");
+        return;
+    }
+
     let editor = start_editor(false).await;
     let (godot, _) = godot_binaries();
     let tools = Arc::new(

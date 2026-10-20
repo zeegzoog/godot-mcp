@@ -4,9 +4,23 @@ All notable changes to godot-mcp. The server and the Godot addon always ship wit
 version number. The section for a version is used as the text of its GitHub Release, so every
 release needs one (the release workflow fails without it).
 
-From 0.5.0 on, each Godot version has its own release line and branch (`godot-v4.5`, `godot-v4.6`, `godot-v4.7`, …), and each line lists its releases in the `CHANGELOG.md` of its branch. All releases are also on the [Releases page](https://github.com/zeegzoog/godot-mcp/releases). This file keeps the history up to 0.4.0.
+Each Godot version has its own release line and branch (`godot-v4.5`, `godot-v4.6`, `godot-v4.7`, …). From 0.5.1 on, one release holds the files of every supported Godot version, and its notes are the section of this file; they mark changes that concern some Godot versions only.
 
 ## [Unreleased]
+
+## [0.5.1] - 2026-10-20
+
+First release made for each Godot version separately. It holds the files for Godot 4.5, 4.6 and 4.7 in one release; download the files whose names end in `-godotM.N` for your Godot version. There is no release 0.5.0: a first attempt that published one release per Godot version was withdrawn in favour of this one. The server and the addon changed together: update both.
+
+### Changed (breaking)
+
+- **One build per Godot version.** Files end in `-godotM.N` (for example `godot-mcp-x86_64-pc-windows-msvc-godot4.6.zip` and `godot-mcp-addon-godot4.6.zip`). Pick the files made for your Godot version; see the table in the README.
+- The addon refuses to start in a Godot older than the version it was made for and prints which files to install. In a newer Godot it starts and prints a warning naming the files for that version.
+- A `GODOT_PATH` that points to a missing file is no longer replaced by another Godot the server finds on its own, which could run a different engine version than the one you chose. The server logs a warning at start, and tools that run Godot fail with a message naming the path. Leaving `GODOT_PATH` unset (or empty) still looks for an installed Godot.
+
+### Added
+
+- `SECURITY.md` explains which versions get security fixes and how to report a vulnerability privately, and `CONTRIBUTING.md` explains how to contribute, including which branch a change belongs to.
 
 ## [0.4.0] - 2026-10-16
 

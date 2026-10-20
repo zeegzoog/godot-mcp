@@ -3,6 +3,7 @@ pub mod cli_runner;
 pub mod config;
 pub mod error;
 pub mod feedback;
+pub mod godot;
 pub mod issues;
 pub mod journal;
 pub mod paths;

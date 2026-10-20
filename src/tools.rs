@@ -838,14 +838,6 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
                 "scene_path": {
                     "type": "string",
                     "description": "Resource path to scene (e.g. 'res://scenes/level1.tscn')."
-                },
-                "reload": {
-                    "type": "boolean",
-                    "description": "When the scene is already open, reload it from disk. Automatic when the file bytes differ from the copy the editor loaded and there are no unsaved bridge edits."
-                },
-                "discard": {
-                    "type": "boolean",
-                    "description": "Reload even if the editor has unsaved changes made through this bridge."
                 }
             }),
             &["scene_path"],

@@ -112,6 +112,9 @@ const UNDO_HOOK: &str = r#"        "__test_undo":
             undo_redo.add_undo_method(root, "remove_child", node)
             undo_redo.commit_action()
             send_success(peer, cmd_id, {"added": true})
+        "__test_open_directly":
+            EditorInterface.open_scene_from_path(str(params.get("scene_path", "")))
+            send_success(peer, cmd_id, {"opened": true})
         "ping":
 "#;
 
@@ -484,8 +487,12 @@ async fn scene_and_property_tools_behave() {
         expect_error(call("add_node", json!({"node_type": class})).await, class);
     }
 
-    // A path outside the project is rejected. Absolute paths inside the project,
-    // including the macOS /var symlink, are a separate change.
+    // open_scene accepts a project file given as an OS path but nothing outside the project.
+    let absolute = editor.project.join("main.tscn");
+    let opened = call("open_scene", json!({"scene_path": absolute}))
+        .await
+        .expect("absolute path inside the project");
+    assert_eq!(opened["scene_path"], "res://main.tscn");
     let outside = tempfile::tempdir().expect("outside dir");
     std::fs::write(outside.path().join("x.tscn"), MAIN_SCENE).expect("outside scene");
     expect_error(
@@ -626,6 +633,53 @@ async fn undo_and_resource_refresh_behave() {
         .expect("tree after discard");
     assert!(find(&after["tree"], "ByHand").is_none(), "{after}");
     assert!(find(&after["tree"], "FromDisk").is_some(), "{after}");
+
+    // The same when the person opened the scene themselves: the bridge never saw it open,
+    // yet its unsaved edits must survive a reload from disk.
+    std::fs::write(
+        editor.project.join("opened.tscn"),
+        "[gd_scene format=3]
+
+[node name=\"Opened\" type=\"Node2D\"]
+",
+    )
+    .expect("opened scene");
+    bridge
+        .send_command(
+            "__test_open_directly",
+            json!({"scene_path": "res://opened.tscn"}),
+        )
+        .await
+        .expect("open directly");
+    sleep(Duration::from_millis(500)).await;
+    bridge
+        .send_command("__test_hand_edit", json!({}))
+        .await
+        .expect("hand edit in the directly opened scene");
+    std::fs::write(
+        editor.project.join("opened.tscn"),
+        "[gd_scene format=3]
+
+[node name=\"Opened\" type=\"Node2D\"]
+
+[node name=\"FromDisk\" type=\"Node\" parent=\".\"]
+",
+    )
+    .expect("rewrite opened scene");
+    expect_error(
+        bridge
+            .send_command("open_scene", json!({"scene_path": "res://opened.tscn"}))
+            .await,
+        "unsaved",
+    );
+    let still = bridge
+        .send_command("get_scene_tree", json!({"scene_path": "res://opened.tscn"}))
+        .await
+        .expect("tree of the directly opened scene");
+    assert!(
+        find(&still["tree"], "ByHand").is_some(),
+        "hand edit in a scene the bridge never opened was discarded: {still}"
+    );
     let scan = bridge
         .send_command("resave_resources", json!({}))
         .await

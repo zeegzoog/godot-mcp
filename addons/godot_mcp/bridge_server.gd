@@ -875,6 +875,12 @@ func _track_open_scenes() -> void:
     for scene_path: String in open:
         if not _scene_sync_hash.has(scene_path):
             _scene_sync_hash[scene_path] = _file_hash(scene_path)
+        # A scene a person opened is as it was on disk when it first shows up here, so edits
+        # they make afterwards move the undo version past this baseline.
+        if not _scene_undo_version.has(scene_path):
+            var version: int = _undo_version(scene_path)
+            if version >= 0:
+                _scene_undo_version[scene_path] = version
     var stale: Array = []
     for key: Variant in _scene_sync_hash:
         if not open.has(String(key)):

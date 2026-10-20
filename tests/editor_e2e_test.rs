@@ -101,19 +101,39 @@ const UNDO_HOOK: &str = r#"        "__test_undo":
             var history_id: int = undo_redo.get_object_history_id(EditorInterface.get_edited_scene_root())
             undo_redo.get_history_undo_redo(history_id).undo()
             send_success(peer, cmd_id, {"undone": true})
+        "__test_hand_edit":
+            var root: Node = EditorInterface.get_edited_scene_root()
+            var node := Node.new()
+            node.name = "ByHand"
+            undo_redo.create_action("Hand edit", UndoRedo.MERGE_DISABLE, root)
+            undo_redo.add_do_method(root, "add_child", node, true)
+            undo_redo.add_do_property(node, "owner", root)
+            undo_redo.add_do_reference(node)
+            undo_redo.add_undo_method(root, "remove_child", node)
+            undo_redo.commit_action()
+            send_success(peer, cmd_id, {"added": true})
+        "__test_open_directly":
+            EditorInterface.open_scene_from_path(str(params.get("scene_path", "")))
+            send_success(peer, cmd_id, {"opened": true})
         "ping":
 "#;
 
 async fn start_editor(with_undo_hook: bool) -> Editor {
+    start_editor_configured(with_undo_hook, "").await
+}
+
+async fn start_editor_configured(with_undo_hook: bool, project_tail: &str) -> Editor {
     let (godot, console) = godot_binaries();
     let dir = tempfile::tempdir().expect("project dir");
     let project = dir.path().to_path_buf();
 
     std::fs::write(
         project.join("project.godot"),
-        "config_version=5\n\n[application]\n\nconfig/name=\"MCP E2E Fixture\"\n\
-         run/main_scene=\"res://main.tscn\"\nconfig/features=PackedStringArray(\"4.5\")\n\n\
-         [editor_plugins]\n\nenabled=PackedStringArray(\"res://addons/godot_mcp/plugin.cfg\")\n",
+        format!(
+            "config_version=5\n\n[application]\n\nconfig/name=\"MCP E2E Fixture\"\n\
+             run/main_scene=\"res://main.tscn\"\nconfig/features=PackedStringArray(\"4.5\")\n\n\
+             [editor_plugins]\n\nenabled=PackedStringArray(\"res://addons/godot_mcp/plugin.cfg\")\n{project_tail}"
+        ),
     )
     .expect("project.godot");
     std::fs::write(project.join("main.tscn"), MAIN_SCENE).expect("main.tscn");
@@ -330,6 +350,50 @@ async fn scene_and_property_tools_behave() {
         .await
         .expect("open main");
 
+    // An already-open scene edited on disk must be reloaded. open_scene used to
+    // report success while get_scene_tree still showed the in-memory copy.
+    std::fs::write(
+        editor.project.join("stale.tscn"),
+        "[gd_scene format=3]\n\n[node name=\"Stale\" type=\"Node2D\"]\n\n[node name=\"Before\" type=\"Node\" parent=\".\"]\n",
+    )
+    .expect("stale scene");
+    let first = call("open_scene", json!({"scene_path": "res://stale.tscn"}))
+        .await
+        .expect("open stale");
+    assert_eq!(first["reloaded"], false, "{first}");
+    std::fs::write(
+        editor.project.join("stale.tscn"),
+        "[gd_scene format=3]\n\n[node name=\"Stale\" type=\"Node2D\"]\n\n[node name=\"FromDisk\" type=\"Node\" parent=\".\"]\n",
+    )
+    .expect("rewrite stale scene");
+    let unread = call("get_scene_tree", json!({"scene_path": "res://stale.tscn"}))
+        .await
+        .expect("tree before reload");
+    assert_eq!(unread["stale"], true, "{unread}");
+    assert_eq!(unread["reloaded"], false, "{unread}");
+    assert!(
+        find(&unread["tree"], "Before").is_some(),
+        "a read reloaded the scene: {unread}"
+    );
+    let reloaded = call("open_scene", json!({"scene_path": "res://stale.tscn"}))
+        .await
+        .expect("reload stale");
+    assert_eq!(reloaded["reloaded"], true, "{reloaded}");
+    let stale_tree = call("get_scene_tree", json!({"scene_path": "res://stale.tscn"}))
+        .await
+        .expect("stale tree");
+    assert!(
+        find(&stale_tree["tree"], "FromDisk").is_some(),
+        "in-memory scene was not reloaded: {stale_tree}"
+    );
+    assert!(
+        find(&stale_tree["tree"], "Before").is_none(),
+        "old node survived the reload: {stale_tree}"
+    );
+    call("open_scene", json!({"scene_path": "res://main.tscn"}))
+        .await
+        .expect("return to main");
+
     // Paths in responses are relative to the edited scene.
     let tree = call("get_scene_tree", json!({})).await.expect("tree");
     assert_eq!(tree["tree"]["path"], ".");
@@ -528,9 +592,142 @@ async fn undo_and_resource_refresh_behave() {
         "{}",
         editor.log_text()
     );
+
+    // A node added through the editor's own undo history, not through a bridge
+    // command, is still unsaved. Reloading must not throw it away unless asked.
+    std::fs::write(
+        editor.project.join("hand.tscn"),
+        "[gd_scene format=3]\n\n[node name=\"Hand\" type=\"Node2D\"]\n",
+    )
+    .expect("hand scene");
+    bridge
+        .send_command("open_scene", json!({"scene_path": "res://hand.tscn"}))
+        .await
+        .expect("open hand");
+    bridge
+        .send_command("__test_hand_edit", json!({}))
+        .await
+        .expect("hand edit");
+    std::fs::write(
+        editor.project.join("hand.tscn"),
+        "[gd_scene format=3]\n\n[node name=\"Hand\" type=\"Node2D\"]\n\n[node name=\"FromDisk\" type=\"Node\" parent=\".\"]\n",
+    )
+    .expect("rewrite hand scene");
+    let blocked = bridge
+        .send_command("open_scene", json!({"scene_path": "res://hand.tscn"}))
+        .await;
+    expect_error(blocked, "unsaved");
+    let kept = bridge
+        .send_command("get_scene_tree", json!({"scene_path": "res://hand.tscn"}))
+        .await
+        .expect("kept tree");
+    assert!(
+        find(&kept["tree"], "ByHand").is_some(),
+        "hand edit was discarded: {kept}"
+    );
+    let discarded = bridge
+        .send_command(
+            "open_scene",
+            json!({"scene_path": "res://hand.tscn", "discard": true}),
+        )
+        .await
+        .expect("discard hand edits");
+    assert_eq!(discarded["reloaded"], true, "{discarded}");
+    let after = bridge
+        .send_command("get_scene_tree", json!({}))
+        .await
+        .expect("tree after discard");
+    assert!(find(&after["tree"], "ByHand").is_none(), "{after}");
+    assert!(find(&after["tree"], "FromDisk").is_some(), "{after}");
+
+    // The same when the person opened the scene themselves: the bridge never saw it open,
+    // yet its unsaved edits must survive a reload from disk.
+    std::fs::write(
+        editor.project.join("opened.tscn"),
+        "[gd_scene format=3]
+
+[node name=\"Opened\" type=\"Node2D\"]
+",
+    )
+    .expect("opened scene");
+    bridge
+        .send_command(
+            "__test_open_directly",
+            json!({"scene_path": "res://opened.tscn"}),
+        )
+        .await
+        .expect("open directly");
+    sleep(Duration::from_millis(500)).await;
+    bridge
+        .send_command("__test_hand_edit", json!({}))
+        .await
+        .expect("hand edit in the directly opened scene");
+    std::fs::write(
+        editor.project.join("opened.tscn"),
+        "[gd_scene format=3]
+
+[node name=\"Opened\" type=\"Node2D\"]
+
+[node name=\"FromDisk\" type=\"Node\" parent=\".\"]
+",
+    )
+    .expect("rewrite opened scene");
+    expect_error(
+        bridge
+            .send_command("open_scene", json!({"scene_path": "res://opened.tscn"}))
+            .await,
+        "unsaved",
+    );
+    let still = bridge
+        .send_command("get_scene_tree", json!({"scene_path": "res://opened.tscn"}))
+        .await
+        .expect("tree of the directly opened scene");
+    assert!(
+        find(&still["tree"], "ByHand").is_some(),
+        "hand edit in a scene the bridge never opened was discarded: {still}"
+    );
     let scan = bridge
         .send_command("resave_resources", json!({}))
         .await
         .expect("full scan");
     assert_eq!(scan["mode"], "full_scan");
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn play_with_runtime_disabled_does_not_write_override() {
+    let editor = start_editor_configured(false, "\n[godot_mcp]\n\nruntime_on_play=false\n").await;
+    let bridge = &editor.bridge;
+    bridge
+        .send_command("run_project", json!({}))
+        .await
+        .expect("play");
+    let override_path = editor.project.join("override.cfg");
+    let mut running = false;
+    for _ in 0..40 {
+        let text = std::fs::read_to_string(&override_path).unwrap_or_default();
+        assert!(
+            !text.contains("godot_mcp: temporary runtime autoload"),
+            "play wrote override.cfg while runtime_on_play is off: {text}"
+        );
+        let status = bridge
+            .send_command("get_run_status", json!({}))
+            .await
+            .expect("status");
+        if status["running"] == true {
+            running = true;
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    assert!(running, "editor play did not start:\n{}", editor.log_text());
+    let text = std::fs::read_to_string(&override_path).unwrap_or_default();
+    assert!(
+        !text.contains("godot_mcp: temporary runtime autoload"),
+        "play wrote override.cfg while runtime_on_play is off: {text}"
+    );
+    bridge
+        .send_command("stop_project", json!({}))
+        .await
+        .expect("stop");
 }

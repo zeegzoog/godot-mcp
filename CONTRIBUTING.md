@@ -75,6 +75,7 @@ Choose the branch for your pull request:
    | Editor command behaviour | `tests/editor_e2e_test.rs` |
    | Addon kept out of exported games | `tests/addon_export_test.rs` |
    | Launched processes staying independent of the server | `tests/detach_test.rs` |
+   | Running game, input, screenshots, breakpoints, GDScript diagnostics | `tests/runtime_e2e_test.rs` |
    | Version string and release line identity | `tests/version_sync_test.rs` |
 
    Unit tests live next to the code in `src/`.
@@ -98,8 +99,22 @@ godot --headless --path . --import   # first run only, or after script changes
 godot --headless --check-only --path . --script addons/godot_mcp/plugin.gd
 godot --headless --check-only --path . --script addons/godot_mcp/bridge_server.gd
 godot --headless --check-only --path . --script addons/godot_mcp/export_plugin.gd
+godot --headless --check-only --path . --script addons/godot_mcp/editor/game_relay.gd
+godot --headless --check-only --path . --script addons/godot_mcp/core/runtime_override.gd
+godot --headless --check-only --path . --script addons/godot_mcp/runtime/mcp_runtime.gd
+godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_input.gd
+godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_live.gd
+godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_output.gd
+godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_result.gd
+godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_view.gd
 GODOT_PATH=/path/to/godot cargo test --test editor_e2e_test -- --ignored
 GODOT_PATH=/path/to/godot cargo test --test addon_export_test -- --ignored
+```
+
+When the running-game tools, the debugger client, or the GDScript language-server client changed, also run that with the same Godot build:
+
+```bash
+GODOT_PATH=/path/to/godot cargo test --test runtime_e2e_test -- --ignored
 ```
 
 ## Commits and Pull Requests

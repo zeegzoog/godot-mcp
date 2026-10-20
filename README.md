@@ -166,6 +166,8 @@ AI client <-stdio JSON-RPC-> godot-mcp <-WebSocket :9333-> addons/godot_mcp (ins
                                  +-> Godot binary (headless fallback)
 ```
 
+Running-game inspection, input, and screenshots are `godot_game_*` tools.
+
 ## Roadmap
 
 Not implemented yet:
@@ -176,6 +178,12 @@ Not implemented yet:
 ## Development
 
 To contribute — set up, choose the branch for your Godot version, run the checks and open a pull request — read [CONTRIBUTING.md](CONTRIBUTING.md). AI agents start with [AGENTS.md](AGENTS.md). Releases are described in [CONTRIBUTING.md](CONTRIBUTING.md#releases).
+
+Running-game input, inspection, and the remote debugger need the Godot build named in [`.github/godot-version`](.github/godot-version):
+
+```bash
+GODOT_PATH=/path/to/godot cargo test --test runtime_e2e_test -- --ignored
+```
 
 ## License
 

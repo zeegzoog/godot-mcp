@@ -8,6 +8,32 @@ This file lists the releases of the Godot 4.5 line (branch `godot-v4.5`). Releas
 
 ## [Unreleased]
 
+## [0.5.0+godot.4.5] - 2026-10-20
+
+First release of the Godot 4.5 line. godot-mcp is now released separately for each Godot
+minor version; this release is the one to install with Godot 4.5.x. The server and the addon
+changed together: update both.
+
+### Changed (breaking)
+
+- **One release per Godot version.** Tags, release titles and file names name the Godot version:
+  tag `v0.5.0+godot.4.5`, title "godot-mcp 0.5.0 for Godot 4.5", files ending in `-godot4.5`
+  (for example `godot-mcp-x86_64-pc-windows-msvc-godot4.5.zip` and
+  `godot-mcp-addon-godot4.5.zip`). Pick the release made for your Godot version; see the table
+  in the README.
+- The addon refuses to start in a Godot older than 4.5 and prints which release to install. In
+  a newer Godot it starts and prints a warning naming the release for that version.
+- A `GODOT_PATH` that points to a missing file is no longer replaced by another Godot the server
+  finds on its own, which could run a different engine version than the one you chose. The server
+  logs a warning at start, and tools that run Godot fail with a message naming the path.
+  Leaving `GODOT_PATH` unset (or empty) still looks for an installed Godot.
+
+### Added
+
+- `SECURITY.md` explains which versions get security fixes and how to report a vulnerability
+  privately, and `CONTRIBUTING.md` explains how to contribute, including which branch a change
+  belongs to.
+
 ## [0.4.0] - 2026-10-16
 
 ### Added
@@ -141,7 +167,8 @@ part of every release), and note the behaviour changes below.
   property operations, viewport capture), headless CLI fallback for version, script validation
   and launching the editor.
 
-[Unreleased]: https://github.com/zeegzoog/godot-mcp/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/zeegzoog/godot-mcp/compare/v0.5.0%2Bgodot.4.5...godot-v4.5
+[0.5.0+godot.4.5]: https://github.com/zeegzoog/godot-mcp/compare/v0.4.0...v0.5.0%2Bgodot.4.5
 [0.4.0]: https://github.com/zeegzoog/godot-mcp/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/zeegzoog/godot-mcp/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/zeegzoog/godot-mcp/compare/v0.1.0...v0.2.0

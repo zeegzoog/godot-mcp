@@ -105,7 +105,7 @@ An empty value counts as "not set", so placeholders in a copied `.env.example` o
 
 In a `.env` file, put **Windows paths in single quotes** (`GODOT_PATH='C:\Program Files\Godot\Godot.exe'`). In double quotes a backslash starts an escape sequence and the whole file fails to load; the server logs a warning when that happens. See [.env.example](.env.example).
 
-The plugin picks its port from the project setting `godot_mcp/bridge_port` if you add one, otherwise from the editor's own `GODOT_DEBUG_PORT` environment variable, otherwise `9333`. Keep it equal to the server's port. Add the project setting `godot_mcp/verbose` = `true` to log every client connection in the editor's Output panel.
+The plugin picks its port from the project setting `godot_mcp/bridge_port` if you add one, otherwise from the editor's own `GODOT_DEBUG_PORT` environment variable, otherwise `9333`. Keep it equal to the server's port. Add the project setting `godot_mcp/verbose` = `true` to log every client connection in the editor's Output panel. Editor Play loads the running-game runtime unless `godot_mcp/runtime_on_play` is `false`.
 
 ## Security
 
@@ -127,9 +127,9 @@ To report a vulnerability, follow [SECURITY.md](SECURITY.md). Never open a publi
 | `godot_get_version` | — | Engine version, from the editor or the Godot binary. |
 | `godot_get_project_info` | Editor | Name, main scene, and features of the open project. |
 | `godot_launch_editor` | — | Launches the editor for `project_path`, or for the project the server runs in. |
-| `godot_run_project` | — | Plays the main scene or a given `res://` scene. With the editor, uses its Play mode (stoppable). Without it, starts a separate game process for `project_path` or the project the server runs in (can't be stopped via MCP). |
-| `godot_stop_project` | Editor | Stops the editor's Play mode. |
-| `godot_get_run_status` | Editor | Whether a scene is playing, and which one. |
+| `godot_run_project` | — | Plays the main scene or a given `res://` scene. With the editor, uses its Play mode. Without it (or with `mode: "process"`), starts a managed game with the remote debugger attached. `godot_stop_project` stops either one. |
+| `godot_stop_project` | — | Stops the editor's Play mode, or a managed process run (`run_id` optional). |
+| `godot_get_run_status` | — | Whether a scene is playing, and the managed process runs. |
 | `godot_get_open_scenes` | Editor | Open scene tabs and the active one. |
 | `godot_open_scene` | Editor | Opens a scene by `res://` path. If that tab is already open and the file on disk has changed, reloads it (pass `discard: true` to drop unsaved bridge edits). |
 | `godot_save_scene` | Editor | Saves the active scene. |
@@ -166,18 +166,24 @@ AI client <-stdio JSON-RPC-> godot-mcp <-WebSocket :9333-> addons/godot_mcp (ins
                                  +-> Godot binary (headless fallback)
 ```
 
+Running-game inspection, input, and screenshots are `godot_game_*` tools.
+
 ## Roadmap
 
 Not implemented yet:
 
-- Runtime log streaming and stack traces (`godot_get_debug_log`, `godot_get_stack_trace`)
-- In-game camera capture (`godot_capture_camera`)
-- Scene creation (`godot_create_scene`) and script read/update/attach tools
-- HTTP/SSE transport and console log capture
+- Scene creation (`godot_create_scene`) and script attach tools
+- HTTP/SSE transport
 
 ## Development
 
 To contribute — set up, choose the branch for your Godot version, run the checks and open a pull request — read [CONTRIBUTING.md](CONTRIBUTING.md). AI agents start with [AGENTS.md](AGENTS.md). Releases are described in [CONTRIBUTING.md](CONTRIBUTING.md#releases).
+
+Running-game input, inspection, and the remote debugger need the Godot build named in [`.github/godot-version`](.github/godot-version):
+
+```bash
+GODOT_PATH=/path/to/godot cargo test --test runtime_e2e_test -- --ignored
+```
 
 ## License
 

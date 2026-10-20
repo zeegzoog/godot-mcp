@@ -2,6 +2,7 @@ use crate::bridge::BridgeClient;
 use crate::cli_runner::CliRunner;
 use crate::config::FeedbackMode;
 use crate::error::McpError;
+use crate::godot::GameHub;
 use crate::journal::EvidenceKind;
 use crate::paths::{ensure_project_dir, find_project, is_valid_identifier, resolve_in_project};
 use crate::protocol::{Tool, ToolResult};
@@ -14,6 +15,7 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
 mod feedback;
+mod game;
 
 const PROJECT_PATH_HINTS: &[&str] = &[
     "Pass project_path: the absolute path of a directory that contains project.godot",
@@ -28,6 +30,7 @@ pub struct ToolManager {
     /// `project_path` is given and no editor is connected.
     working_dir: Option<PathBuf>,
     feedback: feedback::FeedbackState,
+    games: GameHub,
 }
 
 /// A project directory plus whether it came from the live editor.
@@ -38,11 +41,13 @@ struct ResolvedProject {
 
 impl ToolManager {
     pub fn new(bridge: BridgeClient, cli: CliRunner) -> Self {
+        let godot = cli.binary().to_path_buf();
         Self {
             bridge,
             cli,
             working_dir: std::env::current_dir().ok(),
             feedback: feedback::FeedbackState::new(FeedbackMode::default(), None),
+            games: GameHub::new(godot),
         }
     }
 
@@ -95,8 +100,8 @@ impl ToolManager {
             "godot_get_project_info" => self.handle_bridge_call("get_project_info", args).await,
             "godot_launch_editor" => self.handle_launch_editor(args).await,
             "godot_run_project" => self.handle_run_project(args).await,
-            "godot_stop_project" => self.handle_bridge_call("stop_project", args).await,
-            "godot_get_run_status" => self.handle_bridge_call("get_run_status", args).await,
+            "godot_stop_project" => self.handle_stop_project(args).await,
+            "godot_get_run_status" => self.handle_run_status().await,
             "godot_get_scene_tree" => self.handle_bridge_call("get_scene_tree", args).await,
             "godot_get_open_scenes" => self.handle_bridge_call("get_open_scenes", args).await,
             "godot_add_node" => self.handle_bridge_call("add_node", args).await,
@@ -113,6 +118,7 @@ impl ToolManager {
             "godot_create_script" => self.handle_create_script(args).await,
             "godot_validate_script" => self.handle_validate_script(args).await,
             "godot_resave_resources" => self.handle_bridge_call("resave_resources", args).await,
+            name if game::handles(name) => game::call(&self, name, args).await,
             feedback::NOTE => self.handle_note_feedback(args).await,
             feedback::DRAFT => self.handle_draft_feedback(args).await,
             feedback::SUBMIT => self.handle_submit_feedback(args).await,
@@ -216,6 +222,10 @@ impl ToolManager {
                 );
             }
         }
+        let mode = str_arg(&args, "mode").unwrap_or("auto");
+        if mode == "process" {
+            return self.spawn_managed(&args, scene).await;
+        }
 
         // Prefer the live editor: it can be stopped/queried later via
         // godot_stop_project / godot_get_run_status, unlike a spawned process.
@@ -232,20 +242,84 @@ impl ToolManager {
             Err(error) => return bridge_error_result(&error),
         }
 
-        // Fall back to a detached CLI process.
-        let path = match self.host_project(&args) {
+        self.spawn_managed(&args, scene).await
+    }
+
+    async fn spawn_managed(&self, args: &Value, scene: Option<&str>) -> ToolResult {
+        let path = match self.host_project(args) {
             Ok(path) => path,
             Err(result) => return result,
         };
-        match self.cli.run_project(&path, scene).await {
-            Ok(pid) => ToolResult::text(format!(
-                "No editor bridge connected. Spawned a separate Godot process instead (PID: {pid}) for '{}'. Note: godot_stop_project and godot_get_run_status only work through the live editor bridge, not this process.",
+        let breakpoints = string_list(args.get("breakpoints"));
+        let headless = args
+            .get("headless")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let break_on_errors = args
+            .get("break_on_errors")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        match self
+            .games
+            .start(&path, scene, &breakpoints, headless, break_on_errors)
+            .await
+        {
+            Ok(info) => ToolResult::text(format!(
+                "No editor bridge connected. Spawned a managed Godot process (PID: {}, run_id: {}). Stop it with godot_stop_project. Project: '{}'.",
+                info.pid,
+                info.id,
                 path.display()
             )),
-            Err(e) => ToolResult::error(
-                format!("Failed to run project: {e}"),
+            Err(error) => ToolResult::error(
+                format!("Failed to run project: {error}"),
                 &["Verify GODOT_PATH points to a working Godot executable"],
             ),
+        }
+    }
+
+    async fn handle_stop_project(&self, args: Value) -> ToolResult {
+        if let Some(run_id) = str_arg(&args, "run_id") {
+            return match self.games.stop(Some(run_id)).await {
+                Ok(summary) => {
+                    ToolResult::text(serde_json::to_string_pretty(&summary).unwrap_or_default())
+                }
+                Err(error) => ToolResult::error(
+                    error.to_string(),
+                    &["Check godot_get_run_status for live run ids"],
+                ),
+            };
+        }
+        match self.bridge.send_command("stop_project", json!({})).await {
+            Ok(result) => ToolResult::text(format!(
+                "Project stopped via live editor:\n{}",
+                serde_json::to_string_pretty(&result).unwrap_or_default()
+            )),
+            Err(McpError::BridgeUnavailable(detail)) => match self.games.stop(None).await {
+                Ok(summary) => ToolResult::text(format!(
+                    "Stopped managed Godot process:\n{}",
+                    serde_json::to_string_pretty(&summary).unwrap_or_default()
+                )),
+                Err(_) => bridge_error_result(&McpError::BridgeUnavailable(detail)),
+            },
+            Err(error) => bridge_error_result(&error),
+        }
+    }
+
+    async fn handle_run_status(&self) -> ToolResult {
+        let processes = self.games.status();
+        match self.bridge.send_command("get_run_status", json!({})).await {
+            Ok(result) => {
+                let mut combined = result;
+                if let Value::Object(map) = &mut combined {
+                    map.insert("process_runs".into(), Value::Array(processes));
+                }
+                ToolResult::text(serde_json::to_string_pretty(&combined).unwrap_or_default())
+            }
+            Err(McpError::BridgeUnavailable(detail)) if !processes.is_empty() => ToolResult::text(
+                serde_json::to_string_pretty(&json!({"editor": detail, "process_runs": processes}))
+                    .unwrap_or_default(),
+            ),
+            Err(error) => bridge_error_result(&error),
         }
     }
 
@@ -498,6 +572,19 @@ fn str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(Value::as_str)
 }
 
+fn string_list(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn missing_argument(name: &str) -> ToolResult {
     ToolResult::error(
         format!("Missing required parameter: {name}"),
@@ -605,7 +692,7 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
         ),
         tool(
             "godot_run_project",
-            "Runs the Godot project or a specific scene (opens the game window). Uses the live editor's own Play mechanism if the bridge is connected (so godot_stop_project and godot_get_run_status can control it); only if no editor is running does it start a separate Godot process (for project_path, or else the project the server was started in), which cannot be stopped via MCP.",
+            "Runs the Godot project or a specific scene. Uses the live editor's Play mode when the bridge is connected. Otherwise starts a managed process (debugger attached) that godot_stop_project can stop.",
             json!({
                 "project_path": {
                     "type": "string",
@@ -614,19 +701,39 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
                 "scene": {
                     "type": "string",
                     "description": "Optional specific scene path (e.g., 'res://scenes/Main.tscn'). Defaults to the project's main scene."
+                },
+                "breakpoints": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional res://script.gd:LINE breakpoints for a process run."
+                },
+                "headless": {
+                    "type": "boolean",
+                    "description": "Process runs only. When true, start without a window (screenshots will be unavailable)."
+                },
+                "break_on_errors": {
+                    "type": "boolean",
+                    "description": "Process runs only. When true, a script error pauses the game. Default false: the error is still logged, but the game keeps running."
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["auto", "process"],
+                    "description": "auto (default) uses the live editor when the bridge is connected. process always starts a managed debugger-attached process that godot_stop_project can stop."
                 }
             }),
             &[],
         ),
         tool(
             "godot_stop_project",
-            "Stops the project currently running via the live editor's Play mode (started by godot_run_project). Requires the editor bridge to be connected; it cannot stop a process spawned by the CLI fallback.",
-            json!({}),
+            "Stops the project currently running via the live editor's Play mode, or a managed process run when the editor is closed. Pass run_id to stop one process run.",
+            json!({
+                "run_id": {"type": "string", "description": "Optional id of a managed process run. Omit to stop the editor Play mode, or the newest process run when the editor is closed."}
+            }),
             &[],
         ),
         tool(
             "godot_get_run_status",
-            "Reports whether a scene is currently playing via the live editor's Play mode, and which one. Requires the editor bridge to be connected.",
+            "Reports whether a scene is playing in the editor and lists managed process runs.",
             json!({}),
             &[],
         ),
@@ -799,6 +906,7 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
             &[],
         ),
     ];
+    tools.extend(game::catalog());
     tools.extend(feedback::catalog(feedback_mode));
     tools
 }

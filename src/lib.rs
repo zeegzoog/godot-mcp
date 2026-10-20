@@ -6,6 +6,7 @@ pub mod feedback;
 pub mod godot;
 pub mod issues;
 pub mod journal;
+pub mod lsp;
 pub mod paths;
 pub mod protocol;
 pub mod server;

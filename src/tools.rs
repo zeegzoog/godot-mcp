@@ -4,6 +4,7 @@ use crate::config::FeedbackMode;
 use crate::error::McpError;
 use crate::godot::GameHub;
 use crate::journal::EvidenceKind;
+use crate::lsp::LspHub;
 use crate::paths::{ensure_project_dir, find_project, is_valid_identifier, resolve_in_project};
 use crate::protocol::{Tool, ToolResult};
 use crate::validation::validate_arguments;
@@ -14,6 +15,7 @@ use std::sync::{Arc, OnceLock};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
+mod code;
 mod feedback;
 mod game;
 
@@ -31,6 +33,7 @@ pub struct ToolManager {
     working_dir: Option<PathBuf>,
     feedback: feedback::FeedbackState,
     games: GameHub,
+    lsp: LspHub,
 }
 
 /// A project directory plus whether it came from the live editor.
@@ -47,7 +50,8 @@ impl ToolManager {
             cli,
             working_dir: std::env::current_dir().ok(),
             feedback: feedback::FeedbackState::new(FeedbackMode::default(), None),
-            games: GameHub::new(godot),
+            games: GameHub::new(godot.clone()),
+            lsp: LspHub::new(godot),
         }
     }
 
@@ -119,6 +123,7 @@ impl ToolManager {
             "godot_validate_script" => self.handle_validate_script(args).await,
             "godot_resave_resources" => self.handle_bridge_call("resave_resources", args).await,
             name if game::handles(name) => game::call(&self, name, args).await,
+            name if code::handles(name) => code::call(&self, name, args).await,
             feedback::NOTE => self.handle_note_feedback(args).await,
             feedback::DRAFT => self.handle_draft_feedback(args).await,
             feedback::SUBMIT => self.handle_submit_feedback(args).await,
@@ -907,6 +912,7 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
         ),
     ];
     tools.extend(game::catalog());
+    tools.extend(code::catalog());
     tools.extend(feedback::catalog(feedback_mode));
     tools
 }

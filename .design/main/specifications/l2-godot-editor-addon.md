@@ -1,6 +1,6 @@
 # Godot Editor Addon
 
-**Version:** 1.0.0
+**Version:** 1.1.0
 **Status:** Stable
 **Layer:** implementation
 **Implements:** l1-editor-bridge.md
@@ -14,6 +14,8 @@ The editor side of the live bridge, written in GDScript and shipped as `addons/g
 - [l1-editor-bridge.md](l1-editor-bridge.md) - Parent concept.
 - [l2-bridge-client-rust.md](l2-bridge-client-rust.md) - The server-side peer.
 - [l1-distribution.md](l1-distribution.md) - DS-5: shipped as a separate archive.
+- [l1-release-lines.md](l1-release-lines.md) - RL-4: the addon of each line gates on its line's Godot version.
+- [l2-release-branches.md](l2-release-branches.md) - Line identity values in the addon and the per-line guard list.
 
 ## 1. Motivation
 
@@ -21,12 +23,12 @@ GDScript fails differently from Rust: assigning a wrongly typed value to a typed
 
 ## 2. Constraints & Assumptions
 
-- Target: Godot 4.5+; `plugin.gd` refuses to start the bridge on older editors (`MIN_MAJOR`/`MIN_MINOR`). Raising the floor means updating that constant, the README, and the development `project.godot` together.
+- [MODIFIED] Target: the Godot minor version of the branch's release line (4.5, 4.6, 4.7; 4.8 on the development line). `MIN_MAJOR`/`MIN_MINOR` in `plugin.gd` and `config/features` in the development `project.godot` are line identity values; `tests/version_sync_test.rs` keeps them equal to the line in the version string.
 - Observed conventions:
   - Strict static typing for locals, members and return types.
   - No `class_name` in any addon script: a global class would be listed in every exported game's class list while its script is left out. Scripts are loaded by path.
   - Command parameters are read untyped and validated against `PARAM_TYPES` before a handler runs.
-  - APIs missing from 4.5 are called through `has_method()` + `call()` (example: `EditorFileSystem.is_importing`).
+  - [MODIFIED] APIs missing from the line's M.N.0 are called through `has_method()` + `call()`; APIs present there are called directly. Example: `EditorFileSystem.is_importing` exists from 4.7, so lines 4.5 and 4.6 guard it and line 4.7 and the development line call it directly.
   - No third-party dependencies; standard Godot API only.
   - Log lines are prefixed `[Godot MCP]`; connect/disconnect logs only when the project setting `godot_mcp/verbose` is true.
 - The repository root is a minimal Godot project (`project.godot`) so the addon can be enabled and syntax-checked in isolation.
@@ -43,7 +45,7 @@ GDScript fails differently from Rust: assigning a wrongly typed value to a typed
 | BR-6 Scene confinement | `find_scene_node` accepts a result only if it is the edited root or a descendant of it; `.`/empty means the root; removing the root is refused; reported paths are `root.get_path_to(node)`. |
 | BR-7 All-or-nothing updates | `set_node_properties` converts every value first (`convert_property_value`: numbers, vectors/rects/colors from arrays or objects, colors from strings, `res://` resources, packed arrays, Godot literals via `str_to_var`), rejects the whole call on any unknown property or conversion error, then applies all values in one action and replies with values read back. |
 | BR-8 Fast, classified failures | Errors are replied as `status: error` with a human-readable message; the server classifies them. |
-| BR-9 Version gate | `plugin.gd` compares `Engine.get_version_info()` with 4.5 and prints an error instead of starting. |
+| BR-9 Version gate | [MODIFIED] `plugin.gd` compares `Engine.get_version_info()` with the line's `MIN_MAJOR`.`MIN_MINOR`: an older version prints an error and the bridge does not start; a newer version prints a warning naming the release line to install ("This godot-mcp build is for Godot 4.6; install the release for Godot 4.7") and the bridge starts (RL-4). |
 | BR-10 Editor-only | `export_plugin.gd` (registered before the bridge so it works even if the bridge fails) skips every file under its own directory; its name sorts before the built-in "GDScript" export plugin, which would otherwise remap `.gd` files first and end the chain. |
 | BR-11 Project-confined paths | `to_res_path` normalizes separators, localizes absolute paths, and rejects anything outside `res://` or containing a `..` segment; used by `open_scene`, `get_scene_tree`, `run_project` and `resave_resources`. |
 
@@ -63,7 +65,7 @@ addons/godot_mcp/
 ### 5.2 Handler Notes
 
 - `capture_viewport`: refuses headless editors; switches the main screen to 2D or 3D (`auto` picks 3D for a `Node3D` root), waits two frames, forces a draw (an idle editor in low-processor mode would otherwise never redraw), rejects images under 16 px, downscales to `max_dimension` (default 1568) with Lanczos, returns base64 PNG with width, height and view.
-- `resave_resources`: refuses while an import is running (guarded 4.5-safe call); with no paths starts a background `scan()`; otherwise re-imports importable files synchronously and calls `update_file` for others; reports reimported, refreshed, missing and invalid paths.
+- `resave_resources`: refuses while an import is running (`is_import_running`: guarded call before 4.7, direct call from 4.7); with no paths starts a background `scan()`; otherwise re-imports importable files synchronously and calls `update_file` for others; reports reimported, refreshed, missing and invalid paths.
 - `add_node`: native classes must derive from `Node` and be instantiable; global script classes are looked up in the project's class list; non-Node script instances are freed.
 - `get_node_properties`: only properties with editor usage; values in Godot text form, truncated at 2000 characters.
 
@@ -92,3 +94,4 @@ addons/godot_mcp/
 | Version | Date | Author | Description |
 | --- | --- | --- | --- |
 | 1.0.0 | 2026-10-16 | Agent (magic.analyze first-time) | Reverse-engineered from the addon at 94e4540; known limitations carried over from the 2026-10-14 QA report's open items. |
+| 1.1.0 | 2026-10-20 | Agent (magic.spec) | [MODIFIED] Target, guard convention and BR-9 per release line; newer-minor warning. Stable → RFC → Stable after Post-Update Review. |

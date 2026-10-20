@@ -721,7 +721,7 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
         ),
         tool(
             "godot_open_scene",
-            "Opens a scene file in the Godot Editor by its res:// path (absolute paths inside the project are converted).",
+            "Opens a scene file in the Godot Editor by its res:// path. An absolute path inside the project is converted, including both macOS spellings of /var and /private/var.",
             json!({
                 "scene_path": {
                     "type": "string",

@@ -50,7 +50,10 @@ func _enter_tree() -> void:
 
 ## Called by the editor immediately before Play. Injects the runtime autoload, then the
 ## debugger relay removes it once the game has read override.cfg.
+## `godot_mcp/runtime_on_play` = false leaves Play alone.
 func _build() -> bool:
+    if not bool(ProjectSettings.get_setting("godot_mcp/runtime_on_play", true)):
+        return true
     var script: GDScript = load(OVERRIDE_SCRIPT_PATH)
     if script != null:
         script.call("inject")

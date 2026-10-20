@@ -3,7 +3,7 @@
 //! A run listens as the game's remote debugger, injects the runtime autoload through
 //! `override.cfg` (never `project.godot`), and restores that file when the process exits.
 //! The runtime script is copied into the project only when the addon does not already
-//! contain it.
+//! contain it, and those copied files are removed when the run ends.
 
 use crate::error::{McpError, Result};
 use crate::godot::debug_ctl::DebugCtl;
@@ -76,6 +76,7 @@ struct OverrideState {
     path: PathBuf,
     backup_path: PathBuf,
     previous: Option<Vec<u8>>,
+    planted: Vec<PathBuf>,
 }
 
 pub struct Run {
@@ -116,8 +117,8 @@ impl GameHub {
         headless: bool,
         break_on_errors: bool,
     ) -> Result<RunInfo> {
-        ensure_runtime(project)?;
-        let override_state = inject_override(project)?;
+        let planted = ensure_runtime(project)?;
+        let override_state = inject_override(project, planted)?;
         let session = match DebugSession::listen().await {
             Ok(session) => session,
             Err(err) => {
@@ -620,7 +621,8 @@ fn spawn_wait(run: Arc<Run>) {
     });
 }
 
-fn ensure_runtime(project: &Path) -> Result<()> {
+fn ensure_runtime(project: &Path) -> Result<Vec<PathBuf>> {
+    let mut planted = Vec::new();
     for (relative, contents) in RUNTIME_FILES {
         let path = project.join(relative);
         if path.is_file() {
@@ -629,12 +631,41 @@ fn ensure_runtime(project: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, contents)?;
+        std::fs::write(&path, contents)?;
+        planted.push(path);
     }
-    Ok(())
+    Ok(planted)
 }
 
-fn inject_override(project: &Path) -> Result<OverrideState> {
+fn remove_planted(files: &[PathBuf]) {
+    for path in files {
+        let _ = std::fs::remove_file(path);
+        let mut current = path.parent().map(Path::to_path_buf);
+        while let Some(dir) = current {
+            if dir.join("project.godot").is_file() || std::fs::remove_dir(&dir).is_err() {
+                break;
+            }
+            current = dir.parent().map(Path::to_path_buf);
+        }
+    }
+}
+
+struct PlantedGuard(Vec<PathBuf>);
+
+impl Drop for PlantedGuard {
+    fn drop(&mut self) {
+        remove_planted(&self.0);
+    }
+}
+
+fn inject_override(project: &Path, planted: Vec<PathBuf>) -> Result<OverrideState> {
+    let mut planted = PlantedGuard(planted);
+    let state = write_override(project, &planted.0)?;
+    planted.0.clear();
+    Ok(state)
+}
+
+fn write_override(project: &Path, planted: &[PathBuf]) -> Result<OverrideState> {
     let path = project.join("override.cfg");
     let backup_path = project.join(".godot/godot_mcp/override.cfg.user-backup");
     if path.is_file() {
@@ -672,6 +703,7 @@ fn inject_override(project: &Path) -> Result<OverrideState> {
         path,
         backup_path,
         previous,
+        planted: planted.to_vec(),
     })
 }
 
@@ -685,6 +717,7 @@ fn restore_override(state: &OverrideState) {
         }
     }
     let _ = std::fs::remove_file(&state.backup_path);
+    remove_planted(&state.planted);
 }
 
 impl Drop for GameHub {
@@ -695,5 +728,52 @@ impl Drop for GameHub {
             }
             run.restore();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ensure_runtime, inject_override, restore_override};
+
+    #[test]
+    fn a_run_removes_only_the_runtime_files_it_created() {
+        let project = tempfile::tempdir().expect("project");
+        std::fs::write(project.path().join("project.godot"), "config_version=5\n").unwrap();
+        let kept = project
+            .path()
+            .join("addons/godot_mcp/runtime/mcp_runtime.gd");
+        std::fs::create_dir_all(kept.parent().unwrap()).unwrap();
+        std::fs::write(&kept, "extends Node\n").unwrap();
+
+        let planted = ensure_runtime(project.path()).unwrap();
+        assert!(planted.iter().all(|path| path != &kept));
+        assert!(
+            project
+                .path()
+                .join("addons/godot_mcp/runtime/ops/rt_input.gd")
+                .is_file()
+        );
+
+        let state = inject_override(project.path(), planted).unwrap();
+        assert!(
+            std::fs::read_to_string(project.path().join("override.cfg"))
+                .unwrap()
+                .contains("temporary runtime autoload")
+        );
+        restore_override(&state);
+
+        assert!(!project.path().join("override.cfg").exists());
+        assert!(kept.is_file(), "a file the project already had was removed");
+        assert!(!project.path().join("addons/godot_mcp/runtime/ops").exists());
+
+        let fresh = tempfile::tempdir().expect("fresh project");
+        std::fs::write(fresh.path().join("project.godot"), "config_version=5\n").unwrap();
+        let planted = ensure_runtime(fresh.path()).unwrap();
+        let state = inject_override(fresh.path(), planted).unwrap();
+        restore_override(&state);
+        assert!(
+            !fresh.path().join("addons").exists(),
+            "a project without the addon must not keep the copied runtime"
+        );
     }
 }

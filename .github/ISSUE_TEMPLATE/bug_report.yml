@@ -1,0 +1,67 @@
+name: Bug report
+description: Something in godot-mcp does not work as documented or as it did before.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a problem. An AI assistant triages new issues on behalf of the maintainers and says so in its replies; a maintainer can always step in.
+        **Security vulnerabilities:** do not report them here. Follow [SECURITY.md](https://github.com/zeegzoog/godot-mcp/blob/master/SECURITY.md) to report them privately.
+  - type: input
+    id: version
+    attributes:
+      label: godot-mcp version
+      description: The `version=` line of `addons/godot_mcp/plugin.cfg` in your project.
+      placeholder: 0.5.1+godot.4.7
+    validations:
+      required: true
+  - type: input
+    id: godot
+    attributes:
+      label: Godot version
+      description: Shown in the editor under Help → About.
+      placeholder: 4.7.2-stable
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Operating system
+      placeholder: Windows 11 x64, Ubuntu 24.04, macOS 15 on Apple silicon
+    validations:
+      required: true
+  - type: input
+    id: client
+    attributes:
+      label: MCP client
+      placeholder: Claude Code 2.x, Cursor, VS Code, …
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened instead
+      description: The tool's answer or error message, and what the editor showed.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Server log
+      description: Optional. Run the server with `RUST_LOG=godot_mcp=debug`; the log goes to stderr. Leave out tokens and private paths.
+      render: text

@@ -1,0 +1,50 @@
+name: Repo steward reminders
+
+# Issues waiting for information from their author: a reminder after 14 days, then a close as
+# not planned after 7 more. Pull requests waiting for their author get the reminder and are
+# never closed by this workflow. The days follow timing.* in .github/steward.yml.
+
+on:
+  schedule:
+    - cron: "41 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write # actions/stale keeps its state in the cache
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: repo-steward-stale
+  cancel-in-progress: false
+
+jobs:
+  remind:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/stale@v11
+        with:
+          only-labels: "status: needs-info"
+          stale-issue-label: "status: stale"
+          stale-pr-label: "status: stale"
+          days-before-stale: 14
+          days-before-close: 7
+          days-before-pr-close: -1
+          close-issue-reason: not_planned
+          remove-stale-when-updated: true
+          operations-per-run: 60
+          stale-issue-message: |
+            A reminder: this issue is still waiting for the information requested above. Without it, the issue will be closed in 7 days; you can reopen it with the details at any time.
+
+            _Posted automatically by the repo steward on behalf of the maintainers. A maintainer reads this thread and can step in._
+            <!-- repo-steward:v1 kind=reminder state=waiting-author round=0 -->
+          close-issue-message: |
+            I am closing this issue: the information requested above did not arrive. Reopen it, or comment here, when you have it.
+
+            _Posted automatically by the repo steward on behalf of the maintainers. A maintainer reads this thread and can step in._
+            <!-- repo-steward:v1 kind=not-planned state=not-planned round=0 -->
+          stale-pr-message: |
+            A reminder: this pull request is waiting for the changes requested above. It stays open; a maintainer may close it later if it remains inactive.
+
+            _Posted automatically by the repo steward on behalf of the maintainers. A maintainer reads this thread and can step in._
+            <!-- repo-steward:v1 kind=reminder state=waiting-author round=0 -->

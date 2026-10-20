@@ -4,7 +4,8 @@
 //!
 //! Variables (all optional):
 //! - `FAKE_GH_LOG`: file that receives one `[call]` block per run, one argument per line.
-//! - `FAKE_GH_BODY`: file that receives standard input of `issue create`.
+//! - `FAKE_GH_BODY`: file that receives standard input of `issue create`, or the content of the
+//!   file named by `--body-file` for `issue comment`; a file it cannot open fails the run, as gh does.
 //! - `FAKE_GH_LIST_STDOUT`, `FAKE_GH_LIST_STDERR`, `FAKE_GH_LIST_EXIT`, `FAKE_GH_LIST_DELAY_MS`.
 //! - `FAKE_GH_CREATE_STDOUT`, `FAKE_GH_CREATE_STDERR`, `FAKE_GH_CREATE_EXIT`, `FAKE_GH_DELAY_MS`.
 //! - `FAKE_GH_LIST_HIT_URL`: `issue list` answers with one hit at this address whose body holds the
@@ -53,6 +54,31 @@ fn main() {
                 "FAKE_GH_CREATE",
                 "FAKE_GH_DELAY_MS",
                 "https://github.com/zeegzoog/godot-mcp/issues/1\n",
+            )
+        }
+        (Some("issue"), Some("comment")) => {
+            let file = args
+                .iter()
+                .position(|arg| arg == "--body-file")
+                .and_then(|index| args.get(index + 1));
+            if let Some(file) = file {
+                match std::fs::read_to_string(file) {
+                    Ok(text) => {
+                        if let Some(path) = var("FAKE_GH_BODY") {
+                            let _ = std::fs::write(path, text);
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("open {file}: {err}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            (
+                "FAKE_GH_COMMENT",
+                "FAKE_GH_DELAY_MS",
+                "https://github.com/zeegzoog/godot-mcp/issues/1#issuecomment-1
+",
             )
         }
         _ => {

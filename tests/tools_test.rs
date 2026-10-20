@@ -305,6 +305,25 @@ fn launch_editor_schema_no_longer_requires_project_path() {
     );
 }
 
+#[tokio::test]
+async fn game_call_requires_an_explicit_permit_before_any_game_is_running() {
+    let refused = call(
+        "godot_game_call",
+        json!({"method": "queue_free", "path": "."}),
+    )
+    .await;
+    assert!(refused.is_error, "{}", text(&refused));
+    assert!(text(&refused).contains("permit"), "{}", text(&refused));
+
+    let denied = call(
+        "godot_game_call",
+        json!({"method": "quit", "permit": ["quit"]}),
+    )
+    .await;
+    assert!(denied.is_error, "{}", text(&denied));
+    assert!(text(&denied).contains("not allowed"), "{}", text(&denied));
+}
+
 #[test]
 fn tool_text_helper_reads_error_flag() {
     let result = ToolResult::error("boom", &["try again"]);

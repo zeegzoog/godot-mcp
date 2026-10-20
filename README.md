@@ -12,13 +12,13 @@ Requirements: **Godot 4.5 or newer**, the godot-mcp release made for your Godot 
 
 ### Pick the release for your Godot version
 
-Each godot-mcp release is built for one Godot minor version: its title ends with "for Godot M.N" and its files with `-godotM.N`. Install the newest release for your version.
+Each godot-mcp release is built for one Godot minor version: its tag ends with `+godot.M.N` (for example `v0.5.0+godot.4.6`) and its files with `-godotM.N`. Install the newest release for your version.
 
 | Your Godot | Branch | Release to install |
 | --- | --- | --- |
-| 4.7.x | `godot-v4.7` | the newest release titled "for Godot 4.7" |
-| 4.6.x | `godot-v4.6` | the newest release titled "for Godot 4.6" |
-| 4.5.x | `godot-v4.5` | the newest release titled "for Godot 4.5" |
+| 4.7.x | `godot-v4.7` | the newest release whose tag ends with `+godot.4.7` |
+| 4.6.x | `godot-v4.6` | the newest release whose tag ends with `+godot.4.6` |
+| 4.5.x | `godot-v4.5` | the newest release whose tag ends with `+godot.4.5` |
 | 4.8 (pre-release) | `master` | none; build from source |
 
 Release 0.4.0 is one build for Godot 4.5 and newer, and its file names have no `-godotM.N` suffix.
@@ -32,7 +32,7 @@ Install the Godot MCP server (https://github.com/zeegzoog/godot-mcp) for this Go
 
 1. Detect the OS and CPU architecture (Windows, Linux, or macOS; x86_64 or arm64).
 2. Ask me for the full path to my Godot executable. Never guess it: Windows builds are portable, version-named files (e.g. Godot_v4.5-stable_win64.exe) stored wherever I put them. Run `<path> --version` to confirm it works, and note its major.minor version (4.6.3.stable.official → 4.6).
-3. Pick the release for that Godot version: list them with `gh release list --repo zeegzoog/godot-mcp --limit 50` and take the newest one titled "for Godot <major.minor>". If there is none, take v0.4.0 (one build for Godot 4.5 and newer). Download the server archive for this platform and the addon archive from that release, e.g.:
+3. Pick the release for that Godot version: list them with `gh release list --repo zeegzoog/godot-mcp --limit 50` and take the newest one whose tag ends with `+godot.<major.minor>`. If there is none, take v0.4.0 (one build for Godot 4.5 and newer). Download the server archive for this platform and the addon archive from that release, e.g.:
    gh release download <tag> --repo zeegzoog/godot-mcp --pattern "godot-mcp-<target-triple>*"
    gh release download <tag> --repo zeegzoog/godot-mcp --pattern "godot-mcp-addon*"
    Extract the server to a permanent folder outside the project: %LOCALAPPDATA%\godot-mcp\ (Windows), ~/.local/share/godot-mcp/ (Linux), ~/Library/Application Support/godot-mcp/ (macOS).

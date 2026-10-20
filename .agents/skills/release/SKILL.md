@@ -125,7 +125,7 @@ Work on the line's branch or its worktree. The examples release line 4.6 as 0.5.
    ```bash
    git push origin godot-v4.6
    gh run watch $(gh run list --branch godot-v4.6 --workflow ci.yml -L 1 --json databaseId -q '.[0].databaseId')
-   git tag -a "v0.5.1+godot.4.6" -m "godot-mcp 0.5.1 for Godot 4.6"
+   git tag -a "v0.5.1+godot.4.6" -m "godot-mcp 0.5.1 (Godot 4.6)"
    bash .github/scripts/release-line.sh "v0.5.1+godot.4.6"   # the release workflow's own checks
    git push origin "v0.5.1+godot.4.6"
    ```
@@ -140,7 +140,7 @@ Work on the line's branch or its worktree. The examples release line 4.6 as 0.5.
    ```
 
    - All six jobs succeed: `verify`, `addon` and the four builds (`x86_64-pc-windows-msvc`, `x86_64-unknown-linux-gnu`, `x86_64-apple-darwin`, `aarch64-apple-darwin`).
-   - The title is `godot-mcp 0.5.1 for Godot 4.6`, the text is the changelog section, and five files end in `-godot4.6`: four server archives and `godot-mcp-addon-godot4.6.zip`.
+   - The title is `godot-mcp 0.5.1 (Godot 4.6)` and the tag ends in `+godot.4.6`, the text is the changelog section, and five files end in `-godot4.6`: four server archives and `godot-mcp-addon-godot4.6.zip`.
    - The release is marked "Latest" only when 4.6 is the newest line that has releases.
 
 ## D. Release Several Lines Together

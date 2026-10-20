@@ -59,9 +59,20 @@ jobs:
           $GODOT_PATH --headless --check-only --path . --script addons/godot_mcp/plugin.gd
           $GODOT_PATH --headless --check-only --path . --script addons/godot_mcp/bridge_server.gd
           $GODOT_PATH --headless --check-only --path . --script addons/godot_mcp/export_plugin.gd
+          $GODOT_PATH --headless --check-only --path . --script addons/godot_mcp/editor/game_relay.gd
+          $GODOT_PATH --headless --check-only --path . --script addons/godot_mcp/core/runtime_override.gd
+          $GODOT_PATH --headless --check-only --path . --script addons/godot_mcp/runtime/mcp_runtime.gd
+          $GODOT_PATH --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_input.gd
+          $GODOT_PATH --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_live.gd
+          $GODOT_PATH --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_output.gd
+          $GODOT_PATH --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_result.gd
+          $GODOT_PATH --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_view.gd
 
       - name: End-to-end tests against a real editor
         run: cargo test --test editor_e2e_test -- --ignored --test-threads=2
 
       - name: The addon stays out of exported games
         run: cargo test --test addon_export_test -- --ignored
+
+      - name: Running game
+        run: cargo test --test runtime_e2e_test -- --ignored --test-threads=1

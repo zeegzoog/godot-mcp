@@ -1,0 +1,31 @@
+name: Feature request
+description: Propose a new tool, new behaviour or an improvement for godot-mcp.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea. An AI assistant triages new issues on behalf of the maintainers and says so in its replies; the maintainers decide which features the project takes on. For a larger change, agree on the approach here before writing code.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you or your AI assistant trying to do in Godot, and what stops you today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: The behaviour you propose
+      description: For a new tool, its name, its parameters and what it returns.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+  - type: input
+    id: godot
+    attributes:
+      label: Godot versions it concerns
+      placeholder: all, or for example 4.6 and newer

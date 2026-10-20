@@ -43,7 +43,7 @@ Choose the branch for your pull request:
 | changes shared documentation or CI | `master` |
 
 - Find out which lines a bug affects by running its test on each branch, not by reading the code.
-- Files that differ between lines on purpose: `Cargo.toml` and `Cargo.lock` (version), `addons/godot_mcp/plugin.cfg` (version), `addons/godot_mcp/plugin.gd` (`MIN_MAJOR`, `MIN_MINOR`), `project.godot` (`config/features`), `.github/godot-version` (the Godot build the line is tested against) and `CHANGELOG.md` (the line's releases). Keep every other file identical on all lines unless a Godot version forces a difference.
+- Files that differ between lines on purpose: `Cargo.toml` and `Cargo.lock` (version), `addons/godot_mcp/plugin.cfg` (version), `addons/godot_mcp/plugin.gd` (`MIN_MAJOR`, `MIN_MINOR`), `project.godot` (`config/features`) and `.github/godot-version` (the Godot build the line is tested against). Keep every other file identical on all lines unless a Godot version forces a difference.
 
 ## Development Setup
 
@@ -115,6 +115,28 @@ GODOT_PATH=/path/to/godot cargo test --test addon_export_test -- --ignored
 - Leave version numbers and `CHANGELOG.md` sections alone: maintainers set them in release commits.
 - Write code, comments, commit messages and documentation in English.
 
+## Issues and Pull Requests
+
+An AI assistant, the repo steward, works the issue tracker and the pull requests on behalf of the maintainers. Every message it writes says that an AI wrote it.
+
+- **What it does:** it gives each new issue a type and a priority, asks for missing details, answers questions, closes duplicates, reviews pull requests, fixes accepted issues through pull requests of its own, and keeps the project board "godot-mcp issues and pull requests" current.
+- **What the maintainers decide:** whether the project takes on a feature, whether a contributor's pull request is merged or declined, and every release.
+- **Priorities:**
+
+  | Priority | Meaning |
+  | --- | --- |
+  | P0 | security exposure, data loss, the product unusable, a broken release, failing CI on a branch |
+  | P1 | a core function broken without a workaround, or a regression |
+  | P2 | broken with a workaround, misleading behaviour or documentation, a wanted feature |
+  | P3 | minor or cosmetic, nice to have, questions |
+
+- **Labels you may see:**
+  - `status: needs-info` — details are missing. A reminder follows after 14 days, and the issue is closed 7 days after the reminder unless the details arrive. Reopen it, or comment, when you have them.
+  - `status: needs-maintainer` — waiting for a maintainer's decision.
+  - `status: blocked` — waiting for something outside the project.
+- **Reach a person:** ask for a maintainer in a comment, and the assistant hands the issue or pull request over.
+- **Security problems:** never in an issue or pull request; follow [SECURITY.md](SECURITY.md).
+
 ## Carrying Changes Between Lines
 
 A change that affects several lines lands on the newest of them first and is then carried to each older one, newest to oldest. Maintainers usually do the carrying; you may do it yourself:
@@ -140,15 +162,16 @@ git cherry-pick -x <commit>    # -x records "(cherry picked from commit <commit>
 
 - Read [AGENTS.md](AGENTS.md) first and follow it. It holds the engineering standards, the agent workflow and the completion checklist; the commands in [Verification](#verification) are the same as there.
 - Pick the target branch with the table in [Branches and Godot Versions](#branches-and-godot-versions).
-- Never push, tag or publish a release without the explicit approval of your user.
+- Never push, tag or publish a release without the explicit approval of your user — except the actions the repo-steward skill's autonomy settings allow (its defaults, as adjusted in `.github/steward.yml`). Tagging and publishing a release are never among them.
+- Work issues and pull requests with the repo-steward skill: [.agents/skills/repo-steward/SKILL.md](.agents/skills/repo-steward/SKILL.md).
 
 ## Releases
 
-Maintainers release each line on its own, with the agent skill in `.agents/skills/release/SKILL.md`. In short:
+Maintainers publish releases with the agent skill in `.agents/skills/release/SKILL.md`. In short:
 
-- Every release takes the next version number above the highest one released on any line; lines released together for the same change share it.
-- The version names the line: `0.5.0+godot.4.6`, tagged `v0.5.0+godot.4.6` on branch `godot-v4.6`.
-- A person approves every tag before it is pushed. The release workflow then builds the line's files and publishes the release.
+- One release holds the files of every supported Godot line, named `vX.Y.Z` (for example `v0.5.1`). Every release takes the next version number; all lines take it together, and a line without a change of its own only advances its version.
+- Each line's version names the line: `0.5.1+godot.4.6` on branch `godot-v4.6`, with the line tag `v0.5.1+godot.4.6` marking its sources. The release notes are one `CHANGELOG.md` on `master`.
+- A person approves every tag before it is pushed. The release workflow then builds the files of every line and publishes the release.
 
 ## License
 

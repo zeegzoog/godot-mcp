@@ -1,0 +1,63 @@
+# Profile of the repo-steward skill. Every key is optional; the value shown is the default.
+# Uncomment a key only to change it. Format: sections of indented "key: value" lines; a list is
+# one space-separated string; quote a value that contains " #".
+
+tracker:
+  # language: English
+
+project:
+  # Guides read at the start of every run, highest precedence first.
+  # guides: AGENTS.md CLAUDE.md CONTRIBUTING.md SECURITY.md
+
+planning:
+  # auto, magic-spec, spec-kit, kiro, openspec, exec-plans, none, or the exact command to use.
+  # ecosystem: auto
+
+board:
+  # title: "{repo} issues and pull requests"
+  # public: auto
+  # wip_in_progress: 2
+  # wip_in_review: 3
+  # text_fields:
+  # done_retention_days: 14
+
+triage:
+  # fingerprint: gmfb[0-9a-f]{12}
+  # priority_examples:
+
+review:
+  # sensitive_paths: .github/
+
+merge:
+  # method: squash
+
+autonomy:
+  # Values: allowed or approval. Only merge_external may be raised to allowed.
+  # messages: allowed
+  # close_routine: allowed
+  # run_approval: allowed
+  # merge_own: allowed
+  # merge_bots: allowed
+  # merge_external: approval
+
+timing:
+  # needs_info_reminder_days: 14
+  # needs_info_close_days: 7
+
+limits:
+  # max_actions: 20
+  # dispute_rounds: 2
+  # allowed_bots: dependabot[bot] renovate[bot]
+
+release:
+  # procedure:
+  # tag_pattern: '^v[0-9]+\.[0-9]+\.[0-9]+$'
+  # ignore_paths:
+  # skip_subjects: chore(release)
+  # changes_threshold: 3
+  # age_days: 21
+  # p1_days: 3
+  # targets_file:
+  # target_branch:
+  # target_tag:
+  # target_build_file:

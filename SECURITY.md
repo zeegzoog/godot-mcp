@@ -8,11 +8,11 @@ Each godot-mcp release is built for one Godot minor version. Every supported God
 
 | Godot | Branch | Security fixes | Install |
 | --- | --- | --- | --- |
-| 4.7.x | `godot-v4.7` | Yes, in the next 4.7 release | 0.4.0, the last release before the lines |
-| 4.6.x | `godot-v4.6` | Yes, in the next 4.6 release | 0.4.0, the last release before the lines |
-| 4.5.x | `godot-v4.5` | Yes, in the next 4.5 release | 0.4.0, the last release before the lines |
+| 4.7.x | `godot-v4.7` | Yes, in the next 4.7 release | The newest release titled "for Godot 4.7" |
+| 4.6.x | `godot-v4.6` | Yes, in the next 4.6 release | The newest release titled "for Godot 4.6" |
+| 4.5.x | `godot-v4.5` | Yes, in the next 4.5 release | The newest release titled "for Godot 4.5" |
 | 4.8 (pre-release) | `master` | Fixed here first; no releases | Build from source |
-| 0.3.0 and older | — | No | The release for your Godot version |
+| 0.4.0 and older | — | No | The release for your Godot version |
 
 - A release for Godot 4.6 is titled "godot-mcp X.Y.Z for Godot 4.6", and its version ends in `+godot.4.6`.
 - To find the version you run, read `version=` in `addons/godot_mcp/plugin.cfg` of your project.

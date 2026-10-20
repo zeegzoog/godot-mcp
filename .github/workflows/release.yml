@@ -4,7 +4,8 @@ on:
   push:
     tags:
       # One release per Godot release line: vX.Y.Z+godot.M.N, tagged on branch godot-vM.N.
-      - "v*.*.*+godot.*"
+      # No "+": GitHub reads it as a quantifier. release-line.sh checks the exact form.
+      - "v*.*.*godot.*"
 
 permissions:
   contents: write

@@ -4,6 +4,7 @@ extends RefCounted
 ## each capture is compared with the previous one from this process.
 
 const R := preload("rt_result.gd")
+const Hold := preload("rt_hold.gd")
 const DEFAULT_MAX := 768
 const MAX_MAX := 4096
 const MAX_FRAMES := 8
@@ -56,7 +57,20 @@ static func screenshot(rt: Node, params: Dictionary) -> Dictionary:
         "label": picked.get("label", "viewport"),
         "baseline": request,
     }
+    if Hold.is_held():
+        return _capture_now(state)
     return {"_pending": true, "_tick": func() -> bool: return _tick_shot(rt, state)}
+
+
+## A held game draws nothing new, so its capture is the last frame it drew, taken at once.
+static func _capture_now(state: Dictionary) -> Dictionary:
+    var grabbed = _grab(state)
+    if grabbed == null:
+        return R.err(R.GODOT_ERROR, "Nothing has been drawn yet. Take one tick with godot_game_physics first.")
+    if grabbed is Dictionary:
+        return grabbed
+    state["got"] = [grabbed]
+    return _compose(state)
 
 
 static func _tick_shot(rt: Node, state: Dictionary) -> bool:

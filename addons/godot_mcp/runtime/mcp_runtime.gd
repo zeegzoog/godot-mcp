@@ -9,6 +9,7 @@ extends Node
 ##   mcp:hello   [json]  sent once, when the main scene is ready
 
 const R := preload("ops/rt_result.gd")
+const Hold := preload("ops/rt_hold.gd")
 const PROTOCOL_VERSION := 1
 const MODULES: Array = [
     preload("ops/rt_live.gd"),
@@ -19,6 +20,7 @@ const MODULES: Array = [
 
 var _methods: Dictionary = {}
 var _registered := false
+var _hello_sent := false
 var _inbox: Array = []
 var _tick: Callable = Callable()
 var _job_req: Dictionary = {}
@@ -43,6 +45,7 @@ func _enter_tree() -> void:
     var output: GDScript = preload("ops/rt_output.gd")
     output.install()
     _note_scene()
+    Hold.arm_at_launch(self)
 
 
 func _ready() -> void:
@@ -60,10 +63,17 @@ func _process(_delta: float) -> void:
     _drain()
 
 
+func _notification(what: int) -> void:
+    # A person closing the window ends a hold; the game then quits as it normally would.
+    if what == NOTIFICATION_WM_CLOSE_REQUEST and _registered:
+        Hold.release(self)
+
+
 func _exit_tree() -> void:
     if _registered and get_tree().node_added.is_connected(_on_node_added):
         get_tree().node_added.disconnect(_on_node_added)
     if _registered:
+        Hold.release(self)
         # A step that is still in flight must not leave the tick rate or an unpaused tree behind.
         var live_script: GDScript = preload("ops/rt_live.gd")
         live_script.call("restore_physics", self)
@@ -78,7 +88,23 @@ func _exit_tree() -> void:
     _registered = false
 
 
+func on_physics_frame() -> void:
+    Hold.serve(self)
+
+
+## Runs at the hold point, inside the first held tick. The hello may not have gone out yet, and
+## the request that asked for the hold is answered from here.
+func hold_started(status: Dictionary) -> void:
+    _send_hello()
+    _note_scene()
+    if _tick.is_valid():
+        finish_job(R.ok(status))
+
+
 func _send_hello() -> void:
+    if _hello_sent:
+        return
+    _hello_sent = true
     var scene := get_tree().current_scene
     _send("mcp:hello", {
         "protocol": PROTOCOL_VERSION,
@@ -121,12 +147,21 @@ func _dispatch(req: Dictionary) -> void:
     if params == null:
         params = {}
     var reply: Dictionary
+    var refused := ""
+    if params is Dictionary and Hold.is_held() and _methods.has(method):
+        refused = Hold.refusal(method, params)
     if not _methods.has(method):
         reply = R.err(R.BAD_PARAMS, "Unknown runtime method '%s'." % method, {"methods": _method_names()})
     elif not params is Dictionary:
         reply = R.err(R.BAD_PARAMS, "%s: params must be an object." % method)
+    elif not refused.is_empty():
+        reply = R.err(R.BAD_PARAMS, refused)
     else:
         var fn: Callable = (_methods[method] as Dictionary)["fn"]
+        if Hold.is_held():
+            var held_fn := Hold.held_fn(method)
+            if held_fn.is_valid():
+                fn = held_fn
         var out: Variant = fn.call(self, params)
         if out is Dictionary and bool((out as Dictionary).get("_pending", false)):
             _job_req = req

@@ -61,6 +61,48 @@ pub fn fake_godot(dir: &Path) -> PathBuf {
     }
 }
 
+/// A stand-in for the Godot executable that writes the arguments it was started with, on one
+/// line, to the returned file. The file appears shortly after the process starts.
+pub fn recording_godot(dir: &Path) -> (PathBuf, PathBuf) {
+    let record = dir.join("godot_arguments.txt");
+    #[cfg(windows)]
+    {
+        let path = dir.join("recording_godot.bat");
+        std::fs::write(
+            &path,
+            format!("@echo off\r\necho %* > \"{}\"\r\n", record.display()),
+        )
+        .expect("write recording godot");
+        (path, record)
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("recording_godot.sh");
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\necho \"$@\" > '{}'\n", record.display()),
+        )
+        .expect("write recording godot");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod recording godot");
+        (path, record)
+    }
+}
+
+/// Waits for a file a stand-in process writes, then returns what it holds.
+pub async fn wait_for_file(path: &Path) -> String {
+    for _ in 0..100 {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if !text.trim().is_empty() {
+                return text;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("{} was not written", path.display());
+}
+
 /// A stand-in for the Godot executable that stays alive for a few seconds, like an editor.
 pub fn sleeping_godot(dir: &Path) -> PathBuf {
     #[cfg(windows)]

@@ -82,7 +82,7 @@ pub fn catalog() -> Vec<Tool> {
         ),
         tool(
             "godot_game_observe",
-            "Connects to signals for a few frames and returns the ones that fired, then disconnects.",
+            "Connects to signals for a few frames and returns the ones that fired, then disconnects. Refused while the game is held: step with godot_game_physics, then read with godot_game_signals.",
             json!({"run_id": s(""), "path": s(""), "signals": {"type": "array", "items": {"type": "string"}}, "frames": i("How many frames to watch (default 1, max 600).")}),
             &["signals"],
         ),
@@ -94,8 +94,8 @@ pub fn catalog() -> Vec<Tool> {
         ),
         tool(
             "godot_game_input",
-            "Injects input into the running game. Steps: key, text, mouse_move, mouse_button, touch, joy_button, joy_axis, wait, click, click_node, swipe, time_scale. phase is tap (default), press, or release. click is a mouse tap at x, y. click_node taps the center of a Control, Node2D, or Node3D. swipe presses at x, y and releases at to_x, to_y across frames (default 8, pointer mouse or touch). Mouse steps are Godot input events and do not move the OS cursor unless warp_mouse is true. time_scale sets Engine.time_scale (0 through 8) until another call changes it. A failed step releases every button and touch this server is still holding.",
-            json!({"run_id": s(""), "steps": {"type": "array", "items": {"type": "object"}}, "warp_mouse": {"type": "boolean", "description": "Move the real OS cursor to each mouse event. Default false."}}),
+            "Injects input into the running game. Steps: key, text, mouse_move, mouse_button, touch, joy_button, joy_axis, wait, click, click_node, swipe, time_scale. phase is tap (default), press, or release. click is a mouse tap at x, y. click_node taps the center of a Control, Node2D, or Node3D. swipe presses at x, y and releases at to_x, to_y across frames (default 8, pointer mouse or touch). Mouse steps are Godot input events and do not move the OS cursor unless warp_mouse is true. time_scale sets Engine.time_scale (0 through 8) until another call changes it. A failed step releases every button and touch this server is still holding. In a held game the steps are applied at once: key, mouse_button, touch and joy_button taps stay down for hold_ticks ticks (default 2) and are released at the start of the tick they fall due on, so how the ticks are split into steps does not change what the game sees; wait, text and swipe steps are refused while held. Leaving the hold releases everything still held.",
+            json!({"run_id": s(""), "steps": {"type": "array", "items": {"type": "object"}}, "warp_mouse": {"type": "boolean", "description": "Move the real OS cursor to each mouse event. Default false."}, "hold_ticks": i("Held game only: how many ticks a tap stays down before it is released. 1 to 600, default 2.")}),
             &["steps"],
         ),
         tool(
@@ -106,19 +106,19 @@ pub fn catalog() -> Vec<Tool> {
         ),
         tool(
             "godot_game_wait",
-            "Waits in the running game. frames waits process frames (default 1). node waits until that node exists. signal waits until that signal fires on node (timeout frames, default 180; not combined with a property or scene_generation). property reads a public node property, including nested Dictionary keys or Object properties separated by /, using get only: no expressions and no method calls. op is eq, ne, lt, lte, gt, gte, or exists. eq and ne require the same type (a JSON number that is a whole number may match an int; a fraction against an int is a type error; strings are never coerced). Ordering is int-with-int or float-with-float, and float equality is exact. Private names, script, and anything inside an Array are refused. scene_generation waits until the running generation is greater than the given one, and can be combined with node and property. The result and a timeout include the observed value and the scene context. time_scale sets Engine.time_scale from 0 through 8 and keeps it until changed again; the runtime restores the previous scale when the game exits.",
+            "Waits in the running game. frames waits process frames (default 1). node waits until that node exists. signal waits until that signal fires on node (timeout frames, default 180; not combined with a property or scene_generation). property reads a public node property, including nested Dictionary keys or Object properties separated by /, using get only: no expressions and no method calls. op is eq, ne, lt, lte, gt, gte, or exists. eq and ne require the same type (a JSON number that is a whole number may match an int; a fraction against an int is a type error; strings are never coerced). Ordering is int-with-int or float-with-float, and float equality is exact. Private names, script, and anything inside an Array are refused. scene_generation waits until the running generation is greater than the given one, and can be combined with node and property. The result and a timeout include the observed value and the scene context. time_scale sets Engine.time_scale from 0 through 8 and keeps it until changed again; the runtime restores the previous scale when the game exits. Refused while the game is held, because no frame would pass: step with godot_game_physics instead.",
             json!({"run_id": s(""), "frames": i("Default 1. Ignored when node, signal, property, or scene_generation is set, except as the default timeout."), "node": s("Wait until this node exists. Required when property is set."), "signal": s("Wait until this signal fires on node."), "property": s("Public property path. Use / for a Dictionary key or an Object property."), "op": s("eq, ne, lt, lte, gt, gte, or exists."), "value": {"description": "Value to compare. Same type as the property. No string coercion. A whole JSON number may match an int."}, "scene_generation": i("Wait until the running scene generation is greater than this."), "timeout": i("Frame limit for node, signal, property, or scene_generation. Default 180, max 600."), "time_scale": n("Engine.time_scale, from 0 through 8.")}),
             &[],
         ),
         tool(
             "godot_game_physics",
-            "Steps the running game by N real engine physics iterations (1 to 120), then leaves the tree paused. resume clears that pause and continues the game. Each tick has the normal physics delta, so N ticks are N / physics_ticks_per_second seconds of game time (scaled by time_scale). The step sets max_physics_steps_per_frame to 1 while it runs, then restores it; the tick rate and the time scale are not changed. It does not call node _physics_process. Idle _process is not stepped. Nodes with process_mode ALWAYS still run while paused, and the engine physics-frame counter keeps increasing while paused, so it is not a count of pausable game physics. Custom threads and GPU compute are not flushed. This does not make the game deterministic. On failure or when the runtime exits mid-step, the saved timing settings are restored and the tree is paused.",
-            json!({"run_id": s(""), "action": s("step (default), resume, or status."), "ticks": i("Physics iterations for step. Integer from 1 to 120.")}),
+            "Controls game time. action hold stops the game at the start of a physics tick: no tick, frame, timer or signal advances, even in nodes that ignore pause, while reads (tree, get, set, call with permit, signals, snapshot, output, one-frame screenshot) are still answered. While held, step ticks runs exactly that many physics ticks (1 to 600) and holds again; step with until (node, property, op, value, checked before every tick, as in godot_game_wait) and max (1 to 3600) runs until the condition holds and says until_met; resume lets the game run. Held steps are exact only when the game was started with godot_run_project held true: the answer carries deterministic and, when false, deterministic_reason (not_started_held, fixed_rate_differs or frames_did_not_follow_ticks). A hold entered later, or in the editor, still stands still but is not exact. A held game refuses what needs time to pass (godot_game_wait, godot_game_observe, a screenshot sheet or camera, input wait, text and swipe steps) and says to step instead. Without a hold, step advances 1 to 120 real engine physics iterations, then leaves the tree paused (resume clears that pause); it sets max_physics_steps_per_frame to 1 while it runs, does not call node _physics_process, does not step idle _process or nodes that ignore pause, and does not make the game deterministic. status reports held, deterministic and the timing settings",
+            json!({"run_id": s(""), "action": s("step (default), hold, resume, or status. hold stops the game at the start of a physics tick until it is stepped or resumed."), "ticks": i("Physics iterations for step: 1 to 120, or 1 to 600 while the game is held."), "until": {"type": "object", "description": "Held game only. Step until a public node property satisfies a condition: node, property, op (eq, ne, lt, lte, gt, gte, exists) and value, as in godot_game_wait. Checked before every tick. Use max instead of ticks."}, "max": i("With until: the most ticks to run. 1 to 3600, default 600.")}),
             &[],
         ),
         tool(
             "godot_game_screenshot",
-            "Captures the running game window, a viewport, or a Camera2D/Camera3D as one PNG. frames (1 to 8) stitches shots taken every process frames into a single sheet. The text says how many pixels changed since the previous capture of this run, and where (a sheet compares its last frame, and only against a capture of the same size). save_baseline stores the returned image under a name (at most 8, each at most 512×512 pixels). baseline compares the returned image with a saved one. roi is x, y, w, h in pixels of that returned image (roi_space returned_image), including a sheet. tolerance (0 to 255) is the allowed per-channel difference; a larger difference counts as changed. The text reports changed, sampled, ratio, bounds, tolerance, the baseline name, and whether the pixel count is exact or sampled. Fails instead of returning an empty image. Headless games have nothing to capture. A missing baseline, a bad name, or an roi outside the image is an error and does not replace a saved image.",
+            "Captures the running game window, a viewport, or a Camera2D/Camera3D as one PNG. frames (1 to 8) stitches shots taken every process frames into a single sheet. The text says how many pixels changed since the previous capture of this run, and where (a sheet compares its last frame, and only against a capture of the same size). save_baseline stores the returned image under a name (at most 8, each at most 512×512 pixels). baseline compares the returned image with a saved one. roi is x, y, w, h in pixels of that returned image (roi_space returned_image), including a sheet. tolerance (0 to 255) is the allowed per-channel difference; a larger difference counts as changed. The text reports changed, sampled, ratio, bounds, tolerance, the baseline name, and whether the pixel count is exact or sampled. Fails instead of returning an empty image. Headless games have nothing to capture. While the game is held a single capture shows the last frame it drew (a sheet with frames above 1, or a camera switch, is refused: take one capture, step, take the next). A missing baseline, a bad name, or an roi outside the image is an error and does not replace a saved image.",
             json!({"run_id": s(""), "node": s("Viewport or node whose viewport to capture."), "camera": s("Camera2D or Camera3D to make current for the shot."), "max_dimension": i("Longest side of the returned image in pixels. Default 768."), "frames": i("How many frames to stitch. Default 1, max 8."), "every": i("Process frames between shots. Default 1, max 60."), "baseline": s("Name of a saved image to compare."), "save_baseline": s("Store the returned image under this name. Letters, digits, underscore, hyphen. At most 8 names."), "roi": {"type": "object", "description": "Region of the returned image: integer x, y, w, h. w and h are at least 1."}, "tolerance": i("Per-channel difference that still counts as unchanged. 0 to 255. Default 0.")}),
             &[],
         ),
@@ -130,7 +130,7 @@ pub fn catalog() -> Vec<Tool> {
         ),
         tool(
             "godot_debug_control",
-            "Pause, resume, or step a process run that this server is debugging.",
+            "Pause, resume, or step a process run that this server is debugging. Pause is refused on a game held with godot_game_physics: it is already still.",
             json!({"run_id": s(""), "action": {"type": "string", "enum": ["pause", "resume", "step_into", "step_over", "step_out"]}, "wait_seconds": i("How long to wait for the next stop. Default 10.")}),
             &["action"],
         ),
@@ -491,6 +491,15 @@ async fn debug_control(tools: &ToolManager, args: &Value) -> ToolResult {
     let wait = debug_wait(args);
     let debug = run.debug_ctl();
     let action = str_arg(args, "action").unwrap_or("");
+    if action == "pause" && run.is_held() {
+        return ToolResult::error(
+            "The game is held, so it is already still",
+            &[
+                "Step it with godot_game_physics (action step)",
+                "Resume it with godot_game_physics (action resume)",
+            ],
+        );
+    }
     let result = match action {
         "pause" => debug.pause(wait).await.map(stop_json),
         "resume" => debug.resume().await.map(|()| json!({"resumed": true})),
@@ -598,14 +607,57 @@ impl ToolManager {
     ) -> Result<Value, McpError> {
         if run_id != Some("editor") {
             match self.games.select(run_id) {
-                Ok(Some(run)) => {
-                    return run.runtime(method, params, Duration::from_secs(20)).await;
-                }
+                Ok(Some(run)) => return held_aware_call(&run, method, params).await,
                 Ok(None) => {}
                 Err(error) => return Err(error),
             }
         }
         editor_runtime(self, method, params).await
+    }
+}
+
+/// How long a held step may take before the server stops waiting. The game still finishes it.
+const HELD_STEP_WAIT: Duration = Duration::from_secs(60);
+
+/// A runtime call that knows whether the game is held: a held step gets the long wait, a timeout
+/// of one says the game is still running it, and the answer to a physics call keeps the run's
+/// idea of "held" current.
+async fn held_aware_call(
+    run: &crate::godot::Run,
+    method: &str,
+    params: Value,
+) -> Result<Value, McpError> {
+    let physics = method == "game.physics";
+    let was_held = physics && run.is_held();
+    let wait = if was_held {
+        HELD_STEP_WAIT
+    } else {
+        Duration::from_secs(20)
+    };
+    let outcome = run.runtime(method, params, wait).await;
+    if physics {
+        if let Some(held) = outcome
+            .as_ref()
+            .ok()
+            .and_then(|value| value.get("held"))
+            .and_then(Value::as_bool)
+        {
+            run.set_held(held);
+        }
+    }
+    outcome.map_err(|error| held_step_timeout(was_held, error))
+}
+
+/// A timeout while a held step runs is not a failure of the game: it goes on and holds again.
+fn held_step_timeout(was_held: bool, error: McpError) -> McpError {
+    match error {
+        McpError::Process(message) if was_held && message.starts_with("timed out") => {
+            McpError::Process(format!(
+                "the held step did not finish within {} s ({message}). The game finishes it and holds again. Read godot_game_physics with action status before stepping again, or lower ticks or max",
+                HELD_STEP_WAIT.as_secs()
+            ))
+        }
+        other => other,
     }
 }
 
@@ -763,6 +815,28 @@ fn base64_decode(text: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_held_step_that_times_out_is_still_running_in_the_game() {
+        let timeout = || {
+            McpError::Process(
+                "timed out waiting for the game runtime to answer 'game.physics'".into(),
+            )
+        };
+        let held = held_step_timeout(true, timeout()).to_string();
+        assert!(held.contains("finishes it and holds again"), "{held}");
+        assert!(held.contains("action status"), "{held}");
+        // A timeout of anything else, or of a game that was not held, is reported as it is.
+        assert_eq!(
+            held_step_timeout(false, timeout()).to_string(),
+            timeout().to_string()
+        );
+        let other = || McpError::Process("the game disconnected".into());
+        assert_eq!(
+            held_step_timeout(true, other()).to_string(),
+            other().to_string()
+        );
+    }
 
     #[test]
     fn a_wait_the_caller_names_is_bounded() {

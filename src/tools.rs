@@ -230,6 +230,15 @@ impl ToolManager {
             }
         }
         let mode = str_arg(&args, "mode").unwrap_or("auto");
+        if args.get("held").and_then(Value::as_bool).unwrap_or(false) && mode != "process" {
+            return ToolResult::error(
+                "held needs mode \"process\": only a game this server starts can run at a fixed frame rate",
+                &[
+                    "Pass mode: \"process\" with held: true",
+                    "In the editor's Play mode a game can still be held later with godot_game_physics (action hold), but its steps are not exact",
+                ],
+            );
+        }
         if mode == "process" {
             return self.spawn_managed(&args, scene).await;
         }
@@ -266,9 +275,10 @@ impl ToolManager {
             .get("break_on_errors")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let held = args.get("held").and_then(Value::as_bool).unwrap_or(false);
         match self
             .games
-            .start(&path, scene, &breakpoints, headless, break_on_errors)
+            .start(&path, scene, &breakpoints, headless, break_on_errors, held)
             .await
         {
             Ok(info) => ToolResult::text(format!(
@@ -699,7 +709,7 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
         ),
         tool(
             "godot_run_project",
-            "Runs the Godot project or a specific scene. Uses the live editor's Play mode when the bridge is connected. Otherwise starts a managed process (debugger attached) that godot_stop_project can stop.",
+            "Runs the Godot project or a specific scene. Uses the live editor's Play mode when the bridge is connected. Otherwise starts a managed process (debugger attached) that godot_stop_project can stop. held true (with mode process) starts the game held at its first physics tick at a fixed frame rate equal to the project's tick rate, so godot_game_physics steps are exact.",
             json!({
                 "project_path": {
                     "type": "string",
@@ -721,6 +731,10 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
                 "break_on_errors": {
                     "type": "boolean",
                     "description": "Process runs only. When true, a script error pauses the game. Default false: the error is still logged, but the game keeps running."
+                },
+                "held": {
+                    "type": "boolean",
+                    "description": "Process runs only (needs mode process). Start the game held at its first physics tick, at a fixed frame rate equal to the project's tick rate, so held steps are exact."
                 },
                 "mode": {
                     "type": "string",

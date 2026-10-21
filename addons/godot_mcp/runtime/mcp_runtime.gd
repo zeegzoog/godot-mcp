@@ -22,6 +22,11 @@ var _registered := false
 var _inbox: Array = []
 var _tick: Callable = Callable()
 var _job_req: Dictionary = {}
+var _scene_generation := 0
+var _scene_instance_id := 0
+var _scene_script := {"path": "", "sha256": null, "basis": "unavailable"}
+
+const SCRIPT_HASH_NOTE := "script_sha256 is the SHA-256 of the root script source Godot had loaded when this scene instance became current. It is not a later read of the file on disk, and it does not describe a different scene instance."
 
 
 func _enter_tree() -> void:
@@ -33,8 +38,11 @@ func _enter_tree() -> void:
         _methods.merge((module as GDScript).call("methods"), true)
     EngineDebugger.register_message_capture("mcp", _on_message)
     _registered = true
+    if not get_tree().node_added.is_connected(_on_node_added):
+        get_tree().node_added.connect(_on_node_added)
     var output: GDScript = preload("ops/rt_output.gd")
     output.install()
+    _note_scene()
 
 
 func _ready() -> void:
@@ -43,6 +51,7 @@ func _ready() -> void:
 
 
 func _process(_delta: float) -> void:
+    _note_scene()
     if _tick.is_valid():
         var running: bool = _tick.call()
         if running:
@@ -52,7 +61,12 @@ func _process(_delta: float) -> void:
 
 
 func _exit_tree() -> void:
+    if _registered and get_tree().node_added.is_connected(_on_node_added):
+        get_tree().node_added.disconnect(_on_node_added)
     if _registered:
+        # A step that is still in flight must not leave the tick rate or an unpaused tree behind.
+        var live_script: GDScript = preload("ops/rt_live.gd")
+        live_script.call("restore_physics", self)
         # Drop every key, button, axis and touch this runtime is still holding.
         var input_script: GDScript = preload("ops/rt_input.gd")
         input_script.call("release_all", self, {})
@@ -142,6 +156,59 @@ func _method_names() -> Array:
     var names: Array = _methods.keys()
     names.sort()
     return names
+
+
+func _on_node_added(node: Node) -> void:
+    var scene := get_tree().current_scene
+    if scene != null and node == scene:
+        _note_scene()
+
+
+func _note_scene() -> void:
+    var scene := get_tree().current_scene
+    # A gap with no current scene is not a new instance. Counting it would make one reload
+    # look like two generations.
+    if scene == null:
+        return
+    var id := scene.get_instance_id()
+    if id == _scene_instance_id and _scene_generation > 0:
+        return
+    _scene_instance_id = id
+    _scene_generation += 1
+    _scene_script = _script_stamp(scene)
+    preload("ops/rt_output.gd").note_scene(scene_context())
+
+
+func scene_context() -> Dictionary:
+    return {
+        "path": get_tree().current_scene.scene_file_path if get_tree().current_scene != null else "",
+        "name": String(get_tree().current_scene.name) if get_tree().current_scene != null else "",
+        "scene_generation": _scene_generation,
+        "scene_instance_id": _scene_instance_id,
+        "script_path": str(_scene_script.get("path", "")),
+        "script_sha256": _scene_script.get("sha256", null),
+        "script_sha256_basis": str(_scene_script.get("basis", "unavailable")),
+        "script_sha256_note": SCRIPT_HASH_NOTE,
+    }
+
+
+func _script_stamp(scene: Node) -> Dictionary:
+    if scene == null or scene.get_script() == null:
+        return {"path": "", "sha256": null, "basis": "unavailable"}
+    var script: Script = scene.get_script()
+    var path := script.resource_path
+    var source := script.source_code
+    if source.is_empty():
+        return {"path": path, "sha256": null, "basis": "unavailable"}
+    var ctx := HashingContext.new()
+    if ctx.start(HashingContext.HASH_SHA256) != OK:
+        return {"path": path, "sha256": null, "basis": "unavailable"}
+    ctx.update(source.to_utf8_buffer())
+    return {
+        "path": path,
+        "sha256": ctx.finish().hex_encode(),
+        "basis": "loaded_source_at_scene_enter",
+    }
 
 
 func scene_root() -> Node:

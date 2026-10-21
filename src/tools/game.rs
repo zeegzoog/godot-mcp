@@ -34,6 +34,7 @@ pub fn handles(name: &str) -> bool {
             | "godot_game_input"
             | "godot_game_input_release"
             | "godot_game_wait"
+            | "godot_game_physics"
             | "godot_game_screenshot"
             | "godot_debug_breakpoints"
             | "godot_debug_control"
@@ -87,7 +88,7 @@ pub fn catalog() -> Vec<Tool> {
         ),
         tool(
             "godot_game_snapshot",
-            "Compact snapshot of the running game: scene, frame, pause flag, and the current scene's children.",
+            "Compact snapshot of the running game: scene path, monotonic scene_generation, scene_instance_id, frame, pause flag, children, and the loaded root script's path and SHA-256. The hash is the source Godot had loaded when this scene instance became current, not a later read of the file on disk. Reloading the same scene path increments the generation and changes the instance id.",
             json!({"run_id": s("")}),
             &[],
         ),
@@ -105,14 +106,20 @@ pub fn catalog() -> Vec<Tool> {
         ),
         tool(
             "godot_game_wait",
-            "Waits in the running game. frames waits process frames (default 1). node waits until that node exists. signal waits until that signal fires on node (timeout frames, default 180). time_scale sets Engine.time_scale from 0 through 8 and keeps it until changed again; the runtime restores the previous scale when the game exits.",
-            json!({"run_id": s(""), "frames": i("Default 1. Ignored when node or signal is set, except as the default timeout."), "node": s("Wait until this node exists."), "signal": s("Wait until this signal fires on node."), "timeout": i("Frame limit for node or signal. Default 180, max 600."), "time_scale": n("Engine.time_scale, from 0 through 8.")}),
+            "Waits in the running game. frames waits process frames (default 1). node waits until that node exists. signal waits until that signal fires on node (timeout frames, default 180; not combined with a property or scene_generation). property reads a public node property, including nested Dictionary keys or Object properties separated by /, using get only: no expressions and no method calls. op is eq, ne, lt, lte, gt, gte, or exists. eq and ne require the same type (a JSON number that is a whole number may match an int; a fraction against an int is a type error; strings are never coerced). Ordering is int-with-int or float-with-float, and float equality is exact. Private names, script, and anything inside an Array are refused. scene_generation waits until the running generation is greater than the given one, and can be combined with node and property. The result and a timeout include the observed value and the scene context. time_scale sets Engine.time_scale from 0 through 8 and keeps it until changed again; the runtime restores the previous scale when the game exits.",
+            json!({"run_id": s(""), "frames": i("Default 1. Ignored when node, signal, property, or scene_generation is set, except as the default timeout."), "node": s("Wait until this node exists. Required when property is set."), "signal": s("Wait until this signal fires on node."), "property": s("Public property path. Use / for a Dictionary key or an Object property."), "op": s("eq, ne, lt, lte, gt, gte, or exists."), "value": {"description": "Value to compare. Same type as the property. No string coercion. A whole JSON number may match an int."}, "scene_generation": i("Wait until the running scene generation is greater than this."), "timeout": i("Frame limit for node, signal, property, or scene_generation. Default 180, max 600."), "time_scale": n("Engine.time_scale, from 0 through 8.")}),
+            &[],
+        ),
+        tool(
+            "godot_game_physics",
+            "Steps the running game by N real engine physics iterations (1 to 120), then leaves the tree paused. resume clears that pause and continues the game. Each tick has the normal physics delta, so N ticks are N / physics_ticks_per_second seconds of game time (scaled by time_scale). The step sets max_physics_steps_per_frame to 1 while it runs, then restores it; the tick rate and the time scale are not changed. It does not call node _physics_process. Idle _process is not stepped. Nodes with process_mode ALWAYS still run while paused, and the engine physics-frame counter keeps increasing while paused, so it is not a count of pausable game physics. Custom threads and GPU compute are not flushed. This does not make the game deterministic. On failure or when the runtime exits mid-step, the saved timing settings are restored and the tree is paused.",
+            json!({"run_id": s(""), "action": s("step (default), resume, or status."), "ticks": i("Physics iterations for step. Integer from 1 to 120.")}),
             &[],
         ),
         tool(
             "godot_game_screenshot",
-            "Captures the running game window, a viewport, or a Camera2D/Camera3D as one PNG. frames (1 to 8) stitches shots taken every process frames into a single sheet. The text says how many pixels changed since the previous capture of this run, and where (a sheet compares its last frame, and only against a capture of the same size). Fails instead of returning an empty image. Headless games have nothing to capture.",
-            json!({"run_id": s(""), "node": s("Viewport or node whose viewport to capture."), "camera": s("Camera2D or Camera3D to make current for the shot."), "max_dimension": i("Longest side of the returned image in pixels. Default 768."), "frames": i("How many frames to stitch. Default 1, max 8."), "every": i("Process frames between shots. Default 1, max 60.")}),
+            "Captures the running game window, a viewport, or a Camera2D/Camera3D as one PNG. frames (1 to 8) stitches shots taken every process frames into a single sheet. The text says how many pixels changed since the previous capture of this run, and where (a sheet compares its last frame, and only against a capture of the same size). save_baseline stores the returned image under a name (at most 8, each at most 512×512 pixels). baseline compares the returned image with a saved one. roi is x, y, w, h in pixels of that returned image (roi_space returned_image), including a sheet. tolerance (0 to 255) is the allowed per-channel difference; a larger difference counts as changed. The text reports changed, sampled, ratio, bounds, tolerance, the baseline name, and whether the pixel count is exact or sampled. Fails instead of returning an empty image. Headless games have nothing to capture. A missing baseline, a bad name, or an roi outside the image is an error and does not replace a saved image.",
+            json!({"run_id": s(""), "node": s("Viewport or node whose viewport to capture."), "camera": s("Camera2D or Camera3D to make current for the shot."), "max_dimension": i("Longest side of the returned image in pixels. Default 768."), "frames": i("How many frames to stitch. Default 1, max 8."), "every": i("Process frames between shots. Default 1, max 60."), "baseline": s("Name of a saved image to compare."), "save_baseline": s("Store the returned image under this name. Letters, digits, underscore, hyphen. At most 8 names."), "roi": {"type": "object", "description": "Region of the returned image: integer x, y, w, h. w and h are at least 1."}, "tolerance": i("Per-channel difference that still counts as unchanged. 0 to 255. Default 0.")}),
             &[],
         ),
         tool(
@@ -177,6 +184,7 @@ pub async fn call(tools: &ToolManager, name: &str, args: Value) -> ToolResult {
         "godot_game_input" => runtime(tools, &args, "input.run").await,
         "godot_game_input_release" => runtime(tools, &args, "input.release_all").await,
         "godot_game_wait" => runtime(tools, &args, "input.wait").await,
+        "godot_game_physics" => runtime(tools, &args, "game.physics").await,
         "godot_game_screenshot" => screenshot(tools, &args).await,
         "godot_debug_breakpoints" => breakpoints(tools, &args).await,
         "godot_debug_control" => debug_control(tools, &args).await,
@@ -205,11 +213,57 @@ async fn runtime(tools: &ToolManager, args: &Value, method: &str) -> ToolResult 
 }
 
 async fn output(tools: &ToolManager, args: &Value) -> ToolResult {
-    let since = args.get("since").and_then(Value::as_u64).unwrap_or(0);
-    let level = str_arg(args, "level").unwrap_or("all");
-    match tools.games.logs(str_arg(args, "run_id"), since, level) {
-        Ok(value) => ToolResult::text(serde_json::to_string_pretty(&value).unwrap_or_default()),
-        Err(_) => runtime(tools, args, "rt.output").await,
+    // The in-game logger copies the scene stamp when the line is written. Prefer it so an
+    // old error keeps the script hash from that moment, not the file now on disk.
+    let runtime_failure = match tools
+        .runtime_call(
+            str_arg(args, "run_id"),
+            "rt.output",
+            params_without_run(args),
+        )
+        .await
+    {
+        Ok(mut value) => {
+            // Keep the process identity the debugger buffer already reported. The lines
+            // themselves stay the logger's, each stamped when it was written.
+            if let Ok(buffered) =
+                tools
+                    .games
+                    .logs(str_arg(args, "run_id"), since_of(args), level_of(args))
+            {
+                if let Some(run_id) = buffered.get("run_id") {
+                    value["run_id"] = run_id.clone();
+                }
+                if let Some(running) = buffered.get("running") {
+                    value["running"] = running.clone();
+                }
+            }
+            return ToolResult::text(serde_json::to_string_pretty(&value).unwrap_or_default());
+        }
+        Err(error) => error,
+    };
+    match tools
+        .games
+        .logs(str_arg(args, "run_id"), since_of(args), level_of(args))
+    {
+        Ok(mut value) => {
+            if let Some(lines) = value.get_mut("lines").and_then(Value::as_array_mut) {
+                for line in lines.iter_mut() {
+                    if let Some(entry) = line.as_object_mut() {
+                        entry.insert(
+                            "scene".into(),
+                            json!({
+                                "script_sha256": null,
+                                "script_sha256_basis": "unavailable",
+                                "script_sha256_note": "This line was kept by the debugger buffer without a scene stamp from the moment it was written. It is not the script currently on disk.",
+                            }),
+                        );
+                    }
+                }
+            }
+            ToolResult::text(serde_json::to_string_pretty(&value).unwrap_or_default())
+        }
+        Err(_) => runtime_error(&runtime_failure),
     }
 }
 
@@ -307,6 +361,11 @@ fn screenshot_note(value: &Value, width: u32, height: u32, source: &str) -> Stri
                     rect["h"].as_i64().unwrap_or(0),
                 ));
             }
+            match value["diff"].get("exact").and_then(Value::as_bool) {
+                Some(true) => note.push_str(", pixel count exact"),
+                Some(false) => note.push_str(", pixel count sampled"),
+                None => {}
+            }
         }
         Some(false) => match value["diff"].get("reason").and_then(Value::as_str) {
             Some(reason) if reason != "no previous capture" => {
@@ -316,7 +375,68 @@ fn screenshot_note(value: &Value, width: u32, height: u32, source: &str) -> Stri
         },
         None => {}
     }
+    append_baseline(&mut note, value);
     note
+}
+
+fn append_baseline(note: &mut String, value: &Value) {
+    let Some(baseline) = value.get("baseline").filter(|item| item.is_object()) else {
+        return;
+    };
+    if let Some(saved) = baseline.get("saved").and_then(Value::as_str) {
+        note.push_str(&format!(", saved baseline {saved}"));
+    }
+    if baseline.get("compared").and_then(Value::as_bool) != Some(true) {
+        return;
+    }
+    let name = baseline
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("baseline");
+    let changed = json_number(baseline.get("changed"));
+    let sampled = json_number(baseline.get("sampled"));
+    let ratio = json_number(baseline.get("ratio"));
+    let tolerance = json_number(baseline.get("tolerance"));
+    let kind = if baseline.get("exact").and_then(Value::as_bool) == Some(true) {
+        "exact"
+    } else {
+        "sampled"
+    };
+    note.push_str(&format!(
+        ", baseline {name} changed {changed} px, sampled {sampled}, ratio {ratio}, tolerance {tolerance}, {kind}, roi_space returned_image"
+    ));
+    if let Some(roi) = baseline.get("roi").filter(|roi| roi.is_object()) {
+        note.push_str(&format!(
+            ", roi {},{},{}x{}",
+            roi["x"].as_i64().unwrap_or(0),
+            roi["y"].as_i64().unwrap_or(0),
+            roi["w"].as_i64().unwrap_or(0),
+            roi["h"].as_i64().unwrap_or(0),
+        ));
+    }
+    if let Some(bounds) = baseline.get("bounds").filter(|bounds| bounds.is_object()) {
+        note.push_str(&format!(
+            ", bounds {},{},{}x{}",
+            bounds["x"].as_i64().unwrap_or(0),
+            bounds["y"].as_i64().unwrap_or(0),
+            bounds["w"].as_i64().unwrap_or(0),
+            bounds["h"].as_i64().unwrap_or(0),
+        ));
+    }
+}
+
+fn since_of(args: &Value) -> u64 {
+    args.get("since").and_then(Value::as_u64).unwrap_or(0)
+}
+
+fn level_of(args: &Value) -> &str {
+    str_arg(args, "level").unwrap_or("all")
+}
+
+fn json_number(value: Option<&Value>) -> String {
+    value
+        .map(|item| serde_json::to_string(item).unwrap_or_else(|_| "0".into()))
+        .unwrap_or_else(|| "0".into())
 }
 
 async fn breakpoints(tools: &ToolManager, args: &Value) -> ToolResult {
@@ -682,6 +802,58 @@ mod tests {
         assert_eq!(
             sheet,
             "Game screenshot 64x64 (main window), 4 frames, 2 columns, changed 12 px in 1,2,3x4"
+        );
+    }
+
+    #[test]
+    fn screenshot_note_reports_a_named_baseline() {
+        let note = screenshot_note(
+            &json!({
+                "frames": 1,
+                "diff": {"compared": false},
+                "baseline": {
+                    "compared": true,
+                    "name": "menu",
+                    "changed": 4,
+                    "sampled": 10,
+                    "ratio": 0.4,
+                    "tolerance": 8,
+                    "exact": true,
+                    "roi_space": "returned_image",
+                    "roi": {"x": 1, "y": 2, "w": 3, "h": 4},
+                    "bounds": {"x": 1, "y": 2, "w": 3, "h": 4},
+                    "saved": "menu"
+                }
+            }),
+            32,
+            16,
+            "main window",
+        );
+        assert_eq!(
+            note,
+            "Game screenshot 32x16 (main window), no earlier capture to compare, saved baseline menu, baseline menu changed 4 px, sampled 10, ratio 0.4, tolerance 8, exact, roi_space returned_image, roi 1,2,3x4, bounds 1,2,3x4"
+        );
+        let sampled = screenshot_note(
+            &json!({
+                "frames": 1,
+                "baseline": {
+                    "compared": true,
+                    "name": "wide",
+                    "changed": 1,
+                    "sampled": 2,
+                    "ratio": 0.5,
+                    "tolerance": 0,
+                    "exact": false,
+                    "roi": {"x": 0, "y": 0, "w": 2, "h": 2}
+                }
+            }),
+            8,
+            8,
+            "main window",
+        );
+        assert!(
+            sampled.contains("sampled") && !sampled.contains("exact"),
+            "{sampled}"
         );
     }
 

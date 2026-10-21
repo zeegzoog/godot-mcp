@@ -1,6 +1,6 @@
 [package]
 name = "godot-mcp"
-version = "0.5.1+godot.4.5"
+version = "0.6.0+godot.4.5"
 edition = "2024"
 rust-version = "1.85"
 authors = ["Oleg Alexandrov <alexandrovoleg.ru@gmail.com>"]

@@ -159,10 +159,10 @@ To report a vulnerability, follow [SECURITY.md](SECURITY.md). Never open a publi
 | `godot_game_signals` | Running game | A live node's signals and their connections. |
 | `godot_game_observe` | Running game | Watches signals for a few frames, returns the ones that fired, then disconnects. |
 | `godot_game_snapshot` | Running game | Scene, frame, pause flag and the current scene's children in one small result. |
-| `godot_game_input` | Running game | Injects key, text, mouse, touch and gamepad input, and frame waits, as a sequence of steps. |
+| `godot_game_input` | Running game | Injects key, text, mouse, touch and gamepad input, and waits, as a sequence of steps. Gestures: `click`, `swipe` and `click_node` (the center of a Control, Node2D or Node3D). `time_scale` sets `Engine.time_scale`. A step that fails releases everything the server still holds. Mouse steps are Godot events and leave the OS cursor in place unless `warp_mouse` is true. |
 | `godot_game_input_release` | Running game | Releases every key, button, axis and touch this server still holds down. |
-| `godot_game_wait` | Running game | Waits for process frames, so input and screenshots can show their result. |
-| `godot_game_screenshot` | Running game with a window | PNG of the game window, a viewport or a camera. An error, never an empty image; a headless game has nothing to capture. |
+| `godot_game_wait` | Running game | Waits for process frames, for a node to exist (`node`), or for a signal (`node` and `signal`), with a `timeout` in frames. `time_scale` (0 to 8) sets `Engine.time_scale`; the runtime restores the previous value when the game exits. |
+| `godot_game_screenshot` | Running game with a window | PNG of the game window, a viewport or a camera; `frames` (up to 8) stitches shots taken every `every` frames into one sheet. Says how many pixels changed since the previous capture of the run, and where. An error, never an empty image; a headless game has nothing to capture. |
 | `godot_debug_breakpoints` | Process run | Lists, adds, removes or clears breakpoints (`res://script.gd:LINE`). Editor Play uses the editor's own debugger. |
 | `godot_debug_control` | Process run | Pauses, resumes or steps (into, over, out) and waits for the next stop. |
 | `godot_debug_state` | Process run | Stack frames and variables of a stopped run. |

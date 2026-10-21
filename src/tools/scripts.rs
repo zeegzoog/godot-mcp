@@ -11,6 +11,7 @@ use crate::protocol::{Tool, ToolResult};
 use serde_json::{Value, json};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use tokio::io::AsyncWriteExt;
 
 /// Scripts larger than this are not handled by the script tools.
 const MAX_BYTES: u64 = 1_048_576;
@@ -172,6 +173,19 @@ fn occurrences(text: &str, fragment: &str) -> (usize, Option<usize>) {
 /// Writes `edited` (with `\n` line endings) over the script, in the line ending and with the
 /// byte order mark the file had, through a temporary file in the same directory.
 async fn replace_file(script: &Script, edited: &str) -> Result<(), ToolResult> {
+    // Replacing a symbolic link would swap the link for a regular file; the edit leaves it alone.
+    if tokio::fs::symlink_metadata(&script.file)
+        .await
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(ToolResult::error(
+            format!(
+                "{} is a symbolic link, so it is not replaced",
+                script.res_path
+            ),
+            &["Edit the file the link points to, or replace the link with the script itself"],
+        ));
+    }
     let mut body = String::new();
     if script.bom {
         body.push('\u{feff}');
@@ -186,16 +200,22 @@ async fn replace_file(script: &Script, edited: &str) -> Result<(), ToolResult> {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let temporary = script
-        .file
-        .with_file_name(format!(".{name}.godot-mcp-edit.tmp"));
     let failure = |error: std::io::Error| {
         ToolResult::error(
             format!("Could not write {}: {error}", script.res_path),
             &["Check that the file and its directory are writable; the script is unchanged"],
         )
     };
-    if let Err(error) = tokio::fs::write(&temporary, body.as_bytes()).await {
+    let (temporary, mut file) = create_temporary(&script.file, &name)
+        .await
+        .map_err(failure)?;
+    let written = async {
+        file.write_all(body.as_bytes()).await?;
+        file.flush().await
+    }
+    .await;
+    drop(file);
+    if let Err(error) = written {
         let _ = tokio::fs::remove_file(&temporary).await;
         return Err(failure(error));
     }
@@ -204,6 +224,36 @@ async fn replace_file(script: &Script, edited: &str) -> Result<(), ToolResult> {
         return Err(failure(error));
     }
     Ok(())
+}
+
+/// Creates the temporary file next to `target` under a name nobody can predict, and only if
+/// nothing exists at that name (`create_new` fails on an existing file or symlink instead of
+/// following it), so a planted link can never redirect the write out of the project.
+async fn create_temporary(
+    target: &Path,
+    name: &str,
+) -> std::io::Result<(PathBuf, tokio::fs::File)> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    for attempt in 0..16u32 {
+        let suffix = format!("{:x}{:x}{attempt:x}", std::process::id(), nanos);
+        let path = target.with_file_name(format!(".{name}.{suffix}.godot-mcp-edit.tmp"));
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .await
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        ErrorKind::AlreadyExists,
+        "no free temporary file name",
+    ))
 }
 
 /// A script read from disk: its text with `\n` line endings and the facts needed to write it

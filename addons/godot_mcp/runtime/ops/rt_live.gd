@@ -20,6 +20,7 @@ static func methods() -> Dictionary:
         "game.signals": {"fn": signals_of},
         "game.observe": {"fn": observe},
         "game.snapshot": {"fn": snapshot},
+        "game.physics": {"fn": physics},
     }
 
 
@@ -234,13 +235,141 @@ static func snapshot(rt: Node, _params: Dictionary) -> Dictionary:
     if root != null:
         for child: Node in root.get_children():
             children.append({"name": String(child.name), "class": child.get_class()})
-    return R.ok({
+    var body := {
         "scene": root.scene_file_path if root != null else "",
         "scene_name": String(root.name) if root != null else "",
         "frame": Engine.get_process_frames(),
         "paused": rt.get_tree().paused,
         "children": children,
-    })
+    }
+    body.merge(rt.scene_context(), true)
+    return R.ok(body)
+
+
+const MAX_PHYSICS_TICKS := 120
+
+static var _physics_saved: Dictionary = {}
+static var _physics_stepping := false
+
+
+static func restore_physics(rt: Node) -> void:
+    if _physics_saved.is_empty():
+        _physics_stepping = false
+        return
+    _apply_physics_saved(rt, true)
+
+
+static func physics(rt: Node, params: Dictionary) -> Dictionary:
+    var action := str(params.get("action", "step")).strip_edges()
+    if action == "status":
+        return R.ok(_physics_status(rt))
+    if action == "resume":
+        if _physics_stepping:
+            return R.err(R.BAD_PARAMS, "A physics step is still running.")
+        rt.get_tree().paused = false
+        var resumed := _physics_status(rt)
+        resumed["action"] = "resume"
+        return R.ok(resumed)
+    if action != "step":
+        return R.err(R.BAD_PARAMS, "Unknown physics action '%s'." % action)
+    var ticks: Variant = _whole_number(params.get("ticks", null))
+    if ticks == null or int(ticks) < 1 or int(ticks) > MAX_PHYSICS_TICKS:
+        return R.err(R.BAD_PARAMS, "ticks must be an integer from 1 to 120.")
+    if _physics_stepping:
+        return R.err(R.BAD_PARAMS, "A physics step is already running.")
+    _arm_physics(rt)
+    var state := {
+        "ticks": int(ticks),
+        "start": Engine.get_physics_frames(),
+        "budget": int(ticks) + 8,
+    }
+    return {"_pending": true, "_tick": func() -> bool: return _tick_physics(rt, state)}
+
+
+static func _arm_physics(rt: Node) -> void:
+    _physics_stepping = true
+    _physics_saved = {
+        "paused": rt.get_tree().paused,
+        "time_scale": Engine.time_scale,
+        "ticks": Engine.physics_ticks_per_second,
+        "max_steps": Engine.max_physics_steps_per_frame,
+    }
+    # One engine physics iteration per process frame, so N ticks means N iterations.
+    # SceneTree._physics_process is not a function a script can call.
+    Engine.max_physics_steps_per_frame = 1
+    Engine.physics_ticks_per_second = 1000000
+    Engine.time_scale = 1.0
+    rt.get_tree().paused = false
+
+
+static func _apply_physics_saved(rt: Node, pause_after: bool) -> void:
+    var saved := _physics_saved.duplicate(true)
+    _physics_saved = {}
+    _physics_stepping = false
+    if not saved.is_empty():
+        Engine.physics_ticks_per_second = int(saved["ticks"])
+        Engine.max_physics_steps_per_frame = int(saved["max_steps"])
+        Engine.time_scale = float(saved["time_scale"])
+    if rt.get_tree() != null:
+        rt.get_tree().paused = true if pause_after else bool(saved.get("paused", true))
+
+
+static func _tick_physics(rt: Node, state: Dictionary) -> bool:
+    var advanced := Engine.get_physics_frames() - int(state["start"])
+    if advanced >= int(state["ticks"]):
+        var wanted := int(state["ticks"])
+        _apply_physics_saved(rt, true)
+        rt.finish_job(R.ok(_physics_body(rt, wanted, advanced)))
+        return false
+    state["budget"] = int(state["budget"]) - 1
+    if int(state["budget"]) <= 0:
+        var wanted := int(state["ticks"])
+        _apply_physics_saved(rt, true)
+        rt.finish_job(R.err(
+            R.GODOT_ERROR,
+            "Physics did not advance %d ticks before the frame budget ran out." % wanted,
+            {"advanced": advanced, "scene": rt.scene_context()},
+        ))
+        return false
+    return true
+
+
+static func _physics_body(rt: Node, wanted: int, advanced: int) -> Dictionary:
+    var body := _physics_status(rt)
+    body["action"] = "step"
+    body["ticks"] = advanced
+    body["requested"] = wanted
+    body["physics_frames"] = Engine.get_physics_frames()
+    return body
+
+
+static func _physics_status(rt: Node) -> Dictionary:
+    return {
+        "paused": rt.get_tree().paused,
+        "stepping": _physics_stepping,
+        "time_scale": Engine.time_scale,
+        "physics_ticks_per_second": Engine.physics_ticks_per_second,
+        "max_physics_steps_per_frame": Engine.max_physics_steps_per_frame,
+        "scene": rt.scene_context(),
+        "limits": _physics_limits(),
+    }
+
+
+static func _physics_limits() -> Dictionary:
+    return {
+        "advanced": "Engine physics iterations with max_physics_steps_per_frame set to 1. This tool does not call node _physics_process itself.",
+        "still_runs": "Idle _process is not stepped. Nodes with process_mode ALWAYS still receive _process and _physics_process while the tree is paused. The engine physics-frame counter also keeps increasing while paused, so it is not a count of pausable game physics.",
+        "not_covered": "Custom threads and GPU compute are not stepped or flushed, and nothing here waits for the GPU.",
+        "determinism": "This does not make the game deterministic.",
+    }
+
+
+static func _whole_number(raw: Variant) -> Variant:
+    if raw is int:
+        return int(raw)
+    if raw is float and float(int(raw)) == float(raw):
+        return int(raw)
+    return null
 
 
 static func _need(rt: Node, params: Dictionary) -> Node:

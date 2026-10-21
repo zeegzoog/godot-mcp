@@ -38,6 +38,8 @@ fn test_tool_definitions() {
     assert!(tool_names.contains(&"godot_get_run_status"));
     assert!(tool_names.contains(&"godot_get_open_scenes"));
     assert!(tool_names.contains(&"godot_resave_resources"));
+    assert!(tool_names.contains(&"godot_read_script"));
+    assert!(tool_names.contains(&"godot_edit_script"));
 
     // Verify all input schemas are valid JSON objects
     for tool in tools {

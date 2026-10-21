@@ -8,6 +8,31 @@ Each Godot version has its own release line and branch (`godot-v4.5`, `godot-v4.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-21
+
+The AI can now run a game, look at it and drive it, set breakpoints and step through the code, ask Godot's own language server about its scripts, and create scenes, resources and settings. The release holds the files for Godot 4.5, 4.6 and 4.7 as before: download the files whose names end in `-godotM.N` for your Godot version, and update the server and the addon together. Everything below works on all three versions unless it says otherwise.
+
+### Added
+
+- **Look at a running game.** `godot_run_output` reads a game's logs, warnings and errors with stack traces. `godot_game_tree`, `godot_game_get`, `godot_game_signals` and `godot_game_snapshot` show the live nodes, their properties, their signals and a summary; `godot_game_set` changes a property and `godot_game_call` calls a method, only one you name in `permit` (never one that can quit, run code or call other methods). `godot_game_observe` watches signals for a few frames. Nothing a game tool changes is saved to disk.
+- **Drive a running game.** `godot_game_input` presses keys, types text, moves and clicks the mouse, touches and swipes, and moves gamepad buttons and sticks, as a sequence of steps; `click_node` clicks the centre of a node by its path. The real mouse pointer stays where it is unless you pass `warp_mouse`. A step that fails lets go of everything the server still holds, and `godot_game_input_release` does the same on request. `godot_game_wait` waits for frames, for a node to exist or for a signal, and can slow down or speed up the game (`time_scale`, restored when the game ends).
+- **Screenshots of the game.** `godot_game_screenshot` returns the game window, a viewport or a camera as a PNG, never an empty image. It can stitch up to eight frames into one sheet and says how many pixels changed since the previous picture and where. A game started without a window has nothing to capture and says so.
+- **Breakpoints and stepping** for a game the server started: `godot_debug_breakpoints`, `godot_debug_control` (pause, resume, step into, over and out) and `godot_debug_state` (the stack and the variables of each frame). Editor Play keeps the editor's own debugger.
+- **Ask Godot about scripts.** `godot_code_diagnostics`, `godot_code_symbols`, `godot_code_complete`, `godot_code_definition` and `godot_code_references` are answered by Godot's own GDScript language server, so they report what the editor would. The server uses an editor that already runs it (`GODOT_MCP_LSP_PORT`, default 6005) or starts a private headless one; that editor opens no bridge (`GODOT_MCP_NO_BRIDGE=1`, which you can set for any editor that must not open one). A request the server does not answer is an error, never a clean file.
+- **Create content.** `godot_create_scene`, `godot_attach_script`, `godot_connect_signal`, `godot_list_signals`, `godot_create_resource`, `godot_get_project_settings` and `godot_set_project_setting`. Changes to an open scene are undoable in the editor. Nothing replaces an existing scene or resource, a signal is connected only to a method that exists, a setting keeps its type, and a value can never add lines or sections to `project.godot`. Without the editor, scenes, resources and settings are written as files.
+- The README lists every tool, and `docs/feature-parity.md` compares this server with three other Godot MCP servers.
+
+### Changed
+
+- `godot_run_project` without a running editor (or with `mode: "process"`) now starts a game that the server watches: the AI can read its output, inspect it, drive it and debug it, `godot_get_run_status` lists it and `godot_stop_project` stops it. It ends when the server ends; before, it was a separate process that nobody could stop. The game's output is kept in a bounded log. The server adds its runtime script through a temporary `override.cfg` and a private folder under `.godot/`, and removes both when the game ends; your `override.cfg` and your `addons` folder are left as they are.
+
+### Fixed
+
+- `godot_open_scene` on a scene that is already open reloads it when the file on disk changed, so edits made outside the editor are no longer shown stale and later edits through the tools do not overwrite them. Unsaved edits made through the tools are not discarded unless you pass `discard: true`.
+- A project path spelled `/var/...` on macOS is accepted, as it is the same folder as `/private/var/...`.
+- A game tool called right after the editor starts Play waits until the game's runtime is ready instead of failing or sending input too early.
+- A screenshot of a game that is still starting waits for the first frame instead of failing.
+
 ## [0.5.1] - 2026-10-20
 
 First release made for each Godot version separately. It holds the files for Godot 4.5, 4.6 and 4.7 in one release; download the files whose names end in `-godotM.N` for your Godot version. There is no release 0.5.0: a first attempt that published one release per Godot version was withdrawn in favour of this one. The server and the addon changed together: update both.

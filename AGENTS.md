@@ -37,7 +37,7 @@ Agents must treat the Godot Editor as a live, stateful environment while ensurin
 
 - **Zero-Overhead Async I/O**: Use Tokio event loops for stdio JSON-RPC transport and WebSocket bridge communication.
 - **Error Handling**: Never use unhandled panics (`unwrap()` / `expect()`) in production code paths. Use explicit `Result` propagation with informative error types.
-- **Clean Stdio Separation**: All internal logging and diagnostics MUST be emitted to `stderr` using `tracing`. The `stdout` stream is strictly reserved for MCP JSON-RPC frames. Every child process spawned by the server (editor, game) gets null stdio.
+- **Clean Stdio Separation**: All internal logging and diagnostics MUST be emitted to `stderr` using `tracing`. The `stdout` stream is strictly reserved for MCP JSON-RPC frames. No child process spawned by the server inherits its standard streams: an editor launch gets null stdio, and a managed game run has its output piped into a bounded log.
 - **Concurrency**: Tool calls run as independent tasks so a slow editor command never blocks `ping` or other calls; `notifications/cancelled` aborts a running call. Never hold a lock across an editor round-trip.
 - **Standardized MCP Responses**: All errors must return an informative message and at least one actionable recovery solution.
 

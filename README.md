@@ -130,7 +130,7 @@ To report a vulnerability, follow [SECURITY.md](SECURITY.md). Never open a publi
 | `godot_get_version` | — | Engine version, from the editor or the Godot binary. |
 | `godot_get_project_info` | Editor | Name, main scene, and features of the open project. |
 | `godot_launch_editor` | — | Launches the editor for `project_path`, or for the project the server runs in. |
-| `godot_run_project` | — | Plays the main scene or a given `res://` scene. With the editor, uses its Play mode. Without it (or with `mode: "process"`), starts a managed game with the remote debugger attached. `godot_stop_project` stops either one. |
+| `godot_run_project` | — | Plays the main scene or a given `res://` scene. With the editor, uses its Play mode. Without it (or with `mode: "process"`), starts a managed game with the remote debugger attached; `held: true` (process runs only) starts it held, for exact steps. `godot_stop_project` stops either one. |
 | `godot_stop_project` | — | Stops the editor's Play mode, or a managed process run (`run_id` optional). |
 | `godot_get_run_status` | — | Whether a scene is playing, and the managed process runs. |
 | `godot_get_open_scenes` | Editor | Open scene tabs and the active one. |
@@ -163,7 +163,7 @@ To report a vulnerability, follow [SECURITY.md](SECURITY.md). Never open a publi
 | `godot_game_input` | Running game | Injects key, text, mouse, touch and gamepad input, and waits, as a sequence of steps. Gestures: `click`, `swipe` and `click_node` (the center of a Control, Node2D or Node3D). `time_scale` sets `Engine.time_scale`. A step that fails releases everything the server still holds. Mouse steps are Godot events and leave the OS cursor in place unless `warp_mouse` is true. |
 | `godot_game_input_release` | Running game | Releases every key, button, axis and touch this server still holds down. |
 | `godot_game_wait` | Running game | Waits for process frames, for a node to exist (`node`), for a signal (`node` and `signal`), for a public property (`property`, `op`, `value`), or for a newer `scene_generation`. `timeout` is in frames. `time_scale` (0 to 8) sets `Engine.time_scale`; the runtime restores the previous value when the game exits. |
-| `godot_game_physics` | Running game | Advances N real engine physics iterations, each with the normal physics delta, then leaves the tree paused. `resume` continues the game. |
+| `godot_game_physics` | Running game | Controls game time. `hold` stops the game at the start of a physics tick; while held, `step` runs an exact number of ticks (or until a condition holds), input is applied by tick, and `resume` lets the game run. Without a hold, `step` advances N engine physics iterations and leaves the tree paused. See [Holding a game](#holding-a-game). |
 | `godot_game_screenshot` | Running game with a window | PNG of the game window, a viewport or a camera; `frames` (up to 8) stitches shots taken every `every` frames into one sheet. Compares with the previous capture, and can save or compare a named baseline (`save_baseline`, `baseline`, `roi`, `tolerance`). An error, never an empty image; a headless game has nothing to capture. |
 | `godot_debug_breakpoints` | Process run | Lists, adds, removes or clears breakpoints (`res://script.gd:LINE`). Editor Play uses the editor's own debugger. |
 | `godot_debug_control` | Process run | Pauses, resumes or steps (into, over, out) and waits for the next stop. |
@@ -213,6 +213,26 @@ A named baseline is the returned image, so `roi` uses that image's pixels (`roi_
 ```
 
 `godot_game_physics` with `{"action": "step", "ticks": 4}` advances four real engine physics iterations and then pauses the tree. `{"action": "resume"}` continues. Each tick has the normal physics delta, so four ticks are four times `1 / physics_ticks_per_second` seconds of game time, multiplied by `Engine.time_scale`. The step allows at most one physics iteration per process frame while it runs, then restores `max_physics_steps_per_frame`; the tick rate and the time scale are not changed. It does not call `_physics_process` on your nodes. It does not step idle `_process`, nodes with `process_mode` `ALWAYS` (those keep running while the tree is paused), custom threads, or GPU compute, and it does not make the game deterministic. The engine physics-frame counter also keeps moving while the tree is paused, so it is not a count of pausable game physics. If the step fails, or the runtime is removed while a step is still in flight, `max_physics_steps_per_frame` is restored and the tree is left paused.
+
+## Holding a game
+
+`godot_game_physics` with `{"action": "hold"}` stops the running game at the start of a physics tick. Nothing advances while it is held: no tick, frame, timer or awaited signal, including nodes whose `process_mode` ignores pause, and the game's own pause cannot release it. The window stays responsive. Reads are still answered (`godot_game_tree`, `godot_game_get`, `godot_game_set`, `godot_game_call` with `permit`, `godot_game_signals`, `godot_game_snapshot`, `godot_run_output`, and a single `godot_game_screenshot` of the last frame the game drew).
+
+```json
+{"action": "step", "ticks": 5}
+{"action": "step", "until": {"node": ".", "property": "stats/hp", "op": "lte", "value": 0}, "max": 600}
+{"action": "resume"}
+```
+
+A step runs exactly that many physics ticks (1 to 600) and holds again; the answer says how many ran. With `until` the condition is read before every tick, the first included, so one that already holds runs no tick, and the step stops at `max` (default 600, at most 3600) with `until_met` saying which happened. `until` reads a public property with `get`, like a `godot_game_wait` property wait: it never evaluates an expression. A condition that cannot be read yet does not hold; one that does not parse is refused before any tick runs.
+
+Input is applied by tick while held. `godot_game_input` takes key, mouse button, touch and joypad button taps, clicks, mouse moves, axis values and `time_scale` at once; a tap stays down for `hold_ticks` ticks (default 2, 1 to 600) and is let go at the start of the tick it falls due on, so splitting a step in two does not change what the game sees. A press made while held is down from the next tick and is reported as just pressed on the second one. Leaving the hold, with `resume` or by closing the game, releases everything still held.
+
+A held game refuses what needs time to pass, and says to step instead: `godot_game_wait`, `godot_game_observe`, a screenshot sheet or camera switch, and input `wait`, `text` and `swipe` steps. `godot_debug_control` `pause` is refused too, since the game is already still; a breakpoint hit during a step stops the game as usual.
+
+Steps are **exact** only for a game started with `godot_run_project` `{"mode": "process", "held": true}`. That start fixes the engine's frame rate to the project's tick rate (`physics/common/physics_ticks_per_second`, 60 when unset), so every tick is paired with one frame, and the answers say `"deterministic": true`. A hold entered later, or on the editor's Play, still stands still but is reported as `"deterministic": false` with a `deterministic_reason`: `not_started_held`, `fixed_rate_differs` (the game changed its tick rate) or `frames_did_not_follow_ticks` (a step saw frames fail to follow its ticks, which ends the claim for the rest of the run). A step runs its ticks as fast as the game can, so `max` bounds ticks, not seconds. Work on other threads and file loading takes real time, so after starting a game repeat short `until` steps instead of guessing a tick count. A held step that takes longer than 60 seconds is not cancelled: the call returns an error saying the game finishes it and holds again, and `status` shows where it is.
+
+Closing the game's window ends a hold. The server stopping the run does too. A server that disappears without stopping the run leaves its game held, with a window that can still be closed.
 
 ## How it works
 

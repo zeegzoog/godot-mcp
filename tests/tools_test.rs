@@ -2,7 +2,9 @@
 
 mod common;
 
-use common::{fake_godot, free_port, is_tool_error, project_dir, tool_text};
+use common::{
+    fake_godot, free_port, is_tool_error, project_dir, recording_godot, tool_text, wait_for_file,
+};
 use godot_mcp::bridge::BridgeClient;
 use godot_mcp::cli_runner::CliRunner;
 use godot_mcp::protocol::ToolResult;
@@ -554,4 +556,160 @@ async fn forced_process_mode_does_not_claim_the_editor_is_offline() {
         "{}",
         text(&result)
     );
+}
+
+#[tokio::test]
+async fn a_held_run_needs_the_process_mode() {
+    let project = project_dir();
+    let (godot, _record) = recording_godot(project.path());
+    let tools = manager_in(project.path(), godot);
+
+    for args in [json!({"held": true}), json!({"held": true, "mode": "auto"})] {
+        let result = Arc::clone(&tools)
+            .call_tool("godot_run_project", args)
+            .await;
+        assert!(result.is_error, "{}", text(&result));
+        assert!(text(&result).contains("process"), "{}", text(&result));
+    }
+}
+
+#[tokio::test]
+async fn a_held_run_starts_the_engine_at_the_projects_tick_rate() {
+    let project = project_dir();
+    let (godot, record) = recording_godot(project.path());
+
+    // The manager stops the games it started when it is dropped, so it lives until the file is read.
+    let tools = manager_in(project.path(), godot);
+    let result = Arc::clone(&tools)
+        .call_tool(
+            "godot_run_project",
+            json!({"held": true, "mode": "process"}),
+        )
+        .await;
+    assert!(!result.is_error, "{}", text(&result));
+
+    let arguments = wait_for_file(&record).await;
+    assert!(arguments.contains("--fixed-fps 60"), "{arguments}");
+    // The game's own arguments come after the engine's, behind a bare `--`.
+    let (engine, game) = arguments.split_once(" -- ").unwrap_or((&arguments, ""));
+    assert!(engine.contains("--remote-debug"), "{arguments}");
+    assert!(game.contains("--godot-mcp-hold"), "{arguments}");
+    assert!(game.contains("--godot-mcp-fixed-fps=60"), "{arguments}");
+}
+
+#[tokio::test]
+async fn a_held_run_follows_a_project_that_sets_its_own_tick_rate() {
+    let project = project_dir();
+    std::fs::write(
+        project.path().join("project.godot"),
+        "config_version=5\n\n[physics]\n\ncommon/physics_ticks_per_second=30\n",
+    )
+    .unwrap();
+    let (godot, record) = recording_godot(project.path());
+
+    // The manager stops the games it started when it is dropped, so it lives until the file is read.
+    let tools = manager_in(project.path(), godot);
+    let result = Arc::clone(&tools)
+        .call_tool(
+            "godot_run_project",
+            json!({"held": true, "mode": "process"}),
+        )
+        .await;
+    assert!(!result.is_error, "{}", text(&result));
+
+    let arguments = wait_for_file(&record).await;
+    assert!(arguments.contains("--fixed-fps 30"), "{arguments}");
+    assert!(
+        arguments.contains("--godot-mcp-fixed-fps=30"),
+        "{arguments}"
+    );
+}
+
+#[tokio::test]
+async fn a_run_that_is_not_held_gets_no_fixed_rate_and_no_game_arguments() {
+    let project = project_dir();
+    let (godot, record) = recording_godot(project.path());
+
+    // The manager stops the games it started when it is dropped, so it lives until the file is read.
+    let tools = manager_in(project.path(), godot);
+    let result = Arc::clone(&tools)
+        .call_tool("godot_run_project", json!({"mode": "process"}))
+        .await;
+    assert!(!result.is_error, "{}", text(&result));
+
+    let arguments = wait_for_file(&record).await;
+    assert!(!arguments.contains("--fixed-fps"), "{arguments}");
+    assert!(!arguments.contains("godot-mcp"), "{arguments}");
+}
+
+#[test]
+fn the_physics_tool_offers_hold_conditions_and_the_input_tool_hold_ticks() {
+    let tools = ToolManager::list_tools();
+    let schema = |name: &str| {
+        tools
+            .iter()
+            .find(|tool| tool.name == name)
+            .unwrap_or_else(|| panic!("no tool {name}"))
+            .input_schema
+            .clone()
+    };
+    let physics = schema("godot_game_physics");
+    for property in ["action", "ticks", "until", "max"] {
+        assert!(physics["properties"][property].is_object(), "{physics}");
+    }
+    assert!(
+        physics["properties"]["action"]["description"]
+            .as_str()
+            .unwrap_or("")
+            .contains("hold"),
+        "{physics}"
+    );
+    assert!(schema("godot_game_input")["properties"]["hold_ticks"].is_object());
+    assert!(schema("godot_run_project")["properties"]["held"].is_object());
+}
+
+#[test]
+fn the_descriptions_tell_an_agent_what_a_hold_does_and_what_it_refuses() {
+    let tools = ToolManager::list_tools();
+    let description = |name: &str| {
+        tools
+            .iter()
+            .find(|tool| tool.name == name)
+            .unwrap_or_else(|| panic!("no tool {name}"))
+            .description
+            .to_lowercase()
+    };
+    let physics = description("godot_game_physics");
+    for word in [
+        "hold",
+        "until",
+        "deterministic",
+        "exact",
+        "resume",
+        "not_started_held",
+    ] {
+        assert!(
+            physics.contains(word),
+            "godot_game_physics does not say {word}: {physics}"
+        );
+    }
+    let run = description("godot_run_project");
+    assert!(run.contains("held"), "{run}");
+    let input = description("godot_game_input");
+    assert!(
+        input.contains("hold_ticks") && input.contains("held"),
+        "{input}"
+    );
+    for refused in [
+        "godot_game_wait",
+        "godot_game_observe",
+        "godot_game_screenshot",
+    ] {
+        let text = description(refused);
+        assert!(
+            text.contains("held"),
+            "{refused} does not say it is refused while held: {text}"
+        );
+    }
+    assert!(description("godot_debug_control").contains("held"));
 }

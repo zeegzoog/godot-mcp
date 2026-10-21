@@ -25,7 +25,7 @@ Local registry of specifications for this workspace.
 | [l1-content-authoring.md](specifications/l1-content-authoring.md) | Tools that create scenes and resources, attach scripts, connect signals and change project settings without overwriting or corrupting files. Open it before changing an authoring tool. | Stable | concept | 1.0.0 |
 | [l2-rust-stdio-server.md](specifications/l2-rust-stdio-server.md) | How the Rust crate realizes the server core: session loop, configuration, error taxonomy. Open it when editing the entry point, session, protocol types or configuration code. | Stable | implementation | 1.2.0 |
 | [l2-bridge-client-rust.md](specifications/l2-bridge-client-rust.md) | How the server keeps, multiplexes and recovers its editor connection. Open it when editing the bridge client or its timing. | Stable | implementation | 1.0.0 |
-| [l2-godot-editor-addon.md](specifications/l2-godot-editor-addon.md) | How the GDScript addon implements the bridge, its handlers and export exclusion. Open it when editing anything in the addon. | Stable | implementation | 1.2.0 |
+| [l2-godot-editor-addon.md](specifications/l2-godot-editor-addon.md) | How the GDScript addon implements the bridge, its handlers and export exclusion. Open it when editing anything in the addon. | Stable | implementation | 1.3.0 |
 | [l2-tool-handlers.md](specifications/l2-tool-handlers.md) | How the Rust tool layer enforces the catalog rules, and the steps for adding a tool. Open it when editing tools, path checks or engine invocations. | Stable | implementation | 1.2.0 |
 | [l2-ci-release-pipeline.md](specifications/l2-ci-release-pipeline.md) | Which workflow, script or manifest enforces each release rule. Open it when editing CI, release files or repository hygiene. | Stable | implementation | 1.2.1 |
 | [l2-test-suite.md](specifications/l2-test-suite.md) | Map of the test files, shared helpers and opt-in editor tests. Open it to decide where a new test goes or how to run the editor tests. | Stable | implementation | 1.4.0 |
@@ -35,8 +35,8 @@ Local registry of specifications for this workspace.
 
 | [l2-repo-steward-skill.md](specifications/l2-repo-steward-skill.md) | How the portable repo-steward skill realizes stewardship on GitHub. Open it when editing the skill or installing it in another repository. | Stable | implementation | 1.0.4 |
 | [l2-repo-steward-godot-mcp.md](specifications/l2-repo-steward-godot-mcp.md) | How the steward is installed and configured in this repository, including how it treats the Godot lines. Open it when changing the steward's settings or files here. | Stable | implementation | 1.0.2 |
-| [l2-game-runtime.md](specifications/l2-game-runtime.md) | How managed runs, the debugger session, the in-game component and the editor Play relay realize runtime observability. Open it when editing `src/godot/`, `src/tools/game.rs` or the addon's runtime files. | Stable | implementation | 1.0.0 |
-| [l2-lsp-client.md](specifications/l2-lsp-client.md) | How the Rust client finds or starts Godot's language server, frames messages and matches document URIs. Open it when editing `src/lsp/` or `src/tools/code.rs`. | Stable | implementation | 1.0.0 |
+| [l2-game-runtime.md](specifications/l2-game-runtime.md) | How managed runs, the debugger session, the in-game component and the editor Play relay realize runtime observability. Open it when editing `src/godot/`, `src/tools/game.rs` or the addon's runtime files. | Stable | implementation | 1.1.0 |
+| [l2-lsp-client.md](specifications/l2-lsp-client.md) | How the Rust client finds or starts Godot's language server, frames messages and matches document URIs. Open it when editing `src/lsp/` or `src/tools/code.rs`. | Stable | implementation | 1.1.0 |
 <!-- Add your specifications here -->
 <!-- Description: what the specification is for and when to open it, in two sentences at most; no change history (that goes in the specification's Document History). -->
 

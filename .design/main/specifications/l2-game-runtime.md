@@ -1,6 +1,6 @@
 # Game Runtime Channel
 
-**Version:** 1.0.0
+**Version:** 1.1.0
 **Status:** Stable
 **Layer:** implementation
 **Implements:** l1-runtime-observability.md
@@ -33,7 +33,7 @@ Godot already has a debugger protocol that every editor-launched game speaks. Sp
 | RO-1 Observation does not change the game | Read operations (`game.tree`, `game.get`, `game.signals`, `game.snapshot`, `game.screenshot`, log reads) mutate nothing; `game.observe` connects to signals for a few frames and disconnects again. `game.set`, `game.call`, input and the time scale are separate calls. |
 | RO-2 Bounded output | `Run` keeps at most `MAX_LOGS` (2000) entries, oldest first dropped; errors are kept with their stack triples; reads page by sequence number (`since`) and `level`. |
 | RO-3 Hints and reasons | `ready_editor_session` and `select` fail with how to start a game; a closed session reports `the game disconnected` or `the game exited before the runtime said hello`. |
-| RO-4 The component never ships | `ensure_runtime` plants the runtime files only when the addon does not already contain them and records them for removal; `inject_override` writes `res://override.cfg` with a marker line and `restore_override` puts the user's file back on exit, on drop and, after a crash, on the next run. The runtime does nothing unless `EngineDebugger.is_active()`. `export_plugin.gd` excludes the whole addon folder from exports. |
+| RO-4 The component never ships | `ensure_runtime` uses the project's own addon when it has every runtime file; otherwise it writes a private copy under `.godot/godot_mcp/run-<id>/` (not scanned by the editor, ignored by version control) and never touches the project's `addons` folder; copies older than a day (a crashed run's) are swept. `inject_override` writes `res://override.cfg` with a marker line and `restore_override` puts the user's file back and removes the copy and the folders it emptied, on exit, on drop and, after a crash, on the next run. The runtime does nothing unless `EngineDebugger.is_active()`. `export_plugin.gd` excludes the whole addon folder from exports. |
 | RO-5 Local access | `DebugSession::listen` binds `127.0.0.1` on a free port, accepts one connection and stops listening. |
 | RO-6 No caller code | `game_call` requires `permit` to name the method and rejects `quit`, `set_script`, `call`, `callv`, `call_deferred`, `rpc`, `rpc_id` and `free`, and the runtime repeats that list (`rt_live.gd`); `game.set` refuses `script`, names starting with `_` and property paths (`:`); the runtime has no evaluator. |
 | RO-7 Held input released | `rt_input.gd` remembers every press; `input.release_all`, a failing step and `_exit_tree` release them all. |
@@ -63,9 +63,9 @@ addons/godot_mcp/
 
 ### 5.2 Managed Process Run
 
-1. `start` plants the runtime files if needed, writes the override, binds the debugger listener, and spawns Godot with `--path`, `--remote-debug tcp://127.0.0.1:<port>`, optional `--scene` and `--breakpoints`, in its own process group, with the server's stdin closed and output piped.
+1. `start` picks the runtime source (the addon, or a private copy under `.godot/`), writes the override, binds the debugger listener, and spawns Godot with `--path`, `--remote-debug tcp://127.0.0.1:<port>`, optional `--scene` and `--breakpoints`, in its own process group, with the server's stdin closed and output piped.
 2. The game connects; the runtime sends `mcp:hello` when its main scene is ready; calls wait for it.
-3. A watcher task records the exit code; `stop`, a drop of the hub or the end of the process restores the override and removes planted files.
+3. A watcher task records the exit code; `stop`, a drop of the hub or the end of the process restores the override and removes the private copy.
 4. At most eight runs are kept; finished ones are dropped first.
 
 ### 5.3 Editor Play
@@ -86,8 +86,7 @@ Gestures (`click`, `click_node`, `swipe`) go through `Input.parse_input_event` l
 
 ## 6. Implementation Notes
 
-- Known limitation: the debugger port accepts the first local connection without authentication; the loopback bind and the single connection are the only guards.
-- Known limitation: `ensure_runtime` plants runtime files in the project when the addon is not installed there, which sits uneasily with "the server does not modify the project's addon"; they are removed when the run ends.
+- Accepted risk: the debugger port accepts the first local connection without authentication. The port is random, bound to loopback and closed to further connections once the game connects; a web page cannot use it (a browser's request is not a Variant frame and is refused as oversized). Another process of the same user could connect first, but such a process can already read the bridge token and the project. Another user on a shared machine could, in theory, connect first and feed the agent false state; checking the peer's process would need a different mechanism on each operating system, and the game's own handshake carries nothing to check, so this is left as it is.
 - The runtime uses only the engine API of the line's first release, and the editor tests run it on every line's Godot build.
 
 ## 7. Drawbacks & Alternatives
@@ -113,4 +112,5 @@ Gestures (`click`, `click_node`, `swipe`) go through `Input.parse_input_event` l
 
 | Version | Date | Author | Description |
 | --- | --- | --- | --- |
+| 1.1.0 | 2026-10-21 | Agent (magic.spec) | [MODIFIED] The runtime copy moved out of the addons folder (RO-4, 5.2); the debugger port limitation recorded as an accepted risk with its reasoning; a capture retries for an undrawn window. |
 | 1.0.0 | 2026-10-21 | Agent (magic.spec) | Written after pull requests 3 to 5, 9 and 13 merged, with the review changes (bounded variant decoding, capped waits, Play wait for the runtime, canvas-aware clicks, same-size picture comparison). |

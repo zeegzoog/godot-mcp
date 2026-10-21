@@ -1,6 +1,6 @@
 # Godot Editor Addon
 
-**Version:** 1.2.0
+**Version:** 1.3.0
 **Status:** Stable
 **Layer:** implementation
 **Implements:** l1-editor-bridge.md
@@ -72,6 +72,7 @@ addons/godot_mcp/
 - `add_node`: native classes must derive from `Node` and be instantiable; global script classes are looked up in the project's class list; non-Node script instances are freed.
 - `get_node_properties`: only properties with editor usage; values in Godot text form, truncated at 2000 characters.
 - `create_scene`, `create_resource`: refuse an existing file; the scene is packed and opened, the resource saved with `ResourceSaver` and registered with the file system. `attach_script`, `connect_signal`: one undo action each; the script must exist in the project, the target must have the method, a connection that exists is refused. `set_project_setting`: the key is a plain `section/path`, only strings, numbers and booleans, the type of an existing setting is kept, the old value is restored if saving fails.
+- `plugin.gd`: with the environment variable `GODOT_MCP_NO_BRIDGE=1` the plugin still registers the export exclusion but opens no bridge and says so in the log; the server sets it for the private editor of the language server.
 - `game_status`, relay: the plugin lists the played games and their `hello`; the host waits for it before it sends anything to a game started by Play.
 
 ## 6. Implementation Notes
@@ -101,3 +102,4 @@ addons/godot_mcp/
 | 1.0.0 | 2026-10-16 | Agent (magic.analyze first-time) | Reverse-engineered from the addon at 94e4540; known limitations carried over from the 2026-10-14 QA report's open items. |
 | 1.1.0 | 2026-10-20 | Agent (magic.spec) | [MODIFIED] Target, guard convention and BR-9 per release line; newer-minor warning. Stable → RFC → Stable after Post-Update Review. |
 | 1.2.0 | 2026-10-21 | Agent (magic.spec) | [ADDED] The runtime, relay and override files, and the handler notes of the authoring commands. |
+| 1.3.0 | 2026-10-21 | Agent (magic.spec) | [ADDED] The `GODOT_MCP_NO_BRIDGE` switch of the plugin. |

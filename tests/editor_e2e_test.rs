@@ -221,6 +221,81 @@ fn macos_var_spelling(path: &Path) -> PathBuf {
         .unwrap_or_else(|| path.to_path_buf())
 }
 
+/// The editor the server starts for the language server runs the project's addon too. With
+/// `GODOT_MCP_NO_BRIDGE=1` the addon must stay loaded but open no bridge, otherwise the editor
+/// tools would find a hidden editor on the project's port.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn an_editor_told_not_to_open_a_bridge_opens_none() {
+    let (godot, console) = godot_binaries();
+    let dir = tempfile::tempdir().expect("project dir");
+    let project = dir.path();
+    std::fs::write(
+        project.join("project.godot"),
+        "config_version=5\n\n[application]\n\nconfig/name=\"No Bridge\"\nconfig/features=PackedStringArray(\"4.5\")\n\n\
+         [editor_plugins]\n\nenabled=PackedStringArray(\"res://addons/godot_mcp/plugin.cfg\")\n",
+    )
+    .expect("project.godot");
+    copy_dir(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("addons/godot_mcp"),
+        &project.join("addons/godot_mcp"),
+    );
+    let imported = timeout(
+        Duration::from_secs(180),
+        Command::new(&godot)
+            .args(["--headless", "--path"])
+            .arg(project)
+            .arg("--import")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status(),
+    )
+    .await
+    .expect("import timed out")
+    .expect("run godot --import");
+    assert!(imported.success(), "godot --import failed");
+
+    let port = common::free_port();
+    let log = project.join("editor.log");
+    let log_file = std::fs::File::create(&log).expect("log file");
+    let _child = Command::new(&console)
+        .args(["--headless", "--editor", "--path"])
+        .arg(project)
+        .env("GODOT_DEBUG_PORT", port.to_string())
+        .env("GODOT_MCP_NO_BRIDGE", "1")
+        .stdout(Stdio::from(log_file.try_clone().expect("clone log")))
+        .stderr(Stdio::from(log_file))
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn godot editor");
+
+    // The addon says it ran and chose to open nothing, so a closed port is not just an addon
+    // that failed to load.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        if text.contains("bridge is switched off") {
+            break;
+        }
+        assert!(
+            !text.contains("Plugin activated successfully"),
+            "the addon opened its bridge; log:\n{text}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "the addon never said what it did; log:\n{text}"
+        );
+        sleep(Duration::from_millis(500)).await;
+    }
+    sleep(Duration::from_secs(2)).await;
+    assert!(
+        tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_err(),
+        "something is listening on the bridge port"
+    );
+}
+
 fn expect_error(result: Result<Value, McpError>, needle: &str) {
     match result {
         Err(McpError::ToolExecution(message)) => assert!(

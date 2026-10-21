@@ -8,9 +8,10 @@ use crate::lsp::framing::{MessageReader, encode_message};
 use crate::util::lock;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -30,6 +31,15 @@ struct ClientInner {
     pending: Mutex<HashMap<i64, Pending>>,
     next_id: AtomicI64,
     diagnostics: Mutex<HashMap<String, Vec<Value>>>,
+    /// Set when the server closed the connection, which nothing writing to it would notice
+    /// until the next write.
+    closed: AtomicBool,
+}
+
+impl ClientInner {
+    fn is_open(&self) -> bool {
+        !self.closed.load(Ordering::Acquire) && !self.outbound.is_closed()
+    }
 }
 
 struct Live {
@@ -49,13 +59,19 @@ impl Drop for Live {
 pub struct LspHub {
     godot: PathBuf,
     live: Mutex<Option<Live>>,
+    /// Held while an editor is being started, so that calls arriving meanwhile wait for it
+    /// instead of starting another one that would replace it.
+    starting: tokio::sync::Mutex<()>,
 }
+
+type StartResult = Result<(Arc<ClientInner>, Option<Child>)>;
 
 impl LspHub {
     pub fn new(godot: PathBuf) -> Self {
         Self {
             godot,
             live: Mutex::new(None),
+            starting: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -206,19 +222,42 @@ impl LspHub {
     }
 
     async fn client_for(&self, project: &Path) -> Result<Arc<ClientInner>> {
+        let godot = self.godot.clone();
+        self.client_with(project, |root| async move {
+            connect_or_start(&godot, &root).await
+        })
+        .await
+    }
+
+    /// The client for `project`: the live one, or the one `start` makes when there is none
+    /// or its connection has closed. Only one start runs at a time.
+    async fn client_with<F, Fut>(&self, project: &Path, start: F) -> Result<Arc<ClientInner>>
+    where
+        F: FnOnce(PathBuf) -> Fut,
+        Fut: Future<Output = StartResult>,
+    {
         let project = std::fs::canonicalize(project).unwrap_or_else(|_| project.to_path_buf());
-        if let Some(live) = lock(&self.live).as_ref() {
-            if live.root == project {
-                return Ok(Arc::clone(&live.client));
-            }
+        if let Some(client) = self.live_client(&project) {
+            return Ok(client);
         }
-        let (client, child) = connect_or_start(&self.godot, &project).await?;
+        let _starting = self.starting.lock().await;
+        if let Some(client) = self.live_client(&project) {
+            return Ok(client);
+        }
+        let (client, child) = start(project.clone()).await?;
         *lock(&self.live) = Some(Live {
             client: Arc::clone(&client),
             child,
             root: project,
         });
         Ok(client)
+    }
+
+    fn live_client(&self, project: &Path) -> Option<Arc<ClientInner>> {
+        lock(&self.live)
+            .as_ref()
+            .filter(|live| live.root == project && live.client.is_open())
+            .map(|live| Arc::clone(&live.client))
     }
 }
 
@@ -281,25 +320,13 @@ async fn connect_or_start(
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let private_port = listener.local_addr()?.port();
     drop(listener);
-    let mut command = Command::new(godot);
-    command
-        .arg("--headless")
-        .arg("--editor")
-        .arg("--path")
-        .arg(project)
-        .arg("--lsp-port")
-        .arg(private_port.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    #[cfg(unix)]
-    command.process_group(0);
-    let child = command.spawn().map_err(|err| {
-        McpError::Process(format!(
-            "failed to start a headless editor for the language server: {err}"
-        ))
-    })?;
+    let child = private_editor_command(godot, project, private_port)
+        .spawn()
+        .map_err(|err| {
+            McpError::Process(format!(
+                "failed to start a headless editor for the language server: {err}"
+            ))
+        })?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
         if let Ok(client) = connect_client(private_port, project).await {
@@ -312,6 +339,28 @@ async fn connect_or_start(
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+}
+
+/// The headless editor the language server runs in. If the project has this addon enabled, the
+/// addon would open its bridge on the project's port in that editor too, and the editor tools
+/// would then talk to an editor nobody can see; `GODOT_MCP_NO_BRIDGE` keeps it closed.
+fn private_editor_command(godot: &Path, project: &Path, lsp_port: u16) -> Command {
+    let mut command = Command::new(godot);
+    command
+        .arg("--headless")
+        .arg("--editor")
+        .arg("--path")
+        .arg(project)
+        .arg("--lsp-port")
+        .arg(lsp_port.to_string())
+        .env("GODOT_MCP_NO_BRIDGE", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+    command
 }
 
 async fn connect_client(port: u16, project: &Path) -> Result<Arc<ClientInner>> {
@@ -337,6 +386,7 @@ async fn connect_client(port: u16, project: &Path) -> Result<Arc<ClientInner>> {
         pending: Mutex::new(HashMap::new()),
         next_id: AtomicI64::new(1),
         diagnostics: Mutex::new(HashMap::new()),
+        closed: AtomicBool::new(false),
     });
     tokio::spawn(async move {
         while let Some(bytes) = queue.recv().await {
@@ -362,6 +412,7 @@ async fn connect_client(port: u16, project: &Path) -> Result<Arc<ClientInner>> {
                 dispatch(&incoming, message);
             }
         }
+        incoming.closed.store(true, Ordering::Release);
         for (_, pending) in lock(&incoming.pending).drain() {
             let _ = pending.tx.send(Err(McpError::Process(
                 "the language server closed the connection".into(),
@@ -529,6 +580,124 @@ fn bump(position: Option<&mut Value>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    /// A client that is not connected to anything, and the end that keeps it open.
+    fn fake_client() -> (Arc<ClientInner>, mpsc::UnboundedReceiver<Vec<u8>>) {
+        let (outbound, inbox) = mpsc::unbounded_channel();
+        let client = Arc::new(ClientInner {
+            outbound,
+            pending: Mutex::new(HashMap::new()),
+            next_id: AtomicI64::new(1),
+            diagnostics: Mutex::new(HashMap::new()),
+            closed: AtomicBool::new(false),
+        });
+        (client, inbox)
+    }
+
+    /// A start-up that counts itself and takes a moment, like starting an editor does.
+    fn counted_start(
+        started: &Arc<AtomicUsize>,
+        client: &Arc<ClientInner>,
+    ) -> impl FnOnce(PathBuf) -> std::pin::Pin<Box<dyn Future<Output = StartResult> + Send>> {
+        let started = Arc::clone(started);
+        let client = Arc::clone(client);
+        move |_root| {
+            Box::pin(async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Ok((client, None))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn two_first_calls_start_one_editor() {
+        let hub = LspHub::new(PathBuf::from("godot"));
+        let project = tempfile::tempdir().unwrap();
+        let started = Arc::new(AtomicUsize::new(0));
+        let (client, _inbox) = fake_client();
+
+        let (first, second) = tokio::join!(
+            hub.client_with(project.path(), counted_start(&started, &client)),
+            hub.client_with(project.path(), counted_start(&started, &client)),
+        );
+
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            1,
+            "two editors were started"
+        );
+        assert!(Arc::ptr_eq(&first.unwrap(), &second.unwrap()));
+    }
+
+    #[tokio::test]
+    async fn a_live_client_is_reused() {
+        let hub = LspHub::new(PathBuf::from("godot"));
+        let project = tempfile::tempdir().unwrap();
+        let started = Arc::new(AtomicUsize::new(0));
+        let (client, _inbox) = fake_client();
+
+        hub.client_with(project.path(), counted_start(&started, &client))
+            .await
+            .unwrap();
+        hub.client_with(project.path(), counted_start(&started, &client))
+            .await
+            .unwrap();
+
+        assert_eq!(started.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_client_the_server_closed_is_replaced_before_anything_is_written() {
+        let hub = LspHub::new(PathBuf::from("godot"));
+        let project = tempfile::tempdir().unwrap();
+        let started = Arc::new(AtomicUsize::new(0));
+        let (first, _inbox) = fake_client();
+        hub.client_with(project.path(), counted_start(&started, &first))
+            .await
+            .unwrap();
+
+        first.closed.store(true, Ordering::Release);
+        let (second, _inbox) = fake_client();
+        let replaced = hub
+            .client_with(project.path(), counted_start(&started, &second))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            2,
+            "the closed client was kept"
+        );
+        assert!(Arc::ptr_eq(&replaced, &second));
+    }
+
+    #[tokio::test]
+    async fn a_client_whose_connection_closed_is_replaced() {
+        let hub = LspHub::new(PathBuf::from("godot"));
+        let project = tempfile::tempdir().unwrap();
+        let started = Arc::new(AtomicUsize::new(0));
+        let (first, inbox) = fake_client();
+        hub.client_with(project.path(), counted_start(&started, &first))
+            .await
+            .unwrap();
+
+        // The editor went away: nothing reads what the client writes any more.
+        drop(inbox);
+        let (second, _inbox) = fake_client();
+        let replaced = hub
+            .client_with(project.path(), counted_start(&started, &second))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            2,
+            "the dead client was kept"
+        );
+        assert!(Arc::ptr_eq(&replaced, &second));
+    }
 
     #[test]
     fn the_uri_sent_is_clean_and_the_published_uri_finds_it_again() {
@@ -543,6 +712,28 @@ mod tests {
         assert_ne!(
             uri_key(&sent),
             uri_key("file:///C%3A/Users/Some%20One/game/b.gd")
+        );
+    }
+
+    #[test]
+    fn the_private_editor_is_told_not_to_open_a_bridge() {
+        let command = private_editor_command(Path::new("godot"), Path::new("/project"), 6123);
+        let command = command.as_std();
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--lsp-port" && pair[1] == "6123"),
+            "{args:?}"
+        );
+        assert!(
+            command
+                .get_envs()
+                .any(|(name, value)| name == "GODOT_MCP_NO_BRIDGE"
+                    && value == Some(std::ffi::OsStr::new("1"))),
+            "the editor may open a bridge"
         );
     }
 

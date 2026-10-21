@@ -96,6 +96,7 @@ The server reads its settings from CLI flags, the environment (e.g. the MCP clie
 | --- | --- | --- | --- |
 | `GODOT_PATH` | `--godot-path` | auto-detect | Godot executable. If unset, the server tries a few common install locations, then `godot` on `PATH`; set it explicitly. A value that points to a missing file is not replaced: tools that run Godot fail and name the path. |
 | `GODOT_DEBUG_PORT` | `--debug-port` | `9333` | Editor bridge port. |
+| `GODOT_MCP_LSP_PORT` | | `6005` | Port of a running editor's GDScript language server. The `godot_code_*` tools use it if an editor listens there, and otherwise start a private headless editor. |
 | `GODOT_MCP_TOKEN` | | generated | Shared secret for the bridge. Normally unnecessary, see [Security](#security). |
 | `GODOT_CONSOLE_PATH` | `--godot-console-path` | | Windows console wrapper. Unused by the server; the editor end-to-end tests use it for editor logs. |
 | `GODOT_MCP_FEEDBACK` | `--feedback` | `full` | Feedback channel for the maintainers: `off`, `draft` (the AI can write a report but never send one) or `full`. See [Feedback](#feedback-to-the-maintainers). |
@@ -105,7 +106,7 @@ An empty value counts as "not set", so placeholders in a copied `.env.example` o
 
 In a `.env` file, put **Windows paths in single quotes** (`GODOT_PATH='C:\Program Files\Godot\Godot.exe'`). In double quotes a backslash starts an escape sequence and the whole file fails to load; the server logs a warning when that happens. See [.env.example](.env.example).
 
-The plugin picks its port from the project setting `godot_mcp/bridge_port` if you add one, otherwise from the editor's own `GODOT_DEBUG_PORT` environment variable, otherwise `9333`. Keep it equal to the server's port. Add the project setting `godot_mcp/verbose` = `true` to log every client connection in the editor's Output panel. Editor Play loads the running-game runtime unless `godot_mcp/runtime_on_play` is `false`.
+The plugin picks its port from the project setting `godot_mcp/bridge_port` if you add one, otherwise from the editor's own `GODOT_DEBUG_PORT` environment variable, otherwise `9333`. Keep it equal to the server's port. Set the environment variable `GODOT_MCP_NO_BRIDGE=1` for an editor that must not open the bridge at all; the server does this for the private editor it starts for the language server. Add the project setting `godot_mcp/verbose` = `true` to log every client connection in the editor's Output panel. Editor Play loads the running-game runtime unless `godot_mcp/runtime_on_play` is `false`.
 
 ## Security
 

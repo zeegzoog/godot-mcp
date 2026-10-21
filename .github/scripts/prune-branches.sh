@@ -18,6 +18,8 @@ repo="${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is not set}"
 owner="${repo%%/*}"
 dry_run="${DRY_RUN:-false}"
 only="${1:-}"
+stderr=$(mktemp)
+trap 'rm -f "$stderr"' EXIT
 
 default=$(gh api "repos/$repo" --jq .default_branch)
 
@@ -40,8 +42,16 @@ keep_reason() {
 }
 
 if [ -n "$only" ]; then
-    branches=$(gh api "repos/$repo/branches/$only" \
-        --jq '[.name, .commit.sha, .protected] | @tsv')
+    # The repository setting "Automatically delete head branches" may have removed it already.
+    if ! branches=$(gh api "repos/$repo/branches/$only" \
+        --jq '[.name, .commit.sha, .protected] | @tsv' 2> "$stderr"); then
+        if grep -q "Branch not found" "$stderr"; then
+            echo "gone    $only (already deleted)"
+            exit 0
+        fi
+        cat "$stderr" >&2
+        exit 1
+    fi
 else
     branches=$(gh api --paginate "repos/$repo/branches?per_page=100" \
         --jq '.[] | [.name, .commit.sha, .protected] | @tsv')

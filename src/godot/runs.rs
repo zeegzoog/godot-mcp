@@ -40,6 +40,10 @@ const RUNTIME_FILES: &[(&str, &str)] = &[
         include_str!("../../addons/godot_mcp/runtime/ops/rt_live.gd"),
     ),
     (
+        "addons/godot_mcp/runtime/ops/rt_hold.gd",
+        include_str!("../../addons/godot_mcp/runtime/ops/rt_hold.gd"),
+    ),
+    (
         "addons/godot_mcp/runtime/ops/rt_input.gd",
         include_str!("../../addons/godot_mcp/runtime/ops/rt_input.gd"),
     ),
@@ -105,6 +109,8 @@ pub struct Run {
     child: Mutex<Option<Child>>,
     hello: Mutex<Option<Value>>,
     running: AtomicBool,
+    /// Whether the game last said it is held (or was started held).
+    held: AtomicBool,
     exit_code: Mutex<Option<i32>>,
     override_state: OverrideState,
     restored: AtomicBool,
@@ -130,6 +136,7 @@ impl GameHub {
         breakpoints: &[String],
         headless: bool,
         break_on_errors: bool,
+        held: bool,
     ) -> Result<RunInfo> {
         let id = Uuid::new_v4().simple().to_string();
         let id = id[..8].to_string();
@@ -161,6 +168,7 @@ impl GameHub {
             child: Mutex::new(None),
             hello: Mutex::new(None),
             running: AtomicBool::new(true),
+            held: AtomicBool::new(held),
             exit_code: Mutex::new(None),
             override_state,
             restored: AtomicBool::new(false),
@@ -178,6 +186,16 @@ impl GameHub {
         }
         if let Some(scene) = scene {
             command.arg("--scene").arg(scene);
+        }
+        if held {
+            // Exact steps need one frame per tick, so the engine's frame rate is fixed to the tick
+            // rate and the runtime is told both. Only integers reach the command line.
+            let rate = physics_tick_rate(project);
+            command.arg("--fixed-fps").arg(rate.to_string());
+            command
+                .arg("--")
+                .arg(format!("--godot-mcp-fixed-fps={rate}"))
+                .arg("--godot-mcp-hold");
         }
         command
             .stdin(Stdio::null())
@@ -307,6 +325,15 @@ impl Run {
         self.running.load(Ordering::Acquire)
     }
 
+    /// Whether the game last reported that it is held.
+    pub fn is_held(&self) -> bool {
+        self.held.load(Ordering::Acquire)
+    }
+
+    pub fn set_held(&self, held: bool) {
+        self.held.store(held, Ordering::Release);
+    }
+
     fn summary(&self) -> Value {
         json!({
             "run_id": self.id,
@@ -315,6 +342,7 @@ impl Run {
             "scene": self.scene,
             "headless": self.headless,
             "running": self.is_alive(),
+            "held": self.is_held(),
             "debugger_connected": self.session.is_connected(),
             "exit_code": lock(&self.exit_code).clone(),
             "stopped": self.debug.stop().map(|stop| json!({
@@ -492,6 +520,36 @@ impl Run {
         *lock(&self.exit_code) = Some(code.unwrap_or(-1));
         self.restore();
     }
+}
+
+const DEFAULT_TICK_RATE: u32 = 60;
+
+/// The project's physics tick rate, as its settings file stores it; the engine's default when the
+/// file does not set a usable one.
+fn physics_tick_rate(project: &Path) -> u32 {
+    let Ok(text) = std::fs::read_to_string(project.join("project.godot")) else {
+        return DEFAULT_TICK_RATE;
+    };
+    let mut in_physics = false;
+    for line in text.lines().map(str::trim) {
+        if let Some(name) = line
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
+            in_physics = name == "physics";
+        } else if let Some(value) = line
+            .strip_prefix("common/physics_ticks_per_second=")
+            .filter(|_| in_physics)
+        {
+            return value
+                .trim()
+                .parse::<u32>()
+                .ok()
+                .filter(|rate| (1..=1000).contains(rate))
+                .unwrap_or(DEFAULT_TICK_RATE);
+        }
+    }
+    DEFAULT_TICK_RATE
 }
 
 fn spawn_log_task(run: Arc<Run>) {
@@ -783,7 +841,9 @@ impl Drop for GameHub {
 
 #[cfg(test)]
 mod tests {
-    use super::{RUNTIME_FILES, ensure_runtime, inject_override, restore_override};
+    use super::{
+        RUNTIME_FILES, ensure_runtime, inject_override, physics_tick_rate, restore_override,
+    };
     use std::path::Path;
     use std::time::{Duration, SystemTime};
 
@@ -796,6 +856,41 @@ mod tests {
     fn write(path: &Path, text: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn the_tick_rate_comes_from_the_physics_section_or_defaults_to_sixty() {
+        let rate = |text: &str| {
+            let project = tempfile::tempdir().unwrap();
+            std::fs::write(project.path().join("project.godot"), text).unwrap();
+            physics_tick_rate(project.path())
+        };
+        assert_eq!(rate("config_version=5\n"), 60);
+        assert_eq!(
+            rate("[physics]\n\ncommon/physics_ticks_per_second=30\n"),
+            30
+        );
+        assert_eq!(
+            rate("[physics]\n\ncommon/physics_ticks_per_second = 30\n"),
+            60,
+            "only the form the editor writes is read"
+        );
+        assert_eq!(
+            rate("[display]\n\ncommon/physics_ticks_per_second=30\n"),
+            60,
+            "a key in another section is not the setting"
+        );
+        for unusable in ["0", "-5", "abc", "30.5", "100000"] {
+            assert_eq!(
+                rate(&format!(
+                    "[physics]\n\ncommon/physics_ticks_per_second={unusable}\n"
+                )),
+                60,
+                "{unusable}"
+            );
+        }
+        let missing = tempfile::tempdir().unwrap();
+        assert_eq!(physics_tick_rate(missing.path()), 60);
     }
 
     #[test]

@@ -90,6 +90,7 @@ Before submitting or committing changes, agents must execute and pass the comple
    godot --headless --check-only --path . --script addons/godot_mcp/editor/game_relay.gd
    godot --headless --check-only --path . --script addons/godot_mcp/core/runtime_override.gd
    godot --headless --check-only --path . --script addons/godot_mcp/runtime/mcp_runtime.gd
+   godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_hold.gd
    godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_input.gd
    godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_live.gd
    godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_output.gd
@@ -133,6 +134,7 @@ When interacting with a Godot project, agents must adhere to the following workf
    - Read logs and errors with `godot_run_output`. Inspect the live tree with `godot_game_tree` before `godot_game_set` or `godot_game_call`.
    - Capture the game with `godot_game_screenshot`. A headless game returns an error and no image; do not treat that error as a picture.
    - `godot_game_call` runs only a method named in `permit`.
+   - To act, advance a known amount and look, hold the game with `godot_game_physics` (`hold`, then `step`, `resume`), starting it with `godot_run_project` `held: true` when the steps must be exact. Check `deterministic` in the answers. A held game refuses waits, signal watches, screenshot sheets and timed input; step instead. Resume or stop the run when done: a held game does not advance on its own.
 
 5. **Feedback to the Maintainers**:
    - When godot-mcp itself blocks or misleads you (a tool fails for a reason its message does not explain, a needed capability has no tool, a description or schema is wrong), record it with `godot_note_feedback` in English: what you tried, what came back, what you expected, one problem per note. Do not note your own mistakes or problems in the user's project.

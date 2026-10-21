@@ -4,6 +4,7 @@ extends RefCounted
 ## and it is not on the denylist (no eval, no quit, no trampoline through call/rpc).
 
 const R := preload("rt_result.gd")
+const Hold := preload("rt_hold.gd")
 const DENY: Array[String] = [
     "quit", "set_script", "call", "callv", "call_deferred", "rpc", "rpc_id", "free",
 ]
@@ -250,6 +251,7 @@ const MAX_PHYSICS_TICKS := 120
 
 static var _physics_saved: Dictionary = {}
 static var _physics_stepping := false
+static var _paused_by_step := false
 
 
 static func restore_physics(rt: Node) -> void:
@@ -261,12 +263,29 @@ static func restore_physics(rt: Node) -> void:
 
 static func physics(rt: Node, params: Dictionary) -> Dictionary:
     var action := str(params.get("action", "step")).strip_edges()
+    if action == "hold":
+        # Held ticks must reach pausable nodes, so a pause the pause-based step left is cleared.
+        if _paused_by_step:
+            rt.get_tree().paused = false
+            _paused_by_step = false
+        return Hold.begin(rt)
     if action == "status":
         return R.ok(_physics_status(rt))
+    if Hold.is_armed():
+        if action == "resume":
+            Hold.release(rt)
+            var released := _physics_status(rt)
+            released["action"] = "resume"
+            return R.ok(released)
+        if action == "step":
+            return Hold.step(rt, params)
+    elif action == "step" and params.has("until"):
+        return R.err(R.BAD_PARAMS, "until needs a held game. Hold it first with action \"hold\".")
     if action == "resume":
         if _physics_stepping:
             return R.err(R.BAD_PARAMS, "A physics step is still running.")
         rt.get_tree().paused = false
+        _paused_by_step = false
         var resumed := _physics_status(rt)
         resumed["action"] = "resume"
         return R.ok(resumed)
@@ -311,6 +330,7 @@ static func _apply_physics_saved(rt: Node, pause_after: bool) -> void:
         Engine.max_physics_steps_per_frame = int(saved["max_steps"])
     if rt.get_tree() != null:
         rt.get_tree().paused = true if pause_after else bool(saved.get("paused", true))
+        _paused_by_step = pause_after
 
 
 static func _tick_physics(rt: Node, state: Dictionary) -> bool:
@@ -342,7 +362,9 @@ static func _physics_body(rt: Node, wanted: int, advanced: int) -> Dictionary:
 
 
 static func _physics_status(rt: Node) -> Dictionary:
-    return {
+    var body := {
+        "held": Hold.is_held(),
+        "total_ticks": Hold.total_ticks(),
         "paused": rt.get_tree().paused,
         "stepping": _physics_stepping,
         "time_scale": Engine.time_scale,
@@ -351,6 +373,8 @@ static func _physics_status(rt: Node) -> Dictionary:
         "scene": rt.scene_context(),
         "limits": _physics_limits(),
     }
+    body.merge(Hold.exactness())
+    return body
 
 
 static func _physics_limits() -> Dictionary:

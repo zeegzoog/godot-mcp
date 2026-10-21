@@ -1475,3 +1475,1130 @@ async fn windowed_screenshot_returns_a_sheet_and_a_diff() {
     let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
     assert!(!stopped.is_error, "{}", text_of(&stopped));
 }
+
+/// The script of the hold fixture's root node.
+const HOLD_SCRIPT: &str = r#"extends Node2D
+var physics_ticks := 0
+var process_frames := 0
+var timer_fires := 0
+var trace: Array = []
+
+func _ready() -> void:
+    var timer := Timer.new()
+    timer.wait_time = 0.02
+    timer.autostart = true
+    timer.timeout.connect(_on_timer)
+    add_child(timer)
+
+func _on_timer() -> void:
+    timer_fires += 1
+
+func _process(_delta: float) -> void:
+    process_frames += 1
+    queue_redraw()
+
+func _physics_process(_delta: float) -> void:
+    physics_ticks += 1
+    trace.append([physics_ticks, Input.is_key_pressed(KEY_SPACE), Input.is_action_just_pressed("ui_accept")])
+
+func _draw() -> void:
+    draw_rect(Rect2(float(process_frames % 20) * 40.0, 8, 24, 24), Color(1, 0, 0))
+
+func set_tick_rate(rate: int) -> void:
+    Engine.physics_ticks_per_second = rate
+
+func trace_log() -> Array:
+    return trace
+
+func clear_trace() -> void:
+    trace = []
+
+func counters() -> Dictionary:
+    var always := get_node_or_null("Always")
+    return {
+        "space_down": Input.is_key_pressed(KEY_SPACE),
+        "physics_ticks": physics_ticks,
+        "process_frames": process_frames,
+        "timer_fires": timer_fires,
+        "always_frames": always.frames if always != null else -1,
+        "engine_physics_frames": Engine.get_physics_frames(),
+        "engine_process_frames": Engine.get_process_frames(),
+        "paused": get_tree().paused,
+    }
+"#;
+
+/// The 1-based line of the first line of the hold fixture's script that has `needle` in it.
+fn hold_script_line(needle: &str) -> usize {
+    HOLD_SCRIPT
+        .lines()
+        .position(|line| line.contains(needle))
+        .map(|index| index + 1)
+        .unwrap_or_else(|| panic!("no line with {needle}"))
+}
+
+/// A game with counters for every kind of time: physics ticks, process frames, a timer and a
+/// node that keeps running while the tree is paused.
+fn hold_project() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("project");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("scenes")).unwrap();
+    std::fs::create_dir_all(root.join("scripts")).unwrap();
+    std::fs::write(
+        root.join("project.godot"),
+        "config_version=5\n\n[application]\n\nconfig/name=\"HoldProbe\"\nrun/main_scene=\"res://scenes/hold.tscn\"\nconfig/features=PackedStringArray(\"4.5\")\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("scripts/hold.gd"), HOLD_SCRIPT).unwrap();
+    std::fs::write(
+        root.join("scripts/always.gd"),
+        "extends Node\nvar frames := 0\nfunc _ready() -> void:\n\tprocess_mode = Node.PROCESS_MODE_ALWAYS\nfunc _process(_delta: float) -> void:\n\tframes += 1\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("scenes/hold.tscn"),
+        "[gd_scene load_steps=3 format=3]\n\n[ext_resource type=\"Script\" path=\"res://scripts/hold.gd\" id=\"1\"]\n[ext_resource type=\"Script\" path=\"res://scripts/always.gd\" id=\"2\"]\n\n[node name=\"Hold\" type=\"Node2D\"]\nscript = ExtResource(\"1\")\n\n[node name=\"Always\" type=\"Node\" parent=\".\"]\nscript = ExtResource(\"2\")\n",
+    )
+    .unwrap();
+    dir
+}
+
+async fn start_hold(headless: bool) -> (tempfile::TempDir, Arc<ToolManager>, String) {
+    let project = hold_project();
+    let tools = manager(project.path());
+    let started = call(
+        &tools,
+        "godot_run_project",
+        json!({
+            "project_path": project.path(),
+            "scene": "res://scenes/hold.tscn",
+            "mode": "process",
+            "headless": headless
+        }),
+    )
+    .await;
+    assert!(!started.is_error, "{}", text_of(&started));
+    let run_id = run_id_of(&started);
+    (project, tools, run_id)
+}
+
+async fn counters(tools: &Arc<ToolManager>, run_id: &str) -> Value {
+    let reply = call(
+        tools,
+        "godot_game_call",
+        json!({"run_id": run_id, "path": ".", "method": "counters", "permit": ["counters"]}),
+    )
+    .await;
+    assert!(!reply.is_error, "{}", text_of(&reply));
+    call_value(&json_of(&reply))
+}
+
+async fn process_run(tools: &Arc<ToolManager>, run_id: &str) -> Value {
+    let status = json_of(&call(tools, "godot_get_run_status", json!({})).await);
+    status["process_runs"]
+        .as_array()
+        .and_then(|runs| runs.iter().find(|run| run["run_id"] == run_id))
+        .cloned()
+        .unwrap_or_else(|| panic!("no process run {run_id} in {status}"))
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn held_game_stands_still_serves_reads_and_resumes() {
+    let _ = IGNORE;
+    let (_project, tools, run_id) = start_hold(true).await;
+
+    let running = call(
+        &tools,
+        "godot_game_wait",
+        json!({"run_id": run_id, "frames": 5}),
+    )
+    .await;
+    assert!(!running.is_error, "{}", text_of(&running));
+    let free = counters(&tools, &run_id).await;
+    assert!(free["physics_ticks"].as_i64().unwrap_or(0) > 0, "{free}");
+
+    let held = call(
+        &tools,
+        "godot_game_physics",
+        json!({"run_id": run_id, "action": "hold"}),
+    )
+    .await;
+    assert!(!held.is_error, "{}", text_of(&held));
+    assert_eq!(json_of(&held)["held"], true, "{}", text_of(&held));
+
+    let first = counters(&tools, &run_id).await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let second = counters(&tools, &run_id).await;
+    for key in [
+        "physics_ticks",
+        "process_frames",
+        "timer_fires",
+        "always_frames",
+        "engine_physics_frames",
+        "engine_process_frames",
+    ] {
+        assert_eq!(
+            first[key], second[key],
+            "{key} advanced while the game was held: {first} -> {second}"
+        );
+    }
+    assert!(
+        first["physics_ticks"].as_i64().unwrap_or(0) >= free["physics_ticks"].as_i64().unwrap_or(0),
+        "{free} -> {first}"
+    );
+
+    let snapshot = call(&tools, "godot_game_snapshot", json!({"run_id": run_id})).await;
+    assert!(!snapshot.is_error, "{}", text_of(&snapshot));
+    let read = call(
+        &tools,
+        "godot_game_get",
+        json!({"run_id": run_id, "path": ".", "properties": ["physics_ticks"]}),
+    )
+    .await;
+    assert!(!read.is_error, "{}", text_of(&read));
+    assert_eq!(
+        counters(&tools, &run_id).await["physics_ticks"],
+        first["physics_ticks"]
+    );
+
+    let status = call(
+        &tools,
+        "godot_game_physics",
+        json!({"run_id": run_id, "action": "status"}),
+    )
+    .await;
+    assert!(!status.is_error, "{}", text_of(&status));
+    assert_eq!(json_of(&status)["held"], true, "{}", text_of(&status));
+
+    let resumed = call(
+        &tools,
+        "godot_game_physics",
+        json!({"run_id": run_id, "action": "resume"}),
+    )
+    .await;
+    assert!(!resumed.is_error, "{}", text_of(&resumed));
+    assert_eq!(json_of(&resumed)["held"], false, "{}", text_of(&resumed));
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let after = counters(&tools, &run_id).await;
+    for key in [
+        "physics_ticks",
+        "process_frames",
+        "timer_fires",
+        "always_frames",
+    ] {
+        assert!(
+            after[key].as_i64().unwrap_or(0) > second[key].as_i64().unwrap_or(0),
+            "{key} did not advance after resume: {second} -> {after}"
+        );
+    }
+
+    // A game that is held when the run is stopped ends with the run.
+    let held_again = call(
+        &tools,
+        "godot_game_physics",
+        json!({"run_id": run_id, "action": "hold"}),
+    )
+    .await;
+    assert!(!held_again.is_error, "{}", text_of(&held_again));
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+    assert_eq!(process_run(&tools, &run_id).await["running"], false);
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn held_game_refuses_what_needs_time_to_pass_and_stays_held() {
+    let _ = IGNORE;
+    let (_project, tools, run_id) = start_hold(true).await;
+    let held = call(
+        &tools,
+        "godot_game_physics",
+        json!({"run_id": run_id, "action": "hold"}),
+    )
+    .await;
+    assert!(!held.is_error, "{}", text_of(&held));
+
+    let started = std::time::Instant::now();
+    assert_error(
+        &call(
+            &tools,
+            "godot_game_wait",
+            json!({"run_id": run_id, "frames": 3}),
+        )
+        .await,
+        "held",
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "a refusal must not wait for time to pass"
+    );
+    // The game still answers and still holds after the refusal.
+    let before = counters(&tools, &run_id).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        counters(&tools, &run_id).await["engine_process_frames"],
+        before["engine_process_frames"]
+    );
+
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+}
+
+/// A person closing the window of a held game must end the run: the hold keeps the window
+/// responsive and hands the close request to the game, which quits as it normally would.
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn closing_the_window_of_a_held_game_ends_the_run() {
+    let _ = IGNORE;
+    let (_project, tools, run_id) = start_hold(false).await;
+    let held = call(
+        &tools,
+        "godot_game_physics",
+        json!({"run_id": run_id, "action": "hold"}),
+    )
+    .await;
+    assert!(!held.is_error, "{}", text_of(&held));
+    let pid = process_run(&tools, &run_id).await["pid"]
+        .as_u64()
+        .expect("pid");
+
+    let closed = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "if ((Get-Process -Id {pid}).CloseMainWindow()) {{ exit 0 }} else {{ exit 3 }}"
+            ),
+        ])
+        .status()
+        .expect("powershell");
+    assert!(closed.success(), "the game has no window to close");
+
+    let mut ended = false;
+    for _ in 0..50 {
+        if process_run(&tools, &run_id).await["running"] == false {
+            ended = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert!(ended, "the held game ignored its window being closed");
+}
+
+async fn held_step(tools: &Arc<ToolManager>, run_id: &str, extra: Value) -> ToolResult {
+    let mut args = json!({"run_id": run_id, "action": "step"});
+    if let (Some(base), Some(more)) = (args.as_object_mut(), extra.as_object()) {
+        for (key, value) in more {
+            base.insert(key.clone(), value.clone());
+        }
+    }
+    call(tools, "godot_game_physics", args).await
+}
+
+async fn hold_now(tools: &Arc<ToolManager>, run_id: &str) {
+    let held = call(
+        tools,
+        "godot_game_physics",
+        json!({"run_id": run_id, "action": "hold"}),
+    )
+    .await;
+    assert!(!held.is_error, "{}", text_of(&held));
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn held_step_runs_exactly_the_ticks_asked_and_reports_exactness() {
+    let _ = IGNORE;
+    let (_project, tools, run_id) = start_hold(true).await;
+    hold_now(&tools, &run_id).await;
+
+    let start = counters(&tools, &run_id).await;
+    let five = held_step(&tools, &run_id, json!({"ticks": 5})).await;
+    assert!(!five.is_error, "{}", text_of(&five));
+    let five_json = json_of(&five);
+    assert_eq!(five_json["ticks_run"], 5, "{five_json}");
+    assert_eq!(five_json["held"], true, "{five_json}");
+    // The pause-based step is not what ran: the game was never paused.
+    assert_eq!(five_json["paused"], false, "{five_json}");
+    let after_five = counters(&tools, &run_id).await;
+    let delta = |after: &Value, before: &Value, key: &str| {
+        after[key].as_i64().unwrap_or(-1) - before[key].as_i64().unwrap_or(-100)
+    };
+    assert_eq!(
+        delta(&after_five, &start, "physics_ticks"),
+        5,
+        "{start} -> {after_five}"
+    );
+    assert_eq!(delta(&after_five, &start, "engine_physics_frames"), 5);
+
+    // Two steps of 3 equal one of 6.
+    let a = held_step(&tools, &run_id, json!({"ticks": 3})).await;
+    let b = held_step(&tools, &run_id, json!({"ticks": 3})).await;
+    assert!(
+        !a.is_error && !b.is_error,
+        "{} {}",
+        text_of(&a),
+        text_of(&b)
+    );
+    let after_split = counters(&tools, &run_id).await;
+    let six = held_step(&tools, &run_id, json!({"ticks": 6})).await;
+    assert!(!six.is_error, "{}", text_of(&six));
+    let after_six = counters(&tools, &run_id).await;
+    assert_eq!(
+        delta(&after_split, &after_five, "physics_ticks"),
+        delta(&after_six, &after_split, "physics_ticks"),
+        "{after_five} -> {after_split} -> {after_six}"
+    );
+    assert_eq!(delta(&after_six, &after_split, "physics_ticks"), 6);
+
+    // A game that was not started held is never reported as exact.
+    let report = json_of(&six);
+    assert_eq!(report["deterministic"], false, "{report}");
+    assert_eq!(
+        report["deterministic_reason"], "not_started_held",
+        "{report}"
+    );
+    assert!(
+        report["total_ticks"].as_i64().unwrap_or(0) >= 14,
+        "total ticks count every held tick: {report}"
+    );
+
+    assert_error(
+        &held_step(&tools, &run_id, json!({"ticks": 0})).await,
+        "ticks",
+    );
+    assert_error(
+        &held_step(&tools, &run_id, json!({"ticks": 601})).await,
+        "ticks",
+    );
+    assert_error(&held_step(&tools, &run_id, json!({})).await, "ticks");
+    assert_error(
+        &held_step(&tools, &run_id, json!({"ticks": 2, "max": 5})).await,
+        "max",
+    );
+
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn held_step_stops_on_a_condition_and_is_bounded() {
+    let _ = IGNORE;
+    let (_project, tools, run_id) = start_hold(true).await;
+
+    // A condition needs a held game.
+    assert_error(
+        &held_step(
+            &tools,
+            &run_id,
+            json!({"until": {"node": ".", "property": "physics_ticks", "op": "gte", "value": 1}}),
+        )
+        .await,
+        "hold",
+    );
+
+    hold_now(&tools, &run_id).await;
+    let start = counters(&tools, &run_id).await;
+    let target = start["physics_ticks"].as_i64().unwrap_or(0) + 3;
+
+    let reached = held_step(
+        &tools,
+        &run_id,
+        json!({"until": {"node": ".", "property": "physics_ticks", "op": "gte", "value": target}, "max": 100}),
+    )
+    .await;
+    assert!(!reached.is_error, "{}", text_of(&reached));
+    let reached_json = json_of(&reached);
+    assert_eq!(reached_json["ticks_run"], 3, "{reached_json}");
+    assert_eq!(reached_json["until_met"], true, "{reached_json}");
+    assert_eq!(reached_json["held"], true, "{reached_json}");
+
+    // A condition that already holds runs no tick.
+    let already = held_step(
+        &tools,
+        &run_id,
+        json!({"until": {"node": ".", "property": "physics_ticks", "op": "gte", "value": target}}),
+    )
+    .await;
+    assert!(!already.is_error, "{}", text_of(&already));
+    assert_eq!(json_of(&already)["ticks_run"], 0, "{}", text_of(&already));
+    assert_eq!(
+        json_of(&already)["until_met"],
+        true,
+        "{}",
+        text_of(&already)
+    );
+
+    // A condition that never holds stops at the maximum.
+    let never = held_step(
+        &tools,
+        &run_id,
+        json!({"until": {"node": ".", "property": "physics_ticks", "op": "lt", "value": 0}, "max": 7}),
+    )
+    .await;
+    assert!(!never.is_error, "{}", text_of(&never));
+    assert_eq!(json_of(&never)["ticks_run"], 7, "{}", text_of(&never));
+    assert_eq!(json_of(&never)["until_met"], false, "{}", text_of(&never));
+
+    // A condition that cannot be read does not hold, and does not end the step early.
+    let missing = held_step(
+        &tools,
+        &run_id,
+        json!({"until": {"node": "Nowhere", "property": "physics_ticks", "op": "gte", "value": 1}, "max": 4}),
+    )
+    .await;
+    assert!(!missing.is_error, "{}", text_of(&missing));
+    assert_eq!(json_of(&missing)["ticks_run"], 4, "{}", text_of(&missing));
+    assert_eq!(
+        json_of(&missing)["until_met"],
+        false,
+        "{}",
+        text_of(&missing)
+    );
+
+    // Conditions that do not parse are refused before any tick runs.
+    let before = counters(&tools, &run_id).await;
+    for bad in [
+        json!({"node": ".", "property": "physics_ticks", "op": "zz", "value": 1}),
+        json!({"node": ".", "property": "physics_ticks", "op": "gte"}),
+        json!({"node": ".", "property": "_secret", "op": "exists"}),
+        json!({"property": "physics_ticks", "op": "exists"}),
+    ] {
+        let refused = held_step(&tools, &run_id, json!({"until": bad})).await;
+        assert!(refused.is_error, "{}", text_of(&refused));
+    }
+    assert_error(
+        &held_step(
+            &tools,
+            &run_id,
+            json!({"until": {"node": ".", "property": "physics_ticks", "op": "exists"}, "max": 3601}),
+        )
+        .await,
+        "max",
+    );
+    assert_error(
+        &held_step(
+            &tools,
+            &run_id,
+            json!({"ticks": 2, "until": {"node": ".", "property": "physics_ticks", "op": "exists"}}),
+        )
+        .await,
+        "max",
+    );
+    assert_eq!(
+        counters(&tools, &run_id).await["physics_ticks"],
+        before["physics_ticks"],
+        "a refused step ran a tick"
+    );
+
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn a_hold_clears_the_pause_the_pause_based_step_left() {
+    let _ = IGNORE;
+    let (_project, tools, run_id) = start_hold(true).await;
+    let paused = call(
+        &tools,
+        "godot_game_physics",
+        json!({"run_id": run_id, "action": "step", "ticks": 2}),
+    )
+    .await;
+    assert!(!paused.is_error, "{}", text_of(&paused));
+    assert_eq!(json_of(&paused)["paused"], true, "{}", text_of(&paused));
+
+    hold_now(&tools, &run_id).await;
+    let start = counters(&tools, &run_id).await;
+    assert_eq!(start["paused"], false, "{start}");
+    let stepped = held_step(&tools, &run_id, json!({"ticks": 3})).await;
+    assert!(!stepped.is_error, "{}", text_of(&stepped));
+    let after = counters(&tools, &run_id).await;
+    assert_eq!(
+        after["physics_ticks"].as_i64().unwrap_or(0) - start["physics_ticks"].as_i64().unwrap_or(0),
+        3
+    );
+
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn held_game_refuses_every_operation_that_needs_time_and_serves_the_rest() {
+    let _ = IGNORE;
+    let (_project, tools, run_id) = start_hold(true).await;
+    hold_now(&tools, &run_id).await;
+    let start = counters(&tools, &run_id).await;
+
+    let refused: Vec<(&str, Value)> = vec![
+        ("godot_game_wait", json!({"frames": 3})),
+        (
+            "godot_game_wait",
+            json!({"node": ".", "property": "physics_ticks", "op": "gte", "value": 1}),
+        ),
+        (
+            "godot_game_observe",
+            json!({"path": ".", "signals": ["ready"], "frames": 3}),
+        ),
+        ("godot_game_screenshot", json!({"frames": 2})),
+        ("godot_game_screenshot", json!({"camera": "Camera"})),
+        (
+            "godot_game_input",
+            json!({"steps": [{"type": "wait", "frames": 2}]}),
+        ),
+        (
+            "godot_game_input",
+            json!({"steps": [{"type": "text", "text": "hi"}]}),
+        ),
+        (
+            "godot_game_input",
+            json!({"steps": [{"type": "swipe", "x": 1, "y": 1, "to_x": 5, "to_y": 5}]}),
+        ),
+    ];
+    for (tool, extra) in refused {
+        let mut args = json!({"run_id": run_id});
+        for (key, value) in extra.as_object().expect("object") {
+            args[key] = value.clone();
+        }
+        let started = std::time::Instant::now();
+        let result = call(&tools, tool, args.clone()).await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{tool} {args} waited for time that cannot pass"
+        );
+        assert_error(&result, "godot_game_physics");
+        assert_error(&result, "held");
+    }
+
+    // The refusals ran no tick and the game still answers.
+    let after = counters(&tools, &run_id).await;
+    assert_eq!(
+        after["engine_process_frames"],
+        start["engine_process_frames"]
+    );
+    assert_eq!(after["physics_ticks"], start["physics_ticks"]);
+
+    // What finishes at once is served.
+    let set = call(
+        &tools,
+        "godot_game_set",
+        json!({"run_id": run_id, "path": ".", "properties": {"timer_fires": 1000}}),
+    )
+    .await;
+    assert!(!set.is_error, "{}", text_of(&set));
+    assert_eq!(counters(&tools, &run_id).await["timer_fires"], 1000);
+    for tool in ["godot_game_tree", "godot_game_snapshot", "godot_run_output"] {
+        let served = call(&tools, tool, json!({"run_id": run_id})).await;
+        assert!(!served.is_error, "{tool}: {}", text_of(&served));
+    }
+    let signals = call(
+        &tools,
+        "godot_game_signals",
+        json!({"run_id": run_id, "path": "."}),
+    )
+    .await;
+    assert!(!signals.is_error, "{}", text_of(&signals));
+
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn held_windowed_game_captures_the_last_drawn_frame() {
+    let _ = IGNORE;
+    if !windowed_game_can_open() {
+        eprintln!("skipped: a windowed capture needs a display server");
+        return;
+    }
+    let (_project, tools, run_id) = start_hold(false).await;
+    hold_now(&tools, &run_id).await;
+
+    let first = call(
+        &tools,
+        "godot_game_screenshot",
+        json!({"run_id": run_id, "max_dimension": 128}),
+    )
+    .await;
+    assert!(!first.is_error, "{}", text_of(&first));
+    assert!(
+        first.content.iter().any(|item| matches!(
+            item,
+            godot_mcp::protocol::ToolContent::Image { mime_type, .. } if mime_type == "image/png"
+        )),
+        "a held capture returned no PNG: {}",
+        text_of(&first)
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let second = call(
+        &tools,
+        "godot_game_screenshot",
+        json!({"run_id": run_id, "max_dimension": 128}),
+    )
+    .await;
+    assert!(!second.is_error, "{}", text_of(&second));
+    assert!(
+        text_of(&second).contains("changed 0 px"),
+        "a held game drew something new: {}",
+        text_of(&second)
+    );
+
+    let stepped = held_step(&tools, &run_id, json!({"ticks": 3})).await;
+    assert!(!stepped.is_error, "{}", text_of(&stepped));
+    let third = call(
+        &tools,
+        "godot_game_screenshot",
+        json!({"run_id": run_id, "max_dimension": 128}),
+    )
+    .await;
+    assert!(!third.is_error, "{}", text_of(&third));
+    assert!(
+        !text_of(&third).contains("changed 0 px"),
+        "three held ticks changed nothing on screen: {}",
+        text_of(&third)
+    );
+
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+}
+
+async fn game_method(tools: &Arc<ToolManager>, run_id: &str, method: &str) -> Value {
+    let reply = call(
+        tools,
+        "godot_game_call",
+        json!({"run_id": run_id, "path": ".", "method": method, "permit": [method]}),
+    )
+    .await;
+    assert!(!reply.is_error, "{}", text_of(&reply));
+    call_value(&json_of(&reply))
+}
+
+/// Per physics tick since the last clear: whether Space is down and whether the action it is
+/// bound to counts as just pressed.
+async fn key_trace(tools: &Arc<ToolManager>, run_id: &str) -> (Vec<bool>, Vec<bool>) {
+    let rows = game_method(tools, run_id, "trace_log").await;
+    let rows = rows.as_array().expect("trace rows").clone();
+    (
+        rows.iter().map(|row| row[1] == true).collect(),
+        rows.iter().map(|row| row[2] == true).collect(),
+    )
+}
+
+async fn tap_space(tools: &Arc<ToolManager>, run_id: &str, extra: Value) -> ToolResult {
+    let mut args = json!({
+        "run_id": run_id,
+        "steps": [{"type": "key", "key": "Space", "phase": "tap"}]
+    });
+    if let (Some(base), Some(more)) = (args.as_object_mut(), extra.as_object()) {
+        for (key, value) in more {
+            base.insert(key.clone(), value.clone());
+        }
+    }
+    call(tools, "godot_game_input", args).await
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn held_tap_lasts_its_ticks_whatever_the_step_sizes() {
+    let _ = IGNORE;
+    let (_project, tools, run_id) = start_hold(true).await;
+    hold_now(&tools, &run_id).await;
+
+    // One tick at a time.
+    game_method(&tools, &run_id, "clear_trace").await;
+    let tapped = tap_space(&tools, &run_id, json!({})).await;
+    assert!(!tapped.is_error, "{}", text_of(&tapped));
+    assert_eq!(json_of(&tapped)["hold_ticks"], 2, "{}", text_of(&tapped));
+    for _ in 0..6 {
+        let stepped = held_step(&tools, &run_id, json!({"ticks": 1})).await;
+        assert!(!stepped.is_error, "{}", text_of(&stepped));
+    }
+    let (down_split, just_split) = key_trace(&tools, &run_id).await;
+
+    // The same tap, one step.
+    game_method(&tools, &run_id, "clear_trace").await;
+    let tapped = tap_space(&tools, &run_id, json!({})).await;
+    assert!(!tapped.is_error, "{}", text_of(&tapped));
+    let stepped = held_step(&tools, &run_id, json!({"ticks": 6})).await;
+    assert!(!stepped.is_error, "{}", text_of(&stepped));
+    let (down_whole, just_whole) = key_trace(&tools, &run_id).await;
+
+    assert_eq!(
+        down_split, down_whole,
+        "splitting a step changed what the game saw"
+    );
+    assert_eq!(
+        just_split, just_whole,
+        "splitting a step changed what the game saw"
+    );
+    // Measured on a real engine: a press made at the hold point is down from the first tick that
+    // follows, but the engine reports it as just pressed on the second one.
+    assert_eq!(
+        just_whole,
+        vec![false, true, false, false, false, false],
+        "when a press becomes just pressed changed"
+    );
+    assert_eq!(
+        down_whole,
+        vec![true, true, false, false, false, false],
+        "a tap is down for its hold ticks"
+    );
+
+    // A longer tap.
+    game_method(&tools, &run_id, "clear_trace").await;
+    let tapped = tap_space(&tools, &run_id, json!({"hold_ticks": 4})).await;
+    assert!(!tapped.is_error, "{}", text_of(&tapped));
+    held_step(&tools, &run_id, json!({"ticks": 6})).await;
+    let (down_long, _) = key_trace(&tools, &run_id).await;
+    assert_eq!(down_long, vec![true, true, true, true, false, false]);
+
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn held_input_is_released_when_asked_and_when_the_hold_ends() {
+    let _ = IGNORE;
+    let (_project, tools, run_id) = start_hold(true).await;
+    hold_now(&tools, &run_id).await;
+
+    // An explicit release also cancels the release a tap scheduled, so the scheduled one cannot
+    // lift a later press.
+    let tapped = tap_space(&tools, &run_id, json!({"hold_ticks": 5})).await;
+    assert!(!tapped.is_error, "{}", text_of(&tapped));
+    let released = call(
+        &tools,
+        "godot_game_input_release",
+        json!({"run_id": run_id}),
+    )
+    .await;
+    assert!(!released.is_error, "{}", text_of(&released));
+    assert_eq!(counters(&tools, &run_id).await["space_down"], false);
+    game_method(&tools, &run_id, "clear_trace").await;
+    let pressed = call(
+        &tools,
+        "godot_game_input",
+        json!({"run_id": run_id, "steps": [{"type": "key", "key": "Space", "phase": "press"}]}),
+    )
+    .await;
+    assert!(!pressed.is_error, "{}", text_of(&pressed));
+    held_step(&tools, &run_id, json!({"ticks": 7})).await;
+    let (down, _) = key_trace(&tools, &run_id).await;
+    assert_eq!(
+        down,
+        vec![true; 7],
+        "a cancelled release lifted a later press"
+    );
+
+    // Leaving the hold lets go of what is still held.
+    let resumed = call(
+        &tools,
+        "godot_game_physics",
+        json!({"run_id": run_id, "action": "resume"}),
+    )
+    .await;
+    assert!(!resumed.is_error, "{}", text_of(&resumed));
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(counters(&tools, &run_id).await["space_down"], false);
+
+    // What finishes at once is accepted; what needs a frame is refused before anything is applied.
+    hold_now(&tools, &run_id).await;
+    let instant = call(
+        &tools,
+        "godot_game_input",
+        json!({"run_id": run_id, "steps": [
+            {"type": "mouse_move", "x": 5, "y": 5},
+            {"type": "joy_axis", "axis": "left_x", "value": 0.5},
+            {"type": "click", "x": 3, "y": 4},
+            {"type": "time_scale", "scale": 1},
+            {"type": "joy_button", "button": "a", "phase": "tap"}
+        ]}),
+    )
+    .await;
+    assert!(!instant.is_error, "{}", text_of(&instant));
+    assert_eq!(
+        json_of(&instant)["steps"].as_array().map(Vec::len),
+        Some(5),
+        "{}",
+        text_of(&instant)
+    );
+    for bad in [json!({"hold_ticks": 0}), json!({"hold_ticks": 601})] {
+        assert_error(&tap_space(&tools, &run_id, bad).await, "hold_ticks");
+    }
+    assert_error(
+        &call(
+            &tools,
+            "godot_game_input",
+            json!({"run_id": run_id, "steps": [
+                {"type": "key", "key": "Space", "phase": "press"},
+                {"type": "wait", "frames": 1}
+            ]}),
+        )
+        .await,
+        "godot_game_physics",
+    );
+    assert_eq!(
+        counters(&tools, &run_id).await["space_down"],
+        false,
+        "a refused call applied the steps before it"
+    );
+
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn a_held_launch_steps_exactly_and_the_server_knows_it_is_held() {
+    let _ = IGNORE;
+    let project = hold_project();
+    let tools = manager(project.path());
+    let started = call(
+        &tools,
+        "godot_run_project",
+        json!({
+            "project_path": project.path(),
+            "scene": "res://scenes/hold.tscn",
+            "mode": "process",
+            "headless": true,
+            "held": true
+        }),
+    )
+    .await;
+    assert!(!started.is_error, "{}", text_of(&started));
+    let run_id = run_id_of(&started);
+    assert_eq!(process_run(&tools, &run_id).await["held"], true);
+
+    // The game is held from its first tick, before anything asked for it.
+    let status = call(
+        &tools,
+        "godot_game_physics",
+        json!({"run_id": run_id, "action": "status"}),
+    )
+    .await;
+    assert!(!status.is_error, "{}", text_of(&status));
+    let status_json = json_of(&status);
+    assert_eq!(status_json["held"], true, "{status_json}");
+    assert_eq!(status_json["deterministic"], true, "{status_json}");
+    assert_eq!(status_json["deterministic_reason"], "", "{status_json}");
+    let first = counters(&tools, &run_id).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        counters(&tools, &run_id).await["engine_process_frames"],
+        first["engine_process_frames"],
+        "a game started held ran"
+    );
+
+    let ten = held_step(&tools, &run_id, json!({"ticks": 10})).await;
+    assert!(!ten.is_error, "{}", text_of(&ten));
+    let ten_json = json_of(&ten);
+    assert_eq!(ten_json["ticks_run"], 10, "{ten_json}");
+    assert_eq!(ten_json["frames_advanced"], 10, "{ten_json}");
+    assert_eq!(ten_json["deterministic"], true, "{ten_json}");
+    assert_eq!(ten_json["deterministic_reason"], "", "{ten_json}");
+    let after = counters(&tools, &run_id).await;
+    let delta = |key: &str| after[key].as_i64().unwrap_or(-1) - first[key].as_i64().unwrap_or(-100);
+    assert_eq!(delta("physics_ticks"), 10, "{first} -> {after}");
+    assert_eq!(delta("engine_process_frames"), 10, "{first} -> {after}");
+    assert_eq!(delta("engine_physics_frames"), 10, "{first} -> {after}");
+
+    // A game that is already still has nothing to pause.
+    let pause = call(
+        &tools,
+        "godot_debug_control",
+        json!({"run_id": run_id, "action": "pause"}),
+    )
+    .await;
+    assert_error(&pause, "held");
+
+    let resumed = call(
+        &tools,
+        "godot_game_physics",
+        json!({"run_id": run_id, "action": "resume"}),
+    )
+    .await;
+    assert!(!resumed.is_error, "{}", text_of(&resumed));
+    assert_eq!(process_run(&tools, &run_id).await["held"], false);
+
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+}
+
+async fn start_held_launch(
+    breakpoints: &[String],
+) -> (tempfile::TempDir, Arc<ToolManager>, String) {
+    let project = hold_project();
+    let tools = manager(project.path());
+    let started = call(
+        &tools,
+        "godot_run_project",
+        json!({
+            "project_path": project.path(),
+            "scene": "res://scenes/hold.tscn",
+            "mode": "process",
+            "headless": true,
+            "held": true,
+            "breakpoints": breakpoints
+        }),
+    )
+    .await;
+    assert!(!started.is_error, "{}", text_of(&started));
+    let run_id = run_id_of(&started);
+    (project, tools, run_id)
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn exactness_is_withdrawn_when_frames_stop_following_ticks_and_stays_withdrawn() {
+    let _ = IGNORE;
+    let (_project, tools, run_id) = start_held_launch(&[]).await;
+
+    let exact = held_step(&tools, &run_id, json!({"ticks": 3})).await;
+    assert_eq!(
+        json_of(&exact)["deterministic"],
+        true,
+        "{}",
+        text_of(&exact)
+    );
+
+    // A game that runs two ticks in a frame: its tick rate is doubled for one step.
+    let doubled = call(
+        &tools,
+        "godot_game_call",
+        json!({"run_id": run_id, "path": ".", "method": "set_tick_rate", "args": [120], "permit": ["set_tick_rate"]}),
+    )
+    .await;
+    assert!(!doubled.is_error, "{}", text_of(&doubled));
+    let uneven = held_step(&tools, &run_id, json!({"ticks": 4})).await;
+    assert!(!uneven.is_error, "{}", text_of(&uneven));
+    let uneven_json = json_of(&uneven);
+    assert_eq!(uneven_json["ticks_run"], 4, "{uneven_json}");
+    assert_ne!(uneven_json["frames_advanced"], 4, "{uneven_json}");
+    assert_eq!(uneven_json["deterministic"], false, "{uneven_json}");
+
+    // Back at the declared rate, the claim is still not given back.
+    let normal = call(
+        &tools,
+        "godot_game_call",
+        json!({"run_id": run_id, "path": ".", "method": "set_tick_rate", "args": [60], "permit": ["set_tick_rate"]}),
+    )
+    .await;
+    assert!(!normal.is_error, "{}", text_of(&normal));
+    let after = held_step(&tools, &run_id, json!({"ticks": 3})).await;
+    assert_eq!(
+        json_of(&after)["deterministic"],
+        false,
+        "{}",
+        text_of(&after)
+    );
+    assert_eq!(
+        json_of(&after)["deterministic_reason"],
+        "frames_did_not_follow_ticks",
+        "{}",
+        text_of(&after)
+    );
+
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn exactness_is_withdrawn_when_the_game_changes_its_tick_rate() {
+    let _ = IGNORE;
+    let (_project, tools, run_id) = start_held_launch(&[]).await;
+    let exact = call(
+        &tools,
+        "godot_game_physics",
+        json!({"run_id": run_id, "action": "status"}),
+    )
+    .await;
+    assert_eq!(
+        json_of(&exact)["deterministic"],
+        true,
+        "{}",
+        text_of(&exact)
+    );
+
+    let changed = call(
+        &tools,
+        "godot_game_call",
+        json!({"run_id": run_id, "path": ".", "method": "set_tick_rate", "args": [30], "permit": ["set_tick_rate"]}),
+    )
+    .await;
+    assert!(!changed.is_error, "{}", text_of(&changed));
+    let status = call(
+        &tools,
+        "godot_game_physics",
+        json!({"run_id": run_id, "action": "status"}),
+    )
+    .await;
+    let status_json = json_of(&status);
+    assert_eq!(status_json["deterministic"], false, "{status_json}");
+    assert_eq!(
+        status_json["deterministic_reason"], "fixed_rate_differs",
+        "{status_json}"
+    );
+
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn a_breakpoint_hit_during_a_held_step_stops_the_game_as_usual() {
+    let _ = IGNORE;
+    let line = hold_script_line("physics_ticks += 1");
+    let (_project, tools, run_id) =
+        start_held_launch(&[format!("res://scripts/hold.gd:{line}")]).await;
+
+    let stepping = {
+        let tools = Arc::clone(&tools);
+        let run_id = run_id.clone();
+        tokio::spawn(async move { held_step(&tools, &run_id, json!({"ticks": 3})).await })
+    };
+    let mut stopped_at_breakpoint = false;
+    for _ in 0..100 {
+        let state = json_of(&call(&tools, "godot_debug_state", json!({"run_id": run_id})).await);
+        if state["stopped"] == true {
+            stopped_at_breakpoint = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(stopped_at_breakpoint, "the breakpoint was not hit");
+
+    // The game stops at the breakpoint on every tick of the step; letting it go each time
+    // finishes the step.
+    let mut hits = 0;
+    for _ in 0..100 {
+        if stepping.is_finished() {
+            break;
+        }
+        let state = json_of(&call(&tools, "godot_debug_state", json!({"run_id": run_id})).await);
+        if state["stopped"] == true {
+            let resumed = call(
+                &tools,
+                "godot_debug_control",
+                json!({"run_id": run_id, "action": "resume"}),
+            )
+            .await;
+            assert!(!resumed.is_error, "{}", text_of(&resumed));
+            hits += 1;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(hits >= 1, "the step never stopped at the breakpoint");
+    let finished = stepping.await.expect("step task");
+    assert!(!finished.is_error, "{}", text_of(&finished));
+    assert_eq!(json_of(&finished)["ticks_run"], 3, "{}", text_of(&finished));
+    assert_eq!(json_of(&finished)["held"], true, "{}", text_of(&finished));
+
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+}

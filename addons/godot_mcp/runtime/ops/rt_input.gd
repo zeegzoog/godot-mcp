@@ -37,6 +37,7 @@ static var _touches: Dictionary = {}
 static var _mouse_pos := Vector2.ZERO
 static var _warp_mouse := false
 static var _saved_time_scale := -1.0
+static var _scheduled: Array = []
 
 
 static func methods() -> Dictionary:
@@ -48,6 +49,15 @@ static func methods() -> Dictionary:
 
 
 static func run_steps(rt: Node, params: Dictionary) -> Dictionary:
+    var parsed := parse_steps(params)
+    if R.is_err(parsed):
+        return parsed
+    var state := {"steps": parsed["steps"], "index": 0, "mode": "lead", "results": [], "hold": 0, "release": {}}
+    return {"_pending": true, "_tick": func() -> bool: return _tick_steps(rt, state)}
+
+
+## Validates the steps of an input call and notes its warp_mouse choice. Returns {"steps"}.
+static func parse_steps(params: Dictionary) -> Dictionary:
     var raw: Variant = params.get("steps", [])
     if params.has("warp_mouse") and not params["warp_mouse"] is bool:
         return R.err(R.BAD_PARAMS, "input.run: warp_mouse must be a boolean.")
@@ -64,8 +74,69 @@ static func run_steps(rt: Node, params: Dictionary) -> Dictionary:
             return parsed
         steps.append(parsed["step"])
         index += 1
-    var state := {"steps": steps, "index": 0, "mode": "lead", "results": [], "hold": 0, "release": {}}
-    return {"_pending": true, "_tick": func() -> bool: return _tick_steps(rt, state)}
+    return {"steps": steps}
+
+
+## One step of a held game's input, applied now and never waiting for a frame. A tap is pressed
+## now and let go by release_due() once the game's tick count reaches `release_at`.
+static func apply_held_step(rt: Node, step: Dictionary, release_at: int) -> Dictionary:
+    var kind := str(step["type"])
+    if kind == "click_node":
+        var resolved := _resolve_click_node(rt, step)
+        if R.is_err(resolved):
+            return resolved
+        step = resolved["step"]
+        kind = str(step["type"])
+    if kind == "time_scale":
+        var note := _set_time_scale(float(step["scale"]))
+        return {"result": {
+            "type": "time_scale",
+            "ok": true,
+            "time_scale": note["time_scale"],
+            "previous_time_scale": note["previous_time_scale"],
+        }}
+    if kind == "key" or kind == "mouse_button" or kind == "touch" or kind == "joy_button":
+        var phase := str(step["phase"])
+        if phase == "tap":
+            _apply_phase(step, "press")
+            _scheduled.append({"due": release_at, "step": step})
+        else:
+            _apply_phase(step, phase)
+        return {"result": {"type": str(step.get("label", kind)), "ok": true}}
+    if kind == "mouse_move":
+        _mouse_motion(float(step["x"]), float(step["y"]))
+        Input.flush_buffered_events()
+    elif kind == "joy_axis":
+        _joy_axis(str(step["axis"]), float(step["value"]), int(step["device"]))
+        Input.flush_buffered_events()
+    else:
+        return R.err(R.BAD_PARAMS, "A held game cannot apply a '%s' step." % kind)
+    return {"result": {"type": kind, "ok": true}}
+
+
+## Lets go of the taps whose hold ticks are over, before the tick that is about to start runs.
+static func release_due(total_ticks: int) -> void:
+    var remaining: Array = []
+    for entry: Dictionary in _scheduled:
+        if total_ticks >= int(entry["due"]):
+            _release_tap(entry["step"])
+        else:
+            remaining.append(entry)
+    _scheduled = remaining
+
+
+## Lets go of everything held or scheduled, as input.release_all does.
+static func release_everything() -> void:
+    _release_everything()
+    Input.flush_buffered_events()
+
+
+static func held_summary() -> Dictionary:
+    return _held_summary()
+
+
+static func warp_enabled() -> bool:
+    return _warp_mouse
 
 
 static func release_all(rt: Node, _params: Dictionary) -> Dictionary:
@@ -411,6 +482,47 @@ static func _tick_condition(rt: Node, state: Dictionary) -> bool:
         "op": str(state["op"]),
         "scene": scene,
     }))
+
+
+## Parses the condition of a held step: the property triple of a wait, checked before any tick runs.
+static func parse_condition(raw: Variant) -> Dictionary:
+    if not raw is Dictionary:
+        return R.err(R.BAD_PARAMS, "until must be an object with node, property, op and value.")
+    var spec: Dictionary = raw
+    var node_path := str(spec.get("node", "")).strip_edges()
+    var property := str(spec.get("property", "")).strip_edges()
+    if node_path.is_empty() or property.is_empty():
+        return R.err(R.BAD_PARAMS, "until needs a node and a property.")
+    var op := str(spec.get("op", "")).strip_edges()
+    if not op in _WAIT_OPS:
+        return R.err(R.BAD_PARAMS, "op must be eq, ne, lt, lte, gt, gte, or exists.")
+    if op != "exists" and not spec.has("value"):
+        return R.err(R.BAD_PARAMS, "op '%s' needs a value." % op)
+    for part: String in property.split("/", false):
+        var named := _public_segment(part)
+        if R.is_err(named):
+            return named
+    return {"cond": {"node": node_path, "property": property, "op": op, "value": spec.get("value", null)}}
+
+
+## Reads a parsed condition now. A node or property that cannot be read yet, or values that
+## cannot be compared, make it not hold: the step goes on and is bounded by its maximum.
+static func read_condition(rt: Node, cond: Dictionary) -> Dictionary:
+    var node: Node = rt.find_node(str(cond["node"]))
+    if node == null or not is_instance_valid(node):
+        return {"holds": false, "exists": false, "observed": null}
+    var looked := _lookup(node, str(cond["property"]))
+    if R.is_err(looked) or not bool(looked.get("exists", false)):
+        return {"holds": false, "exists": false, "observed": null}
+    var observed: Variant = looked.get("value", null)
+    if str(cond["op"]) == "exists":
+        return {"holds": true, "exists": true, "observed": rt.encode(observed)}
+    var compared := _compare(str(cond["op"]), observed, cond.get("value", null))
+    return {
+        "holds": not R.is_err(compared) and bool(compared.get("match", false)),
+        "exists": true,
+        "observed": rt.encode(observed),
+    }
 
 
 static func _fail_condition(rt: Node, result: Dictionary) -> bool:
@@ -1063,6 +1175,7 @@ static func _joy_axis(axis: String, value: float, device: int) -> void:
 
 
 static func _release_everything() -> Dictionary:
+    _scheduled.clear()
     var keys: Array = _keys.keys()
     for code: Variant in keys:
         _key_event(int(code), false)

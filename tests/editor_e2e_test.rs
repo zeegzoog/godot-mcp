@@ -1249,3 +1249,86 @@ async fn editor_play_can_wait_step_and_compare_a_baseline() {
         .await;
     assert!(!stopped.is_error, "{}", tool_text(&stopped));
 }
+
+/// Editor Play can be held and stepped through the relay, but its frame rate is the editor's, so
+/// its steps are never reported as exact.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn editor_play_can_be_held_and_stepped_but_is_not_exact() {
+    use godot_mcp::cli_runner::CliRunner;
+    use godot_mcp::tools::ToolManager;
+    use std::sync::Arc;
+
+    if cfg!(target_os = "linux")
+        && std::env::var_os("DISPLAY").is_none()
+        && std::env::var_os("WAYLAND_DISPLAY").is_none()
+    {
+        eprintln!("skipped: editor Play needs a display");
+        return;
+    }
+
+    let editor = start_editor(false).await;
+    let (godot, _) = godot_binaries();
+    let tools = Arc::new(
+        ToolManager::new(BridgeClient::new(editor.port), CliRunner::new(godot))
+            .with_working_dir(editor.project.clone()),
+    );
+    let started = Arc::clone(&tools)
+        .call_tool("godot_run_project", json!({"scene": "res://main.tscn"}))
+        .await;
+    assert!(!started.is_error, "{}", tool_text(&started));
+
+    let held = Arc::clone(&tools)
+        .call_tool("godot_game_physics", json!({"action": "hold"}))
+        .await;
+    assert!(!held.is_error, "{}", tool_text(&held));
+    let held_json: Value = serde_json::from_str(&tool_text(&held)).expect("hold json");
+    assert_eq!(held_json["held"], true, "{held_json}");
+    assert_eq!(held_json["deterministic"], false, "{held_json}");
+    assert_eq!(
+        held_json["deterministic_reason"], "not_started_held",
+        "{held_json}"
+    );
+
+    // Reads are answered while the editor's game is held, and it stands still.
+    let first = Arc::clone(&tools)
+        .call_tool("godot_game_snapshot", json!({}))
+        .await;
+    assert!(!first.is_error, "{}", tool_text(&first));
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let second = Arc::clone(&tools)
+        .call_tool("godot_game_snapshot", json!({}))
+        .await;
+    let frame_of = |result: &godot_mcp::protocol::ToolResult| {
+        serde_json::from_str::<Value>(&tool_text(result)).expect("snapshot json")["frame"].clone()
+    };
+    assert_eq!(frame_of(&first), frame_of(&second), "the held game ran");
+
+    let stepped = Arc::clone(&tools)
+        .call_tool("godot_game_physics", json!({"action": "step", "ticks": 3}))
+        .await;
+    assert!(!stepped.is_error, "{}", tool_text(&stepped));
+    let stepped_json: Value = serde_json::from_str(&tool_text(&stepped)).expect("step json");
+    assert_eq!(stepped_json["ticks_run"], 3, "{stepped_json}");
+    assert_eq!(stepped_json["held"], true, "{stepped_json}");
+    assert_eq!(stepped_json["deterministic"], false, "{stepped_json}");
+
+    let refused = Arc::clone(&tools)
+        .call_tool("godot_game_wait", json!({"frames": 2}))
+        .await;
+    assert!(refused.is_error, "{}", tool_text(&refused));
+    assert!(
+        tool_text(&refused).contains("held"),
+        "{}",
+        tool_text(&refused)
+    );
+
+    let resumed = Arc::clone(&tools)
+        .call_tool("godot_game_physics", json!({"action": "resume"}))
+        .await;
+    assert!(!resumed.is_error, "{}", tool_text(&resumed));
+    let stopped = Arc::clone(&tools)
+        .call_tool("godot_stop_project", json!({}))
+        .await;
+    assert!(!stopped.is_error, "{}", tool_text(&stopped));
+}

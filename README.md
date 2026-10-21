@@ -113,12 +113,14 @@ The plugin picks its port from the project setting `godot_mcp/bridge_port` if yo
 - Every command must carry a random token. The plugin writes it when the editor starts to `<user data dir>/godot-mcp/bridge-<port>.token` (readable by your user only), and the server reads it from there. This also keeps web pages in your browser from driving the editor. Both processes must therefore run as the same OS user. If they can't (containers, Flatpak, different users), set the same `GODOT_MCP_TOKEN` for both instead.
 - `godot_create_script` only writes `.gd` files inside the project, never overwrites without `overwrite: true`, and accepts only plain identifiers for `class_name` and `extends_class`.
 - Node paths are resolved inside the edited scene only; the scene root can't be removed.
+- `godot_game_call` runs only the methods you list in `permit`, and never one that can quit, evaluate code, call another method or free a node. `godot_game_set` refuses `script` and private names. Nothing `godot_game_set` changes is saved to disk.
+- The authoring tools never replace an existing scene or resource. `godot_set_project_setting` accepts only a plain `section/path` key, escapes the value, and keeps the type of a setting that exists, so it cannot add lines or sections to `project.godot`.
 
 To report a vulnerability, follow [SECURITY.md](SECURITY.md). Never open a public issue for it.
 
 ## Tools
 
-"Editor" means the tool needs a running Godot editor with the plugin enabled.
+"Editor" means the tool needs a running Godot editor with the plugin enabled. "Running game" means a game started with `godot_run_project`, in the editor's Play mode or as a managed process. "Process run" means a managed process run, the one this server can debug.
 
 `project_path` can be omitted when the server runs inside the project: tools then use the project open in the editor, else the first folder with a `project.godot` from the server's working directory upwards, else the only subfolder that has one (such as `app/`).
 
@@ -149,6 +151,26 @@ To report a vulnerability, follow [SECURITY.md](SECURITY.md). Never open a publi
 | `godot_create_script` | — | Writes a `.gd` file from an `extends` / `class_name` / `_ready()` template into the project (`res://` path; the project is `project_path`, the editor's, or the one the server runs in). Refuses to overwrite unless `overwrite: true`. |
 | `godot_validate_script` | — | Syntax-checks a `.gd` file with `godot --headless --check-only`. |
 | `godot_resave_resources` | Editor | Refreshes the given `res://` files after external edits: assets are re-imported (synchronous), other files re-scanned. Without paths, rescans the whole project (background). |
+| `godot_run_output` | Running game | Logs, warnings and errors, with stack traces, from a managed process run or the editor's running game (`since`, `level`). |
+| `godot_game_tree` | Running game | Live nodes of the running game: path, class, position, visible text. Filter by `name`, `class`, `group` or `text`. |
+| `godot_game_get` | Running game | A live node's properties, groups and, optionally, signals and methods. |
+| `godot_game_set` | Running game | Sets properties on a live node. Refuses `script` and private names. Nothing is saved to disk. |
+| `godot_game_call` | Running game | Calls one method on a live node. The method must be listed in `permit`; methods that can quit, evaluate code, call other methods or free the node are refused. |
+| `godot_game_signals` | Running game | A live node's signals and their connections. |
+| `godot_game_observe` | Running game | Watches signals for a few frames, returns the ones that fired, then disconnects. |
+| `godot_game_snapshot` | Running game | Scene, frame, pause flag and the current scene's children in one small result. |
+| `godot_game_input` | Running game | Injects key, text, mouse, touch and gamepad input, and frame waits, as a sequence of steps. |
+| `godot_game_input_release` | Running game | Releases every key, button, axis and touch this server still holds down. |
+| `godot_game_wait` | Running game | Waits for process frames, so input and screenshots can show their result. |
+| `godot_game_screenshot` | Running game with a window | PNG of the game window, a viewport or a camera. An error, never an empty image; a headless game has nothing to capture. |
+| `godot_debug_breakpoints` | Process run | Lists, adds, removes or clears breakpoints (`res://script.gd:LINE`). Editor Play uses the editor's own debugger. |
+| `godot_debug_control` | Process run | Pauses, resumes or steps (into, over, out) and waits for the next stop. |
+| `godot_debug_state` | Process run | Stack frames and variables of a stopped run. |
+| `godot_code_diagnostics` | Godot binary | GDScript diagnostics from Godot's language server, which runs in a private headless editor started on first use. Never reports a clean file when the server does not answer. |
+| `godot_code_complete` | Godot binary | Code completion at a line and column. |
+| `godot_code_symbols` | Godot binary | Symbols of a GDScript file. |
+| `godot_code_definition` | Godot binary | Go to definition at a position. |
+| `godot_code_references` | Godot binary | Find references at a position. |
 | `godot_note_feedback` | — | The AI records something missing, broken or misleading in godot-mcp itself. Kept in memory only. |
 | `godot_draft_feedback` | — | Turns the notes into one report for the maintainers and shows it to you. Sends nothing. |
 | `godot_submit_feedback` | — | Publishes a draft as a GitHub issue, only after you said yes. Not available in `draft` mode. |
@@ -173,7 +195,7 @@ AI client <-stdio JSON-RPC-> godot-mcp <-WebSocket :9333-> addons/godot_mcp (ins
                                  +-> Godot binary (headless fallback)
 ```
 
-Running-game inspection, input, and screenshots are `godot_game_*` tools.
+Game tools reach a game through Godot's remote debugger: a managed process connects to this server on loopback, and the plugin relays editor Play. The comparison with the other Godot MCP servers is in [docs/feature-parity.md](docs/feature-parity.md).
 
 ## Roadmap
 

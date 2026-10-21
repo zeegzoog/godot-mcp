@@ -7,6 +7,9 @@ const BRIDGE_SCRIPT_PATH: String = "res://addons/godot_mcp/bridge_server.gd"
 const EXPORT_PLUGIN_PATH: String = "res://addons/godot_mcp/export_plugin.gd"
 const RELAY_SCRIPT_PATH: String = "res://addons/godot_mcp/editor/game_relay.gd"
 const OVERRIDE_SCRIPT_PATH: String = "res://addons/godot_mcp/core/runtime_override.gd"
+## Set to 1 for an editor that must not open the bridge. The MCP server sets it for the private
+## editor it starts for the language server, so that editor tools never reach a hidden editor.
+const NO_BRIDGE_ENV: String = "GODOT_MCP_NO_BRIDGE"
 
 var bridge_node: Node = null
 var export_plugin: EditorExportPlugin = null
@@ -32,6 +35,10 @@ func _enter_tree() -> void:
     else:
         export_plugin = export_script.new()
         add_export_plugin(export_plugin)
+
+    if OS.get_environment(NO_BRIDGE_ENV) == "1":
+        print("[Godot MCP] The bridge is switched off by %s." % NO_BRIDGE_ENV)
+        return
 
     # Loaded at runtime (not through its class_name) so that a script which fails to compile
     # reports a clear message instead of breaking this plugin as well.

@@ -7,6 +7,8 @@ const R := preload("rt_result.gd")
 const DEFAULT_MAX := 768
 const MAX_MAX := 4096
 const MAX_FRAMES := 8
+## Frames a capture waits for a window that has not drawn anything yet before it gives up.
+const EMPTY_RETRIES := 60
 
 static var _previous = null
 
@@ -61,6 +63,15 @@ static func _tick_shot(rt: Node, state: Dictionary) -> bool:
             return true
         state["phase"] = "capture"
     var grabbed = _grab(state)
+    if grabbed == null:
+        # A window that has not drawn its first frame has no image yet, which a slow start
+        # makes likely: wait for it instead of failing the first capture.
+        state["empty"] = int(state.get("empty", 0)) + 1
+        if int(state["empty"]) <= EMPTY_RETRIES:
+            return true
+        _restore_cameras(state)
+        rt.finish_job(R.err(R.GODOT_ERROR, "The viewport returned no image."))
+        return false
     if grabbed is Dictionary:
         _restore_cameras(state)
         rt.finish_job(grabbed)
@@ -82,7 +93,7 @@ static func _grab(state: Dictionary) -> Variant:
     var texture := viewport.get_texture()
     var image: Image = texture.get_image() if texture != null else null
     if image == null or image.is_empty():
-        return R.err(R.GODOT_ERROR, "The viewport returned no image.")
+        return null
     image.convert(Image.FORMAT_RGBA8)
     var frame_max := int(state["frame_max"])
     var size := image.get_size()

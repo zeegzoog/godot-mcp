@@ -320,25 +320,13 @@ async fn connect_or_start(
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let private_port = listener.local_addr()?.port();
     drop(listener);
-    let mut command = Command::new(godot);
-    command
-        .arg("--headless")
-        .arg("--editor")
-        .arg("--path")
-        .arg(project)
-        .arg("--lsp-port")
-        .arg(private_port.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    #[cfg(unix)]
-    command.process_group(0);
-    let child = command.spawn().map_err(|err| {
-        McpError::Process(format!(
-            "failed to start a headless editor for the language server: {err}"
-        ))
-    })?;
+    let child = private_editor_command(godot, project, private_port)
+        .spawn()
+        .map_err(|err| {
+            McpError::Process(format!(
+                "failed to start a headless editor for the language server: {err}"
+            ))
+        })?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
         if let Ok(client) = connect_client(private_port, project).await {
@@ -351,6 +339,28 @@ async fn connect_or_start(
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+}
+
+/// The headless editor the language server runs in. If the project has this addon enabled, the
+/// addon would open its bridge on the project's port in that editor too, and the editor tools
+/// would then talk to an editor nobody can see; `GODOT_MCP_NO_BRIDGE` keeps it closed.
+fn private_editor_command(godot: &Path, project: &Path, lsp_port: u16) -> Command {
+    let mut command = Command::new(godot);
+    command
+        .arg("--headless")
+        .arg("--editor")
+        .arg("--path")
+        .arg(project)
+        .arg("--lsp-port")
+        .arg(lsp_port.to_string())
+        .env("GODOT_MCP_NO_BRIDGE", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+    command
 }
 
 async fn connect_client(port: u16, project: &Path) -> Result<Arc<ClientInner>> {
@@ -702,6 +712,28 @@ mod tests {
         assert_ne!(
             uri_key(&sent),
             uri_key("file:///C%3A/Users/Some%20One/game/b.gd")
+        );
+    }
+
+    #[test]
+    fn the_private_editor_is_told_not_to_open_a_bridge() {
+        let command = private_editor_command(Path::new("godot"), Path::new("/project"), 6123);
+        let command = command.as_std();
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--lsp-port" && pair[1] == "6123"),
+            "{args:?}"
+        );
+        assert!(
+            command
+                .get_envs()
+                .any(|(name, value)| name == "GODOT_MCP_NO_BRIDGE"
+                    && value == Some(std::ffi::OsStr::new("1"))),
+            "the editor may open a bridge"
         );
     }
 

@@ -446,10 +446,13 @@ static func _viewport_point(node: Node) -> Variant:
     var viewport := node.get_viewport()
     if viewport == null:
         return R.err(R.NOT_FOUND, "Node '%s' has no viewport." % node.name)
+    # The canvas transform is part of where a canvas item is drawn: a camera that scrolls, or a
+    # CanvasLayer, moves the item on screen but not its global position.
     if node is Control:
-        return (node as Control).get_global_rect().get_center()
+        var control := node as Control
+        return control.get_global_transform_with_canvas() * (control.size / 2.0)
     if node is Node2D:
-        return viewport.get_canvas_transform() * (node as Node2D).global_position
+        return (node as Node2D).get_global_transform_with_canvas().origin
     if node is Node3D:
         var camera := viewport.get_camera_3d()
         if camera == null:

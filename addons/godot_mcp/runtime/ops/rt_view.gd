@@ -137,8 +137,9 @@ static func _diff_against(image: Image) -> Dictionary:
     if previous == null:
         return {"compared": false, "reason": "no previous capture"}
     if previous.get_width() != image.get_width() or previous.get_height() != image.get_height():
-        previous = previous.duplicate()
-        previous.resize(image.get_width(), image.get_height(), Image.INTERPOLATE_NEAREST)
+        # A picture scaled to another size differs from the original everywhere, so a count of
+        # changed pixels between the two would report changes that are not in the game.
+        return {"compared": false, "reason": "the previous capture had another size"}
     var width := image.get_width()
     var height := image.get_height()
     var stride := 1

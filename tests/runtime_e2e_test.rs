@@ -617,6 +617,22 @@ async fn windowed_screenshot_returns_a_sheet_and_a_diff() {
     assert!(!sheet.is_error, "{}", text_of(&sheet));
     let note = text_of(&sheet);
     assert!(note.contains("4 frames, 2 columns"), "{note}");
+    assert!(
+        note.contains("not compared: the previous capture had another size"),
+        "{note}"
+    );
+    let again = call(
+        &tools,
+        "godot_game_screenshot",
+        json!({"run_id": run_id, "frames": 4, "every": 1, "max_dimension": 128}),
+    )
+    .await;
+    assert!(!again.is_error, "{}", text_of(&again));
+    assert!(
+        text_of(&again).contains("changed"),
+        "two sheets of one size are compared: {}",
+        text_of(&again)
+    );
 
     let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
     assert!(!stopped.is_error, "{}", text_of(&stopped));

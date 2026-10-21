@@ -111,7 +111,7 @@ pub fn catalog() -> Vec<Tool> {
         ),
         tool(
             "godot_game_screenshot",
-            "Captures the running game window, a viewport, or a Camera2D/Camera3D as one PNG. frames (1 to 8) stitches shots taken every process frames into a single sheet. The text says how many pixels changed since the previous capture of this run, and where. Fails instead of returning an empty image. Headless games have nothing to capture.",
+            "Captures the running game window, a viewport, or a Camera2D/Camera3D as one PNG. frames (1 to 8) stitches shots taken every process frames into a single sheet. The text says how many pixels changed since the previous capture of this run, and where (a sheet compares its last frame, and only against a capture of the same size). Fails instead of returning an empty image. Headless games have nothing to capture.",
             json!({"run_id": s(""), "node": s("Viewport or node whose viewport to capture."), "camera": s("Camera2D or Camera3D to make current for the shot."), "max_dimension": i("Longest side of the returned image in pixels. Default 768."), "frames": i("How many frames to stitch. Default 1, max 8."), "every": i("Process frames between shots. Default 1, max 60.")}),
             &[],
         ),
@@ -308,7 +308,12 @@ fn screenshot_note(value: &Value, width: u32, height: u32, source: &str) -> Stri
                 ));
             }
         }
-        Some(false) => note.push_str(", no earlier capture to compare"),
+        Some(false) => match value["diff"].get("reason").and_then(Value::as_str) {
+            Some(reason) if reason != "no previous capture" => {
+                note.push_str(&format!(", not compared: {reason}"));
+            }
+            _ => note.push_str(", no earlier capture to compare"),
+        },
         None => {}
     }
     note
@@ -677,6 +682,23 @@ mod tests {
         assert_eq!(
             sheet,
             "Game screenshot 64x64 (main window), 4 frames, 2 columns, changed 12 px in 1,2,3x4"
+        );
+    }
+
+    #[test]
+    fn screenshot_note_says_why_two_captures_were_not_compared() {
+        let note = screenshot_note(
+            &json!({
+                "frames": 1,
+                "diff": {"compared": false, "reason": "the previous capture had another size"}
+            }),
+            64,
+            64,
+            "main window",
+        );
+        assert_eq!(
+            note,
+            "Game screenshot 64x64 (main window), not compared: the previous capture had another size"
         );
     }
 

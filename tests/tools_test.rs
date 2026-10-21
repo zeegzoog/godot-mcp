@@ -713,3 +713,392 @@ fn the_descriptions_tell_an_agent_what_a_hold_does_and_what_it_refuses() {
     }
     assert!(description("godot_debug_control").contains("held"));
 }
+
+fn script_answer(result: &ToolResult) -> Value {
+    assert!(!result.is_error, "{}", text(result));
+    serde_json::from_str(&text(result)).expect("the answer is JSON")
+}
+
+fn write_script(project: &Path, name: &str, bytes: &[u8]) {
+    std::fs::write(project.join(name), bytes).expect("write script");
+}
+
+#[tokio::test]
+async fn read_script_without_an_editor_reads_the_file_and_labels_it() {
+    let project = project_dir();
+    write_script(project.path(), "other.gd", b"extends Node\n");
+    write_script(project.path(), "crlf.gd", b"extends Node\r\n");
+    write_script(project.path(), "empty.gd", b"");
+    write_script(project.path(), "a.gd", b"a");
+    let read = |path: &str| {
+        let args = json!({"script_path": path, "project_path": project.path()});
+        async move { call("godot_read_script", args).await }
+    };
+
+    let other = script_answer(&read("res://other.gd").await);
+    assert_eq!(other["path"], "res://other.gd");
+    assert_eq!(other["text"], "extends Node\n");
+    assert_eq!(other["source"], "file");
+    assert_eq!(other["dirty"], false);
+    assert_eq!(other["editor_consulted"], false);
+    // The label vectors the addon is held to as well.
+    assert_eq!(other["version"], "688cd8553db5c904");
+
+    let crlf = script_answer(&read("crlf.gd").await);
+    assert_eq!(crlf["path"], "res://crlf.gd");
+    assert_eq!(crlf["text"], "extends Node\n", "text is given with \\n");
+    assert_eq!(crlf["version"], "688cd8553db5c904");
+
+    assert_eq!(
+        script_answer(&read("res://empty.gd").await)["version"],
+        "cbf29ce484222325"
+    );
+    assert_eq!(
+        script_answer(&read("res://a.gd").await)["version"],
+        "af63dc4c8601ec8c"
+    );
+}
+
+#[tokio::test]
+async fn read_script_refuses_what_it_should_with_a_fix() {
+    let project = project_dir();
+    write_script(project.path(), "notes.txt", b"hello\n");
+    write_script(project.path(), "binary.gd", &[0xff, 0xfe, 0x00, 0x41]);
+    write_script(project.path(), "big.gd", "#".repeat(1_048_577).as_bytes());
+    let refused = |path: &str, needle: &str| {
+        let args = json!({"script_path": path, "project_path": project.path()});
+        let needle = needle.to_owned();
+        async move {
+            let result = call("godot_read_script", args).await;
+            assert!(result.is_error, "expected a refusal: {}", text(&result));
+            assert!(
+                text(&result).contains(&needle),
+                "{:?} should mention {needle:?}",
+                text(&result)
+            );
+        }
+    };
+    refused("res://missing.gd", "godot_create_script").await;
+    refused("res://notes.txt", ".gd").await;
+    refused("res://../outside.gd", "..").await;
+    refused("res://binary.gd", "UTF-8").await;
+    refused("res://big.gd", "1 MiB").await;
+}
+
+#[tokio::test]
+async fn read_script_asks_the_editor_first_and_does_not_hide_its_errors() {
+    use common::{MockBridge, Reply};
+    let project = project_dir();
+    write_script(project.path(), "other.gd", b"extends Node\n");
+    let bridge = MockBridge::start(|command| {
+        match command["params"]["script_path"]
+            .as_str()
+            .unwrap_or_default()
+        {
+            "res://typed.gd" => Reply::Ok(json!({
+                "path": "res://typed.gd", "text": "# typed\n", "source": "editor",
+                "dirty": true, "version": "0123456789abcdef"
+            })),
+            _ => Reply::Err("The script editor's state cannot be matched. Close the tabs.".into()),
+        }
+    })
+    .await;
+    let manager = Arc::new(ToolManager::new(
+        BridgeClient::new(bridge.port),
+        CliRunner::new(PathBuf::from("unused-godot")),
+    ));
+
+    let typed = manager
+        .clone()
+        .call_tool(
+            "godot_read_script",
+            json!({"script_path": "res://typed.gd", "project_path": project.path()}),
+        )
+        .await;
+    let typed = script_answer(&typed);
+    assert_eq!(typed["source"], "editor");
+    assert_eq!(typed["dirty"], true);
+    assert_eq!(typed["text"], "# typed\n");
+
+    // An error from a live editor is returned as it is; the file is not read instead, because
+    // that would hide unsaved typing the editor may hold.
+    let refused = manager
+        .clone()
+        .call_tool(
+            "godot_read_script",
+            json!({"script_path": "res://other.gd", "project_path": project.path()}),
+        )
+        .await;
+    assert!(refused.is_error, "{}", text(&refused));
+    assert!(
+        text(&refused).contains("cannot be matched"),
+        "{}",
+        text(&refused)
+    );
+    assert!(
+        bridge
+            .received()
+            .iter()
+            .all(|command| command["type"] == "read_script")
+    );
+}
+
+const TWO_VARS: &str = "extends Node\n\nvar x = 1\nvar y = 1\n";
+
+fn edit_args(project: &Path, path: &str, old: &str, new: &str) -> Value {
+    json!({"script_path": path, "old_text": old, "new_text": new, "project_path": project})
+}
+
+fn files_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .expect("read dir")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+#[tokio::test]
+async fn edit_script_without_an_editor_replaces_one_fragment() {
+    let project = project_dir();
+    write_script(project.path(), "other.gd", TWO_VARS.as_bytes());
+    let before = files_in(project.path());
+
+    let result = call(
+        "godot_edit_script",
+        edit_args(project.path(), "res://other.gd", "var x = 1", "var x = 2"),
+    )
+    .await;
+    let answer = script_answer(&result);
+    assert_eq!(answer["path"], "res://other.gd");
+    assert_eq!(answer["replaced"], 1);
+    assert_eq!(answer["source"], "file");
+    assert_eq!(answer["editor_consulted"], false);
+    assert_eq!(answer["version"], "9a79065d76c35fdc");
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("other.gd")).expect("file"),
+        "extends Node\n\nvar x = 2\nvar y = 1\n"
+    );
+    assert_eq!(
+        files_in(project.path()),
+        before,
+        "no temporary file is left"
+    );
+
+    // The label the answer carries is the label a read gives for the new text.
+    let read = call(
+        "godot_read_script",
+        json!({"script_path": "res://other.gd", "project_path": project.path()}),
+    )
+    .await;
+    assert_eq!(script_answer(&read)["version"], answer["version"]);
+}
+
+#[tokio::test]
+async fn edit_script_refuses_what_it_should_and_leaves_the_file_alone() {
+    let project = project_dir();
+    write_script(project.path(), "other.gd", TWO_VARS.as_bytes());
+    write_script(project.path(), "notes.txt", b"hello\n");
+    let before = files_in(project.path());
+    let refused = |args: Value, needle: &str| {
+        let needle = needle.to_owned();
+        async move {
+            let result = call("godot_edit_script", args).await;
+            assert!(result.is_error, "expected a refusal: {}", text(&result));
+            assert!(
+                text(&result).contains(&needle),
+                "{:?} should mention {needle:?}",
+                text(&result)
+            );
+        }
+    };
+    let p = project.path();
+    refused(
+        edit_args(p, "res://other.gd", "var z = 1", "var z = 2"),
+        "0 times",
+    )
+    .await;
+    refused(edit_args(p, "res://other.gd", "var ", "let "), "2 times").await;
+    refused(edit_args(p, "res://other.gd", "", "x"), "must not be empty").await;
+    refused(
+        edit_args(p, "res://other.gd", "var x = 1", "var x = 1"),
+        "identical",
+    )
+    .await;
+    refused(
+        json!({"script_path": "res://other.gd", "old_text": "var y = 1",
+               "new_text": "var y = 2", "version": "0000000000000000", "project_path": p}),
+        "changed since it was read",
+    )
+    .await;
+    refused(
+        edit_args(p, "res://missing.gd", "a", "b"),
+        "godot_create_script",
+    )
+    .await;
+    refused(edit_args(p, "res://notes.txt", "hello", "bye"), ".gd").await;
+    refused(edit_args(p, "res://../outside.gd", "a", "b"), "..").await;
+
+    assert_eq!(
+        std::fs::read_to_string(p.join("other.gd")).expect("file"),
+        TWO_VARS
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.join("notes.txt")).expect("file"),
+        "hello\n"
+    );
+    assert_eq!(
+        files_in(p),
+        before,
+        "a refused edit leaves no temporary file"
+    );
+}
+
+#[tokio::test]
+async fn edit_script_accepts_the_current_label_and_treats_text_as_data() {
+    let project = project_dir();
+    write_script(project.path(), "other.gd", TWO_VARS.as_bytes());
+    let read = call(
+        "godot_read_script",
+        json!({"script_path": "res://other.gd", "project_path": project.path()}),
+    )
+    .await;
+    let version = script_answer(&read)["version"].clone();
+
+    let tricky = "var y = \"%s {0} \\\\ \\n $x\"\nfunc injected() -> void:\n\tOS.crash(\"no\")";
+    let result = call(
+        "godot_edit_script",
+        json!({"script_path": "res://other.gd", "old_text": "var y = 1",
+               "new_text": tricky, "version": version, "project_path": project.path()}),
+    )
+    .await;
+    assert_eq!(script_answer(&result)["replaced"], 1);
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("other.gd")).expect("file"),
+        format!("extends Node\n\nvar x = 1\n{tricky}\n")
+    );
+}
+
+#[tokio::test]
+async fn edit_script_keeps_the_line_endings_and_the_byte_order_mark_of_the_file() {
+    let project = project_dir();
+    write_script(
+        project.path(),
+        "crlf.gd",
+        b"\xef\xbb\xbfextends Node\r\n\r\nvar x = 1\r\nvar y = 1\r\n",
+    );
+
+    // The old text is written with \n and still matches across two CRLF lines.
+    let result = call(
+        "godot_edit_script",
+        edit_args(
+            project.path(),
+            "res://crlf.gd",
+            "var x = 1\nvar y = 1",
+            "var x = 2\nvar y = 2\nvar z = 3",
+        ),
+    )
+    .await;
+    assert_eq!(script_answer(&result)["replaced"], 1);
+    assert_eq!(
+        std::fs::read(project.path().join("crlf.gd")).expect("file"),
+        b"\xef\xbb\xbfextends Node\r\n\r\nvar x = 2\r\nvar y = 2\r\nvar z = 3\r\n".to_vec()
+    );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn edit_script_leaves_the_script_unchanged_when_it_cannot_be_replaced() {
+    let project = project_dir();
+    write_script(project.path(), "locked.gd", TWO_VARS.as_bytes());
+    let path = project.path().join("locked.gd");
+    let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(&path, permissions.clone()).expect("lock");
+    let before = files_in(project.path());
+
+    let result = call(
+        "godot_edit_script",
+        edit_args(project.path(), "res://locked.gd", "var x = 1", "var x = 2"),
+    )
+    .await;
+    assert!(result.is_error, "{}", text(&result));
+    assert!(
+        text(&result).contains("Could not write res://locked.gd"),
+        "the refusal should come from the write: {}",
+        text(&result)
+    );
+    assert_eq!(std::fs::read_to_string(&path).expect("file"), TWO_VARS);
+    assert_eq!(
+        files_in(project.path()),
+        before,
+        "the temporary file is removed"
+    );
+
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    std::fs::set_permissions(&path, permissions).expect("unlock");
+}
+
+#[tokio::test]
+async fn edit_script_asks_the_editor_first_and_does_not_hide_its_refusals() {
+    use common::{MockBridge, Reply};
+    let project = project_dir();
+    write_script(project.path(), "other.gd", TWO_VARS.as_bytes());
+    let bridge = MockBridge::start(|command| {
+        match command["params"]["script_path"].as_str().unwrap_or_default() {
+            "res://ok.gd" => Reply::Ok(json!({
+                "path": "res://ok.gd", "replaced": 1, "version": "0123456789abcdef", "source": "editor"
+            })),
+            _ => Reply::Err("res://other.gd has unsaved changes in the script editor. Save it.".into()),
+        }
+    })
+    .await;
+    let manager = Arc::new(ToolManager::new(
+        BridgeClient::new(bridge.port),
+        CliRunner::new(PathBuf::from("unused-godot")),
+    ));
+
+    let tricky = "a \"quoted\" %s {0}\nline";
+    let done = manager
+        .clone()
+        .call_tool(
+            "godot_edit_script",
+            json!({"script_path": "res://ok.gd", "old_text": tricky, "new_text": "b",
+                   "version": "fedcba9876543210", "project_path": project.path()}),
+        )
+        .await;
+    assert_eq!(script_answer(&done)["source"], "editor");
+    let sent = bridge.received();
+    assert_eq!(sent[0]["type"], "edit_script");
+    assert_eq!(
+        sent[0]["params"]["old_text"], tricky,
+        "strings travel as data"
+    );
+    assert_eq!(sent[0]["params"]["version"], "fedcba9876543210");
+
+    let refused = manager
+        .clone()
+        .call_tool(
+            "godot_edit_script",
+            edit_args(project.path(), "res://other.gd", "var x = 1", "var x = 2"),
+        )
+        .await;
+    assert!(refused.is_error, "{}", text(&refused));
+    assert!(
+        text(&refused).contains("unsaved changes"),
+        "{}",
+        text(&refused)
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("other.gd")).expect("file"),
+        TWO_VARS,
+        "a refusal from the editor is not turned into a file write"
+    );
+}

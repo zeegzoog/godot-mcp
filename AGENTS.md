@@ -88,6 +88,7 @@ Before submitting or committing changes, agents must execute and pass the comple
    godot --headless --check-only --path . --script addons/godot_mcp/bridge_server.gd
    godot --headless --check-only --path . --script addons/godot_mcp/export_plugin.gd
    godot --headless --check-only --path . --script addons/godot_mcp/editor/game_relay.gd
+   godot --headless --check-only --path . --script addons/godot_mcp/editor/script_ops.gd
    godot --headless --check-only --path . --script addons/godot_mcp/core/runtime_override.gd
    godot --headless --check-only --path . --script addons/godot_mcp/runtime/mcp_runtime.gd
    godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_hold.gd
@@ -124,6 +125,7 @@ When interacting with a Godot project, agents must adhere to the following workf
 
 2. **Validation After Modification**:
    - Run `godot_validate_script` immediately after creating or altering any `.gd` file. Without `project_path`, `godot_create_script` uses the editor's project, else the project the server was started in; it refuses to overwrite without `overwrite: true`.
+   - To change an existing script, read it with `godot_read_script` and replace one fragment with `godot_edit_script`, passing the `version` you read. Do not rewrite the file behind the editor's back. An edit is refused while the editor holds unsaved changes to the script: ask the person to save or discard them, then read again.
    - Catch and resolve syntax errors before attempting to run scenes.
 
 3. **Visual Verification**:

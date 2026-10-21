@@ -19,6 +19,7 @@ const INBOUND_BUFFER_SIZE: int = 1 << 22
 const OUTBOUND_BUFFER_SIZE: int = 1 << 25
 
 const MAX_VALUE_CHARS: int = 2000
+const SCRIPT_OPS_PATH: String = "res://addons/godot_mcp/editor/script_ops.gd"
 const MAX_CAPTURE_DIMENSION: int = 1568
 const MIN_CAPTURE_SIZE: int = 16
 
@@ -42,6 +43,8 @@ const PARAM_TYPES: Dictionary = {
     "resave_resources": {"paths": TYPE_ARRAY},
     "create_scene": {"scene_path": TYPE_STRING, "root_type": TYPE_STRING, "root_name": TYPE_STRING},
     "attach_script": {"node_path": TYPE_STRING, "script_path": TYPE_STRING},
+    "read_script": {"script_path": TYPE_STRING},
+    "edit_script": {"script_path": TYPE_STRING, "old_text": TYPE_STRING, "new_text": TYPE_STRING, "version": TYPE_STRING},
     "connect_signal": {"node_path": TYPE_STRING, "signal_name": TYPE_STRING, "method": TYPE_STRING, "target_path": TYPE_STRING},
     "list_signals": {"node_path": TYPE_STRING},
     "create_resource": {"resource_path": TYPE_STRING, "class_name": TYPE_STRING},
@@ -68,6 +71,7 @@ var undo_redo: EditorUndoRedoManager = null
 var game_relay: EditorDebuggerPlugin = null
 var port: int = DEFAULT_PORT
 var verbose: bool = false
+var _script_ops_instance: RefCounted = null
 ## scene res:// path -> hash of the file bytes last loaded or saved by this bridge.
 ## Compared by content, not mtime, so an edit in the same second is still detected.
 var _scene_sync_hash: Dictionary = {}
@@ -274,6 +278,10 @@ func dispatch_command(peer: WebSocketPeer, cmd_id: String, cmd_type: String, par
             create_scene(peer, cmd_id, params)
         "attach_script":
             attach_script(peer, cmd_id, params)
+        "read_script":
+            read_script(peer, cmd_id, params)
+        "edit_script":
+            edit_script(peer, cmd_id, params)
         "connect_signal":
             connect_signal(peer, cmd_id, params)
         "list_signals":
@@ -1079,6 +1087,48 @@ func attach_script(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> v
         target.set_script(script)
     mark_scene_dirty()
     send_success(peer, cmd_id, {"node_path": node_path, "script_path": script_path})
+
+## The script commands keep their logic in editor/script_ops.gd; this only checks the path.
+func read_script(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
+    var res_path: String = _script_command_path(peer, cmd_id, params)
+    if res_path.is_empty():
+        return
+    var result: Dictionary = _script_ops().read(res_path)
+    if result.has("error"):
+        send_error(peer, cmd_id, str(result["error"]))
+        return
+    send_success(peer, cmd_id, result)
+
+func edit_script(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
+    var res_path: String = _script_command_path(peer, cmd_id, params)
+    if res_path.is_empty():
+        return
+    for key: String in ["old_text", "new_text"]:
+        if not params.has(key):
+            send_error(peer, cmd_id, "Missing %s. Pass the fragment to replace as old_text and its replacement as new_text." % key)
+            return
+    var result: Dictionary = _script_ops().edit(res_path, str(params["old_text"]), str(params["new_text"]), str(params.get("version", "")))
+    if result.has("error"):
+        send_error(peer, cmd_id, str(result["error"]))
+        return
+    send_success(peer, cmd_id, result)
+
+## The res:// path of the script_path parameter, or "" after an error reply was sent.
+func _script_command_path(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> String:
+    var raw: String = str(params.get("script_path", "")).strip_edges()
+    if raw.is_empty():
+        send_error(peer, cmd_id, "Missing script_path. Pass a res:// path to a .gd script.")
+        return ""
+    var res_path: String = to_res_path(raw)
+    if res_path.is_empty():
+        send_error(peer, cmd_id, "script_path must be a path inside the project (res://...): " + raw)
+        return ""
+    return res_path
+
+func _script_ops() -> RefCounted:
+    if _script_ops_instance == null:
+        _script_ops_instance = (load(SCRIPT_OPS_PATH) as GDScript).new() as RefCounted
+    return _script_ops_instance
 
 func connect_signal(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
     var root: Node = scene_root_or_error(peer, cmd_id)

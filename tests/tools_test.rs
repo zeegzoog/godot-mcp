@@ -1102,3 +1102,42 @@ async fn edit_script_asks_the_editor_first_and_does_not_hide_its_refusals() {
         "a refusal from the editor is not turned into a file write"
     );
 }
+
+/// A link planted where a temporary file used to be named must not redirect the write, and a
+/// script that is itself a link is not swapped for a regular file.
+#[cfg(unix)]
+#[tokio::test]
+async fn edit_script_never_follows_a_planted_link() {
+    let project = project_dir();
+    let outside = tempfile::tempdir().expect("outside dir");
+    let victim = outside.path().join("victim.txt");
+    std::fs::write(&victim, "keep").expect("victim");
+    write_script(project.path(), "other.gd", TWO_VARS.as_bytes());
+    std::os::unix::fs::symlink(&victim, project.path().join(".other.gd.godot-mcp-edit.tmp"))
+        .expect("plant link");
+
+    let done = call(
+        "godot_edit_script",
+        edit_args(project.path(), "res://other.gd", "var x = 1", "var x = 2"),
+    )
+    .await;
+    assert_eq!(script_answer(&done)["replaced"], 1);
+    assert_eq!(std::fs::read_to_string(&victim).expect("victim"), "keep");
+
+    std::os::unix::fs::symlink(
+        project.path().join("other.gd"),
+        project.path().join("link.gd"),
+    )
+    .expect("script link");
+    let refused = call(
+        "godot_edit_script",
+        edit_args(project.path(), "res://link.gd", "var y = 1", "var y = 2"),
+    )
+    .await;
+    assert!(refused.is_error, "{}", text(&refused));
+    assert!(
+        text(&refused).contains("symbolic link"),
+        "{}",
+        text(&refused)
+    );
+}

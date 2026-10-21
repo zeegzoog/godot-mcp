@@ -123,6 +123,19 @@ async fn start_editor(with_undo_hook: bool) -> Editor {
 }
 
 async fn start_editor_configured(with_undo_hook: bool, project_tail: &str) -> Editor {
+    let hook = with_undo_hook.then_some(UNDO_HOOK);
+    start_editor_with(hook, "", &[], project_tail).await
+}
+
+/// Starts an editor on a fixture project. `hook` is match arms for test-only commands inserted
+/// into a *copy* of the bridge, `helpers` is functions appended to it, and `files` are extra
+/// project files (name, text).
+async fn start_editor_with(
+    hook: Option<&str>,
+    helpers: &str,
+    files: &[(&str, &str)],
+    project_tail: &str,
+) -> Editor {
     let (godot, console) = godot_binaries();
     let dir = tempfile::tempdir().expect("project dir");
     let project = dir.path().to_path_buf();
@@ -138,6 +151,9 @@ async fn start_editor_configured(with_undo_hook: bool, project_tail: &str) -> Ed
     .expect("project.godot");
     std::fs::write(project.join("main.tscn"), MAIN_SCENE).expect("main.tscn");
     std::fs::write(project.join("script.gd"), "extends Node\n").expect("script.gd");
+    for (name, text) in files {
+        std::fs::write(project.join(name), text).expect("fixture file");
+    }
 
     let mut big = String::from("[gd_scene format=3]\n\n[node name=\"Big\" type=\"Node2D\"]\n");
     for i in 0..3000 {
@@ -152,13 +168,16 @@ async fn start_editor_configured(with_undo_hook: bool, project_tail: &str) -> Ed
         &Path::new(env!("CARGO_MANIFEST_DIR")).join("addons/godot_mcp"),
         &addon,
     );
-    if with_undo_hook {
+    if hook.is_some() || !helpers.is_empty() {
         let script_path = addon.join("bridge_server.gd");
-        let source = std::fs::read_to_string(&script_path).expect("bridge script");
-        let anchor = "        \"ping\":\n";
-        assert!(source.contains(anchor), "dispatch table anchor not found");
-        std::fs::write(&script_path, source.replacen(anchor, UNDO_HOOK, 1))
-            .expect("patch bridge script");
+        let mut source = std::fs::read_to_string(&script_path).expect("bridge script");
+        if let Some(hook) = hook {
+            let anchor = "        \"ping\":\n";
+            assert!(source.contains(anchor), "dispatch table anchor not found");
+            source = source.replacen(anchor, hook, 1);
+        }
+        source.push_str(helpers);
+        std::fs::write(&script_path, source).expect("patch bridge script");
     }
 
     let imported = timeout(
@@ -1331,4 +1350,563 @@ async fn editor_play_can_be_held_and_stepped_but_is_not_exact() {
         .call_tool("godot_stop_project", json!({}))
         .await;
     assert!(!stopped.is_error, "{}", tool_text(&stopped));
+}
+
+/// Test-only commands that drive the script editor the way a person would, to measure what
+/// the editor offers before the real script commands are written.
+const SCRIPT_PROBE_HOOK: &str = r#"        "__probe_open":
+            var path: String = str(params.get("path", ""))
+            EditorInterface.edit_script(load(path))
+            send_success(peer, cmd_id, {"open": _probe_open_paths()})
+        "__probe_shape":
+            var editors: Array = EditorInterface.get_script_editor().get_open_script_editors()
+            var out: Dictionary = {"count": editors.size(), "scripts": EditorInterface.get_script_editor().get_open_scripts().map(func(s: Script) -> String: return s.resource_path)}
+            if editors.size() > 0:
+                var names: Array = []
+                for m in editors[0].get_method_list():
+                    var n: String = str(m["name"])
+                    if "edit" in n or "script" in n or "resource" in n or "save" in n or "path" in n:
+                        names.append(n)
+                out["methods"] = names
+                var props: Array = []
+                for p in editors[0].get_property_list():
+                    props.append(str(p["name"]))
+                out["props"] = props
+                out["class"] = editors[0].get_class()
+            send_success(peer, cmd_id, out)
+        "__probe_mixed":
+            var se: ScriptEditor = EditorInterface.get_script_editor()
+            EditorInterface.edit_resource(load("res://notes.txt"))
+            se.goto_help("class_name:Node")
+            var editors: Array = se.get_open_script_editors()
+            var names: Array = []
+            for e in editors:
+                names.append([e.get_class(), str(e.get_meta("_tab_name", ""))])
+            var current: Variant = se.get_current_editor()
+            send_success(peer, cmd_id, {"editors": names, "scripts": se.get_open_scripts().map(func(s: Script) -> String: return s.resource_path), "current": str(current.get_class()) if current != null else "", "current_script": se.get_current_script().resource_path if se.get_current_script() != null else ""})
+        "__probe_state":
+            var path: String = str(params.get("path", ""))
+            var found: Variant = _probe_editor(path)
+            if found == null:
+                send_success(peer, cmd_id, {"found": false, "open": _probe_open_paths()})
+            else:
+                var base: CodeEdit = found.get_base_editor() as CodeEdit
+                var script: Script = load(path) as Script
+                send_success(peer, cmd_id, {"found": true, "text": base.text, "version": base.get_version(), "saved_version": base.get_saved_version(), "source_code": script.source_code})
+        "__probe_type":
+            var found: Variant = _probe_editor(str(params.get("path", "")))
+            var base: CodeEdit = found.get_base_editor() as CodeEdit
+            base.insert_text(str(params.get("text", "")), 0, 0)
+            send_success(peer, cmd_id, {"version": base.get_version(), "saved_version": base.get_saved_version()})
+        "__probe_replace":
+            var found: Variant = _probe_editor(str(params.get("path", "")))
+            var base: CodeEdit = found.get_base_editor() as CodeEdit
+            var old_text: String = str(params.get("old", ""))
+            var new_text: String = str(params.get("new", ""))
+            var text: String = base.text
+            var index: int = text.find(old_text)
+            var before: String = text.substr(0, index)
+            var line: int = before.count("\n")
+            var col: int = index - (before.rfind("\n") + 1)
+            var old_lines: int = old_text.count("\n")
+            var end_line: int = line + old_lines
+            var end_col: int = col + old_text.length()
+            if old_lines > 0:
+                end_col = old_text.length() - (old_text.rfind("\n") + 1)
+            base.begin_complex_operation()
+            base.remove_text(line, col, end_line, end_col)
+            base.insert_text(new_text, line, col)
+            base.end_complex_operation()
+            send_success(peer, cmd_id, {"text": base.text, "version": base.get_version()})
+        "__probe_undo":
+            var found: Variant = _probe_editor(str(params.get("path", "")))
+            var base: CodeEdit = found.get_base_editor() as CodeEdit
+            base.undo()
+            send_success(peer, cmd_id, {"text": base.text, "version": base.get_version(), "saved_version": base.get_saved_version()})
+        "__probe_save":
+            var path: String = str(params.get("path", ""))
+            var found: Variant = _probe_editor(path)
+            var base: CodeEdit = found.get_base_editor() as CodeEdit
+            var script: Script = load(path) as Script
+            script.source_code = base.text
+            var save_err: Error = ResourceSaver.save(script, path)
+            base.tag_saved_version()
+            EditorInterface.get_resource_filesystem().update_file(path)
+            var reload_err: Error = script.reload(true)
+            send_success(peer, cmd_id, {"save_err": save_err, "reload_err": reload_err, "version": base.get_version(), "saved_version": base.get_saved_version()})
+        "__probe_attach":
+            var node := Node.new()
+            node.set_script(load(str(params.get("path", ""))))
+            Engine.set_meta("probe_node", node)
+            send_success(peer, cmd_id, {"answer": node.call("answer")})
+        "__probe_call":
+            var node: Node = Engine.get_meta("probe_node") as Node
+            send_success(peer, cmd_id, {"answer": node.call("answer")})
+        "ping":
+"#;
+
+const SCRIPT_PROBE_HELPERS: &str = r#"
+
+func _probe_open_paths() -> Array:
+    var paths: Array = []
+    for script in EditorInterface.get_script_editor().get_open_scripts():
+        paths.append(script.resource_path)
+    return paths
+
+func _probe_editor(path: String) -> Variant:
+    var editors: Array = EditorInterface.get_script_editor().get_open_script_editors()
+    var scripts: Array = EditorInterface.get_script_editor().get_open_scripts()
+    for index in range(scripts.size()):
+        if scripts[index].resource_path == path and index < editors.size():
+            return editors[index]
+    return null
+"#;
+
+/// Feasibility measurements for reading and editing a script through the editor. Run with
+/// `--nocapture` to see the answers; the assertions hold the facts the design needs.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn script_editor_facts_for_reading_and_editing() {
+    let probe = "@tool\nextends Node\n\nfunc answer() -> int:\n\treturn 1\n";
+    let editor = start_editor_with(
+        Some(SCRIPT_PROBE_HOOK),
+        SCRIPT_PROBE_HELPERS,
+        &[
+            ("probe.gd", probe),
+            ("other.gd", "extends Node\n\nvar x = 1\n"),
+        ],
+        "",
+    )
+    .await;
+    let send = |name: &'static str, params: Value| {
+        let bridge = &editor.bridge;
+        async move {
+            bridge
+                .send_command(name, params)
+                .await
+                .unwrap_or_else(|error| panic!("{name} failed: {error:?}"))
+        }
+    };
+
+    // 1. A script opened for editing is found among the open script editors.
+    let opened = send("__probe_open", json!({"path": "res://probe.gd"})).await;
+    println!("1 open: {opened}");
+    println!("1 shape: {}", send("__probe_shape", json!({})).await);
+    sleep(Duration::from_millis(500)).await;
+    let state = send("__probe_state", json!({"path": "res://probe.gd"})).await;
+    println!("1 state after open: {state}");
+    assert_eq!(state["found"], true, "the opened script has an editor");
+    assert_eq!(state["text"], probe, "the editor shows the file text");
+    assert_eq!(
+        state["version"], state["saved_version"],
+        "a fresh script is saved"
+    );
+
+    // 2. Typing makes the unsaved state detectable and the unsaved text readable.
+    let typed = send(
+        "__probe_type",
+        json!({"path": "res://probe.gd", "text": "# typed\n"}),
+    )
+    .await;
+    println!("2 typed: {typed}");
+    let dirty = send("__probe_state", json!({"path": "res://probe.gd"})).await;
+    println!("2 state after typing: {dirty}");
+    assert_ne!(
+        dirty["version"], dirty["saved_version"],
+        "typing marks the script unsaved"
+    );
+    assert!(
+        dirty["text"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("# typed\n")
+    );
+    println!(
+        "2 resource source_code follows the buffer: {}",
+        dirty["source_code"] == dirty["text"]
+    );
+    assert_eq!(
+        std::fs::read_to_string(editor.project.join("probe.gd")).expect("file"),
+        probe,
+        "typing does not touch the file"
+    );
+
+    // 3. One complex operation is undone by one undo step. First drop the typed line.
+    let undone_typing = send("__probe_undo", json!({"path": "res://probe.gd"})).await;
+    println!("3 undo typing: {undone_typing}");
+    assert_eq!(undone_typing["text"], probe);
+    let replaced = send(
+        "__probe_replace",
+        json!({"path": "res://probe.gd", "old": "return 1", "new": "return 2"}),
+    )
+    .await;
+    println!("3 replaced: {replaced}");
+    assert!(replaced["text"].as_str().unwrap_or("").contains("return 2"));
+    let undone = send("__probe_undo", json!({"path": "res://probe.gd"})).await;
+    println!("3 undo replace: {undone}");
+    assert_eq!(
+        undone["text"], probe,
+        "one undo step reverses the replacement"
+    );
+
+    // 4. Saving writes the new text to disk and a node running the script gets the new code.
+    let attached = send("__probe_attach", json!({"path": "res://probe.gd"})).await;
+    println!("4 attached: {attached}");
+    assert_eq!(attached["answer"], 1);
+    send(
+        "__probe_replace",
+        json!({"path": "res://probe.gd", "old": "return 1", "new": "return 2"}),
+    )
+    .await;
+    let saved = send("__probe_save", json!({"path": "res://probe.gd"})).await;
+    println!("4 saved: {saved}");
+    assert_eq!(saved["save_err"], 0);
+    assert_eq!(
+        saved["version"], saved["saved_version"],
+        "saving clears the unsaved state"
+    );
+    let on_disk = std::fs::read_to_string(editor.project.join("probe.gd")).expect("file");
+    println!("4 file after save: {on_disk:?}");
+    assert!(on_disk.contains("return 2"));
+    let called = send("__probe_call", json!({})).await;
+    println!("4 running node answers: {called}");
+    assert_eq!(called["answer"], 2, "the running script has the new code");
+
+    // 5. A script that was not open is opened, edited and saved the same way.
+    let before_open = send("__probe_state", json!({"path": "res://other.gd"})).await;
+    println!("5 other before open: {before_open}");
+    assert_eq!(before_open["found"], false, "other.gd was never opened");
+    send("__probe_open", json!({"path": "res://other.gd"})).await;
+    sleep(Duration::from_millis(500)).await;
+    send(
+        "__probe_replace",
+        json!({"path": "res://other.gd", "old": "var x = 1", "new": "var x = 2"}),
+    )
+    .await;
+    let saved_other = send("__probe_save", json!({"path": "res://other.gd"})).await;
+    println!("5 other saved: {saved_other}");
+    let other_disk = std::fs::read_to_string(editor.project.join("other.gd")).expect("file");
+    assert!(
+        other_disk.contains("var x = 2"),
+        "file after save: {other_disk:?}"
+    );
+
+    // Non-script tabs: a text file and a help page share the tab list with the scripts.
+    println!("6 mixed: {}", send("__probe_mixed", json!({})).await);
+}
+
+/// The version label of the script tools: 64-bit FNV-1a over the UTF-8 bytes of the text with
+/// `\r\n` read as `\n`, as 16 lowercase hex digits. The addon computes it in GDScript, the host
+/// in Rust; both are held to the same vectors.
+fn script_label(text: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.replace("\r\n", "\n").bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+#[test]
+fn the_script_label_matches_its_published_vectors() {
+    assert_eq!(script_label(""), "cbf29ce484222325");
+    assert_eq!(script_label("extends Node\n"), "688cd8553db5c904");
+    assert_eq!(script_label("a"), "af63dc4c8601ec8c");
+    assert_eq!(
+        script_label("extends Node\r\n"),
+        script_label("extends Node\n")
+    );
+}
+
+/// CA-7: a read answers with the text the editor would save, says where it came from and
+/// whether the editor holds unsaved changes, and every refusal is a reply with a fix.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn read_script_answers_from_the_file_or_from_unsaved_editor_text() {
+    let big = "#".repeat(1_048_577);
+    let editor = start_editor_with(
+        Some(SCRIPT_PROBE_HOOK),
+        SCRIPT_PROBE_HELPERS,
+        &[
+            (
+                "probe.gd",
+                "@tool\nextends Node\n\nfunc answer() -> int:\n\treturn 1\n",
+            ),
+            ("other.gd", "extends Node\n"),
+            ("crlf.gd", "extends Node\r\n"),
+            ("empty.gd", ""),
+            ("a.gd", "a"),
+            ("notes.txt", "hello\n"),
+            ("big.gd", big.as_str()),
+        ],
+        "",
+    )
+    .await;
+    let read = |path: &'static str| {
+        let bridge = &editor.bridge;
+        async move {
+            bridge
+                .send_command("read_script", json!({"script_path": path}))
+                .await
+        }
+    };
+
+    // A script that is not open is read from the file.
+    let other = read("res://other.gd").await.expect("read other.gd");
+    assert_eq!(other["path"], "res://other.gd");
+    assert_eq!(other["text"], "extends Node\n");
+    assert_eq!(other["source"], "file");
+    assert_eq!(other["dirty"], false);
+    assert_eq!(other["version"], "688cd8553db5c904");
+
+    // The label ignores the file's line endings, and the text is given with `\n`.
+    let crlf = read("res://crlf.gd").await.expect("read crlf.gd");
+    assert_eq!(crlf["text"], "extends Node\n");
+    assert_eq!(crlf["version"], "688cd8553db5c904");
+
+    // The shared vectors, computed by the addon.
+    assert_eq!(
+        read("res://empty.gd").await.expect("empty")["version"],
+        "cbf29ce484222325"
+    );
+    assert_eq!(
+        read("res://a.gd").await.expect("a")["version"],
+        "af63dc4c8601ec8c"
+    );
+
+    // An open script with no unsaved typing is still read from the file.
+    editor
+        .bridge
+        .send_command("__probe_open", json!({"path": "res://probe.gd"}))
+        .await
+        .expect("open");
+    sleep(Duration::from_millis(500)).await;
+    let saved_text = "@tool\nextends Node\n\nfunc answer() -> int:\n\treturn 1\n";
+    let clean = read("res://probe.gd").await.expect("read clean");
+    assert_eq!(clean["source"], "file");
+    assert_eq!(clean["dirty"], false);
+    assert_eq!(clean["version"], script_label(saved_text));
+
+    // Unsaved typing: the answer carries the editor's text and a label of that text.
+    editor
+        .bridge
+        .send_command(
+            "__probe_type",
+            json!({"path": "res://probe.gd", "text": "# typed\n"}),
+        )
+        .await
+        .expect("type");
+    let typed = read("res://probe.gd").await.expect("read typed");
+    let typed_text = format!("# typed\n{saved_text}");
+    assert_eq!(typed["source"], "editor");
+    assert_eq!(typed["dirty"], true);
+    assert_eq!(typed["text"], typed_text);
+    assert_eq!(typed["version"], script_label(&typed_text));
+    assert_ne!(typed["version"], clean["version"]);
+    assert_eq!(
+        std::fs::read_to_string(editor.project.join("probe.gd")).expect("file"),
+        saved_text,
+        "a read never touches the file"
+    );
+
+    // Refusals reply, name the problem and leave the editor usable.
+    expect_error(read("res://missing.gd").await, "does not exist");
+    expect_error(read("res://notes.txt").await, ".gd");
+    expect_error(read("res://../outside.gd").await, "inside the project");
+    expect_error(read("res://big.gd").await, "1 MiB");
+    expect_error(
+        editor
+            .bridge
+            .send_command("read_script", json!({"script_path": 5}))
+            .await,
+        "must be of type",
+    );
+    expect_error(
+        editor.bridge.send_command("read_script", json!({})).await,
+        "script_path",
+    );
+    assert_eq!(
+        read("res://other.gd").await.expect("still answering")["version"],
+        "688cd8553db5c904"
+    );
+}
+
+/// CA-8 to CA-10: an edit replaces one fragment through the script editor as one undo step,
+/// saves it, and never touches a script the editor holds unsaved typing for.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn edit_script_replaces_one_fragment_and_never_overwrites_typing() {
+    let live = "@tool\nextends Node\n\nfunc answer() -> int:\n\treturn 1\n";
+    let other = "extends Node\n\nvar x = 1\nvar y = 1\n";
+    let editor = start_editor_with(
+        Some(SCRIPT_PROBE_HOOK),
+        SCRIPT_PROBE_HELPERS,
+        &[
+            ("probe.gd", live),
+            ("live.gd", live),
+            ("other.gd", other),
+            ("notes.txt", "hello\n"),
+        ],
+        "",
+    )
+    .await;
+    let bridge = &editor.bridge;
+    let file = |name: &str| std::fs::read_to_string(editor.project.join(name)).expect("file");
+    let edit = |path: &'static str, old: &str, new: &str| {
+        let params = json!({"script_path": path, "old_text": old, "new_text": new});
+        async move { bridge.send_command("edit_script", params).await }
+    };
+    let state = |path: &'static str| async move {
+        bridge
+            .send_command("__probe_state", json!({"path": path}))
+            .await
+            .expect("state")
+    };
+
+    // One fragment is replaced, the file is saved, the answer carries the new label, and the
+    // editor shows a saved script that one undo step takes back.
+    let uid_before = std::fs::read_to_string(editor.project.join("other.gd.uid")).ok();
+    let edited_text = "extends Node\n\nvar x = 2\nvar y = 1\n";
+    let done = edit("res://other.gd", "var x = 1", "var x = 2")
+        .await
+        .expect("edit other.gd");
+    assert_eq!(done["path"], "res://other.gd");
+    assert_eq!(done["replaced"], 1);
+    assert_eq!(done["source"], "editor");
+    assert_eq!(done["version"], script_label(edited_text));
+    assert_eq!(file("other.gd"), edited_text);
+    let shown = state("res://other.gd").await;
+    assert_eq!(
+        shown["found"], true,
+        "the edited script is open in the editor"
+    );
+    assert_eq!(shown["text"], edited_text);
+    assert_eq!(
+        shown["version"], shown["saved_version"],
+        "the edit is saved"
+    );
+    assert_eq!(
+        std::fs::read_to_string(editor.project.join("other.gd.uid")).ok(),
+        uid_before,
+        "the script keeps its uid file"
+    );
+    let undone = bridge
+        .send_command("__probe_undo", json!({"path": "res://other.gd"}))
+        .await
+        .expect("undo");
+    assert_eq!(undone["text"], other, "one undo step reverses the edit");
+    // Put the saved text back in the editor so later edits start clean.
+    let again = edit("res://other.gd", "var x = 1", "var x = 2").await;
+    expect_error(again, "unsaved changes");
+    bridge
+        .send_command("__probe_save", json!({"path": "res://other.gd"}))
+        .await
+        .expect("save original text");
+    assert_eq!(file("other.gd"), other);
+
+    // Zero and several matches are refused with the count and leave everything as it was.
+    expect_error(
+        edit("res://other.gd", "var z = 1", "var z = 2").await,
+        "0 times",
+    );
+    expect_error(edit("res://other.gd", "var ", "let ").await, "2 times");
+    assert_eq!(file("other.gd"), other);
+
+    // A stale label is refused; the current label is accepted.
+    let stale = bridge
+        .send_command(
+            "edit_script",
+            json!({"script_path": "res://other.gd", "old_text": "var y = 1",
+                   "new_text": "var y = 3", "version": "0000000000000000"}),
+        )
+        .await;
+    expect_error(stale, "changed since it was read");
+    assert_eq!(file("other.gd"), other);
+    let fresh = bridge
+        .send_command(
+            "edit_script",
+            json!({"script_path": "res://other.gd", "old_text": "var y = 1",
+                   "new_text": "var y = 3", "version": script_label(other)}),
+        )
+        .await
+        .expect("edit with the current label");
+    assert_eq!(fresh["replaced"], 1);
+
+    // Text is data: quotes, format markers, braces, backslashes and code-looking lines are
+    // inserted as they are.
+    let tricky = "var y = \"%s {0} \\\\ \\n $x\"\nfunc injected() -> void:\n\tOS.crash(\"no\")";
+    edit("res://other.gd", "var y = 3", tricky)
+        .await
+        .expect("edit with tricky text");
+    assert!(
+        file("other.gd").contains(tricky),
+        "file: {:?}",
+        file("other.gd")
+    );
+
+    // Unsaved typing is never overwritten (CA-9).
+    bridge
+        .send_command("__probe_open", json!({"path": "res://probe.gd"}))
+        .await
+        .expect("open");
+    sleep(Duration::from_millis(500)).await;
+    bridge
+        .send_command(
+            "__probe_type",
+            json!({"path": "res://probe.gd", "text": "# typed\n"}),
+        )
+        .await
+        .expect("type");
+    expect_error(
+        edit("res://probe.gd", "return 1", "return 2").await,
+        "unsaved changes",
+    );
+    assert_eq!(file("probe.gd"), live, "the file is untouched");
+    let still = state("res://probe.gd").await;
+    assert!(
+        still["text"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("# typed\n"),
+        "the typed text is still in the editor"
+    );
+
+    // A running script gets the edited code, and the edit opened the script that was closed.
+    let before = bridge
+        .send_command("__probe_attach", json!({"path": "res://live.gd"}))
+        .await
+        .expect("attach");
+    assert_eq!(before["answer"], 1);
+    assert_eq!(state("res://live.gd").await["found"], false);
+    edit("res://live.gd", "return 1", "return 2")
+        .await
+        .expect("edit live.gd");
+    let after = bridge
+        .send_command("__probe_call", json!({}))
+        .await
+        .expect("call");
+    assert_eq!(after["answer"], 2, "the running node has the new code");
+
+    // Refusals reply with a fix.
+    expect_error(edit("res://other.gd", "", "x").await, "must not be empty");
+    expect_error(
+        edit("res://other.gd", "var x = 1", "var x = 1").await,
+        "identical",
+    );
+    expect_error(
+        edit("res://missing.gd", "a", "b").await,
+        "godot_create_script",
+    );
+    expect_error(edit("res://notes.txt", "hello", "bye").await, ".gd");
+    expect_error(edit("res://../x.gd", "a", "b").await, "inside the project");
+    expect_error(
+        bridge
+            .send_command(
+                "edit_script",
+                json!({"script_path": "res://other.gd", "old_text": "a", "new_text": 5}),
+            )
+            .await,
+        "must be of type",
+    );
+    assert_eq!(file("notes.txt"), "hello\n");
 }

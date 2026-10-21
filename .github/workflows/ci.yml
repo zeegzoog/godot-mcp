@@ -60,6 +60,7 @@ jobs:
           $GODOT_PATH --headless --check-only --path . --script addons/godot_mcp/bridge_server.gd
           $GODOT_PATH --headless --check-only --path . --script addons/godot_mcp/export_plugin.gd
           $GODOT_PATH --headless --check-only --path . --script addons/godot_mcp/editor/game_relay.gd
+          $GODOT_PATH --headless --check-only --path . --script addons/godot_mcp/editor/script_ops.gd
           $GODOT_PATH --headless --check-only --path . --script addons/godot_mcp/core/runtime_override.gd
           $GODOT_PATH --headless --check-only --path . --script addons/godot_mcp/runtime/mcp_runtime.gd
           $GODOT_PATH --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_hold.gd

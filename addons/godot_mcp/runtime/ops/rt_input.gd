@@ -2,9 +2,11 @@ extends RefCounted
 ## Input injection for a running game.
 ##
 ## Events go through Input.parse_input_event and Input.flush_buffered_events, which is the
-## same path a real device uses (including the headless display server). Presses are
+## same path a real device uses (including the headless display server). Mouse events do
+## not move the OS cursor unless the call passes warp_mouse. Presses are
 ## remembered so input.release_all can clear them. A tap is delivered at the start of a
-## frame, held for one process frame, then released.
+## frame, held for one process frame, then released. click, click_node, and swipe are
+## gestures on that same path. A step that fails releases every held button and touch.
 
 const R := preload("rt_result.gd")
 
@@ -33,6 +35,8 @@ static var _joy_buttons: Dictionary = {}
 static var _joy_axes: Dictionary = {}
 static var _touches: Dictionary = {}
 static var _mouse_pos := Vector2.ZERO
+static var _warp_mouse := false
+static var _saved_time_scale := -1.0
 
 
 static func methods() -> Dictionary:
@@ -45,6 +49,9 @@ static func methods() -> Dictionary:
 
 static func run_steps(rt: Node, params: Dictionary) -> Dictionary:
     var raw: Variant = params.get("steps", [])
+    if params.has("warp_mouse") and not params["warp_mouse"] is bool:
+        return R.err(R.BAD_PARAMS, "input.run: warp_mouse must be a boolean.")
+    _warp_mouse = bool(params.get("warp_mouse", false))
     if not raw is Array or (raw as Array).is_empty():
         return R.err(R.BAD_PARAMS, "input.run: 'steps' must be a non-empty array.")
     var steps: Array = []
@@ -68,15 +75,42 @@ static func release_all(rt: Node, _params: Dictionary) -> Dictionary:
 
 
 static func wait_frames(rt: Node, params: Dictionary) -> Dictionary:
+    var scaled := _note_time_scale(params)
+    if R.is_err(scaled):
+        return scaled
+    var note: Dictionary = scaled["note"]
+    var node_path := str(params.get("node", "")).strip_edges()
+    var sig := str(params.get("signal", "")).strip_edges()
+    if not sig.is_empty() and node_path.is_empty():
+        return R.err(R.BAD_PARAMS, "input.wait: a signal needs a node path.")
+    if not node_path.is_empty() or not sig.is_empty():
+        var timeout := clampi(int(params.get("timeout", params.get("frames", 180))), 1, 600)
+        var state := {
+            "until": _until_state(node_path, sig, timeout),
+            "note": note,
+            "results": [],
+            "index": 0,
+            "mode": "until",
+            "tool_wait": true,
+        }
+        return {"_pending": true, "_tick": func() -> bool: return _tick_until(rt, state)}
     var frames := clampi(int(params.get("frames", 1)), 0, 600)
-    var state := {"left": frames, "start": Engine.get_process_frames()}
+    var state := {"left": frames, "start": Engine.get_process_frames(), "note": note}
     return {"_pending": true, "_tick": func() -> bool:
         if int(state["left"]) > 0:
             state["left"] = int(state["left"]) - 1
             return true
-        rt.finish_job(R.ok({"frames": Engine.get_process_frames() - int(state["start"])}))
+        var body := {"frames": Engine.get_process_frames() - int(state["start"])}
+        body.merge(state["note"])
+        rt.finish_job(R.ok(body))
         return false
     }
+
+
+static func restore_time_scale() -> void:
+    if _saved_time_scale >= 0.0:
+        Engine.time_scale = _saved_time_scale
+        _saved_time_scale = -1.0
 
 
 static func _tick_steps(rt: Node, state: Dictionary) -> bool:
@@ -89,7 +123,8 @@ static func _tick_steps(rt: Node, state: Dictionary) -> bool:
     if mode == "hold":
         _release_tap(state["release"])
         state["release"] = {}
-        (state["results"] as Array).append({"type": str((steps[index] as Dictionary)["type"]), "ok": true})
+        var done: Dictionary = steps[index]
+        (state["results"] as Array).append({"type": str(done.get("label", done["type"])), "ok": true})
         state["index"] = index + 1
         state["mode"] = "body"
         index += 1
@@ -102,14 +137,44 @@ static func _tick_steps(rt: Node, state: Dictionary) -> bool:
         state["index"] = index + 1
         state["mode"] = "body"
         index += 1
+    if mode == "until":
+        return _tick_until(rt, state)
+    if mode == "gesture":
+        return _tick_gesture(rt, state)
     if mode == "text":
         return _tick_text(rt, state)
     if index >= steps.size():
-        rt.finish_job(R.ok({"steps": state["results"], "held": _held_summary()}))
+        rt.finish_job(R.ok({"steps": state["results"], "held": _held_summary(), "warp_mouse": _warp_mouse}))
         return false
     var step: Dictionary = steps[index]
     var kind := str(step["type"])
+    if kind == "click_node":
+        var resolved := _resolve_click_node(rt, step)
+        if R.is_err(resolved):
+            return _fail(rt, state, resolved)
+        step = resolved["step"]
+        steps[index] = step
+        kind = str(step["type"])
+    if kind == "swipe":
+        state["gesture"] = {"step": step, "i": 0, "at": Vector2(float(step["x"]), float(step["y"]))}
+        state["mode"] = "gesture"
+        return _tick_gesture(rt, state)
+    if kind == "time_scale":
+        var note := _set_time_scale(float(step["scale"]))
+        (state["results"] as Array).append({
+            "type": "time_scale",
+            "ok": true,
+            "time_scale": note["time_scale"],
+            "previous_time_scale": note["previous_time_scale"],
+        })
+        state["index"] = index + 1
+        return true
     if kind == "wait":
+        if not str(step.get("node", "")).is_empty() or not str(step.get("signal", "")).is_empty():
+            state["until"] = _until_state(str(step["node"]), str(step["signal"]), int(step["timeout"]))
+            state["mode"] = "until"
+            state["tool_wait"] = false
+            return _tick_until(rt, state)
         var frames := int(step["frames"])
         if frames <= 0:
             (state["results"] as Array).append({"type": "wait", "ok": true})
@@ -135,7 +200,7 @@ static func _tick_steps(rt: Node, state: Dictionary) -> bool:
             state["mode"] = "hold"
             return true
         _apply_phase(step, phase)
-        (state["results"] as Array).append({"type": kind, "ok": true})
+        (state["results"] as Array).append({"type": str(step.get("label", kind)), "ok": true})
         state["index"] = index + 1
         return true
     if kind == "mouse_move":
@@ -214,6 +279,254 @@ static func _apply_phase(step: Dictionary, phase: String) -> void:
         Input.flush_buffered_events()
 
 
+static func _fail(rt: Node, state: Dictionary, error: Dictionary) -> bool:
+    if state.has("until"):
+        _disconnect_wait(state["until"])
+    _release_everything()
+    Input.flush_buffered_events()
+    rt.finish_job(error)
+    return false
+
+
+static func _note_time_scale(params: Dictionary) -> Dictionary:
+    if not params.has("time_scale"):
+        return {"note": {}}
+    var parsed := _parse_time_scale(params.get("time_scale"))
+    if R.is_err(parsed):
+        return parsed
+    return {"note": _set_time_scale(float(parsed["scale"]))}
+
+
+static func _parse_time_scale(raw: Variant) -> Dictionary:
+    if not (raw is float or raw is int):
+        return R.err(R.BAD_PARAMS, "time_scale must be a number from 0 to 8.")
+    var scale := float(raw)
+    if scale < 0.0 or scale > 8.0:
+        return R.err(R.BAD_PARAMS, "time_scale must be a number from 0 to 8.")
+    return {"scale": scale}
+
+
+static func _set_time_scale(scale: float) -> Dictionary:
+    var previous := Engine.time_scale
+    if _saved_time_scale < 0.0:
+        _saved_time_scale = previous
+    Engine.time_scale = scale
+    return {"previous_time_scale": previous, "time_scale": scale}
+
+
+static func _until_state(path: String, sig: String, timeout: int) -> Dictionary:
+    return {
+        "node_path": path,
+        "signal_name": sig,
+        "left": timeout,
+        "node": null,
+        "hook": Callable(),
+        "connected": false,
+        "fired": false,
+        "start": Engine.get_process_frames(),
+    }
+
+
+static func _tick_until(rt: Node, state: Dictionary) -> bool:
+    var watching: Dictionary = state["until"]
+    var path := str(watching["node_path"])
+    var sig := str(watching["signal_name"])
+    var node: Node = watching.get("node")
+    if node == null or not is_instance_valid(node):
+        node = rt.find_node(path) if not path.is_empty() else null
+        watching["node"] = node
+    if not sig.is_empty():
+        if node != null and not bool(watching["connected"]):
+            if not node.has_signal(sig):
+                return _fail(rt, state, R.err(R.NOT_FOUND, "Node '%s' has no signal '%s'." % [path, sig]))
+            # The node itself stores the flag. A lambda that writes a captured Dictionary
+            # can copy that Dictionary, so the tick would never see the write.
+            # A zero-argument lambda also never runs when the signal carries arguments.
+            var argc := _signal_argc(node, sig)
+            var target := node
+            var hook := Callable()
+            match argc:
+                0:
+                    hook = func() -> void: _mark_wait(target)
+                1:
+                    hook = func(_a) -> void: _mark_wait(target)
+                2:
+                    hook = func(_a, _b) -> void: _mark_wait(target)
+                3:
+                    hook = func(_a, _b, _c) -> void: _mark_wait(target)
+                _:
+                    return _fail(rt, state, R.err(R.BAD_PARAMS, "Signal '%s' has too many arguments to wait for." % sig))
+            var err := node.connect(sig, hook)
+            if err != OK:
+                return _fail(rt, state, R.err(R.GODOT_ERROR, "Could not wait for '%s': %s." % [sig, error_string(err)]))
+            watching["hook"] = hook
+            watching["connected"] = true
+        if node != null and bool(node.get_meta(&"godot_mcp_wait_fired", false)):
+            return _finish_until(rt, state, sig, path)
+    elif node != null:
+        return _finish_until(rt, state, "", path)
+    watching["left"] = int(watching["left"]) - 1
+    if int(watching["left"]) > 0:
+        return true
+    var found := node != null and is_instance_valid(node)
+    var was_connected := bool(watching.get("connected", false))
+    _disconnect_wait(watching)
+    var what := sig if not sig.is_empty() else path
+    return _fail(rt, state, R.err(R.NOT_FOUND, "Timed out waiting for '%s'." % what, {
+        "connected": was_connected,
+        "found": found,
+    }))
+
+
+static func _finish_until(rt: Node, state: Dictionary, sig: String, path: String) -> bool:
+    var watching: Dictionary = state["until"]
+    var waited := Engine.get_process_frames() - int(watching["start"])
+    _disconnect_wait(watching)
+    var body := {"ok": true, "path": path, "frames": waited}
+    if not sig.is_empty():
+        body["signal"] = sig
+    if bool(state.get("tool_wait", false)):
+        body.merge(state.get("note", {}))
+        rt.finish_job(R.ok(body))
+        return false
+    body["type"] = "wait"
+    (state["results"] as Array).append(body)
+    state["index"] = int(state["index"]) + 1
+    state["mode"] = "body"
+    return true
+
+
+static func _signal_argc(node: Node, sig: String) -> int:
+    for info: Dictionary in node.get_signal_list():
+        if str(info.get("name", "")) == sig:
+            var args: Array = info.get("args", [])
+            return args.size()
+    return -1
+
+
+static func _mark_wait(target: Node) -> void:
+    if is_instance_valid(target):
+        target.set_meta(&"godot_mcp_wait_fired", true)
+
+
+static func _disconnect_wait(watching: Dictionary) -> void:
+    var node: Node = watching.get("node")
+    var hook: Callable = watching.get("hook", Callable())
+    var sig := str(watching.get("signal_name", ""))
+    if node != null and is_instance_valid(node):
+        if hook.is_valid() and not sig.is_empty() and node.is_connected(sig, hook):
+            node.disconnect(sig, hook)
+        if node.has_meta(&"godot_mcp_wait_fired"):
+            node.remove_meta(&"godot_mcp_wait_fired")
+    watching["connected"] = false
+
+
+static func _resolve_click_node(rt: Node, step: Dictionary) -> Dictionary:
+    var path := str(step["node"])
+    var node: Node = rt.find_node(path)
+    if node == null:
+        return R.err(R.NOT_FOUND, "No node at '%s' to click." % path)
+    var point = _viewport_point(node)
+    if point is Dictionary:
+        return point
+    var at: Vector2 = point
+    var pointer := str(step["pointer"])
+    if pointer == "touch":
+        return {"step": {
+            "type": "touch", "phase": "tap", "label": "click_node",
+            "x": at.x, "y": at.y, "button": "left", "index": int(step["index"]),
+        }}
+    return {"step": {
+        "type": "mouse_button", "phase": "tap", "label": "click_node",
+        "x": at.x, "y": at.y, "button": str(step["button"]), "index": 0,
+    }}
+
+
+static func _viewport_point(node: Node) -> Variant:
+    var viewport := node.get_viewport()
+    if viewport == null:
+        return R.err(R.NOT_FOUND, "Node '%s' has no viewport." % node.name)
+    # The canvas transform is part of where a canvas item is drawn: a camera that scrolls, or a
+    # CanvasLayer, moves the item on screen but not its global position.
+    if node is Control:
+        var control := node as Control
+        return control.get_global_transform_with_canvas() * (control.size / 2.0)
+    if node is Node2D:
+        return (node as Node2D).get_global_transform_with_canvas().origin
+    if node is Node3D:
+        var camera := viewport.get_camera_3d()
+        if camera == null:
+            return R.err(R.NOT_FOUND, "No Camera3D to project '%s'." % node.name)
+        var at: Vector3 = (node as Node3D).global_position
+        if camera.is_position_behind(at):
+            return R.err(R.BAD_PARAMS, "Node '%s' is behind the camera." % node.name)
+        return camera.unproject_position(at)
+    return R.err(R.BAD_PARAMS, "click_node needs a Control, Node2D, or Node3D.")
+
+
+static func _tick_gesture(_rt: Node, state: Dictionary) -> bool:
+    var gesture: Dictionary = state["gesture"]
+    var step: Dictionary = gesture["step"]
+    var frames := int(step["frames"])
+    var i := int(gesture["i"])
+    var from := Vector2(float(step["x"]), float(step["y"]))
+    var to := Vector2(float(step["to_x"]), float(step["to_y"]))
+    var at := from.lerp(to, clampf(float(i) / float(frames), 0.0, 1.0))
+    if i == 0:
+        _gesture_press(step, from)
+    elif i < frames:
+        _gesture_move(step, gesture["at"], at)
+    else:
+        _gesture_move(step, gesture["at"], to)
+        _gesture_release(step, to)
+        (state["results"] as Array).append({"type": "swipe", "ok": true})
+        state["index"] = int(state["index"]) + 1
+        state["mode"] = "body"
+        state["gesture"] = {}
+        return true
+    gesture["at"] = at if i > 0 else from
+    gesture["i"] = i + 1
+    return true
+
+
+static func _gesture_press(step: Dictionary, at: Vector2) -> void:
+    if str(step["pointer"]) == "touch":
+        var touch_index := int(step["index"])
+        _touch_event(touch_index, true, at.x, at.y)
+        _touches[touch_index] = at
+    else:
+        var button := str(step["button"])
+        _mouse_motion(at.x, at.y)
+        _mouse_event(int(MOUSE_BUTTONS[button]), true, at.x, at.y)
+        _mouse[button] = true
+    Input.flush_buffered_events()
+
+
+static func _gesture_move(step: Dictionary, previous: Vector2, at: Vector2) -> void:
+    if str(step["pointer"]) == "touch":
+        var event := InputEventScreenDrag.new()
+        event.index = int(step["index"])
+        event.position = at
+        event.relative = at - previous
+        _touches[int(step["index"])] = at
+        Input.parse_input_event(event)
+    else:
+        _mouse_motion(at.x, at.y)
+    Input.flush_buffered_events()
+
+
+static func _gesture_release(step: Dictionary, at: Vector2) -> void:
+    if str(step["pointer"]) == "touch":
+        var touch_index := int(step["index"])
+        _touch_event(touch_index, false, at.x, at.y)
+        _touches.erase(touch_index)
+    else:
+        var button := str(step["button"])
+        _mouse_event(int(MOUSE_BUTTONS[button]), false, at.x, at.y)
+        _mouse.erase(button)
+    Input.flush_buffered_events()
+
+
 static func _release_tap(step: Dictionary) -> void:
     if step.is_empty():
         return
@@ -246,6 +559,55 @@ static func _parse(step: Dictionary, index: int) -> Dictionary:
                 "type": kind, "phase": phase, "x": float(step["x"]), "y": float(step["y"]),
                 "button": button, "index": int(step.get("index", 0)),
             }}
+        "click":
+            if not step.has("x") or not step.has("y"):
+                return R.err(R.BAD_PARAMS, "steps[%d]: click needs x and y." % index)
+            var click_button := str(step.get("button", "left"))
+            if not MOUSE_BUTTONS.has(click_button):
+                return R.err(R.BAD_PARAMS, "steps[%d]: unknown mouse button '%s'." % [index, click_button])
+            return {"step": {
+                "type": "mouse_button", "phase": "tap", "label": "click",
+                "x": float(step["x"]), "y": float(step["y"]), "button": click_button, "index": 0,
+            }}
+        "click_node":
+            var node_path := str(step.get("node", "")).strip_edges()
+            if node_path.is_empty():
+                return R.err(R.BAD_PARAMS, "steps[%d]: click_node needs a node path." % index)
+            var pointer := str(step.get("pointer", "mouse"))
+            if not pointer in ["mouse", "touch"]:
+                return R.err(R.BAD_PARAMS, "steps[%d]: pointer must be mouse or touch." % index)
+            var node_button := str(step.get("button", "left"))
+            if pointer == "mouse" and not MOUSE_BUTTONS.has(node_button):
+                return R.err(R.BAD_PARAMS, "steps[%d]: unknown mouse button '%s'." % [index, node_button])
+            return {"step": {
+                "type": kind, "node": node_path, "pointer": pointer,
+                "button": node_button, "index": int(step.get("index", 0)),
+            }}
+        "swipe":
+            for key: String in ["x", "y", "to_x", "to_y"]:
+                if not step.has(key):
+                    return R.err(R.BAD_PARAMS, "steps[%d]: swipe needs x, y, to_x, and to_y." % index)
+            var swipe_frames := int(step.get("frames", 8))
+            if swipe_frames < 1 or swipe_frames > 60:
+                return R.err(R.BAD_PARAMS, "steps[%d]: swipe frames must be from 1 to 60." % index)
+            var swipe_pointer := str(step.get("pointer", "mouse"))
+            if not swipe_pointer in ["mouse", "touch"]:
+                return R.err(R.BAD_PARAMS, "steps[%d]: pointer must be mouse or touch." % index)
+            var swipe_button := str(step.get("button", "left"))
+            if swipe_pointer == "mouse" and not MOUSE_BUTTONS.has(swipe_button):
+                return R.err(R.BAD_PARAMS, "steps[%d]: unknown mouse button '%s'." % [index, swipe_button])
+            return {"step": {
+                "type": kind, "pointer": swipe_pointer, "button": swipe_button,
+                "index": int(step.get("index", 0)), "frames": swipe_frames,
+                "x": float(step["x"]), "y": float(step["y"]),
+                "to_x": float(step["to_x"]), "to_y": float(step["to_y"]),
+            }}
+        "time_scale":
+            var scale_value: Variant = step.get("scale", step.get("time_scale", null))
+            var parsed_scale := _parse_time_scale(scale_value)
+            if R.is_err(parsed_scale):
+                return R.err(R.BAD_PARAMS, "steps[%d]: %s" % [index, parsed_scale["error"]["message"]])
+            return {"step": {"type": kind, "scale": parsed_scale["scale"]}}
         "joy_button":
             var button_name := str(step.get("button", ""))
             if not JOY_BUTTONS.has(button_name):
@@ -257,7 +619,18 @@ static func _parse(step: Dictionary, index: int) -> Dictionary:
                 return R.err(R.BAD_PARAMS, "steps[%d]: unknown joypad axis '%s'." % [index, axis])
             return {"step": {"type": kind, "axis": axis, "value": clampf(float(step.get("value", 0.0)), -1.0, 1.0), "device": int(step.get("device", 0))}}
         "wait":
-            return {"step": {"type": kind, "frames": clampi(int(step.get("frames", 1)), 0, 600)}}
+            var node_path := str(step.get("node", "")).strip_edges()
+            var sig := str(step.get("signal", "")).strip_edges()
+            if not sig.is_empty() and node_path.is_empty():
+                return R.err(R.BAD_PARAMS, "steps[%d]: a signal wait needs a node path." % index)
+            var waiting := not node_path.is_empty() or not sig.is_empty()
+            return {"step": {
+                "type": kind,
+                "frames": clampi(int(step.get("frames", 1)), 0, 600),
+                "node": node_path,
+                "signal": sig,
+                "timeout": clampi(int(step.get("timeout", (180 if waiting else 1))), 1, 600),
+            }}
         _:
             return R.err(R.BAD_PARAMS, "steps[%d]: unknown type '%s'." % [index, kind])
 
@@ -331,7 +704,10 @@ static func _mouse_motion(x: float, y: float) -> void:
     event.global_position = event.position
     event.relative = event.position - _mouse_pos
     _mouse_pos = event.position
-    Input.warp_mouse(event.position)
+    # warp_mouse moves the real cursor. The parsed event is enough for _input and
+    # Viewport.get_mouse_position, and it leaves the user's pointer where it was.
+    if _warp_mouse:
+        Input.warp_mouse(event.position)
     Input.parse_input_event(event)
 
 

@@ -93,8 +93,8 @@ pub fn catalog() -> Vec<Tool> {
         ),
         tool(
             "godot_game_input",
-            "Injects input into the running game: key, text, mouse_move, mouse_button, touch, joy_button, joy_axis, wait. phase is tap (default), press, or release.",
-            json!({"run_id": s(""), "steps": {"type": "array", "items": {"type": "object"}}}),
+            "Injects input into the running game. Steps: key, text, mouse_move, mouse_button, touch, joy_button, joy_axis, wait, click, click_node, swipe, time_scale. phase is tap (default), press, or release. click is a mouse tap at x, y. click_node taps the center of a Control, Node2D, or Node3D. swipe presses at x, y and releases at to_x, to_y across frames (default 8, pointer mouse or touch). Mouse steps are Godot input events and do not move the OS cursor unless warp_mouse is true. time_scale sets Engine.time_scale (0 through 8) until another call changes it. A failed step releases every button and touch this server is still holding.",
+            json!({"run_id": s(""), "steps": {"type": "array", "items": {"type": "object"}}, "warp_mouse": {"type": "boolean", "description": "Move the real OS cursor to each mouse event. Default false."}}),
             &["steps"],
         ),
         tool(
@@ -105,14 +105,14 @@ pub fn catalog() -> Vec<Tool> {
         ),
         tool(
             "godot_game_wait",
-            "Waits for process frames in the running game so input and screenshots can observe the result.",
-            json!({"run_id": s(""), "frames": i("Default 1.")}),
+            "Waits in the running game. frames waits process frames (default 1). node waits until that node exists. signal waits until that signal fires on node (timeout frames, default 180). time_scale sets Engine.time_scale from 0 through 8 and keeps it until changed again; the runtime restores the previous scale when the game exits.",
+            json!({"run_id": s(""), "frames": i("Default 1. Ignored when node or signal is set, except as the default timeout."), "node": s("Wait until this node exists."), "signal": s("Wait until this signal fires on node."), "timeout": i("Frame limit for node or signal. Default 180, max 600."), "time_scale": n("Engine.time_scale, from 0 through 8.")}),
             &[],
         ),
         tool(
             "godot_game_screenshot",
-            "Captures the running game window, a viewport, or a Camera2D/Camera3D as a PNG. Fails instead of returning an empty image. Headless games have nothing to capture.",
-            json!({"run_id": s(""), "node": s("Viewport or node whose viewport to capture."), "camera": s("Camera2D or Camera3D to make current for the shot."), "max_dimension": i("Longest side in pixels. Default 768.")}),
+            "Captures the running game window, a viewport, or a Camera2D/Camera3D as one PNG. frames (1 to 8) stitches shots taken every process frames into a single sheet. The text says how many pixels changed since the previous capture of this run, and where (a sheet compares its last frame, and only against a capture of the same size). Fails instead of returning an empty image. Headless games have nothing to capture.",
+            json!({"run_id": s(""), "node": s("Viewport or node whose viewport to capture."), "camera": s("Camera2D or Camera3D to make current for the shot."), "max_dimension": i("Longest side of the returned image in pixels. Default 768."), "frames": i("How many frames to stitch. Default 1, max 8."), "every": i("Process frames between shots. Default 1, max 60.")}),
             &[],
         ),
         tool(
@@ -154,6 +154,10 @@ fn i(description: &str) -> Value {
 
 fn b() -> Value {
     json!({"type": "boolean"})
+}
+
+fn n(description: &str) -> Value {
+    json!({"type": "number", "description": description})
 }
 
 fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> Tool {
@@ -270,10 +274,49 @@ async fn screenshot(tools: &ToolManager, args: &Value) -> ToolResult {
         .and_then(Value::as_str)
         .unwrap_or("viewport");
     ToolResult::image_with_text(
-        format!("Game screenshot {width}x{height} ({source})"),
+        screenshot_note(&value, width, height, source),
         data,
         "image/png",
     )
+}
+
+fn screenshot_note(value: &Value, width: u32, height: u32, source: &str) -> String {
+    let frames = value.get("frames").and_then(Value::as_u64).unwrap_or(1);
+    let mut note = format!("Game screenshot {width}x{height} ({source})");
+    if frames > 1 {
+        let columns = value.get("columns").and_then(Value::as_u64).unwrap_or(1);
+        note.push_str(&format!(", {frames} frames, {columns} columns"));
+    }
+    match value
+        .get("diff")
+        .and_then(|diff| diff.get("compared"))
+        .and_then(Value::as_bool)
+    {
+        Some(true) => {
+            let changed = value["diff"]
+                .get("changed")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            note.push_str(&format!(", changed {changed} px"));
+            if let Some(rect) = value["diff"].get("rect").filter(|rect| rect.is_object()) {
+                note.push_str(&format!(
+                    " in {},{},{}x{}",
+                    rect["x"].as_i64().unwrap_or(0),
+                    rect["y"].as_i64().unwrap_or(0),
+                    rect["w"].as_i64().unwrap_or(0),
+                    rect["h"].as_i64().unwrap_or(0),
+                ));
+            }
+        }
+        Some(false) => match value["diff"].get("reason").and_then(Value::as_str) {
+            Some(reason) if reason != "no previous capture" => {
+                note.push_str(&format!(", not compared: {reason}"));
+            }
+            _ => note.push_str(", no earlier capture to compare"),
+        },
+        None => {}
+    }
+    note
 }
 
 async fn breakpoints(tools: &ToolManager, args: &Value) -> ToolResult {
@@ -612,6 +655,51 @@ mod tests {
         let longest = debug_wait(&json!({"wait_seconds": u64::MAX}));
         assert_eq!(longest, Duration::from_secs(MAX_WAIT_SECONDS));
         let _ = tokio::time::Instant::now() + longest;
+    }
+
+    #[test]
+    fn screenshot_note_names_a_sheet_and_the_changed_rect() {
+        let first = screenshot_note(
+            &json!({"frames": 1, "diff": {"compared": false}}),
+            32,
+            16,
+            "main window",
+        );
+        assert_eq!(
+            first,
+            "Game screenshot 32x16 (main window), no earlier capture to compare"
+        );
+        let sheet = screenshot_note(
+            &json!({
+                "frames": 4,
+                "columns": 2,
+                "diff": {"compared": true, "changed": 12, "rect": {"x": 1, "y": 2, "w": 3, "h": 4}}
+            }),
+            64,
+            64,
+            "main window",
+        );
+        assert_eq!(
+            sheet,
+            "Game screenshot 64x64 (main window), 4 frames, 2 columns, changed 12 px in 1,2,3x4"
+        );
+    }
+
+    #[test]
+    fn screenshot_note_says_why_two_captures_were_not_compared() {
+        let note = screenshot_note(
+            &json!({
+                "frames": 1,
+                "diff": {"compared": false, "reason": "the previous capture had another size"}
+            }),
+            64,
+            64,
+            "main window",
+        );
+        assert_eq!(
+            note,
+            "Game screenshot 64x64 (main window), not compared: the previous capture had another size"
+        );
     }
 
     #[test]

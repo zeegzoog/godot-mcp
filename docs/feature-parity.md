@@ -42,10 +42,10 @@ Tool names are the MCP names. Solo and Vollkorn do not use a `godot_` prefix.
 | Live method call | implemented `godot_game_call`. Caller must pass `permit`. Denylist: quit, set_script, call, callv, call_deferred, rpc, rpc_id, free. Verified `poke` returned 4 | implemented inside `godot_game_edit`. `godot_game_eval` is opt-in | unsupported | partial `call_method`, `evaluate_expression` (unrestricted) | `Node.callv` | Permit list. No `godot_game_eval` |
 | Signals | partial. Editor: `godot_list_signals`, `godot_connect_signal` (CONNECT_PERSIST, undo; the editor e2e test connects, lists, and refuses an unknown signal, a missing method and a second connection). Runtime: `godot_game_signals`, `godot_game_observe` (connects, waits frames, disconnects). Observe returned without error; a signal fired during the watch window was not asserted | implemented `godot_signal_*` and runtime observe | unsupported | partial `connect_signal`, `subscribe_signals`, `wait_for_signal` | `Node.connect` | Editor connections are undoable. Runtime observation is temporary |
 | Snapshot | partial `godot_game_snapshot` (scene, frame, paused, children). Not in the e2e | implemented as part of tree/time | unsupported | partial `game_state` | `SceneTree` | Small on purpose |
-| Keyboard, mouse, touch, gamepad, wait | implemented `godot_game_input`. Verified on a headless process run: key `A`, left click, touch, joy button A, left stick X, one-frame wait. Events hit the game's `_input`, not the editor | implemented, richer (actions, drag, click-on-node) | unsupported | implemented `send_key`, `send_mouse_*`, `send_joypad_*`, `send_input` through `input_receiver.gd` | `Input.parse_input_event` + `Input.flush_buffered_events` inside the game | JS path. Vollkorn's receiver never sees the editor's input map the same way and is easier to leave stuck |
+| Keyboard, mouse, touch, gamepad, wait | implemented `godot_game_input`. Verified on a headless process run: key `A`, left click, touch, joy button A, left stick X, one-frame wait, `click`, mouse and touch `swipe`, `click_node` on a Button and a Node2D. A failing step releases what is held. The OS cursor stays put unless `warp_mouse` is set. Events hit the game's `_input`, not the editor | implemented, richer (actions, drag, click-on-node) | unsupported | implemented `send_key`, `send_mouse_*`, `send_joypad_*`, `send_input` through `input_receiver.gd` | `Input.parse_input_event` + `Input.flush_buffered_events` inside the game | JS path. Vollkorn's receiver never sees the editor's input map the same way and is easier to leave stuck |
 | Release stuck input | implemented `godot_game_input_release`. Verified held counts return to 0. The runtime also releases on `_exit_tree` | implemented (release steps; recording layer is separate) | unsupported | partial; no single release-all in the tool list | same `Input` events with `pressed = false`, axes to 0 | Required. No tool leaves a button down without a matching release path |
-| Frame wait | implemented `godot_game_wait` and a `wait` input step | implemented `godot_game_time` (also pause, speed, physics ticks, wait for node/signal) | unsupported | partial `wait_for_node`, `wait_for_signal` | `_process` on the autoload (`PROCESS_MODE_ALWAYS`) | Frames only. Time-scale and suspend are a later gap |
-| Game screenshot | partial `godot_game_screenshot`. PNG magic, IHDR size, and non-empty buffer required before an MCP image. Headless returns an error and no image (verified). A windowed capture was not run | implemented, including editor viewports and image diff | unsupported | implemented `game_screenshot`, `capture_screenshot` (writes a file) | `Viewport.get_texture().get_image().save_png_to_buffer` | Image content only for real PNG bytes |
+| Frame wait | implemented `godot_game_wait` and a `wait` input step: frames, a node to exist, or a signal, with a timeout; `time_scale` 0 to 8, restored when the game exits | implemented `godot_game_time` (also pause, speed, physics ticks, wait for node/signal) | unsupported | partial `wait_for_node`, `wait_for_signal` | `_process` on the autoload (`PROCESS_MODE_ALWAYS`) | Frames, a node or a signal, and the time scale. Pausing the tree and physics ticks are a later gap |
+| Game screenshot | implemented `godot_game_screenshot`. PNG magic, IHDR size, and non-empty buffer required before an MCP image. Headless returns an error and no image (verified). A windowed capture returns a PNG, a sheet of up to 8 frames, and a count and rectangle of changed pixels against the previous capture of the same size (`windowed_screenshot_returns_a_sheet_and_a_diff`) | implemented, including editor viewports and image diff | unsupported | implemented `game_screenshot`, `capture_screenshot` (writes a file) | `Viewport.get_texture().get_image().save_png_to_buffer` | Image content only for real PNG bytes |
 | Editor screenshot | partial `godot_capture_viewport` (pre-existing). Needs a window | `godot_game_screenshot` can target the editor view | unsupported | `capture_screenshot` | editor viewport | Left as the existing tool |
 | Breakpoints, pause, step, stack, variables | partial. Process runs only. Verified pause (`reason: pause`, no script stack, which matches `core:break`) and a line breakpoint whose stack contained `_process`. Step into/over/out and variable decode are implemented (`src/godot/debug_ctl.rs`) and not driven by the e2e | implemented `godot_debug_*`, plus evaluate | unsupported | unsupported as a real debugger. `pause_game` sets `SceneTree.paused` | `core:breakpoint`, `core:break`, `step`/`next`/`out`/`continue`, `get_stack_dump`, `get_stack_frame_vars` | Client of Godot's debugger. Editor Play stays on the editor's debugger; the relay does not receive `debug_enter` |
 | GDScript LSP | partial. `godot_code_diagnostics` and `godot_code_symbols` verified against a real script (headless `--lsp-port`; the same script is queried repeatedly). Complete, definition, references are implemented (`src/lsp/`) and not in the e2e | implemented `godot_code_diagnostics`, `godot_code_symbols`, `godot_code_lookup`, `godot_code_rename` | unsupported | unsupported | Godot's GDScript language server, TCP, `Content-Length` only | Client. No language server of our own. Rename is not ported |
@@ -113,26 +113,26 @@ build named in `.github/godot-version` (see the README):
 
 - `runtime_e2e_test`: a process run with a live tree, keyboard, mouse, touch, joypad button
   and axis, a wait step, property readback, a permitted call, signal observation, headless
-  screenshot rejection, release-all, the error log, pause, a line breakpoint with its stack,
-  resume, and stop with `override.cfg` restored; and the language server on a broken script
-  and on a script queried again.
+  screenshot rejection, release-all, gestures (`click`, `swipe`, `click_node`), the time
+  scale, waits for a signal and for a missing node, a failed click releasing a held key, the
+  error log, pause, a line breakpoint with its stack, resume, and stop with `override.cfg`
+  restored; a windowed screenshot with a frame sheet and a pixel diff (skipped on a Linux
+  machine without a display); and the language server on a broken script and on a script
+  queried again.
 - `editor_e2e_test`: the loopback-only, token-checked bridge; the scene and property tools,
   including the reload of an open scene whose file changed; undo and resource refresh; the
   authoring tools; and a game tool called right after editor Play (skipped on a Linux
   machine without a display).
 - `addon_export_test`: the addon stays out of exported games.
 
-No end-to-end test drives: a windowed game screenshot, step into/over/out, language-server
-completion, definition and references, `godot_game_set`, `godot_game_signals`,
-`godot_game_snapshot`, or `godot_game_wait` as a tool of its own. A GUT / GdUnit4 runner was not
-added: it needs those addons in a fixture project, and `godot --headless --check-only` plus
+No end-to-end test drives: step into/over/out, language-server completion, definition and
+references, `godot_game_set`, `godot_game_signals`, or `godot_game_snapshot`. A GUT / GdUnit4
+runner was not added: it needs those addons in a fixture project, and `godot --headless --check-only` plus
 the end-to-end tests already compile the scripts.
 
 ## Remaining gaps
 
-- A windowed `godot_game_screenshot` was not executed. The code path exists (viewport PNG).
-- `godot_game_time` features beyond frame waits: suspend, speed, physics ticks, wait for a
-  node or signal.
+- `godot_game_time` features beyond waits and the time scale: pausing the tree, physics ticks.
 - LSP rename, hover, and the offline class reference (`godot_docs_*`).
 - Input-map, autoload, plugin, and import-option editors.
 - Animation, tilemaps, navigation, audio buses, visual shaders, export.

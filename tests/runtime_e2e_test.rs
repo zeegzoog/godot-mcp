@@ -454,6 +454,26 @@ async fn running_game_accepts_input_and_can_be_inspected() {
     assert_eq!(state_json["stopped"], true, "{state_json}");
     // core:break stops between frames and has no script stack. A line breakpoint does.
     assert_eq!(state_json["stop"]["reason"], "pause", "{state_json}");
+    // A stopped game cannot answer the runtime, so its output has to come from what the
+    // server kept, at once.
+    let asked = std::time::Instant::now();
+    let while_stopped = call(
+        &tools,
+        "godot_run_output",
+        json!({"run_id": run_id, "level": "error"}),
+    )
+    .await;
+    assert!(!while_stopped.is_error, "{}", text_of(&while_stopped));
+    assert!(
+        asked.elapsed() < std::time::Duration::from_secs(5),
+        "the output of a stopped game took {:?}",
+        asked.elapsed()
+    );
+    assert!(
+        text_of(&while_stopped).contains("mcp-probe-error"),
+        "{}",
+        text_of(&while_stopped)
+    );
     let resumed = call(
         &tools,
         "godot_debug_control",
@@ -538,6 +558,7 @@ var stats := {"hp": 1}
 var samples := [1, 2]
 var mark: Node2D
 var physics_ticks := 0
+var physics_time := 0.0
 var slide := 0.0
 var _secret := 1
 
@@ -548,8 +569,9 @@ func _ready() -> void:
 func _process(_delta: float) -> void:
     queue_redraw()
 
-func _physics_process(_delta: float) -> void:
+func _physics_process(delta: float) -> void:
     physics_ticks += 1
+    physics_time += delta
 
 func _draw() -> void:
     draw_rect(Rect2(slide, 0, 80, 80), Color(1, 0, 0))
@@ -572,6 +594,7 @@ func timing() -> Dictionary:
         "max_physics_steps_per_frame": Engine.max_physics_steps_per_frame,
         "paused": get_tree().paused,
         "physics_ticks": physics_ticks,
+        "physics_time": physics_time,
         "always_ticks": always.ticks if always != null else -1,
     }
 
@@ -984,6 +1007,16 @@ async fn headless_game_waits_for_a_value_a_new_scene_and_real_physics_ticks() {
         mid["physics_ticks"].as_i64().unwrap_or(-1),
         before["physics_ticks"].as_i64().unwrap_or(-2) + 4,
         "pausable physics did not advance by exactly 4 ticks: before {before} after {mid}"
+    );
+    // A tick has the normal physics delta: 4 ticks at a time scale of 2 are 4 / ticks per
+    // second * 2 seconds of game time, not a sliver of it.
+    let per_second = before["physics_ticks_per_second"].as_f64().unwrap_or(60.0);
+    let expected_time = 4.0 / per_second * 2.0;
+    let advanced_time = mid["physics_time"].as_f64().unwrap_or(-1.0)
+        - before["physics_time"].as_f64().unwrap_or(0.0);
+    assert!(
+        (advanced_time - expected_time).abs() < expected_time * 0.05,
+        "four ticks advanced {advanced_time} s of game time, expected {expected_time} s: before {before} after {mid}"
     );
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     let held = call(

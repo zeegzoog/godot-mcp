@@ -278,10 +278,13 @@ static func physics(rt: Node, params: Dictionary) -> Dictionary:
     if _physics_stepping:
         return R.err(R.BAD_PARAMS, "A physics step is already running.")
     _arm_physics(rt)
+    # Ticks come at the game's own rate, at most one per frame, so the wait is measured in time:
+    # generously more than the ticks need, and less than the server waits for an answer.
+    var wait_ms := mini(15000, 2000 + int(ticks) * 4000 / maxi(Engine.physics_ticks_per_second, 1))
     var state := {
         "ticks": int(ticks),
         "start": Engine.get_physics_frames(),
-        "budget": int(ticks) + 8,
+        "deadline": Time.get_ticks_msec() + wait_ms,
     }
     return {"_pending": true, "_tick": func() -> bool: return _tick_physics(rt, state)}
 
@@ -290,15 +293,13 @@ static func _arm_physics(rt: Node) -> void:
     _physics_stepping = true
     _physics_saved = {
         "paused": rt.get_tree().paused,
-        "time_scale": Engine.time_scale,
-        "ticks": Engine.physics_ticks_per_second,
         "max_steps": Engine.max_physics_steps_per_frame,
     }
-    # One engine physics iteration per process frame, so N ticks means N iterations.
-    # SceneTree._physics_process is not a function a script can call.
+    # At most one physics iteration per process frame, so this runtime sees every iteration and
+    # can pause the tree right after the Nth. The tick rate and the time scale stay as they are:
+    # every tick has the game's normal physics delta, so the game advances by N ticks of its
+    # own time. SceneTree._physics_process is not a function a script can call.
     Engine.max_physics_steps_per_frame = 1
-    Engine.physics_ticks_per_second = 1000000
-    Engine.time_scale = 1.0
     rt.get_tree().paused = false
 
 
@@ -307,9 +308,7 @@ static func _apply_physics_saved(rt: Node, pause_after: bool) -> void:
     _physics_saved = {}
     _physics_stepping = false
     if not saved.is_empty():
-        Engine.physics_ticks_per_second = int(saved["ticks"])
         Engine.max_physics_steps_per_frame = int(saved["max_steps"])
-        Engine.time_scale = float(saved["time_scale"])
     if rt.get_tree() != null:
         rt.get_tree().paused = true if pause_after else bool(saved.get("paused", true))
 
@@ -321,13 +320,12 @@ static func _tick_physics(rt: Node, state: Dictionary) -> bool:
         _apply_physics_saved(rt, true)
         rt.finish_job(R.ok(_physics_body(rt, wanted, advanced)))
         return false
-    state["budget"] = int(state["budget"]) - 1
-    if int(state["budget"]) <= 0:
+    if Time.get_ticks_msec() >= int(state["deadline"]):
         var wanted := int(state["ticks"])
         _apply_physics_saved(rt, true)
         rt.finish_job(R.err(
             R.GODOT_ERROR,
-            "Physics did not advance %d ticks before the frame budget ran out." % wanted,
+            "Physics did not advance %d ticks in time." % wanted,
             {"advanced": advanced, "scene": rt.scene_context()},
         ))
         return false
@@ -357,7 +355,7 @@ static func _physics_status(rt: Node) -> Dictionary:
 
 static func _physics_limits() -> Dictionary:
     return {
-        "advanced": "Engine physics iterations with max_physics_steps_per_frame set to 1. This tool does not call node _physics_process itself.",
+        "advanced": "Engine physics iterations, with max_physics_steps_per_frame set to 1 while the step runs. Each has the normal physics delta (scaled by Engine.time_scale), so N ticks are N / physics_ticks_per_second seconds of game time. This tool does not call node _physics_process itself.",
         "still_runs": "Idle _process is not stepped. Nodes with process_mode ALWAYS still receive _process and _physics_process while the tree is paused. The engine physics-frame counter also keeps increasing while paused, so it is not a count of pausable game physics.",
         "not_covered": "Custom threads and GPU compute are not stepped or flushed, and nothing here waits for the GPU.",
         "determinism": "This does not make the game deterministic.",

@@ -107,7 +107,8 @@ func _editor_problem(res_path: String, file_lf: String, pair: Dictionary) -> Str
 ## {"state": "none"} when the script is not open, {"state": "found", "editor": ScriptEditorBase}
 ## when exactly one editor is matched to the path, {"state": "unknown", "reason": ...} otherwise.
 ## The editor API has no call that names an editor's resource, so the two lists the script
-## editor offers (same order) are paired, and the tab name must start with the file name.
+## editor offers (same order) are paired. Newer editors also name the tab (the `_tab_name`
+## metadata, absent in Godot 4.5.2), and then the name must start with the file name.
 func _pair_editor(res_path: String) -> Dictionary:
     var script_editor: ScriptEditor = EditorInterface.get_script_editor()
     if script_editor == null:
@@ -125,9 +126,10 @@ func _pair_editor(res_path: String) -> Dictionary:
     for index: int in range(scripts.size()):
         if (scripts[index] as Script).resource_path != res_path:
             continue
-        var tab_name: String = str(editors[index].get_meta("_tab_name", ""))
-        if not tab_name.begins_with(res_path.get_file()):
-            return {"state": "unknown", "reason": "the tab '%s' does not belong to %s" % [tab_name, res_path.get_file()]}
+        if editors[index].has_meta("_tab_name"):
+            var tab_name: String = str(editors[index].get_meta("_tab_name"))
+            if not tab_name.begins_with(res_path.get_file()):
+                return {"state": "unknown", "reason": "the tab '%s' does not belong to %s" % [tab_name, res_path.get_file()]}
         return {"state": "found", "editor": editors[index]}
     return {"state": "none"}
 

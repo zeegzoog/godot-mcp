@@ -159,11 +159,12 @@ To report a vulnerability, follow [SECURITY.md](SECURITY.md). Never open a publi
 | `godot_game_call` | Running game | Calls one method on a live node. The method must be listed in `permit`; methods that can quit, evaluate code, call other methods or free the node are refused. |
 | `godot_game_signals` | Running game | A live node's signals and their connections. |
 | `godot_game_observe` | Running game | Watches signals for a few frames, returns the ones that fired, then disconnects. |
-| `godot_game_snapshot` | Running game | Scene, frame, pause flag and the current scene's children in one small result. |
+| `godot_game_snapshot` | Running game | Scene path, monotonic `scene_generation`, `scene_instance_id`, frame, pause flag, children, and the loaded root script path plus its SHA-256. |
 | `godot_game_input` | Running game | Injects key, text, mouse, touch and gamepad input, and waits, as a sequence of steps. Gestures: `click`, `swipe` and `click_node` (the center of a Control, Node2D or Node3D). `time_scale` sets `Engine.time_scale`. A step that fails releases everything the server still holds. Mouse steps are Godot events and leave the OS cursor in place unless `warp_mouse` is true. |
 | `godot_game_input_release` | Running game | Releases every key, button, axis and touch this server still holds down. |
-| `godot_game_wait` | Running game | Waits for process frames, for a node to exist (`node`), or for a signal (`node` and `signal`), with a `timeout` in frames. `time_scale` (0 to 8) sets `Engine.time_scale`; the runtime restores the previous value when the game exits. |
-| `godot_game_screenshot` | Running game with a window | PNG of the game window, a viewport or a camera; `frames` (up to 8) stitches shots taken every `every` frames into one sheet. Says how many pixels changed since the previous capture of the run, and where. An error, never an empty image; a headless game has nothing to capture. |
+| `godot_game_wait` | Running game | Waits for process frames, for a node to exist (`node`), for a signal (`node` and `signal`), for a public property (`property`, `op`, `value`), or for a newer `scene_generation`. `timeout` is in frames. `time_scale` (0 to 8) sets `Engine.time_scale`; the runtime restores the previous value when the game exits. |
+| `godot_game_physics` | Running game | Advances N real engine physics iterations, each with the normal physics delta, then leaves the tree paused. `resume` continues the game. |
+| `godot_game_screenshot` | Running game with a window | PNG of the game window, a viewport or a camera; `frames` (up to 8) stitches shots taken every `every` frames into one sheet. Compares with the previous capture, and can save or compare a named baseline (`save_baseline`, `baseline`, `roi`, `tolerance`). An error, never an empty image; a headless game has nothing to capture. |
 | `godot_debug_breakpoints` | Process run | Lists, adds, removes or clears breakpoints (`res://script.gd:LINE`). Editor Play uses the editor's own debugger. |
 | `godot_debug_control` | Process run | Pauses, resumes or steps (into, over, out) and waits for the next stop. |
 | `godot_debug_state` | Process run | Stack frames and variables of a stopped run. |
@@ -187,6 +188,31 @@ While it works, the AI can note what is missing, broken or misleading in godot-m
 What is recorded: the AI's own notes, and from the server only the versions (server, addon, Godot), platform, whether the editor was reachable, the first line of recent failures of the tools a note names, and the names of tools the AI asked for that do not exist. Never gathered: project name, scene, script or resource contents, screenshots, environment values, the bridge token. Everything stays in memory until you approve a submission, and absolute paths, tokens and `@mentions` are removed from the text. The report will be public, so read it before you agree; the redaction is a safety net, not a guarantee.
 
 To tighten it, set `GODOT_MCP_FEEDBACK=draft` (the AI can write reports but has no way to send one) or `off` (the feature does not exist). If your MCP client lets you pre-approve tools, do not pre-approve `godot_submit_feedback`: a per-call prompt is the only check outside the AI's own judgement.
+
+## Checking a running game
+
+These calls work on a managed process and on editor Play. A property wait reads with `get` only. It does not evaluate an expression or call a method. A name that starts with `_`, the name `script`, and a path that goes through an Array are refused. `eq` and `ne` need the same type. JSON has one number type, so a whole number such as `1` may match an int property; `1.5` against an int is a type error. Strings are not turned into numbers. Float equality is exact.
+
+```json
+{"node": ".", "property": "stats/hp", "op": "gte", "value": 1, "timeout": 60}
+```
+
+`scene_generation` on a snapshot increases when the current scene instance changes, including a reload of the same path. Wait until the running generation is newer, optionally also until a node exists:
+
+```json
+{"scene_generation": 3, "node": "Player", "timeout": 180}
+```
+
+`script_sha256` is the SHA-256 of the root script source Godot had loaded when that scene instance became current. It is not a later read of the file on disk. Reloading the same scene keeps that hash when Godot reuses the script it already loaded (`Resource.reload` on a script that is in use returns "Already in use"). The hash changes when a new scene instance loads different source, for example a scene whose script was not loaded yet. Log lines copy that stamp when they are written, so an older error keeps the hash from its own scene. `script_sha256_basis` is `loaded_source_at_scene_enter` when the source was available, and `unavailable` when it was not. A line recovered only from the debugger buffer after the runtime logger was gone is also `unavailable`; that is not the file currently on disk. `StringName` values, such as a node's `name`, are compared as text. A bool is not a number.
+
+A named baseline is the returned image, so `roi` uses that image's pixels (`roi_space` is `returned_image`), including a sheet. `tolerance` is the per-channel difference that still counts as unchanged, from 0 to 255. The text reports `changed`, `sampled`, `ratio`, `bounds`, `tolerance`, and whether the count is `exact` or `sampled`. At most 8 baselines are kept, each at most 512×512 pixels. A missing name, a bad name, or an `roi` outside the image is an error and does not replace a saved image. The previous-capture comparison is unchanged: a sheet compares its last frame, and only with a capture of the same size.
+
+```json
+{"save_baseline": "menu", "max_dimension": 256}
+{"baseline": "menu", "roi": {"x": 0, "y": 0, "w": 80, "h": 24}, "tolerance": 8}
+```
+
+`godot_game_physics` with `{"action": "step", "ticks": 4}` advances four real engine physics iterations and then pauses the tree. `{"action": "resume"}` continues. Each tick has the normal physics delta, so four ticks are four times `1 / physics_ticks_per_second` seconds of game time, multiplied by `Engine.time_scale`. The step allows at most one physics iteration per process frame while it runs, then restores `max_physics_steps_per_frame`; the tick rate and the time scale are not changed. It does not call `_physics_process` on your nodes. It does not step idle `_process`, nodes with `process_mode` `ALWAYS` (those keep running while the tree is paused), custom threads, or GPU compute, and it does not make the game deterministic. The engine physics-frame counter also keeps moving while the tree is paused, so it is not a count of pausable game physics. If the step fails, or the runtime is removed while a step is still in flight, `max_physics_steps_per_frame` is restored and the tree is left paused.
 
 ## How it works
 

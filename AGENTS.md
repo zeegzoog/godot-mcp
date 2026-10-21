@@ -35,6 +35,11 @@ Agents must treat the Godot Editor as a live, stateful environment while ensurin
 
 ## Implementation Standards
 
+### File Names
+
+- Template files are named in capitals with underscores: `PULL_REQUEST_TEMPLATE.md`, `ISSUE_TEMPLATE/BUG_REPORT.yml`. The extension stays lowercase.
+- Every other multi-word file name is lowercase with hyphens: `agent-feedback.md`, `steward-priorities.md`, `release-notes.sh`. Names a tool requires keep the spelling it requires (`dependabot.yml`, `config.yml`, `workflows/`).
+
 ### Core Server Standards (Rust)
 
 - **Zero-Overhead Async I/O**: Use Tokio event loops for stdio JSON-RPC transport and WebSocket bridge communication.

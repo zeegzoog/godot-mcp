@@ -8,8 +8,8 @@ Run the steps in order; each one leaves what already exists untouched and report
 2. **Profile.** If `.github/steward.yml` is missing, write it from `templates/steward.yml`: uncomment only the keys whose discovered value differs from the default (the board title, a release procedure the guides name, release targets the repository has). Show the file to the person.
 3. **Files.** Copy from `templates/` each file the repository does not have:
    - `workflows/steward-stale.yml`, `workflows/steward-readiness.yml`, `workflows/steward-agent.yml` → `.github/workflows/`. Then: where this skill lives somewhere other than `.agents/skills/repo-steward`, replace that path; set the readiness workflow's `branches: [main]` to the default branch; and when `timing.*` differs from 14 and 7 days, change the reminder workflow's `days-before-stale`, `days-before-close` and the "7 days" in its message;
-   - `ISSUE_TEMPLATE/bug_report.yml`, `ISSUE_TEMPLATE/feature_request.yml` → `.github/ISSUE_TEMPLATE/`; adjust the version fields to what the product needs reported;
-   - `pull_request_template.md` → `.github/pull_request_template.md`, unless the repository has a pull request template elsewhere.
+   - `ISSUE_TEMPLATE/BUG_REPORT.yml`, `ISSUE_TEMPLATE/FEATURE_REQUEST.yml` → `.github/ISSUE_TEMPLATE/`; adjust the version fields to what the product needs reported;
+   - `PULL_REQUEST_TEMPLATE.md` → `.github/PULL_REQUEST_TEMPLATE.md`, unless the repository has a pull request template elsewhere.
    An existing file is never overwritten: show the difference between it and what the template would produce, and let the person decide.
 4. **Agents that read skills elsewhere.** Claude Code reads `.claude/skills/`: link this directory there (`ln -s ../../<skill path> .claude/skills/repo-steward` on Linux and macOS; `mklink /J .claude\skills\repo-steward <skill path>` on Windows). The link is local; do not commit it.
 5. **GitHub** (outward actions; attended runs ask for one approval covering both): `scripts/labels.sh`, then `scripts/board.sh ensure`.

@@ -76,7 +76,7 @@ README.md                          links both; Development and Releasing reduced
 AGENTS.md                          links CONTRIBUTING.md; one completion checklist item
 .github/ISSUE_TEMPLATE/config.yml  contact link to private vulnerability reporting; blank issues enabled
 .github/ISSUE_TEMPLATE/*.yml       bug and feature forms (content: l2-repo-steward-godot-mcp.md §5.8)
-.github/pull_request_template.md   pull request description (content: l2-repo-steward-godot-mcp.md §5.8)
+.github/PULL_REQUEST_TEMPLATE.md   pull request description (content: l2-repo-steward-godot-mcp.md §5.8)
 ```
 
 ### 5.4 Repository Setting (Maintainer)

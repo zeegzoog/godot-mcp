@@ -91,9 +91,9 @@ The concept fixes what the steward does. This specification fixes the files, com
     ├── workflows/steward-stale.yml
     ├── workflows/steward-readiness.yml
     ├── workflows/steward-agent.yml
-    ├── ISSUE_TEMPLATE/bug_report.yml
-    ├── ISSUE_TEMPLATE/feature_request.yml
-    └── pull_request_template.md
+    ├── ISSUE_TEMPLATE/BUG_REPORT.yml
+    ├── ISSUE_TEMPLATE/FEATURE_REQUEST.yml
+    └── PULL_REQUEST_TEMPLATE.md
 ```
 
 `SKILL.md` front matter:

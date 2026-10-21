@@ -12,7 +12,7 @@
 
 - **Task:** T-5E04 First acting run
 - **Spec:** l2-ci-release-pipeline.md §4 (DS-8)
-- **Next Action:** T-5E04: a third steward run to prove it posts nothing twice (ST-14); T-5E03 settings are the maintainer's; the readiness notice says v0.6.0 is due and the release is the maintainer's decision
+- **Next Action:** T-5E04: a third steward run to prove it posts nothing twice (ST-14); T-5E03 settings are the maintainer's; v0.6.0 was released on 2026-10-21 at the maintainer's instruction
 
 ## Progress
 

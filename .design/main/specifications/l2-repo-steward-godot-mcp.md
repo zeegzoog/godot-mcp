@@ -72,10 +72,10 @@ The skill is generic by design; this repository has facts it must be told: four 
 .github/workflows/steward-stale.yml       installed from the skill templates
 .github/workflows/steward-readiness.yml   installed from the skill templates
 .github/workflows/steward-agent.yml       installed; does nothing until STEWARD_AGENT is on
-.github/ISSUE_TEMPLATE/bug_report.yml     issue form (§5.8)
-.github/ISSUE_TEMPLATE/feature_request.yml
+.github/ISSUE_TEMPLATE/BUG_REPORT.yml     issue form (§5.8)
+.github/ISSUE_TEMPLATE/FEATURE_REQUEST.yml
 .github/ISSUE_TEMPLATE/config.yml         unchanged: blank issues enabled, security contact link
-.github/pull_request_template.md          the description CONTRIBUTING.md asks for (§5.8)
+.github/PULL_REQUEST_TEMPLATE.md          the description CONTRIBUTING.md asks for (§5.8)
 .gitignore                                skill rule /.*/skills/* with the exception !/.agents/skills/repo-steward
 CONTRIBUTING.md                           section Issues and Pull Requests; For AI Agents exception (§5.9)
 AGENTS.md                                 pointer to the skill for issue and pull request work (§5.9)
@@ -161,9 +161,9 @@ The three templates of the skill with the profile values. `steward-agent.yml` ad
 
 | File | Fields |
 | --- | --- |
-| `bug_report.yml` (label `bug`) | godot-mcp version (from `plugin.cfg`), Godot version, operating system, MCP client, steps, expected, actual, server log (optional, `RUST_LOG=godot_mcp=debug`); a reminder that vulnerabilities go to `SECURITY.md` |
-| `feature_request.yml` (label `enhancement`) | the problem, the proposed behaviour, alternatives, which Godot versions it concerns |
-| `pull_request_template.md` | what changed and why; which Godot lines it affects and how that was checked; the checks of § Verification that were run; `Fixes #` line |
+| `BUG_REPORT.yml` (label `bug`) | godot-mcp version (from `plugin.cfg`), Godot version, operating system, MCP client, steps, expected, actual, server log (optional, `RUST_LOG=godot_mcp=debug`); a reminder that vulnerabilities go to `SECURITY.md` |
+| `FEATURE_REQUEST.yml` (label `enhancement`) | the problem, the proposed behaviour, alternatives, which Godot versions it concerns |
+| `PULL_REQUEST_TEMPLATE.md` | what changed and why; which Godot lines it affects and how that was checked; the checks of § Verification that were run; `Fixes #` line |
 
 Forms only add choices: blank issues and the agent feedback template stay.
 

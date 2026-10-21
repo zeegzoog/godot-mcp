@@ -1,0 +1,42 @@
+name: Branch cleanup
+
+# Deletes a branch once its pull request is merged, and sweeps weekly for finished branches that
+# were missed (see .github/scripts/prune-branches.sh for what is never deleted: the default
+# branch, the godot-v* release lines, protected branches, open or unmerged work).
+
+on:
+  pull_request:
+    types: [closed]
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Only print the branches that would be deleted
+        type: boolean
+        default: true
+
+permissions:
+  contents: write # deleting a branch
+  pull-requests: read
+
+concurrency:
+  group: branch-cleanup
+  cancel-in-progress: false
+
+jobs:
+  prune:
+    # A pull request from a fork has its branch in the fork, not here.
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.merged &&
+       github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Delete finished branches
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+          MERGED_BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: bash .github/scripts/prune-branches.sh ${MERGED_BRANCH:+"$MERGED_BRANCH"}

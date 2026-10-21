@@ -42,6 +42,7 @@ Choose the branch for your pull request:
 | adds a feature or an improvement | `master` |
 | changes shared documentation or CI | `master` |
 
+- A branch is deleted automatically once its pull request is merged (`.github/workflows/branch-cleanup.yml`). The release lines, protected branches and branches with unmerged work are never deleted.
 - Find out which lines a bug affects by running its test on each branch, not by reading the code.
 - Files that differ between lines on purpose: `Cargo.toml` and `Cargo.lock` (version), `addons/godot_mcp/plugin.cfg` (version), `addons/godot_mcp/plugin.gd` (`MIN_MAJOR`, `MIN_MINOR`), `project.godot` (`config/features`) and `.github/godot-version` (the Godot build the line is tested against). Keep every other file identical on all lines unless a Godot version forces a difference.
 

@@ -167,6 +167,17 @@ async fn running_game_accepts_input_and_can_be_inspected() {
     .await;
     assert!(!started.is_error, "{}", text_of(&started));
     let run_id = run_id_of(&started);
+    assert!(
+        !project.path().join("addons").exists(),
+        "a run copied the runtime into the project's addons folder"
+    );
+    assert!(
+        project
+            .path()
+            .join(format!(".godot/godot_mcp/run-{run_id}/mcp_runtime.gd"))
+            .is_file(),
+        "the run has no private copy of the runtime"
+    );
 
     let tree = call(&tools, "godot_game_tree", json!({"run_id": run_id})).await;
     assert!(!tree.is_error, "{}", text_of(&tree));
@@ -496,6 +507,10 @@ async fn running_game_accepts_input_and_can_be_inspected() {
     assert!(
         !project.path().join("addons").exists(),
         "the run left runtime files in a project that had no addon"
+    );
+    assert!(
+        !project.path().join(".godot/godot_mcp").exists(),
+        "the run left its private copy of the runtime behind"
     );
 }
 

@@ -15,6 +15,16 @@ use std::sync::Arc;
 
 const IGNORE: &str = "needs GODOT_PATH pointing at a Godot 4.5+ executable";
 
+/// A windowed Godot process needs a display server. The Linux CI runner has neither
+/// `DISPLAY` nor `WAYLAND_DISPLAY`, and the game exits before its runtime says hello.
+fn windowed_game_can_open() -> bool {
+    if cfg!(target_os = "linux") {
+        std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some()
+    } else {
+        true
+    }
+}
+
 fn godot_path() -> PathBuf {
     let _ = dotenvy::dotenv();
     std::env::var("GODOT_PATH")
@@ -540,6 +550,10 @@ async fn language_server_answers_the_same_script_again() {
 #[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
 async fn windowed_screenshot_returns_a_sheet_and_a_diff() {
     let _ = IGNORE;
+    if !windowed_game_can_open() {
+        eprintln!("skipped: a windowed screenshot needs a display server");
+        return;
+    }
     let project = project();
     let tools = manager(project.path());
     let started = call(

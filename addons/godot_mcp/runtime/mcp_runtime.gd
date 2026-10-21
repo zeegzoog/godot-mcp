@@ -56,6 +56,7 @@ func _exit_tree() -> void:
         # Drop every key, button, axis and touch this runtime is still holding.
         var input_script: GDScript = preload("ops/rt_input.gd")
         input_script.call("release_all", self, {})
+        input_script.call("restore_time_scale")
     if _registered and EngineDebugger.has_capture("mcp"):
         EngineDebugger.unregister_message_capture("mcp")
     if _registered:

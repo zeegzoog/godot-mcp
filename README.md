@@ -173,7 +173,7 @@ AI client <-stdio JSON-RPC-> godot-mcp <-WebSocket :9333-> addons/godot_mcp (ins
                                  +-> Godot binary (headless fallback)
 ```
 
-Running-game inspection, input, and screenshots are `godot_game_*` tools.
+Running-game inspection, input, and screenshots are `godot_game_*` tools. Input steps include `click`, `click_node` (the center of a Control, Node2D, or Node3D), and `swipe`; a step that fails releases every button and touch the server is still holding. Mouse steps are Godot events and leave the OS cursor in place unless `warp_mouse` is true. `godot_game_wait` can wait for a node or a signal and can set `Engine.time_scale` (restored when the game exits). `godot_game_screenshot` can stitch up to 8 frames into one PNG and reports how many pixels changed since the previous capture.
 
 ## Roadmap
 

@@ -81,6 +81,12 @@ static func wait_frames(rt: Node, params: Dictionary) -> Dictionary:
     var note: Dictionary = scaled["note"]
     var node_path := str(params.get("node", "")).strip_edges()
     var sig := str(params.get("signal", "")).strip_edges()
+    var property := str(params.get("property", "")).strip_edges()
+    var has_generation := params.has("scene_generation")
+    if not sig.is_empty() and (not property.is_empty() or has_generation):
+        return R.err(R.BAD_PARAMS, "Wait for a signal on its own. A property or scene_generation wait cannot include a signal.")
+    if not property.is_empty() or has_generation:
+        return _begin_condition(rt, params, node_path, property, has_generation, note)
     if not sig.is_empty() and node_path.is_empty():
         return R.err(R.BAD_PARAMS, "input.wait: a signal needs a node path.")
     if not node_path.is_empty() or not sig.is_empty():
@@ -312,6 +318,261 @@ static func _set_time_scale(scale: float) -> Dictionary:
         _saved_time_scale = previous
     Engine.time_scale = scale
     return {"previous_time_scale": previous, "time_scale": scale}
+
+
+const _WAIT_OPS: Array[String] = ["eq", "ne", "lt", "lte", "gt", "gte", "exists"]
+
+
+static func _begin_condition(rt: Node, params: Dictionary, node_path: String, property: String, has_generation: bool, note: Dictionary) -> Dictionary:
+    if not property.is_empty() and node_path.is_empty():
+        return R.err(R.BAD_PARAMS, "input.wait: a property needs a node path.")
+    var op := ""
+    if not property.is_empty():
+        op = str(params.get("op", "")).strip_edges()
+        if not op in _WAIT_OPS:
+            return R.err(R.BAD_PARAMS, "op must be eq, ne, lt, lte, gt, gte, or exists.")
+        if op != "exists" and not params.has("value"):
+            return R.err(R.BAD_PARAMS, "op '%s' needs a value." % op)
+    var generation := 0
+    if has_generation:
+        var whole: Variant = _whole_number(params.get("scene_generation"))
+        if whole == null or int(whole) < 0:
+            return R.err(R.BAD_PARAMS, "scene_generation must be a whole number from 0 up.")
+        generation = int(whole)
+    var timeout := clampi(int(params.get("timeout", params.get("frames", 180))), 1, 600)
+    var state := {
+        "node": node_path,
+        "property": property,
+        "op": op,
+        "has_property": not property.is_empty(),
+        "has_generation": has_generation,
+        "generation": generation,
+        "value": params.get("value", null),
+        "left": timeout,
+        "start": Engine.get_process_frames(),
+        "note": note,
+    }
+    return {"_pending": true, "_tick": func() -> bool: return _tick_condition(rt, state)}
+
+
+static func _tick_condition(rt: Node, state: Dictionary) -> bool:
+    var scene: Dictionary = rt.scene_context()
+    var generation_ok := true
+    if bool(state["has_generation"]):
+        generation_ok = int(scene.get("scene_generation", 0)) > int(state["generation"])
+    var path := str(state["node"])
+    var node: Node = rt.find_node(path) if not path.is_empty() else null
+    var node_ok := path.is_empty() or (node != null and is_instance_valid(node))
+    var property_ok := not bool(state["has_property"])
+    var exists := false
+    var observed: Variant = null
+    if node_ok and bool(state["has_property"]) and node != null:
+        var looked := _lookup(node, str(state["property"]))
+        if R.is_err(looked):
+            return _fail_condition(rt, _with_scene(looked, scene))
+        exists = bool(looked.get("exists", false))
+        if exists:
+            observed = looked.get("value", null)
+            if str(state["op"]) == "exists":
+                property_ok = true
+            else:
+                var compared := _compare(str(state["op"]), observed, state.get("value", null))
+                if R.is_err(compared):
+                    return _fail_condition(rt, _with_scene(compared, scene, rt.encode(observed), true))
+                property_ok = bool(compared.get("match", false))
+        else:
+            property_ok = false
+    if generation_ok and node_ok and property_ok:
+        var body := {
+            "ok": true,
+            "frames": Engine.get_process_frames() - int(state["start"]),
+            "scene": scene,
+        }
+        if not path.is_empty():
+            body["path"] = path
+        if bool(state["has_property"]):
+            body["property"] = str(state["property"])
+            body["op"] = str(state["op"])
+            body["exists"] = true
+            body["observed"] = rt.encode(observed)
+        if bool(state["has_generation"]):
+            body["scene_generation"] = int(scene.get("scene_generation", 0))
+        body.merge(state.get("note", {}), true)
+        rt.finish_job(R.ok(body))
+        return false
+    state["left"] = int(state["left"]) - 1
+    if int(state["left"]) > 0:
+        return true
+    var what := str(state["property"]) if bool(state["has_property"]) else "scene generation newer than %d" % int(state["generation"])
+    return _fail_condition(rt, R.err(R.NOT_FOUND, "Timed out waiting for '%s'." % what, {
+        "observed": rt.encode(observed) if exists else null,
+        "exists": exists,
+        "property": str(state["property"]),
+        "op": str(state["op"]),
+        "scene": scene,
+    }))
+
+
+static func _fail_condition(rt: Node, result: Dictionary) -> bool:
+    rt.finish_job(result)
+    return false
+
+
+static func _with_scene(result: Dictionary, scene: Dictionary, observed: Variant = null, exists: bool = false) -> Dictionary:
+    if result.has("error") and result["error"] is Dictionary:
+        var data: Dictionary = {}
+        var existing: Variant = (result["error"] as Dictionary).get("data", null)
+        if existing is Dictionary:
+            data = (existing as Dictionary).duplicate(true)
+        data["scene"] = scene
+        if exists:
+            data["observed"] = observed
+            data["exists"] = true
+        result["error"]["data"] = data
+    return result
+
+
+static func _lookup(node: Node, path: String) -> Dictionary:
+    var parts: PackedStringArray = path.split("/", false)
+    if parts.is_empty():
+        return R.err(R.BAD_PARAMS, "property must name a public property.")
+    var current: Variant = node
+    var index := 0
+    for part: String in parts:
+        var named := _public_segment(part)
+        if R.is_err(named):
+            return named
+        if index == 0:
+            if not _has_public_property(node, part):
+                return {"exists": false}
+            current = node.get(part)
+        elif current is Dictionary:
+            if not (current as Dictionary).has(part):
+                return {"exists": false}
+            current = (current as Dictionary)[part]
+        elif current is Array:
+            return R.err(R.BAD_PARAMS, "Cannot read '%s' inside an Array." % part)
+        elif current is Object and current != null:
+            var object := current as Object
+            if not _has_public_property(object, part):
+                return {"exists": false}
+            current = object.get(part)
+        else:
+            return R.err(R.BAD_PARAMS, "Cannot read '%s' inside a %s." % [part, type_string(typeof(current))])
+        index += 1
+    return {"exists": true, "value": current}
+
+
+static func _public_segment(part: String) -> Dictionary:
+    if part.is_empty() or part.begins_with("_") or part.contains(":"):
+        return R.err(R.DENIED, "Refusing private property '%s'." % part)
+    if part == "script":
+        return R.err(R.DENIED, "Refusing property 'script'.")
+    return {}
+
+
+static func _has_public_property(object: Object, part: String) -> bool:
+    for info: Dictionary in object.get_property_list():
+        if str(info.get("name", "")) != part:
+            continue
+        var usage := int(info.get("usage", 0))
+        if usage & PROPERTY_USAGE_CATEGORY != 0 or usage & PROPERTY_USAGE_GROUP != 0 or usage & PROPERTY_USAGE_SUBGROUP != 0:
+            continue
+        return true
+    return false
+
+
+static func _compare(op: String, observed: Variant, expected: Variant) -> Dictionary:
+    # bool passes `is int` in GDScript. Handle it before the numeric path so true does not
+    # become 1 and compare equal to a JSON number.
+    if observed is bool or expected is bool:
+        if not (observed is bool and expected is bool):
+            return R.err(R.BAD_PARAMS, "Type mismatch: observed is %s and the value is %s." % [type_string(typeof(observed)), type_string(typeof(expected))])
+        if op != "eq" and op != "ne":
+            return R.err(R.BAD_PARAMS, "Ordering needs both sides to be int or both to be float.")
+        var same_bool := bool(observed) == bool(expected)
+        return {"match": same_bool if op == "eq" else not same_bool}
+    if observed is String or observed is StringName:
+        if not (expected is String or expected is StringName):
+            return R.err(R.BAD_PARAMS, "Type mismatch: observed is text and the value is %s." % type_string(typeof(expected)))
+        if op != "eq" and op != "ne":
+            return R.err(R.BAD_PARAMS, "Ordering needs both sides to be int or both to be float.")
+        var same := str(observed) == str(expected)
+        return {"match": same if op == "eq" else not same}
+    if observed is int or observed is float or expected is int or expected is float:
+        return _compare_numbers(op, observed, expected)
+    if op != "eq" and op != "ne":
+        return R.err(R.BAD_PARAMS, "Ordering needs both sides to be int or both to be float.")
+    if typeof(observed) != typeof(expected):
+        return R.err(R.BAD_PARAMS, "Type mismatch: observed is %s and the value is %s." % [type_string(typeof(observed)), type_string(typeof(expected))])
+    var same_value := bool(observed == expected)
+    return {"match": same_value if op == "eq" else not same_value}
+
+
+static func _compare_numbers(op: String, observed: Variant, expected: Variant) -> Dictionary:
+    if not (observed is int or observed is float) or not (expected is int or expected is float):
+        return R.err(R.BAD_PARAMS, "Type mismatch: observed is %s and the value is %s." % [type_string(typeof(observed)), type_string(typeof(expected))])
+    var as_ints := false
+    var as_floats := false
+    if observed is int and expected is int:
+        as_ints = true
+    elif observed is float and expected is float:
+        as_floats = true
+    elif observed is int and _whole_number(expected) != null:
+        # JSON has one number type, so Godot delivers a whole number as a float.
+        as_ints = true
+    elif observed is float and expected is int:
+        as_floats = true
+    elif observed is int and expected is float:
+        return R.err(R.BAD_PARAMS, "Type mismatch: a fractional number cannot be compared with an int.")
+    else:
+        return R.err(R.BAD_PARAMS, "Type mismatch: observed is %s and the value is %s." % [type_string(typeof(observed)), type_string(typeof(expected))])
+    var match_value := false
+    if as_ints:
+        var left := int(observed)
+        var right := int(expected) if expected is int else int(_whole_number(expected))
+        match op:
+            "eq":
+                match_value = left == right
+            "ne":
+                match_value = left != right
+            "lt":
+                match_value = left < right
+            "lte":
+                match_value = left <= right
+            "gt":
+                match_value = left > right
+            "gte":
+                match_value = left >= right
+            _:
+                return R.err(R.BAD_PARAMS, "op must be eq, ne, lt, lte, gt, gte, or exists.")
+    elif as_floats:
+        var left_f := float(observed)
+        var right_f := float(expected)
+        match op:
+            "eq":
+                match_value = left_f == right_f
+            "ne":
+                match_value = left_f != right_f
+            "lt":
+                match_value = left_f < right_f
+            "lte":
+                match_value = left_f <= right_f
+            "gt":
+                match_value = left_f > right_f
+            "gte":
+                match_value = left_f >= right_f
+            _:
+                return R.err(R.BAD_PARAMS, "op must be eq, ne, lt, lte, gt, gte, or exists.")
+    return {"match": match_value}
+
+
+static func _whole_number(raw: Variant) -> Variant:
+    if raw is int:
+        return int(raw)
+    if raw is float and float(int(raw)) == float(raw):
+        return int(raw)
+    return null
 
 
 static func _until_state(path: String, sig: String, timeout: int) -> Dictionary:

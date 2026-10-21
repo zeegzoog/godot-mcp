@@ -7,10 +7,13 @@ const R := preload("rt_result.gd")
 const DEFAULT_MAX := 768
 const MAX_MAX := 4096
 const MAX_FRAMES := 8
+const MAX_BASELINES := 8
+const MAX_BASELINE_PIXELS := 512 * 512
 ## Frames a capture waits for a window that has not drawn anything yet before it gives up.
 const EMPTY_RETRIES := 60
 
 static var _previous = null
+static var _baselines: Dictionary = {}
 
 
 static func methods() -> Dictionary:
@@ -24,6 +27,9 @@ static func screenshot(rt: Node, params: Dictionary) -> Dictionary:
     var every := int(params.get("every", 1))
     if every < 1 or every > 60:
         return R.err(R.BAD_PARAMS, "every must be from 1 to 60.")
+    var request := _baseline_request(params)
+    if R.is_err(request):
+        return request
     if DisplayServer.get_name() == "headless":
         return R.err(R.UNSUPPORTED, "This game is headless, so there is no image to capture. Start it without headless mode.")
     var picked := _pick(rt, params)
@@ -48,6 +54,7 @@ static func screenshot(rt: Node, params: Dictionary) -> Dictionary:
         "made_current_2d": picked.get("made_current_2d"),
         "previous_2d": bool(picked.get("previous_2d", false)),
         "label": picked.get("label", "viewport"),
+        "baseline": request,
     }
     return {"_pending": true, "_tick": func() -> bool: return _tick_shot(rt, state)}
 
@@ -82,7 +89,7 @@ static func _tick_shot(rt: Node, state: Dictionary) -> bool:
         state["phase"] = "pause"
         return true
     _restore_cameras(state)
-    rt.finish_job(_compose(state["got"], str(state["label"])))
+    rt.finish_job(_compose(state))
     return false
 
 
@@ -104,9 +111,10 @@ static func _grab(state: Dictionary) -> Variant:
     return image
 
 
-static func _compose(frames: Array, label: String) -> Dictionary:
+static func _compose(state: Dictionary) -> Dictionary:
+    var frames: Array = state["got"]
+    var label := str(state.get("label", "viewport"))
     var last: Image = frames[frames.size() - 1]
-    var diff := _diff_against(last)
     var count := frames.size()
     var cols := 1
     while cols * cols < count:
@@ -128,7 +136,13 @@ static func _compose(frames: Array, label: String) -> Dictionary:
     var bytes := sheet.save_png_to_buffer()
     if bytes.is_empty() or bytes.size() < 8 or bytes[0] != 0x89:
         return R.err(R.GODOT_ERROR, "PNG encoding produced no image.")
-    return R.ok({
+    var request: Dictionary = state.get("baseline", {})
+    var applied := _apply_baseline(sheet, request)
+    if R.is_err(applied):
+        return applied
+    var diff := _diff_against(last, _previous as Image)
+    _previous = last.duplicate()
+    var body := {
         "mime_type": "image/png",
         "data": Marshalls.raw_to_base64(bytes),
         "width": sheet.get_width(),
@@ -139,64 +153,190 @@ static func _compose(frames: Array, label: String) -> Dictionary:
         "frame_width": frame_w,
         "frame_height": frame_h,
         "diff": diff,
-    })
+    }
+    var report: Dictionary = applied.get("report", {})
+    if not report.is_empty():
+        body["baseline"] = report
+    return R.ok(body)
 
 
-static func _diff_against(image: Image) -> Dictionary:
-    var previous: Image = _previous as Image
-    _previous = image.duplicate()
+static func _diff_against(image: Image, previous: Image) -> Dictionary:
     if previous == null:
         return {"compared": false, "reason": "no previous capture"}
     if previous.get_width() != image.get_width() or previous.get_height() != image.get_height():
         # A picture scaled to another size differs from the original everywhere, so a count of
         # changed pixels between the two would report changes that are not in the game.
         return {"compared": false, "reason": "the previous capture had another size"}
-    var width := image.get_width()
-    var height := image.get_height()
+    var measured := _measure(image, previous, 0, Rect2i(0, 0, image.get_width(), image.get_height()))
+    measured["rect"] = measured.get("bounds", null)
+    return measured
+
+
+static func _measure(current: Image, previous: Image, tolerance: int, roi: Rect2i) -> Dictionary:
+    var image_width := current.get_width()
+    var image_height := current.get_height()
+    var width := roi.size.x
+    var height := roi.size.y
     var stride := 1
     while width * height > stride * stride * 700000:
         stride += 1
-    var current_bytes := image.get_data()
+    var current_bytes := current.get_data()
     var previous_bytes := previous.get_data()
     var changed := 0
     var sampled := 0
-    var min_x := width
-    var min_y := height
+    var min_x := image_width
+    var min_y := image_height
     var max_x := -1
     var max_y := -1
     var y := 0
     while y < height:
         var x := 0
         while x < width:
-            var offset := (y * width + x) * 4
+            var pixel_x := roi.position.x + x
+            var pixel_y := roi.position.y + y
+            var offset := (pixel_y * image_width + pixel_x) * 4
             sampled += 1
-            if current_bytes[offset] != previous_bytes[offset] \
-                    or current_bytes[offset + 1] != previous_bytes[offset + 1] \
-                    or current_bytes[offset + 2] != previous_bytes[offset + 2] \
-                    or current_bytes[offset + 3] != previous_bytes[offset + 3]:
+            if absi(int(current_bytes[offset]) - int(previous_bytes[offset])) > tolerance \
+                    or absi(int(current_bytes[offset + 1]) - int(previous_bytes[offset + 1])) > tolerance \
+                    or absi(int(current_bytes[offset + 2]) - int(previous_bytes[offset + 2])) > tolerance \
+                    or absi(int(current_bytes[offset + 3]) - int(previous_bytes[offset + 3])) > tolerance:
                 changed += 1
-                min_x = mini(min_x, x)
-                min_y = mini(min_y, y)
-                max_x = maxi(max_x, x)
-                max_y = maxi(max_y, y)
+                min_x = mini(min_x, pixel_x)
+                min_y = mini(min_y, pixel_y)
+                max_x = maxi(max_x, pixel_x)
+                max_y = maxi(max_y, pixel_y)
             x += stride
         y += stride
-    var ratio := 0.0 if sampled == 0 else float(changed) / float(sampled)
-    var rect = null
+    var bounds = null
     if changed > 0:
-        rect = {
+        bounds = {
             "x": min_x,
             "y": min_y,
-            "w": max_x - min_x + stride,
-            "h": max_y - min_y + stride,
+            "w": mini(max_x - min_x + stride, image_width - min_x),
+            "h": mini(max_y - min_y + stride, image_height - min_y),
         }
+    var ratio := 0.0 if sampled == 0 else float(changed) / float(sampled)
     return {
         "compared": true,
         "changed": changed,
         "sampled": sampled,
         "ratio": snappedf(ratio, 0.0001),
-        "rect": rect,
+        "bounds": bounds,
+        "exact": stride == 1,
     }
+
+
+static func _baseline_request(params: Dictionary) -> Dictionary:
+    var save := ""
+    if params.has("save_baseline"):
+        save = str(params.get("save_baseline", "")).strip_edges()
+        if not _valid_baseline_name(save):
+            return R.err(R.BAD_PARAMS, "save_baseline name must match ^[A-Za-z_][A-Za-z0-9_-]{0,63}$.")
+    var compare := ""
+    if params.has("baseline"):
+        compare = str(params.get("baseline", "")).strip_edges()
+        if not _valid_baseline_name(compare):
+            return R.err(R.BAD_PARAMS, "baseline name must match ^[A-Za-z_][A-Za-z0-9_-]{0,63}$.")
+        if not _baselines.has(compare):
+            return R.err(R.NOT_FOUND, "No baseline named '%s' is saved in this run." % compare)
+    var tolerance := 0
+    if params.has("tolerance"):
+        var whole: Variant = _whole_number(params.get("tolerance"))
+        if whole == null or int(whole) < 0 or int(whole) > 255:
+            return R.err(R.BAD_PARAMS, "tolerance must be an integer from 0 to 255.")
+        tolerance = int(whole)
+    var roi: Variant = null
+    if params.has("roi"):
+        var parsed := _parse_roi(params.get("roi"))
+        if R.is_err(parsed):
+            return parsed
+        roi = parsed["roi"]
+    if save.is_empty() and compare.is_empty() and (roi != null or params.has("tolerance")):
+        return R.err(R.BAD_PARAMS, "roi and tolerance are only used when comparing a baseline.")
+    return {"save": save, "compare": compare, "tolerance": tolerance, "roi": roi}
+
+
+static func _apply_baseline(image: Image, request: Dictionary) -> Dictionary:
+    var compare := str(request.get("compare", ""))
+    var save := str(request.get("save", ""))
+    if compare.is_empty() and save.is_empty():
+        return {"report": {}}
+    var report := {}
+    if not compare.is_empty():
+        var stored: Image = _baselines[compare]
+        if stored.get_width() != image.get_width() or stored.get_height() != image.get_height():
+            return R.err(
+                R.BAD_PARAMS,
+                "Baseline '%s' is %dx%d and this image is %dx%d, so an roi would not refer to the same pixels." % [compare, stored.get_width(), stored.get_height(), image.get_width(), image.get_height()],
+            )
+        var roi := Rect2i(0, 0, image.get_width(), image.get_height())
+        if request.get("roi") != null:
+            var fitted := _fit_roi(request["roi"], image)
+            if R.is_err(fitted):
+                return fitted
+            roi = fitted["rect"]
+        report = _measure(image, stored, int(request.get("tolerance", 0)), roi)
+        report["name"] = compare
+        report["tolerance"] = int(request.get("tolerance", 0))
+        report["roi"] = {"x": roi.position.x, "y": roi.position.y, "w": roi.size.x, "h": roi.size.y}
+        report["roi_space"] = "returned_image"
+    if not save.is_empty():
+        var pixels := image.get_width() * image.get_height()
+        if pixels > MAX_BASELINE_PIXELS:
+            return R.err(R.BAD_PARAMS, "This image has %d pixels. A baseline can store at most %d pixels." % [pixels, MAX_BASELINE_PIXELS])
+        if not _baselines.has(save) and _baselines.size() >= MAX_BASELINES:
+            return R.err(R.BAD_PARAMS, "At most %d baselines can be stored in this run." % MAX_BASELINES)
+        _baselines[save] = image.duplicate()
+        report["saved"] = save
+        report["roi_space"] = "returned_image"
+    return {"report": report}
+
+
+static func _parse_roi(raw: Variant) -> Dictionary:
+    if not raw is Dictionary:
+        return R.err(R.BAD_PARAMS, "roi must be an object with integer x, y, w and h.")
+    var roi: Dictionary = raw
+    for key: String in ["x", "y", "w", "h"]:
+        if _whole_number(roi.get(key, null)) == null:
+            return R.err(R.BAD_PARAMS, "roi.%s must be an integer." % key)
+    var w := int(_whole_number(roi["w"]))
+    var h := int(_whole_number(roi["h"]))
+    if w < 1 or h < 1:
+        return R.err(R.BAD_PARAMS, "roi w and h must be at least 1.")
+    return {"roi": {
+        "x": int(_whole_number(roi["x"])),
+        "y": int(_whole_number(roi["y"])),
+        "w": w,
+        "h": h,
+    }}
+
+
+static func _fit_roi(raw: Variant, image: Image) -> Dictionary:
+    var roi: Dictionary = raw
+    var x := int(roi["x"])
+    var y := int(roi["y"])
+    var w := int(roi["w"])
+    var h := int(roi["h"])
+    if x < 0 or y < 0 or x + w > image.get_width() or y + h > image.get_height():
+        return R.err(R.BAD_PARAMS, "roi %d,%d %dx%d is outside the returned image (%dx%d)." % [x, y, w, h, image.get_width(), image.get_height()])
+    return {"rect": Rect2i(x, y, w, h)}
+
+
+static func _valid_baseline_name(name: String) -> bool:
+    if name.is_empty() or name.length() > 64:
+        return false
+    var pattern := RegEx.new()
+    if pattern.compile("^[A-Za-z_][A-Za-z0-9_\\-]{0,63}$") != OK:
+        return false
+    return pattern.search(name) != null
+
+
+static func _whole_number(raw: Variant) -> Variant:
+    if raw is int:
+        return int(raw)
+    if raw is float and float(int(raw)) == float(raw):
+        return int(raw)
+    return null
 
 
 static func _restore_cameras(state: Dictionary) -> void:

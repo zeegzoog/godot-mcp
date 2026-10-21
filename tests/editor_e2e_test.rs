@@ -1103,3 +1103,149 @@ func on_ready() -> void:
         "{project_file}"
     );
 }
+
+fn tool_text(result: &godot_mcp::protocol::ToolResult) -> String {
+    result
+        .content
+        .iter()
+        .filter_map(|item| match item {
+            godot_mcp::protocol::ToolContent::Text { text } => Some(text.as_str()),
+            godot_mcp::protocol::ToolContent::Image { .. } => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Editor Play reaches the same runtime as a managed process: scene generation, a property
+/// wait, one real physics step, and a named screenshot baseline.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn editor_play_can_wait_step_and_compare_a_baseline() {
+    use godot_mcp::cli_runner::CliRunner;
+    use godot_mcp::tools::ToolManager;
+    use std::sync::Arc;
+
+    if cfg!(target_os = "linux")
+        && std::env::var_os("DISPLAY").is_none()
+        && std::env::var_os("WAYLAND_DISPLAY").is_none()
+    {
+        eprintln!("skipped: editor Play needs a display");
+        return;
+    }
+
+    let editor = start_editor(false).await;
+    let (godot, _) = godot_binaries();
+    let tools = Arc::new(
+        ToolManager::new(BridgeClient::new(editor.port), CliRunner::new(godot))
+            .with_working_dir(editor.project.clone()),
+    );
+    let started = Arc::clone(&tools)
+        .call_tool("godot_run_project", json!({"scene": "res://main.tscn"}))
+        .await;
+    assert!(!started.is_error, "{}", tool_text(&started));
+
+    let snap = Arc::clone(&tools)
+        .call_tool("godot_game_snapshot", json!({}))
+        .await;
+    assert!(!snap.is_error, "{}", tool_text(&snap));
+    let snap_json: Value = serde_json::from_str(&tool_text(&snap)).expect("snapshot json");
+    assert!(
+        snap_json["scene"]
+            .as_str()
+            .unwrap_or("")
+            .ends_with("main.tscn"),
+        "{snap_json}"
+    );
+    assert!(
+        snap_json["scene_generation"].as_i64().unwrap_or(0) >= 1,
+        "{snap_json}"
+    );
+    assert!(
+        snap_json["scene_instance_id"].as_i64().unwrap_or(0) > 0,
+        "{snap_json}"
+    );
+    assert_eq!(
+        snap_json["script_sha256_basis"], "unavailable",
+        "{snap_json}"
+    );
+    assert!(snap_json["script_sha256"].is_null(), "{snap_json}");
+
+    let found = Arc::clone(&tools)
+        .call_tool("godot_game_wait", json!({"node": "Player", "timeout": 60}))
+        .await;
+    assert!(!found.is_error, "{}", tool_text(&found));
+
+    let named = Arc::clone(&tools)
+        .call_tool(
+            "godot_game_wait",
+            json!({"node": ".", "property": "name", "op": "eq", "value": "Main"}),
+        )
+        .await;
+    assert!(!named.is_error, "{}", tool_text(&named));
+    let named_json: Value = serde_json::from_str(&tool_text(&named)).expect("wait json");
+    assert_eq!(named_json["observed"], "Main", "{named_json}");
+    assert!(
+        named_json["scene"]["scene_generation"]
+            .as_i64()
+            .unwrap_or(0)
+            >= 1,
+        "{named_json}"
+    );
+
+    let denied = Arc::clone(&tools)
+        .call_tool(
+            "godot_game_wait",
+            json!({"node": ".", "property": "_secret", "op": "exists", "timeout": 1}),
+        )
+        .await;
+    assert!(denied.is_error, "{}", tool_text(&denied));
+    assert!(
+        tool_text(&denied).to_lowercase().contains("private"),
+        "{}",
+        tool_text(&denied)
+    );
+
+    let stepped = Arc::clone(&tools)
+        .call_tool("godot_game_physics", json!({"action": "step", "ticks": 2}))
+        .await;
+    assert!(!stepped.is_error, "{}", tool_text(&stepped));
+    let stepped_json: Value = serde_json::from_str(&tool_text(&stepped)).expect("physics json");
+    assert_eq!(stepped_json["ticks"], 2, "{stepped_json}");
+    assert_eq!(stepped_json["paused"], true, "{stepped_json}");
+    assert!(
+        stepped_json["scene"]["scene_generation"]
+            .as_i64()
+            .unwrap_or(0)
+            >= 1,
+        "{stepped_json}"
+    );
+
+    let saved = Arc::clone(&tools)
+        .call_tool(
+            "godot_game_screenshot",
+            json!({"max_dimension": 64, "save_baseline": "play"}),
+        )
+        .await;
+    assert!(!saved.is_error, "{}", tool_text(&saved));
+    assert!(tool_text(&saved).contains("play"), "{}", tool_text(&saved));
+    let compared = Arc::clone(&tools)
+        .call_tool(
+            "godot_game_screenshot",
+            json!({"max_dimension": 64, "baseline": "play", "tolerance": 255}),
+        )
+        .await;
+    assert!(!compared.is_error, "{}", tool_text(&compared));
+    let note = tool_text(&compared);
+    assert!(note.contains("changed 0"), "{note}");
+    assert!(note.contains("exact"), "{note}");
+    assert!(note.contains("tolerance 255"), "{note}");
+
+    let resumed = Arc::clone(&tools)
+        .call_tool("godot_game_physics", json!({"action": "resume"}))
+        .await;
+    assert!(!resumed.is_error, "{}", tool_text(&resumed));
+    let stopped = Arc::clone(&tools)
+        .call_tool("godot_stop_project", json!({}))
+        .await;
+    assert!(!stopped.is_error, "{}", tool_text(&stopped));
+}

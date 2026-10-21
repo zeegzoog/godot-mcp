@@ -7,16 +7,25 @@ const MAX_LINES := 2000
 const MAX_TEXT := 2000
 
 static var _logger: OutputLogger = null
+static var _pending_scene: Dictionary = {}
 
 
 static func methods() -> Dictionary:
     return {"rt.output": {"fn": output}}
 
 
+static func note_scene(context: Dictionary) -> void:
+    _pending_scene = context.duplicate(true)
+    if _logger != null:
+        _logger.set_scene(_pending_scene)
+
+
 static func install() -> void:
     if _logger != null:
         return
     _logger = OutputLogger.new()
+    if not _pending_scene.is_empty():
+        _logger.set_scene(_pending_scene)
     OS.add_logger(_logger)
 
 
@@ -62,6 +71,12 @@ class OutputLogger extends Logger:
     var _seq := 0
     var _errors := 0
     var _warnings := 0
+    var _scene: Dictionary = {}
+
+    func set_scene(context: Dictionary) -> void:
+        _mutex.lock()
+        _scene = context.duplicate(true)
+        _mutex.unlock()
 
     func _log_message(message: String, error: bool) -> void:
         _add("info", ("[stderr] " if error else "") + message.trim_suffix("\n"), [])
@@ -83,7 +98,14 @@ class OutputLogger extends Logger:
         if text.length() > MAX_TEXT:
             text = text.substr(0, MAX_TEXT)
         _mutex.lock()
-        _entries.append({"seq": _seq, "level": level, "text": text, "stack": frames})
+        # Copy the stamp from this moment. A later scene must not rewrite an old line.
+        _entries.append({
+            "seq": _seq,
+            "level": level,
+            "text": text,
+            "stack": frames,
+            "scene": _scene.duplicate(true),
+        })
         _seq += 1
         if level == "error":
             _errors += 1

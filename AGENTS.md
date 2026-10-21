@@ -35,8 +35,8 @@ Agents must treat the Godot Editor as a live, stateful environment while ensurin
 
 ### File Names
 
-- Template files are named in capitals with underscores: `PULL_REQUEST_TEMPLATE.md`, `ISSUE_TEMPLATE/BUG_REPORT.yml`. The extension stays lowercase.
-- Every other multi-word file name is lowercase with hyphens: `agent-feedback.md`, `steward-priorities.md`, `release-notes.sh`. Names a tool requires keep the spelling it requires (`dependabot.yml`, `config.yml`, `workflows/`).
+- Files that GitHub looks up by name in the repository root or in `.github/` are capitalized: `README.md`, `CONTRIBUTING.md`, `SECURITY.md`, `PULL_REQUEST_TEMPLATE.md`. The `ISSUE_TEMPLATE/` folder is capitalized as GitHub writes it.
+- Every other file name is lowercase, and several words are joined with hyphens: `agent-feedback.md`, `steward-priorities.md`, `release-notes.sh`. The issue forms keep the underscores GitHub generates (`ISSUE_TEMPLATE/bug_report.yml`). A name a tool requires keeps its spelling (`dependabot.yml`, `config.yml`, `workflows/`).
 
 ### Core Server Standards (Rust)
 

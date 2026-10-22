@@ -167,6 +167,24 @@ async fn only_gd_files_can_be_created() {
 }
 
 #[tokio::test]
+async fn an_offline_editor_names_the_bridge_port_the_server_is_using() {
+    let port = free_port();
+    let tools = Arc::new(ToolManager::new(
+        BridgeClient::with_port_origin(port, format!("port {port} from --debug-port")),
+        CliRunner::new(PathBuf::from("godot-binary-that-does-not-exist")),
+    ));
+    let result = tools.call_tool("godot_get_project_info", json!({})).await;
+    let message = text(&result);
+    assert!(result.is_error, "{message}");
+    assert!(message.contains(&port.to_string()), "{message}");
+    assert!(message.contains("--debug-port"), "{message}");
+    assert!(message.contains("godot_mcp/bridge_port"), "{message}");
+    assert!(message.contains("must listen"), "{message}");
+    assert!(!message.contains("default: 9333"), "{message}");
+    assert!(!message.contains("Verify GODOT_DEBUG_PORT"), "{message}");
+}
+
+#[tokio::test]
 async fn needs_a_project_when_the_editor_is_offline() {
     let result = call("godot_create_script", json!({"file_path": "res://a.gd"})).await;
     assert!(result.is_error);

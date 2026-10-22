@@ -67,6 +67,8 @@ struct State {
 #[derive(Clone, Debug)]
 pub struct BridgeClient {
     port: u16,
+    /// Phrase that says which port is in effect and where the server read it.
+    port_origin: String,
     command_timeout: Duration,
     state: Arc<Mutex<State>>,
     events: EventSubs,
@@ -74,8 +76,13 @@ pub struct BridgeClient {
 
 impl BridgeClient {
     pub fn new(port: u16) -> Self {
+        Self::with_port_origin(port, format!("port {port}"))
+    }
+
+    pub fn with_port_origin(port: u16, port_origin: impl Into<String>) -> Self {
         Self {
             port,
+            port_origin: port_origin.into(),
             command_timeout: DEFAULT_COMMAND_TIMEOUT,
             state: Arc::default(),
             events: EventSubs::default(),
@@ -176,14 +183,16 @@ impl BridgeClient {
 
         let tcp = match timeout(CONNECT_TIMEOUT, TcpStream::connect(&address)).await {
             Ok(Ok(tcp)) => tcp,
-            Ok(Err(err)) => return Err(unavailable(port, &format!("connection failed: {err}"))),
-            Err(_) => return Err(unavailable(port, "connection timed out")),
+            Ok(Err(err)) => {
+                return Err(self.unavailable(&format!("connection failed: {err}")));
+            }
+            Err(_) => return Err(self.unavailable("connection timed out")),
         };
         let url = format!("ws://{address}");
         let websocket = match timeout(HANDSHAKE_TIMEOUT, client_async(url.as_str(), tcp)).await {
             Ok(Ok((websocket, _))) => websocket,
-            Ok(Err(err)) => return Err(unavailable(port, &format!("handshake failed: {err}"))),
-            Err(_) => return Err(unavailable(port, "handshake timed out")),
+            Ok(Err(err)) => return Err(self.unavailable(&format!("handshake failed: {err}"))),
+            Err(_) => return Err(self.unavailable("handshake timed out")),
         };
 
         let (outbound, queue) = mpsc::unbounded_channel();
@@ -219,8 +228,13 @@ impl Drop for PendingGuard {
     }
 }
 
-fn unavailable(port: u16, detail: &str) -> McpError {
-    McpError::BridgeUnavailable(format!("ws://127.0.0.1:{port}: {detail}"))
+impl BridgeClient {
+    fn unavailable(&self, detail: &str) -> McpError {
+        McpError::BridgeUnavailable(format!(
+            "ws://127.0.0.1:{}: {detail}. This server is using {}. The Godot MCP addon must listen on that same port: set the project setting godot_mcp/bridge_port to it, or leave that unset and start the editor with the same GODOT_DEBUG_PORT",
+            self.port, self.port_origin
+        ))
+    }
 }
 
 fn connection_closed() -> McpError {

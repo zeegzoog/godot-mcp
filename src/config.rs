@@ -1,4 +1,5 @@
-use clap::Parser;
+use clap::parser::ValueSource;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use std::convert::Infallible;
 use std::path::PathBuf;
 use tracing::{debug, warn};
@@ -34,6 +35,11 @@ pub struct Config {
     /// when unset
     #[arg(long = "gh-path", env = "GODOT_MCP_GH_PATH", value_parser = parse_path)]
     pub gh_path: Option<PathBuf>,
+
+    /// Where `debug_port` came from. Empty until `load`; tests that parse arguments directly
+    /// leave it empty.
+    #[arg(skip)]
+    bridge_port_origin: String,
 }
 
 /// How much of the agent feedback channel the human allows.
@@ -102,6 +108,17 @@ fn parse_path(raw: &str) -> Result<PathBuf, Infallible> {
     Ok(PathBuf::from(raw))
 }
 
+/// Names the port the server will dial and the place that value was read from.
+pub fn describe_bridge_port(port: u16, source: Option<ValueSource>) -> String {
+    match source {
+        Some(ValueSource::CommandLine) => format!("port {port} from --debug-port"),
+        Some(ValueSource::EnvVariable) => {
+            format!("port {port} from the environment variable GODOT_DEBUG_PORT")
+        }
+        _ => format!("port {port}, the default when --debug-port and GODOT_DEBUG_PORT are unset"),
+    }
+}
+
 /// Like `u16`, except that an empty value selects the default port.
 fn parse_port(raw: &str) -> Result<u16, String> {
     let raw = raw.trim();
@@ -130,7 +147,20 @@ fn load_dotenv() {
 impl Config {
     pub fn load() -> Self {
         load_dotenv();
-        Config::parse()
+        let matches = Self::command().get_matches();
+        let mut config = Self::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+        config.bridge_port_origin =
+            describe_bridge_port(config.debug_port, matches.value_source("debug_port"));
+        config
+    }
+
+    /// The port the editor addon has to listen on, and the flag or variable that set it.
+    pub fn bridge_port_origin(&self) -> String {
+        if self.bridge_port_origin.is_empty() {
+            format!("port {}", self.debug_port)
+        } else {
+            self.bridge_port_origin.clone()
+        }
     }
 
     /// Resolve the effective Godot binary path.
@@ -265,8 +295,9 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, FeedbackMode};
-    use clap::Parser;
+    use super::{Config, FeedbackMode, describe_bridge_port};
+    use clap::parser::ValueSource;
+    use clap::{CommandFactory, Parser};
     use std::path::PathBuf;
 
     #[test]
@@ -312,6 +343,38 @@ mod tests {
             Some(PathBuf::from("/opt/gh"))
         );
         assert_eq!(parse(&["--gh-path", ""]).gh_path, Some(PathBuf::from("")));
+    }
+
+    #[test]
+    fn an_offline_bridge_is_told_the_port_the_server_actually_reads() {
+        let from_env = describe_bridge_port(19333, Some(ValueSource::EnvVariable));
+        assert!(from_env.contains("19333"), "{from_env}");
+        assert!(
+            from_env.contains("environment variable GODOT_DEBUG_PORT"),
+            "{from_env}"
+        );
+        assert!(!from_env.contains("default: 9333"), "{from_env}");
+
+        let from_flag = describe_bridge_port(19444, Some(ValueSource::CommandLine));
+        assert!(
+            from_flag.contains("19444") && from_flag.contains("--debug-port"),
+            "{from_flag}"
+        );
+        assert!(!from_flag.contains("GODOT_DEBUG_PORT"), "{from_flag}");
+
+        let fallback = describe_bridge_port(9333, None);
+        assert!(
+            fallback.contains("9333") && fallback.contains("default"),
+            "{fallback}"
+        );
+
+        let matches = Config::command()
+            .try_get_matches_from(["godot-mcp", "--debug-port", "19444"])
+            .expect("args");
+        assert_eq!(
+            matches.value_source("debug_port"),
+            Some(ValueSource::CommandLine)
+        );
     }
 
     fn parse(args: &[&str]) -> Config {

@@ -5,8 +5,10 @@
 
 use super::{ToolManager, str_arg, string_list};
 use crate::error::McpError;
+use crate::paths::resolve_in_project;
 use crate::protocol::{Tool, ToolResult};
 use serde_json::{Value, json};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 const DENY_METHODS: &[&str] = &[
@@ -47,6 +49,7 @@ pub fn handles(name: &str) -> bool {
             | "godot_game_wait"
             | "godot_game_physics"
             | "godot_game_screenshot"
+            | "godot_game_record"
             | "godot_debug_breakpoints"
             | "godot_debug_control"
             | "godot_debug_state"
@@ -69,13 +72,13 @@ pub fn catalog() -> Vec<Tool> {
         ),
         tool(
             "godot_game_get",
-            "Reads a live node's properties, groups and, optionally, signals and methods.",
+            "Reads a live node's properties, groups and, optionally, signals and methods. A property may step through resources with ':' (material_override:shader_parameter/caustics), including a segment that starts with _. A requested script name is omitted, not rejected. A path that is not a resource is refused.",
             json!({"run_id": s(""), "path": s("Node path relative to the current scene, or /root/..."), "properties": {"type": "array", "items": {"type": "string"}}, "signals": b(), "methods": b()}),
             &[],
         ),
         tool(
             "godot_game_set",
-            "Sets properties on a live node. Refuses `script` and private names. Nothing is saved to disk.",
+            "Sets properties on a live node. A name may step through resources with ':' (material_override:shader_parameter/caustics); '/' stays inside one Godot property name. Refuses script, a private segment, and a path that is not a resource. Nothing is saved to disk.",
             json!({"run_id": s(""), "path": s(""), "properties": {"type": "object"}}),
             &["properties"],
         ),
@@ -129,8 +132,21 @@ pub fn catalog() -> Vec<Tool> {
         ),
         tool(
             "godot_game_screenshot",
-            "Captures the running game window, a viewport, or a Camera2D/Camera3D as one PNG. frames (1 to 8) stitches shots taken every process frames into a single sheet. The text says how many pixels changed since the previous capture of this run, and where (a sheet compares its last frame, and only against a capture of the same size). save_baseline stores the returned image under a name (at most 8, each at most 512×512 pixels). baseline compares the returned image with a saved one. roi is x, y, w, h in pixels of that returned image (roi_space returned_image), including a sheet. tolerance (0 to 255) is the allowed per-channel difference; a larger difference counts as changed. The text reports changed, sampled, ratio, bounds, tolerance, the baseline name, and whether the pixel count is exact or sampled. Fails instead of returning an empty image. Headless games have nothing to capture. While the game is held a single capture shows the last frame it drew (a sheet with frames above 1, or a camera switch, is refused: take one capture, step, take the next). A missing baseline, a bad name, or an roi outside the image is an error and does not replace a saved image.",
+            "Captures the running game window, a viewport, or a Camera2D/Camera3D as one PNG. frames (1 to 8) stitches shots taken every process frames into a single sheet. For a longer series saved as PNG files, use godot_game_record. The text says how many pixels changed since the previous capture of this run, and where (a sheet compares its last frame, and only against a capture of the same size). save_baseline stores the returned image under a name (at most 8, each at most 512×512 pixels). baseline compares the returned image with a saved one. roi is x, y, w, h in pixels of that returned image (roi_space returned_image), including a sheet. tolerance (0 to 255) is the allowed per-channel difference; a larger difference counts as changed. The text reports changed, sampled, ratio, bounds, tolerance, the baseline name, and whether the pixel count is exact or sampled. Fails instead of returning an empty image. Headless games have nothing to capture. While the game is held a single capture shows the last frame it drew (a sheet with frames above 1, or a camera switch, is refused: take one capture, step, take the next). A missing baseline, a bad name, or an roi outside the image is an error and does not replace a saved image.",
             json!({"run_id": s(""), "node": s("Viewport or node whose viewport to capture."), "camera": s("Camera2D or Camera3D to make current for the shot."), "max_dimension": i("Longest side of the returned image in pixels. Default 768."), "frames": ir("How many frames to stitch. Default 1, max 8.", 1, Some(8)), "every": ir("Process frames between shots. Default 1, max 60.", 1, Some(60)), "baseline": s("Name of a saved image to compare."), "save_baseline": s("Store the returned image under this name. Letters, digits, underscore, hyphen. At most 8 names."), "roi": roi_schema(), "tolerance": ir("Per-channel difference that still counts as unchanged. 0 to 255. Default 0.", 0, Some(255))}),
+            &[],
+        ),
+        tool(
+            "godot_game_record",
+            "Records the game window as PNG files on disk, for motion that a sheet of 8 frames cannot cover. frames is 1 to 240 (default 60). every is the process frames between shots, 1 to 60 (default 1). frames * every must be at most 480. max_dimension is the longest side of each file (default 768, 16 to 4096). Each frame only grabs an image. The PNG files are written after the last frame, and the timings are those capture instants. frames × width × height × 4 must stay within 512 MB after max_dimension. directory is an absolute path inside the system temporary directory; omit it for a new one. The reply lists each file's path, size and timing, and does not embed image bytes. format png (default) writes only those files. gif or mp4 also builds recording.gif or recording.mp4 when ffmpeg is on PATH; without ffmpeg the PNG files are still returned. Refused while the game is held, and a headless game has nothing to record.",
+            json!({
+                "run_id": s(""),
+                "frames": ir("How many PNG files to save. 1 to 240, default 60.", 1, Some(240)),
+                "every": ir("Process frames between shots. 1 to 60, default 1. frames * every must be at most 480.", 1, Some(60)),
+                "max_dimension": ir("Longest side of each PNG in pixels. 16 to 4096, default 768.", 16, Some(4096)),
+                "directory": s("Absolute directory to write into, inside the system temporary directory. Created if missing. Must not already contain frame PNGs or a recording. Omit for a new one."),
+                "format": {"type": "string", "enum": ["png", "gif", "mp4"], "description": "png (default) keeps the frames. gif or mp4 also runs ffmpeg when it is on PATH."}
+            }),
             &[],
         ),
         tool(
@@ -260,6 +276,7 @@ pub async fn call(tools: &ToolManager, name: &str, args: Value) -> ToolResult {
         "godot_game_wait" => runtime(tools, &args, "input.wait").await,
         "godot_game_physics" => runtime(tools, &args, "game.physics").await,
         "godot_game_screenshot" => screenshot(tools, &args).await,
+        "godot_game_record" => record(tools, &args).await,
         "godot_debug_breakpoints" => breakpoints(tools, &args).await,
         "godot_debug_control" => debug_control(tools, &args).await,
         "godot_debug_state" => debug_state(tools, &args).await,
@@ -741,6 +758,11 @@ impl ToolManager {
 /// How long a held step may take before the server stops waiting. The game still finishes it.
 const HELD_STEP_WAIT: Duration = Duration::from_secs(60);
 
+/// How long a recording may take. Capturing is at most 480 process frames. The PNG files are
+/// written after the last frame and before the runtime answers, so this wait covers that disk
+/// time. The 512 MB pixel cap keeps the write inside it.
+const RECORD_WAIT: Duration = Duration::from_secs(120);
+
 /// A runtime call that knows whether the game is held: a held step gets the long wait, a timeout
 /// of one says the game is still running it, and the answer to a physics call keeps the run's
 /// idea of "held" current.
@@ -750,8 +772,11 @@ async fn held_aware_call(
     params: Value,
 ) -> Result<Value, McpError> {
     let physics = method == "game.physics";
+    let recording = method == "game.record";
     let was_held = physics && run.is_held();
-    let wait = if was_held {
+    let wait = if recording {
+        RECORD_WAIT
+    } else if was_held {
         HELD_STEP_WAIT
     } else {
         Duration::from_secs(20)
@@ -767,7 +792,13 @@ async fn held_aware_call(
             run.set_held(held);
         }
     }
-    outcome.map_err(|error| held_step_timeout(was_held, error))
+    outcome.map_err(|error| {
+        if recording {
+            record_timeout(error)
+        } else {
+            held_step_timeout(was_held, error)
+        }
+    })
 }
 
 /// A timeout while a held step runs is not a failure of the game: it goes on and holds again.
@@ -777,6 +808,18 @@ fn held_step_timeout(was_held: bool, error: McpError) -> McpError {
             McpError::Process(format!(
                 "the held step did not finish within {} s ({message}). The game finishes it and holds again. Read godot_game_physics with action status before stepping again, or lower ticks or max",
                 HELD_STEP_WAIT.as_secs()
+            ))
+        }
+        other => other,
+    }
+}
+
+/// A recording that outlives its wait is still writing the PNG files. That is not a held step.
+fn record_timeout(error: McpError) -> McpError {
+    match error {
+        McpError::Process(message) if message.starts_with("timed out") => {
+            McpError::Process(format!(
+                "timed out while the game was writing the recorded PNG files ({message}). The frames were already captured. Wait and look in the directory, or record fewer or smaller frames"
             ))
         }
         other => other,
@@ -934,6 +977,294 @@ fn base64_decode(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+const MAX_RECORD_FRAMES: i64 = 240;
+const MAX_RECORD_EVERY: i64 = 60;
+const MAX_RECORD_SPAN: i64 = 480;
+
+async fn record(tools: &ToolManager, args: &Value) -> ToolResult {
+    let frames = match bounded_int(args, "frames", 60, 1, MAX_RECORD_FRAMES) {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    let every = match bounded_int(args, "every", 1, 1, MAX_RECORD_EVERY) {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    if frames.saturating_mul(every) > MAX_RECORD_SPAN {
+        return ToolResult::error(
+            format!("frames * every must be at most {MAX_RECORD_SPAN} process frames"),
+            &["Lower frames or every. 180 frames with every 1 is about three seconds at 60 fps"],
+        );
+    }
+    let max_dimension = match bounded_int(args, "max_dimension", 768, 16, 4096) {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    let format = str_arg(args, "format").unwrap_or("png");
+    if !matches!(format, "png" | "gif" | "mp4") {
+        return ToolResult::error(
+            "format must be png, gif, or mp4",
+            &["Omit format to keep the PNG files only"],
+        );
+    }
+    let directory = match prepare_record_dir(str_arg(args, "directory")) {
+        Ok(directory) => directory,
+        Err(result) => return result,
+    };
+    let mut params = params_without_run(args);
+    if let Some(map) = params.as_object_mut() {
+        map.insert("directory".into(), json!(directory.display().to_string()));
+        map.insert("frames".into(), json!(frames));
+        map.insert("every".into(), json!(every));
+        map.insert("max_dimension".into(), json!(max_dimension));
+        map.remove("format");
+    }
+    let value = match tools
+        .runtime_call(str_arg(args, "run_id"), "game.record", params)
+        .await
+    {
+        Ok(value) => value,
+        Err(error) => return runtime_error(&error),
+    };
+    let Some(reported) = value.get("frames").and_then(Value::as_array) else {
+        return ToolResult::error(
+            "The game did not return a frame list",
+            &["Update the Godot MCP addon runtime"],
+        );
+    };
+    let expected = usize::try_from(frames).unwrap_or(usize::MAX);
+    if reported.len() != expected {
+        return ToolResult::error(
+            format!(
+                "The recording saved {} frames, not {frames}",
+                reported.len()
+            ),
+            &["Retry godot_game_record. A closed window stops the recording"],
+        );
+    }
+    let mut frames_out = Vec::with_capacity(reported.len());
+    for (offset, frame) in reported.iter().enumerate() {
+        let index = offset + 1;
+        let path = directory.join(format!("frame-{index:04}.png"));
+        if !is_png(&path) {
+            return ToolResult::error(
+                format!("{} is not a PNG", path.display()),
+                &["The game could not finish writing the frame"],
+            );
+        }
+        let Some(object) = frame.as_object() else {
+            return ToolResult::error(
+                "A recorded frame was not an object",
+                &["Update the Godot MCP addon runtime"],
+            );
+        };
+        let mut item = object.clone();
+        item.insert("index".into(), json!(index));
+        item.insert("file".into(), json!(format!("frame-{index:04}.png")));
+        item.insert("path".into(), json!(path.display().to_string()));
+        frames_out.push(Value::Object(item));
+    }
+    let rate = recording_rate(&frames_out);
+    let video = encode_video(&directory, format, frames, &rate).await;
+    let mut body = value;
+    if let Some(object) = body.as_object_mut() {
+        object.insert("directory".into(), json!(directory.display().to_string()));
+        object.insert("count".into(), json!(frames));
+        object.insert("frames".into(), Value::Array(frames_out));
+        object.insert("video".into(), video);
+    }
+    ToolResult::text(serde_json::to_string_pretty(&body).unwrap_or_default())
+}
+
+fn bounded_int(
+    args: &Value,
+    key: &str,
+    default: i64,
+    min: i64,
+    max: i64,
+) -> Result<i64, ToolResult> {
+    let Some(value) = args.get(key).filter(|value| !value.is_null()) else {
+        return Ok(default);
+    };
+    let Some(number) = value.as_i64() else {
+        return Err(ToolResult::error(
+            format!("{key} must be an integer from {min} to {max}"),
+            &["Pass a whole number"],
+        ));
+    };
+    if !(min..=max).contains(&number) {
+        return Err(ToolResult::error(
+            format!("{key} must be from {min} to {max}"),
+            &["Use a value inside the documented range"],
+        ));
+    }
+    Ok(number)
+}
+
+fn prepare_record_dir(requested: Option<&str>) -> Result<PathBuf, ToolResult> {
+    let temp_root = std::env::temp_dir();
+    let directory = if let Some(text) = requested {
+        let hint = format!(
+            "Pass an absolute directory below {}, or omit directory",
+            temp_root.display()
+        );
+        if text.is_empty() || text.chars().any(char::is_control) {
+            return Err(ToolResult::error(
+                "directory must be an absolute path",
+                &[hint.as_str()],
+            ));
+        }
+        let path = PathBuf::from(text);
+        if !path.is_absolute()
+            || path
+                .components()
+                .any(|component| matches!(component, Component::ParentDir))
+        {
+            return Err(ToolResult::error(
+                "directory must be an absolute path and must not contain ..",
+                &[hint.as_str()],
+            ));
+        }
+        // A tool call must not write files anywhere on the machine: the recording goes below the
+        // system temporary directory, links in the part that exists included.
+        resolve_in_project(&temp_root, text).map_err(|_| {
+            ToolResult::error(
+                format!(
+                    "directory must be inside the system temporary directory {}",
+                    temp_root.display()
+                ),
+                &[hint.as_str()],
+            )
+        })?
+    } else {
+        std::env::temp_dir()
+            .join("godot-mcp-records")
+            .join(uuid::Uuid::new_v4().simple().to_string())
+    };
+    if directory.is_file() {
+        return Err(ToolResult::error(
+            format!("directory is a file: {}", directory.display()),
+            &["Pass a directory, or omit directory for a temporary one"],
+        ));
+    }
+    if let Err(error) = std::fs::create_dir_all(&directory) {
+        return Err(ToolResult::error(
+            format!("Could not create the recording directory: {error}"),
+            &["Choose a directory you can write to"],
+        ));
+    }
+    let entries = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            return Err(ToolResult::error(
+                format!("Could not read the recording directory: {error}"),
+                &["Choose a directory you can write to"],
+            ));
+        }
+    };
+    let occupied = entries.flatten().any(|entry| {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        (name.starts_with("frame-") && name.ends_with(".png")) || name.starts_with("recording.")
+    });
+    if occupied {
+        return Err(ToolResult::error(
+            "directory already contains frame PNG files or a recording",
+            &["Pass an empty directory, or omit directory for a new one"],
+        ));
+    }
+    Ok(directory)
+}
+
+fn is_png(path: &Path) -> bool {
+    let mut header = [0_u8; 8];
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    std::io::Read::read_exact(&mut file, &mut header).is_ok()
+        && header == [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']
+}
+
+fn recording_rate(frames: &[Value]) -> String {
+    let msec = |frame: &Value| frame.get("msec").and_then(Value::as_f64);
+    let first = frames.first().and_then(msec).unwrap_or(0.0);
+    let last = frames.last().and_then(msec).unwrap_or(first);
+    let span = last - first;
+    let rate = if frames.len() > 1 && span > 0.0 {
+        (frames.len() - 1) as f64 * 1000.0 / span
+    } else {
+        10.0
+    };
+    format!("{:.2}", rate.clamp(1.0, 60.0))
+}
+
+async fn encode_video(directory: &Path, format: &str, count: i64, rate: &str) -> Value {
+    encode_video_with(directory, format, count, rate, "ffmpeg").await
+}
+
+async fn encode_video_with(
+    directory: &Path,
+    format: &str,
+    count: i64,
+    rate: &str,
+    program: &str,
+) -> Value {
+    if format == "png" {
+        return json!({"format": "png", "ffmpeg": "not_requested"});
+    }
+    let video_path = directory.join(format!("recording.{format}"));
+    let mut command = tokio::process::Command::new(program);
+    command
+        .current_dir(directory)
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .arg("-y")
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-framerate")
+        .arg(rate)
+        .arg("-start_number")
+        .arg("1")
+        .arg("-i")
+        .arg("frame-%04d.png")
+        .arg("-frames:v")
+        .arg(count.to_string());
+    if format == "mp4" {
+        command.args([
+            "-vf",
+            "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+            "-pix_fmt",
+            "yuv420p",
+        ]);
+    }
+    command.arg(&video_path);
+    let outcome = tokio::time::timeout(Duration::from_secs(60), command.output()).await;
+    match outcome {
+        Ok(Ok(output)) if output.status.success() && video_path.is_file() => json!({
+            "format": format,
+            "path": video_path.display().to_string(),
+            "ffmpeg": "used",
+        }),
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            json!({"format": format, "ffmpeg": "not_found"})
+        }
+        Ok(Ok(output)) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let detail = stderr
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("ffmpeg failed")
+                .trim();
+            json!({"format": format, "ffmpeg": "failed", "error": detail})
+        }
+        Ok(Err(error)) => json!({"format": format, "ffmpeg": "failed", "error": error.to_string()}),
+        Err(_) => json!({"format": format, "ffmpeg": "failed", "error": "ffmpeg timed out"}),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1015,6 +1346,21 @@ mod tests {
             held_step_timeout(true, other()).to_string(),
             other().to_string()
         );
+    }
+
+    #[test]
+    fn a_recording_timeout_says_the_png_files_are_still_being_written() {
+        let timeout = || {
+            McpError::Process(
+                "timed out waiting for the game runtime to answer 'game.record'".into(),
+            )
+        };
+        let text = record_timeout(timeout()).to_string();
+        assert!(text.contains("writing the recorded PNG files"), "{text}");
+        assert!(text.contains("already captured"), "{text}");
+        assert!(!text.to_lowercase().contains("held step"), "{text}");
+        let other = || McpError::Process("the game disconnected".into());
+        assert_eq!(record_timeout(other()).to_string(), other().to_string());
     }
 
     #[test]
@@ -1139,5 +1485,13 @@ mod tests {
         assert_eq!(png_dimensions(&png), Some((32, 16)));
         png[16..20].copy_from_slice(&0u32.to_be_bytes());
         assert!(png_dimensions(&png).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_missing_ffmpeg_leaves_the_request_as_png_only() {
+        let dir = tempfile::tempdir().expect("record dir");
+        let video = encode_video_with(dir.path(), "gif", 1, "10", "godot-mcp-ffmpeg-missing").await;
+        assert_eq!(video["ffmpeg"], "not_found");
+        assert!(video.get("path").is_none());
     }
 }

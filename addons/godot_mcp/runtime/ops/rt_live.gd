@@ -112,16 +112,24 @@ static func get_node(rt: Node, params: Dictionary) -> Dictionary:
         return R.err(R.NOT_FOUND, "Node not found at '%s'." % str(params.get("path", ".")))
     var wanted: Variant = params.get("properties", [])
     var props := {}
+    var errors := {}
     if wanted is Array and not (wanted as Array).is_empty():
         for key: Variant in wanted:
             var name := str(key)
             if name.contains("/") and not name.contains(":"):
                 # The same resolver a property wait uses: get only, no method calls.
+                # A missing segment is that property's error. A real null stays null.
                 var looked := Inputs._lookup(node, name)
                 if R.is_err(looked):
+                    var failure: Dictionary = looked["error"]
+                    if str(failure.get("code", "")) == R.NOT_FOUND:
+                        errors[name] = str(failure.get("message", ""))
+                        continue
                     return looked
-                var value: Variant = looked["value"] if bool(looked.get("exists", false)) else null
-                props[name] = rt.encode(value)
+                if not bool(looked.get("exists", false)):
+                    errors[name] = "Property '%s' does not exist." % name
+                    continue
+                props[name] = rt.encode(looked.get("value", null))
                 continue
             var located := _locate(node, name, false)
             if bool(located.get("skip", false)):
@@ -148,6 +156,8 @@ static func get_node(rt: Node, params: Dictionary) -> Dictionary:
         "properties": props,
         "groups": node.get_groups(),
     }
+    if not errors.is_empty():
+        result["property_errors"] = errors
     if node.get_script() != null:
         result["script"] = (node.get_script() as Script).resource_path
     if bool(params.get("signals", false)):

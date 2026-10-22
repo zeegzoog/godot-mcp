@@ -2,7 +2,7 @@
 //! logs, and the remote debugger. Ignored unless `GODOT_PATH` points at Godot 4.5+.
 //!
 //! ```bash
-//! GODOT_PATH=/path/to/godot cargo test --test runtime_e2e_test -- --ignored --nocapture
+//! GODOT_PATH=/path/to/godot cargo test --test runtime_e2e_test -- --ignored --test-threads=1 --nocapture
 //! ```
 
 use godot_mcp::bridge::BridgeClient;
@@ -105,12 +105,15 @@ var scale_seen := 1.0
 var pad_presses := 0
 var tiny_presses := 0
 var firefly_law: RefCounted
+var river: RefCounted
 var bag := {"count": 2}
+var quiet = null
 var swatch: Resource
 signal pinged(value)
 
 func _ready() -> void:
     firefly_law = Law.new()
+    river = River.new()
     swatch = Tone.new()
     set_meta("note", "hi")
     print("mcp-probe-ready")
@@ -120,6 +123,10 @@ class Law:
     extends RefCounted
     var births := 3
     var _hidden := 1
+
+class River:
+    extends RefCounted
+    var camera_x := 1.5
 
 class Tone:
     extends Resource
@@ -302,6 +309,63 @@ async fn running_game_accepts_input_and_can_be_inspected() {
     );
     assert_eq!(nested_values["bag/count"], 2, "{}", text_of(&nested));
     assert_eq!(nested_values["swatch:level"], 4, "{}", text_of(&nested));
+    let missing = call(
+        &tools,
+        "godot_game_get",
+        json!({
+            "run_id": run_id,
+            "path": ".",
+            "properties": ["river/berry", "river/camera_x", "quiet", "bag/nope"]
+        }),
+    )
+    .await;
+    assert!(!missing.is_error, "{}", text_of(&missing));
+    let missing_json = json_of(&missing);
+    assert!(
+        missing_json["properties"].get("river/berry").is_none(),
+        "a missing segment must not be null: {missing_json}"
+    );
+    assert_eq!(
+        missing_json["properties"]["river/camera_x"], 1.5,
+        "{missing_json}"
+    );
+    assert!(
+        missing_json["properties"]["quiet"].is_null(),
+        "a real null stays null: {missing_json}"
+    );
+    let property_errors = &missing_json["property_errors"];
+    assert!(
+        property_errors["river/berry"]
+            .as_str()
+            .unwrap_or("")
+            .contains("berry"),
+        "{missing_json}"
+    );
+    assert!(
+        property_errors["bag/nope"]
+            .as_str()
+            .unwrap_or("")
+            .contains("nope"),
+        "{missing_json}"
+    );
+    let missing_wait = call(
+        &tools,
+        "godot_game_wait",
+        json!({
+            "run_id": run_id,
+            "node": ".",
+            "property": "river/berry",
+            "op": "exists",
+            "timeout": 30
+        }),
+    )
+    .await;
+    assert!(missing_wait.is_error, "{}", text_of(&missing_wait));
+    let missing_wait_text = text_of(&missing_wait);
+    assert!(
+        missing_wait_text.contains("berry") && !missing_wait_text.contains("Timed out"),
+        "{missing_wait_text}"
+    );
     // A property whose own name has a slash is read whole, not walked as a path.
     let slashed = call(
         &tools,
@@ -1663,6 +1727,11 @@ async fn windowed_screenshot_returns_a_sheet_and_a_diff() {
         text_of(&first)
     );
     assert!(
+        text_of(&first).contains("input space") && text_of(&first).contains("image scale"),
+        "{}",
+        text_of(&first)
+    );
+    assert!(
         first.content.iter().any(|item| matches!(
             item,
             godot_mcp::protocol::ToolContent::Image { mime_type, .. } if mime_type == "image/png"
@@ -1698,6 +1767,10 @@ async fn windowed_screenshot_returns_a_sheet_and_a_diff() {
     let note = text_of(&sheet);
     assert!(note.contains("4 frames, 2 columns"), "{note}");
     assert!(
+        note.contains("input space") && note.contains("image scale") && note.contains("per frame"),
+        "{note}"
+    );
+    assert!(
         note.contains("not compared: the previous capture had another size"),
         "{note}"
     );
@@ -1713,6 +1786,133 @@ async fn windowed_screenshot_returns_a_sheet_and_a_diff() {
         "two sheets of one size are compared: {}",
         text_of(&again)
     );
+
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+}
+
+/// A window larger than the viewport, so content scale is not 1. Touch positions must arrive
+/// in the visible rectangle, and the emulated mouse must share that position and come first.
+fn stretched_touch_project() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("stretch project");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("scripts")).unwrap();
+    std::fs::write(
+        root.join("project.godot"),
+        "config_version=5\n\n[application]\n\nconfig/name=\"StretchProbe\"\nrun/main_scene=\"res://scripts/main.tscn\"\nconfig/features=PackedStringArray(\"4.8\")\n\n[display]\n\nwindow/size/viewport_width=200\nwindow/size/viewport_height=150\nwindow/size/window_width_override=400\nwindow/size/window_height_override=300\nwindow/stretch/mode=\"canvas_items\"\nwindow/stretch/aspect=\"expand\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("scripts/main.gd"),
+        r#"extends Node
+var touch_at := Vector2(-1, -1)
+var mouse_at := Vector2(-1, -1)
+var mouse_device := 0
+var order := ""
+var emulated := 0
+
+func _input(event: InputEvent) -> void:
+    if event is InputEventMouseButton and event.pressed:
+        mouse_at = event.position
+        mouse_device = event.device
+        order += "m"
+        if event.device == InputEvent.DEVICE_ID_EMULATION:
+            emulated += 1
+    elif event is InputEventScreenTouch and event.pressed:
+        touch_at = event.position
+        order += "t"
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("scripts/main.tscn"),
+        "[gd_scene load_steps=2 format=3]\n\n[ext_resource type=\"Script\" path=\"res://scripts/main.gd\" id=\"1\"]\n\n[node name=\"Probe\" type=\"Node\"]\nscript = ExtResource(\"1\")\n",
+    )
+    .unwrap();
+    dir
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn touch_lands_in_viewport_space_and_emulation_can_be_suppressed() {
+    let _ = IGNORE;
+    if !windowed_game_can_open() {
+        eprintln!("skipped: a stretched window needs a display server");
+        return;
+    }
+    let project = stretched_touch_project();
+    let tools = manager(project.path());
+    let started = call(
+        &tools,
+        "godot_run_project",
+        json!({
+            "project_path": project.path(),
+            "scene": "res://scripts/main.tscn",
+            "mode": "process",
+            "headless": false
+        }),
+    )
+    .await;
+    assert!(!started.is_error, "{}", text_of(&started));
+    let run_id = run_id_of(&started);
+    let input = call(
+        &tools,
+        "godot_game_input",
+        json!({
+            "run_id": run_id,
+            "steps": [{"type": "touch", "x": 40, "y": 50, "phase": "press"}]
+        }),
+    )
+    .await;
+    assert!(!input.is_error, "{}", text_of(&input));
+    let seen = call(
+        &tools,
+        "godot_game_get",
+        json!({
+            "run_id": run_id,
+            "path": ".",
+            "properties": ["touch_at", "mouse_at", "mouse_device", "order", "emulated"]
+        }),
+    )
+    .await;
+    assert!(!seen.is_error, "{}", text_of(&seen));
+    let values = &json_of(&seen)["properties"];
+    let touch = values["touch_at"].as_array().expect("touch");
+    let mouse = values["mouse_at"].as_array().expect("mouse");
+    let near = |point: &Vec<Value>, axis: usize, want: f64| {
+        (point[axis].as_f64().unwrap_or(999.0) - want).abs() < 1.5
+    };
+    assert!(near(touch, 0, 40.0) && near(touch, 1, 50.0), "{values}");
+    assert!(near(mouse, 0, 40.0) && near(mouse, 1, 50.0), "{values}");
+    assert_eq!(values["order"], "mt", "{values}");
+    assert_eq!(values["mouse_device"], -1, "{values}");
+    assert!(values["emulated"].as_i64().unwrap_or(0) >= 1, "{values}");
+
+    let quiet = call(
+        &tools,
+        "godot_game_input",
+        json!({
+            "run_id": run_id,
+            "emulate_mouse": false,
+            "steps": [{"type": "touch", "x": 10, "y": 12, "index": 1, "phase": "press"}]
+        }),
+    )
+    .await;
+    assert!(!quiet.is_error, "{}", text_of(&quiet));
+    let after = json_of(
+        &call(
+            &tools,
+            "godot_game_get",
+            json!({"run_id": run_id, "path": ".", "properties": ["emulated", "touch_at"]}),
+        )
+        .await,
+    );
+    assert_eq!(
+        after["properties"]["emulated"], values["emulated"],
+        "emulation stayed off: {after}"
+    );
+    let again = after["properties"]["touch_at"].as_array().expect("touch");
+    assert!(near(again, 0, 10.0) && near(again, 1, 12.0), "{after}");
 
     let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
     assert!(!stopped.is_error, "{}", text_of(&stopped));
@@ -3526,6 +3726,77 @@ func _ready() -> void:
     std::fs::write(
         root.join("scenes/main.tscn"),
         "[gd_scene load_steps=2 format=3]\n\n[ext_resource type=\"Script\" path=\"res://scripts/swatch.gd\" id=\"1\"]\n\n[node name=\"Root\" type=\"Node2D\"]\nscript = ExtResource(\"1\")\n",
+    )
+    .unwrap();
+    dir
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn run_script_returns_an_exit_code_and_kills_a_script_that_never_quits() {
+    let _ = IGNORE;
+    let project = project_dir_with_scripts();
+    let tools = manager(project.path());
+    let ok = call(
+        &tools,
+        "godot_run_script",
+        json!({
+            "script": "res://scripts/quit.gd",
+            "project_path": project.path(),
+            "user_args": ["from-e2e"],
+            "timeout_seconds": 30
+        }),
+    )
+    .await;
+    assert!(!ok.is_error, "{}", text_of(&ok));
+    let ok_text = text_of(&ok);
+    assert!(
+        ok_text.contains("\"exit_code\": 0") && ok_text.contains("from-e2e"),
+        "{ok_text}"
+    );
+
+    let started = std::time::Instant::now();
+    let hung = call(
+        &tools,
+        "godot_run_script",
+        json!({
+            "script": "res://scripts/hang.gd",
+            "project_path": project.path(),
+            "timeout_seconds": 8
+        }),
+    )
+    .await;
+    // A busy machine can spend the timeout starting Godot, so the script may never print
+    // "HANGING". The kill and the timeout flag are what this half of the test proves.
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "a SceneTree script that never quits was not killed"
+    );
+    assert!(hung.is_error, "{}", text_of(&hung));
+    let hung_text = text_of(&hung);
+    assert!(
+        hung_text.contains("killed the process tree") && hung_text.contains("\"timed_out\": true"),
+        "{hung_text}"
+    );
+}
+
+fn project_dir_with_scripts() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("script project");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("scripts")).unwrap();
+    std::fs::write(
+        root.join("project.godot"),
+        "config_version=5\n\n[application]\n\nconfig/name=\"ScriptRun\"\nconfig/features=PackedStringArray(\"4.8\")\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("scripts/quit.gd"),
+        "extends SceneTree\n\nfunc _initialize() -> void:\n\tprint(\"USER \", \" \".join(OS.get_cmdline_user_args()))\n\tquit(0)\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("scripts/hang.gd"),
+        "extends SceneTree\n\nfunc _initialize() -> void:\n\tprint(\"HANGING\")\n",
     )
     .unwrap();
     dir

@@ -764,3 +764,50 @@ fn every_text_that_reaches_github_is_checked_for_credentials() {
         "a refused status update still reached GitHub:\n{text}"
     );
 }
+
+#[test]
+fn delete_branch_refuses_what_is_not_a_finished_branch_before_asking_github() {
+    let Some(bash) = bash() else {
+        eprintln!("skipped: no bash found (Git for Windows' bash on Windows)");
+        return;
+    };
+    for (name, why) in [
+        ("-D", "an option"),
+        ("a..b", "a parent segment"),
+        ("a b", "a space"),
+        ("topic;rm", "a shell character"),
+        ("/topic", "a leading slash"),
+        ("godot-v4.7", "a release branch"),
+        ("godot-v4.99", "a release branch of a later line"),
+    ] {
+        let (ok, text) = run_script(&bash, "act.sh", &["delete-branch", name, "--dry-run"], &[]);
+        assert!(
+            !ok,
+            "act.sh delete-branch must refuse {why} ({name}):\n{text}"
+        );
+        assert!(
+            !text.contains("would run"),
+            "a refused branch reached the delete call ({name}):\n{text}"
+        );
+    }
+}
+
+#[test]
+fn deleting_a_finished_branch_is_allowed_by_default() {
+    let Some(bash) = bash() else {
+        eprintln!("skipped: no bash found (Git for Windows' bash on Windows)");
+        return;
+    };
+    let (ok, value) = run_script(
+        &bash,
+        "profile.sh",
+        &["get", "autonomy.delete_merged_branches"],
+        &[],
+    );
+    assert!(ok, "profile.sh failed:\n{value}");
+    assert_eq!(
+        value.trim(),
+        "allowed",
+        "deleting a finished branch is allowed by default"
+    );
+}

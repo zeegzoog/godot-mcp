@@ -71,6 +71,7 @@ Post one review with `scripts/act.sh review <n> approve|request-changes|comment 
 4. Post the `merged` message; for each issue it closed, post the `fixed` message (closing keywords close issues only when merging into the default branch; close others yourself with the `fixed` message).
 5. Board: the pull request and its issues to Done, Finished set.
 6. Carry it to other release branches only as the project's release procedure says.
+7. Delete its branch with `scripts/act.sh delete-branch <head branch>` when the branch is in this repository (not a fork): the script refuses the default branch, a release branch, a protected branch, one with an open pull request and one whose tip no merged pull request ends at. A branch the project's own cleanup already removed is not an error.
 
 ## Edits
 

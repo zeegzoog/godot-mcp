@@ -32,6 +32,7 @@ autonomy.run_approval=allowed
 autonomy.merge_own=allowed
 autonomy.merge_bots=allowed
 autonomy.merge_external=approval
+autonomy.delete_merged_branches=allowed
 timing.needs_info_reminder_days=14
 timing.needs_info_close_days=7
 limits.max_actions=20

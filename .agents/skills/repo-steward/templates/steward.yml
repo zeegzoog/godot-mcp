@@ -39,6 +39,7 @@ autonomy:
   # merge_own: allowed
   # merge_bots: allowed
   # merge_external: approval
+  # delete_merged_branches: allowed
 
 timing:
   # needs_info_reminder_days: 14

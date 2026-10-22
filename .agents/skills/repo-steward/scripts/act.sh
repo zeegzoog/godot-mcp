@@ -13,6 +13,7 @@
 #   act.sh approve-run <run-id>
 #   act.sh merge <pr> squash|merge|rebase <subject>
 #   act.sh open-pr <base> <head> <title> <body>
+#   act.sh delete-branch <branch>   delete a branch whose pull request is merged (checks below)
 #
 # --dry-run (anywhere) prints the gh call instead of making it.
 set -euo pipefail
@@ -170,6 +171,39 @@ open-pr)
 	one_line "$3" title
 	message_file "$4"
 	run gh pr create -R "$repo" --base "$1" --head "$2" --title "$3" --body-file "$file"
+	;;
+delete-branch)
+	[ $# -eq 1 ] || fail "usage: delete-branch <branch>"
+	name=$1
+	# The name goes into a URL path: plain branch-name characters only, no option, no `..`.
+	case "$name" in -* | *..* | */ | /* | *//* | *[!A-Za-z0-9._/-]*) fail "'$name' is not a plain branch name" ;; esac
+	[ -n "$name" ] || fail "the branch name is empty"
+	[ "$(bash "$here/profile.sh" get autonomy.delete_merged_branches)" = allowed ] ||
+		fail "the profile asks for a maintainer's approval before a branch is deleted"
+	# Release branches of the project are never deleted: the profile's pattern, `{t}` as a wildcard.
+	pattern=$(bash "$here/profile.sh" get release.target_branch)
+	if [ -n "$pattern" ]; then
+		# shellcheck disable=SC2254
+		case "$name" in ${pattern//\{t\}/*}) fail "'$name' is a release branch; it is never deleted" ;; esac
+	fi
+	owner=${repo%%/*}
+	default=$(gh api "repos/$repo" --jq .default_branch | tr -d '\r')
+	[ "$name" != "$default" ] || fail "'$name' is the default branch; it is never deleted"
+	# Where the branch is now: gone is fine, protected is not.
+	info=$(gh api "repos/$repo/branches/$name" --jq '[.commit.sha, .protected] | @tsv' 2>&1) || {
+		case "$info" in *"Branch not found"*) echo "branch '$name' is already gone"; exit 0 ;; esac
+		fail "cannot read the branch '$name': $info"
+	}
+	sha=$(printf '%s' "$info" | cut -f1 | tr -d '\r')
+	protected=$(printf '%s' "$info" | cut -f2 | tr -d '\r')
+	[ "$protected" != true ] || fail "'$name' is protected; it is never deleted"
+	open=$(gh api "repos/$repo/pulls?state=open&head=$owner:$name&per_page=1" --jq length | tr -d '\r')
+	[ "$open" = 0 ] || fail "'$name' has an open pull request"
+	# Finished work only: a merged pull request of this repository ends exactly at the branch tip.
+	merged=$(gh api "repos/$repo/pulls?state=closed&head=$owner:$name&per_page=100" \
+		--jq "[.[] | select(.merged_at != null and .head.sha == \"$sha\")] | length" | tr -d '\r')
+	[ "$merged" != 0 ] || fail "no merged pull request of this repository ends at the tip of '$name'; it keeps its commits"
+	run gh api -X DELETE "repos/$repo/git/refs/heads/$name"
 	;;
 *) fail "unknown action '$action'; see the usage at the top of this script" ;;
 esac

@@ -5,10 +5,14 @@ extends RefCounted
 ## same path a real device uses (including the headless display server). Mouse events do
 ## not move the OS cursor unless the call passes warp_mouse. Presses are
 ## remembered so input.release_all can clear them. A tap is delivered at the start of a
-## frame, held for one process frame, then released. click, click_node, and swipe are
-## gestures on that same path. A step that fails releases every held button and touch.
+## frame, held for one process frame, then released. click, click_node, swipe, and path are
+## gestures on that same path. path presses at the first point, moves through the rest, and
+## releases at the last. A step that fails releases every held button and touch.
 
 const R := preload("rt_result.gd")
+
+## The most frames one path or circle step may take; the same bound as a wait step.
+const MAX_PATH_FRAMES := 600
 
 const MOUSE_BUTTONS := {
     "left": MOUSE_BUTTON_LEFT,
@@ -232,8 +236,13 @@ static func _tick_steps(rt: Node, state: Dictionary) -> bool:
         step = resolved["step"]
         steps[index] = step
         kind = str(step["type"])
-    if kind == "swipe":
-        state["gesture"] = {"step": step, "i": 0, "at": Vector2(float(step["x"]), float(step["y"]))}
+    if kind == "swipe" or kind == "path":
+        var origin := Vector2.ZERO
+        if kind == "swipe":
+            origin = Vector2(float(step["x"]), float(step["y"]))
+        else:
+            origin = (step["points"] as Array)[0]
+        state["gesture"] = {"step": step, "i": 0, "at": origin}
         state["mode"] = "gesture"
         return _tick_gesture(rt, state)
     if kind == "time_scale":
@@ -548,6 +557,14 @@ static func _lookup(node: Node, path: String) -> Dictionary:
     var parts: PackedStringArray = path.split("/", false)
     if parts.is_empty():
         return R.err(R.BAD_PARAMS, "property must name a public property.")
+    # Some properties carry the slash in their own name (metadata/note,
+    # theme_override_colors/font_color). Read those whole before walking the path.
+    if parts.size() > 1 and _has_public_property(node, path):
+        for part: String in parts:
+            var whole := _public_segment(part)
+            if R.is_err(whole):
+                return whole
+        return {"exists": true, "value": node.get(path)}
     var current: Variant = node
     var index := 0
     for part: String in parts:
@@ -872,6 +889,8 @@ static func _pointer_note(step: Dictionary) -> String:
 static func _tick_gesture(_rt: Node, state: Dictionary) -> bool:
     var gesture: Dictionary = state["gesture"]
     var step: Dictionary = gesture["step"]
+    if str(step["type"]) == "path":
+        return _tick_path(state)
     var frames := int(step["frames"])
     var i := int(gesture["i"])
     var from := Vector2(float(step["x"]), float(step["y"]))
@@ -891,6 +910,41 @@ static func _tick_gesture(_rt: Node, state: Dictionary) -> bool:
         return true
     gesture["at"] = at if i > 0 else from
     gesture["i"] = i + 1
+    return true
+
+
+static func _tick_path(state: Dictionary) -> bool:
+    var gesture: Dictionary = state["gesture"]
+    var step: Dictionary = gesture["step"]
+    var points: Array = step["points"]
+    var per := int(step["frames_per_point"])
+    var segments := points.size() - 1
+    var total := segments * per
+    var i := int(gesture["i"])
+    if i == 0:
+        var start: Vector2 = points[0]
+        _gesture_press(step, start)
+        gesture["at"] = start
+        gesture["i"] = 1
+        return true
+    if i < total:
+        var along := i
+        var segment := mini(int((along - 1) / per), segments - 1)
+        var within := (along - 1) - segment * per
+        var from: Vector2 = points[segment]
+        var to: Vector2 = points[segment + 1]
+        var at := from.lerp(to, float(within + 1) / float(per))
+        _gesture_move(step, gesture["at"], at)
+        gesture["at"] = at
+        gesture["i"] = i + 1
+        return true
+    var last: Vector2 = points[points.size() - 1]
+    _gesture_move(step, gesture["at"], last)
+    _gesture_release(step, last)
+    (state["results"] as Array).append({"type": "path", "ok": true, "points": points.size()})
+    state["index"] = int(state["index"]) + 1
+    state["mode"] = "body"
+    state["gesture"] = {}
     return true
 
 
@@ -1006,6 +1060,33 @@ static func _parse(step: Dictionary, index: int) -> Dictionary:
                 "index": int(step.get("index", 0)), "frames": swipe_frames,
                 "x": float(step["x"]), "y": float(step["y"]),
                 "to_x": float(step["to_x"]), "to_y": float(step["to_y"]),
+            }}
+        "path":
+            var points: Variant = step.get("points", [])
+            if not points is Array or (points as Array).size() < 2 or (points as Array).size() > 256:
+                return R.err(R.BAD_PARAMS, "steps[%d]: path needs 2 to 256 points, each [x, y]." % index)
+            var per := int(step.get("frames_per_point", 1))
+            if per < 1 or per > 60:
+                return R.err(R.BAD_PARAMS, "steps[%d]: frames_per_point must be from 1 to 60." % index)
+            # A gesture lasts as long as the longest wait, so the call returns before the server gives up.
+            if ((points as Array).size() - 1) * per > MAX_PATH_FRAMES:
+                return R.err(R.BAD_PARAMS, "steps[%d]: a path may take at most %d frames (points - 1 times frames_per_point)." % [index, MAX_PATH_FRAMES])
+            var parsed_points: Array = []
+            for item: Variant in points:
+                if not item is Array or (item as Array).size() < 2:
+                    return R.err(R.BAD_PARAMS, "steps[%d]: each path point must be [x, y]." % index)
+                var pair: Array = item
+                parsed_points.append(Vector2(float(pair[0]), float(pair[1])))
+            var path_pointer := str(step.get("pointer", "mouse"))
+            if not path_pointer in ["mouse", "touch"]:
+                return R.err(R.BAD_PARAMS, "steps[%d]: pointer must be mouse or touch." % index)
+            var path_button := str(step.get("button", "left"))
+            if path_pointer == "mouse" and not MOUSE_BUTTONS.has(path_button):
+                return R.err(R.BAD_PARAMS, "steps[%d]: unknown mouse button '%s'." % [index, path_button])
+            return {"step": {
+                "type": kind, "pointer": path_pointer, "button": path_button,
+                "index": int(step.get("index", 0)), "frames_per_point": per,
+                "points": parsed_points,
             }}
         "time_scale":
             var scale_value: Variant = step.get("scale", step.get("time_scale", null))

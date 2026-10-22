@@ -7,6 +7,7 @@ extends RefCounted
 
 const R := preload("rt_result.gd")
 const Hold := preload("rt_hold.gd")
+const Inputs := preload("rt_input.gd")
 const DENY: Array[String] = [
     "quit",
     "set_script",
@@ -114,6 +115,14 @@ static func get_node(rt: Node, params: Dictionary) -> Dictionary:
     if wanted is Array and not (wanted as Array).is_empty():
         for key: Variant in wanted:
             var name := str(key)
+            if name.contains("/") and not name.contains(":"):
+                # The same resolver a property wait uses: get only, no method calls.
+                var looked := Inputs._lookup(node, name)
+                if R.is_err(looked):
+                    return looked
+                var value: Variant = looked["value"] if bool(looked.get("exists", false)) else null
+                props[name] = rt.encode(value)
+                continue
             var located := _locate(node, name, false)
             if bool(located.get("skip", false)):
                 continue
@@ -198,7 +207,8 @@ static func _locate(root: Object, path: String, writing: bool) -> Dictionary:
         var current: Variant = target.get(segments[index])
         if not current is Resource:
             var verb := "changed" if writing else "read"
-            return {"error": R.err(R.BAD_PARAMS, "Property '%s' is not a resource, so '%s' cannot be %s through it." % [segments[index], path, verb])}
+            var slash := "/".join(segments)
+            return {"error": R.err(R.BAD_PARAMS, "Property '%s' is not a resource, so '%s' cannot be %s through it. Use '/' for a field of an Object or Dictionary, for example %s." % [segments[index], path, verb, slash])}
         if writing and current is Script:
             # A script resource holds code: `source_code` is changed through its own tools, not here.
             return {"error": _refused_path(path, writing)}

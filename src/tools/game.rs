@@ -72,7 +72,7 @@ pub fn catalog() -> Vec<Tool> {
         ),
         tool(
             "godot_game_get",
-            "Reads a live node's properties, groups and, optionally, signals and methods. A property may step through resources with ':' (material_override:shader_parameter/caustics), including a segment that starts with _. A requested script name is omitted, not rejected. A path that is not a resource is refused.",
+            "Reads a live node's properties, groups and, optionally, signals and methods. A property uses '/' for a Dictionary key or an Object property, the same way godot_game_wait does: get only, no method calls, and a private name or script is refused. A property whose own name contains '/' (metadata/note, theme_override_colors/font_color) is read whole. ':' steps through a Resource (material_override:shader_parameter/caustics), including a segment that starts with _. A requested script name is omitted, not rejected. A ':' step through something that is not a Resource is an error and names '/'.",
             json!({"run_id": s(""), "path": s("Node path relative to the current scene, or /root/..."), "properties": {"type": "array", "items": {"type": "string"}}, "signals": b(), "methods": b()}),
             &[],
         ),
@@ -108,8 +108,8 @@ pub fn catalog() -> Vec<Tool> {
         ),
         tool(
             "godot_game_input",
-            "Injects input into the running game. Steps: key, text, mouse_move, mouse_button, touch, joy_button, joy_axis, wait, click, click_node, swipe, time_scale. phase is tap (default), press, or release. click is a mouse tap at x, y. click_node taps the center of a Control, Node2D, or Node3D. swipe presses at x, y and releases at to_x, to_y across frames (default 8, pointer mouse or touch). Mouse steps are Godot input events and do not move the OS cursor unless warp_mouse is true. time_scale sets Engine.time_scale (0 through 8) until another call changes it. A failed step releases every button and touch this server is still holding. In a held game the steps are applied at once: key, mouse_button, touch and joy_button taps stay down for hold_ticks ticks (default 2) and are released at the start of the tick they fall due on, so how the ticks are split into steps does not change what the game sees; wait, text and swipe steps are refused while held. Leaving the hold releases everything still held.",
-            json!({"run_id": s(""), "steps": {"type": "array", "items": step_schema()}, "warp_mouse": {"type": "boolean", "description": "Move the real OS cursor to each mouse event. Default false."}, "hold_ticks": ir("Held game only: how many ticks a tap stays down before it is released. 1 to 600, default 2.", 1, Some(600))}),
+            "Injects input into the running game. Steps: key, text, mouse_move, mouse_button, touch, joy_button, joy_axis, wait, click, click_node, swipe, path, circle, time_scale. phase is tap (default), press, or release. click is a mouse tap at x, y. click_node taps the center of a Control, Node2D, or Node3D. swipe presses at x, y and releases at to_x, to_y across frames (default 8, pointer mouse or touch). path presses once at the first of points ([[x, y], ...], 2 to 256), moves through them, and releases at the last; frames_per_point is the frames spent on each step between points (default 1); a path takes at most 600 frames in all (points - 1 times frames_per_point). circle is that same drag around center [x, y]: radius, turns (default 1, max 8) and points_per_turn (default 16, 4 to 64). pointer is mouse or touch, and touch may set index. Mouse steps are Godot input events and do not move the OS cursor unless warp_mouse is true. time_scale sets Engine.time_scale (0 through 8) until another call changes it. A failed step releases every button and touch this server is still holding. More than 20 steps return ok_count and failed instead of one object per step, unless verbose is true. In a held game the steps are applied at once: key, mouse_button, touch and joy_button taps stay down for hold_ticks ticks (default 2) and are released at the start of the tick they fall due on, so how the ticks are split into steps does not change what the game sees; wait, text, swipe, path and circle steps are refused while held. Leaving the hold releases everything still held.",
+            json!({"run_id": s(""), "steps": {"type": "array", "items": step_schema()}, "warp_mouse": {"type": "boolean", "description": "Move the real OS cursor to each mouse event. Default false."}, "verbose": {"type": "boolean", "description": "Return every step when there are more than 20. Default false, which answers with ok_count and failed."}, "hold_ticks": ir("Held game only: how many ticks a tap stays down before it is released. 1 to 600, default 2.", 1, Some(600))}),
             &["steps"],
         ),
         tool(
@@ -126,7 +126,7 @@ pub fn catalog() -> Vec<Tool> {
         ),
         tool(
             "godot_game_physics",
-            "Controls game time. action hold stops the game at the start of a physics tick: no tick, frame, timer or signal advances, even in nodes that ignore pause, while reads (tree, get, set, call with permit, signals, snapshot, output, one-frame screenshot) are still answered. While held, step ticks runs exactly that many physics ticks (1 to 600) and holds again; step with until (node, property, op, value, checked before every tick, as in godot_game_wait) and max (1 to 3600) runs until the condition holds and says until_met; resume lets the game run. Held steps are exact only when the game was started with godot_run_project held true: the answer carries deterministic and, when false, deterministic_reason (not_started_held, fixed_rate_differs or frames_did_not_follow_ticks). A hold entered later, or in the editor, still stands still but is not exact. A held game refuses what needs time to pass (godot_game_wait, godot_game_observe, a screenshot sheet or camera, input wait, text and swipe steps) and says to step instead. Without a hold, step advances 1 to 120 real engine physics iterations, then leaves the tree paused (resume clears that pause); it sets max_physics_steps_per_frame to 1 while it runs, does not call node _physics_process, does not step idle _process or nodes that ignore pause, and does not make the game deterministic. status reports held, deterministic and the timing settings",
+            "Controls game time. action hold stops the game at the start of a physics tick: no tick, frame, timer or signal advances, even in nodes that ignore pause, while reads (tree, get, set, call with permit, signals, snapshot, output, one-frame screenshot) are still answered. While held, step ticks runs exactly that many physics ticks (1 to 600) and holds again; step with until (node, property, op, value, checked before every tick, as in godot_game_wait) and max (1 to 3600) runs until the condition holds and says until_met; resume lets the game run. Held steps are exact only when the game was started with godot_run_project held true: the answer carries deterministic and, when false, deterministic_reason (not_started_held, fixed_rate_differs or frames_did_not_follow_ticks). A hold entered later, or in the editor, still stands still but is not exact. A held game refuses what needs time to pass (godot_game_wait, godot_game_observe, a screenshot sheet or camera, godot_game_record, input wait, text, swipe, path and circle steps) and says to step instead. Without a hold, step advances 1 to 120 real engine physics iterations, then leaves the tree paused (resume clears that pause); it sets max_physics_steps_per_frame to 1 while it runs, does not call node _physics_process, does not step idle _process or nodes that ignore pause, and does not make the game deterministic. status reports held, deterministic and the timing settings",
             json!({"run_id": s(""), "action": s("step (default), hold, resume, or status. hold stops the game at the start of a physics tick until it is stepped or resumed."), "ticks": ir("Physics iterations for step: 1 to 120, or 1 to 600 while the game is held.", 1, None), "until": until_schema(), "max": ir("With until: the most ticks to run. 1 to 3600, default 600.", 1, Some(3600))}),
             &[],
         ),
@@ -195,9 +195,9 @@ fn b() -> Value {
 fn step_schema() -> Value {
     json!({
         "type": "object",
-        "description": "One input step. type is required; the other fields depend on it (key: key, phase; text: text; mouse_move, mouse_button, touch: x, y, button, index, phase; click: x, y, button; click_node: node, pointer, button; swipe: x, y, to_x, to_y, frames, pointer, button; joy_button: button, device, phase; joy_axis: axis, value, device; wait: frames, node, signal, timeout; time_scale: scale).",
+        "description": "One input step. type is required; the other fields depend on it (key: key, phase; text: text; mouse_move, mouse_button, touch: x, y, button, index, phase; click: x, y, button; click_node: node, pointer, button; swipe: x, y, to_x, to_y, frames, pointer, button; path: points, frames_per_point, pointer, button, index; circle: center, radius, turns, points_per_turn, frames_per_point, pointer, button, index; joy_button: button, device, phase; joy_axis: axis, value, device; wait: frames, node, signal, timeout; time_scale: scale).",
         "properties": {
-            "type": {"type": "string", "enum": ["key", "text", "mouse_move", "mouse_button", "touch", "click", "click_node", "swipe", "joy_button", "joy_axis", "wait", "time_scale"]},
+            "type": {"type": "string", "enum": ["key", "text", "mouse_move", "mouse_button", "touch", "click", "click_node", "swipe", "path", "circle", "joy_button", "joy_axis", "wait", "time_scale"]},
             "phase": {"type": "string", "enum": ["tap", "press", "release"], "description": "Default tap."},
             "key": {"type": "string", "description": "An engine key name such as Right, Space or A."},
             "text": {"type": "string"},
@@ -209,6 +209,12 @@ fn step_schema() -> Value {
             "node": {"type": "string", "description": "A node path in the running game."},
             "signal": {"type": "string"},
             "frames": {"type": "integer", "description": "wait: frames to wait (0 to 600); swipe: frames the swipe takes (1 to 60, default 8)."},
+            "points": {"type": "array", "description": "path: 2 to 256 points, each [x, y].", "items": {"type": "array", "items": {"type": "number"}}},
+            "frames_per_point": {"type": "integer", "description": "path and circle: frames spent on each step between points. 1 to 60, default 1; the whole gesture takes at most 600 frames."},
+            "center": {"type": "array", "description": "circle: [x, y].", "items": {"type": "number"}},
+            "radius": {"type": "number", "description": "circle: greater than 0."},
+            "turns": {"type": "integer", "description": "circle: 1 to 8, default 1."},
+            "points_per_turn": {"type": "integer", "description": "circle: 4 to 64, default 16."},
             "timeout": {"type": "integer", "description": "wait for a node or signal: frames before giving up (1 to 600)."},
             "axis": {"type": "string"}, "value": {"type": "number", "description": "joy_axis: -1 to 1."},
             "device": {"type": "integer"},
@@ -271,7 +277,7 @@ pub async fn call(tools: &ToolManager, name: &str, args: Value) -> ToolResult {
         "godot_game_signals" => runtime(tools, &args, "game.signals").await,
         "godot_game_observe" => runtime(tools, &args, "game.observe").await,
         "godot_game_snapshot" => runtime(tools, &args, "game.snapshot").await,
-        "godot_game_input" => runtime(tools, &args, "input.run").await,
+        "godot_game_input" => game_input(tools, &args).await,
         "godot_game_input_release" => runtime(tools, &args, "input.release_all").await,
         "godot_game_wait" => runtime(tools, &args, "input.wait").await,
         "godot_game_physics" => runtime(tools, &args, "game.physics").await,
@@ -300,6 +306,165 @@ async fn runtime(tools: &ToolManager, args: &Value, method: &str) -> ToolResult 
     {
         Ok(value) => ToolResult::text(serde_json::to_string_pretty(&value).unwrap_or_default()),
         Err(error) => runtime_error(&error),
+    }
+}
+
+async fn game_input(tools: &ToolManager, args: &Value) -> ToolResult {
+    let verbose = args
+        .get("verbose")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut params = params_without_run(args);
+    if let Some(map) = params.as_object_mut() {
+        map.remove("verbose");
+    }
+    if let Err(message) = prepare_input_steps(&mut params) {
+        return ToolResult::error(
+            message,
+            &["Give path 2 to 256 points of [x, y], or a circle with a positive radius"],
+        );
+    }
+    match tools
+        .runtime_call(str_arg(args, "run_id"), "input.run", params)
+        .await
+    {
+        Ok(mut value) => {
+            compact_input_reply(&mut value, verbose);
+            ToolResult::text(serde_json::to_string_pretty(&value).unwrap_or_default())
+        }
+        Err(error) => runtime_error(&error),
+    }
+}
+
+const MAX_PATH_POINTS: i64 = 256;
+const COMPACT_AFTER: usize = 20;
+
+/// Turns each `circle` step into a `path`. The game plays that one gesture.
+fn prepare_input_steps(params: &mut Value) -> Result<(), String> {
+    let Some(steps) = params.get_mut("steps").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    for (index, step) in steps.iter_mut().enumerate() {
+        if step.get("type").and_then(Value::as_str) != Some("circle") {
+            continue;
+        }
+        let points = circle_from_step(step, index)?;
+        let Some(map) = step.as_object_mut() else {
+            return Err(format!("steps[{index}] must be an object"));
+        };
+        map.insert("type".into(), json!("path"));
+        map.insert("points".into(), json!(points));
+        map.remove("center");
+        map.remove("radius");
+        map.remove("turns");
+        map.remove("points_per_turn");
+    }
+    Ok(())
+}
+
+fn circle_from_step(step: &Value, index: usize) -> Result<Vec<[f64; 2]>, String> {
+    let Some(pair) = step
+        .get("center")
+        .and_then(Value::as_array)
+        .filter(|pair| pair.len() >= 2)
+    else {
+        return Err(format!("steps[{index}]: circle needs center [x, y]"));
+    };
+    let Some(x) = json_f64(&pair[0]) else {
+        return Err(format!("steps[{index}]: circle center x must be a number"));
+    };
+    let Some(y) = json_f64(&pair[1]) else {
+        return Err(format!("steps[{index}]: circle center y must be a number"));
+    };
+    let Some(radius) = step.get("radius").and_then(json_f64) else {
+        return Err(format!("steps[{index}]: circle needs a radius"));
+    };
+    if !radius.is_finite() || radius <= 0.0 {
+        return Err(format!(
+            "steps[{index}]: circle radius must be greater than 0"
+        ));
+    }
+    let turns = match step.get("turns") {
+        Some(value) => json_whole(value)
+            .ok_or_else(|| format!("steps[{index}]: turns must be a whole number from 1 to 8"))?,
+        None => 1,
+    };
+    if !(1..=8).contains(&turns) {
+        return Err(format!(
+            "steps[{index}]: turns must be a whole number from 1 to 8"
+        ));
+    }
+    let per = match step.get("points_per_turn") {
+        Some(value) => json_whole(value).ok_or_else(|| {
+            format!("steps[{index}]: points_per_turn must be a whole number from 4 to 64")
+        })?,
+        None => 16,
+    };
+    if !(4..=64).contains(&per) {
+        return Err(format!(
+            "steps[{index}]: points_per_turn must be a whole number from 4 to 64"
+        ));
+    }
+    let count = turns.saturating_mul(per).saturating_add(1);
+    if count > MAX_PATH_POINTS {
+        return Err(format!(
+            "steps[{index}]: a circle may have at most {MAX_PATH_POINTS} points"
+        ));
+    }
+    Ok(circle_points(x, y, radius, turns, per))
+}
+
+fn circle_points(x: f64, y: f64, radius: f64, turns: i64, points_per_turn: i64) -> Vec<[f64; 2]> {
+    let total = turns * points_per_turn;
+    (0..=total)
+        .map(|index| {
+            let angle = std::f64::consts::TAU * (index as f64) / (points_per_turn as f64);
+            [x + radius * angle.cos(), y + radius * angle.sin()]
+        })
+        .collect()
+}
+
+fn json_f64(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_i64().map(|number| number as f64))
+}
+
+fn json_whole(value: &Value) -> Option<i64> {
+    if let Some(number) = value.as_i64() {
+        return Some(number);
+    }
+    value
+        .as_f64()
+        .filter(|number| number.fract() == 0.0 && number.is_finite())
+        .map(|number| number as i64)
+}
+
+/// A long step list answers with a count. `verbose` keeps every step.
+fn compact_input_reply(value: &mut Value, verbose: bool) {
+    let Some(steps) = value.get("steps").and_then(Value::as_array).cloned() else {
+        return;
+    };
+    if verbose || steps.len() <= COMPACT_AFTER {
+        return;
+    }
+    let mut ok_count = 0_u64;
+    let mut failed = Vec::new();
+    for (index, step) in steps.into_iter().enumerate() {
+        if step.get("ok").and_then(Value::as_bool) == Some(true) {
+            ok_count += 1;
+            continue;
+        }
+        let mut item = step;
+        if let Some(map) = item.as_object_mut() {
+            map.entry("index").or_insert_with(|| json!(index));
+        }
+        failed.push(item);
+    }
+    if let Some(map) = value.as_object_mut() {
+        map.remove("steps");
+        map.insert("ok_count".into(), json!(ok_count));
+        map.insert("failed".into(), Value::Array(failed));
     }
 }
 
@@ -1347,6 +1512,62 @@ mod tests {
         for name in ["add_child", "remove_child", "reparent"] {
             assert!(!server.iter().any(|item| item == name), "{name} is refused");
         }
+    }
+
+    #[test]
+    fn a_circle_becomes_a_closed_path_and_a_long_reply_shrinks() {
+        let mut params = json!({
+            "steps": [{
+                "type": "circle",
+                "center": [0, 0],
+                "radius": 10,
+                "turns": 1,
+                "points_per_turn": 4,
+                "pointer": "touch",
+                "index": 2
+            }]
+        });
+        prepare_input_steps(&mut params).expect("circle");
+        let step = &params["steps"][0];
+        assert_eq!(step["type"], "path");
+        assert_eq!(step["pointer"], "touch");
+        assert_eq!(step["index"], 2);
+        assert!(step.get("radius").is_none());
+        let points = step["points"].as_array().expect("points");
+        assert_eq!(points.len(), 5);
+        let first = &points[0];
+        let last = &points[4];
+        assert!((first[0].as_f64().unwrap() - 10.0).abs() < 1e-9);
+        assert!(first[1].as_f64().unwrap().abs() < 1e-9);
+        assert!(points[1][0].as_f64().unwrap().abs() < 1e-9);
+        assert!((points[1][1].as_f64().unwrap() - 10.0).abs() < 1e-9);
+        assert!((last[0].as_f64().unwrap() - first[0].as_f64().unwrap()).abs() < 1e-9);
+        assert!((last[1].as_f64().unwrap() - first[1].as_f64().unwrap()).abs() < 1e-9);
+
+        let mut too_big = json!({"steps": [{"type": "circle", "center": [0, 0], "radius": 1, "turns": 8, "points_per_turn": 64}]});
+        let error = prepare_input_steps(&mut too_big).expect_err("too many points");
+        assert!(error.contains("256"), "{error}");
+
+        let mut reply = json!({
+            "steps": (0..21).map(|index| json!({"type": "key", "ok": index != 3})).collect::<Vec<_>>(),
+            "warp_mouse": false
+        });
+        compact_input_reply(&mut reply, false);
+        assert!(reply.get("steps").is_none(), "{reply}");
+        assert_eq!(reply["ok_count"], 20);
+        assert_eq!(reply["failed"].as_array().map(Vec::len), Some(1));
+        assert_eq!(reply["failed"][0]["index"], 3);
+        assert_eq!(reply["warp_mouse"], false);
+
+        let mut short = json!({"steps": [{"type": "key", "ok": true}]});
+        compact_input_reply(&mut short, false);
+        assert_eq!(short["steps"].as_array().map(Vec::len), Some(1));
+
+        let mut listed = json!({
+            "steps": (0..21).map(|_| json!({"type": "key", "ok": true})).collect::<Vec<_>>()
+        });
+        compact_input_reply(&mut listed, true);
+        assert_eq!(listed["steps"].as_array().map(Vec::len), Some(21));
     }
 
     #[test]

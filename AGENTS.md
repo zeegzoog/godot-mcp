@@ -97,6 +97,7 @@ Before submitting or committing changes, agents must execute and pass the comple
    godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_output.gd
    godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_result.gd
    godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_view.gd
+   godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_record.gd
    ```
 
 5. **Editor End-to-End Tests** (whenever `addons/godot_mcp/` changed; needs the Godot build named in `.github/godot-version`, ignored by default):
@@ -134,7 +135,8 @@ When interacting with a Godot project, agents must adhere to the following workf
 4. **Runtime Monitoring**:
    - After `godot_run_project`, check `godot_get_run_status` and stop the run with `godot_stop_project` when done: without `run_id` it stops the editor's Play mode and every managed run, and lists what it stopped.
    - Read logs and errors with `godot_run_output`. Inspect the live tree with `godot_game_tree` before `godot_game_set` or `godot_game_call`.
-   - Capture the game with `godot_game_screenshot`. A headless game returns an error and no image; do not treat that error as a picture.
+   - Capture the game with `godot_game_screenshot`. A headless game returns an error and no image; do not treat that error as a picture. For a series of frames on disk, use `godot_game_record`.
+   - Pass game flags with `godot_run_project` `user_args` and `mode: "process"`. They go after `--`. Do not put Godot engine options there.
    - `godot_game_call` runs only a method named in `permit`, and never one that quits, evaluates, calls another method by name, sets a property by name or frees or replaces a node.
    - To act, advance a known amount and look, hold the game with `godot_game_physics` (`hold`, then `step`, `resume`), starting it with `godot_run_project` `held: true` when the steps must be exact. Check `deterministic` in the answers. A held game refuses waits, signal watches, screenshot sheets and timed input; step instead. Resume or stop the run when done: a held game does not advance on its own.
 

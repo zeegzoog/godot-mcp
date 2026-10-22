@@ -69,6 +69,8 @@ static func refusal(method: String, params: Dictionary) -> String:
             if sheet or not str(params.get("camera", "")).strip_edges().is_empty():
                 return _refused("a frame sheet or a camera switch needs frames to be drawn", "take one capture, step with godot_game_physics, then take the next")
             return ""
+        "game.record":
+            return _refused("a recording needs frames to be drawn", "resume, or step with godot_game_physics and take screenshots")
         "input.run":
             var steps: Variant = params.get("steps", [])
             if steps is Array:

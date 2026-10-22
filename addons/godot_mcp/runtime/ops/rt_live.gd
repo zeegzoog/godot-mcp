@@ -199,6 +199,9 @@ static func _locate(root: Object, path: String, writing: bool) -> Dictionary:
         if not current is Resource:
             var verb := "changed" if writing else "read"
             return {"error": R.err(R.BAD_PARAMS, "Property '%s' is not a resource, so '%s' cannot be %s through it." % [segments[index], path, verb])}
+        if writing and current is Script:
+            # A script resource holds code: `source_code` is changed through its own tools, not here.
+            return {"error": _refused_path(path, writing)}
         target = current
     return {"target": target, "leaf": segments[segments.size() - 1]}
 

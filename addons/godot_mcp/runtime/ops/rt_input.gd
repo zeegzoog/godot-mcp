@@ -2,12 +2,19 @@ extends RefCounted
 ## Input injection for a running game.
 ##
 ## Events go through Input.parse_input_event and Input.flush_buffered_events, which is the
-## same path a real device uses (including the headless display server). Mouse events do
+## same path a real device uses (including the headless display server). Positions passed
+## to this server are pixels of the root viewport's visible rectangle, the space the game
+## reads in _input. parse_input_event treats a position as a window pixel and the engine
+## then applies the inverse content-scale transform, so each position is multiplied by
+## the root viewport's final transform before it is parsed. Mouse events do
 ## not move the OS cursor unless the call passes warp_mouse. Presses are
 ## remembered so input.release_all can clear them. A tap is delivered at the start of a
 ## frame, held for one process frame, then released. click, click_node, swipe, and path are
 ## gestures on that same path. path presses at the first point, moves through the rest, and
 ## releases at the last. A step that fails releases every held button and touch.
+## A touch also produces the engine's emulated mouse event when
+## Input.emulate_mouse_from_touch is on: the mouse is delivered first, with device
+## DEVICE_ID_EMULATION, at the same viewport position as the touch.
 
 const R := preload("rt_result.gd")
 
@@ -57,6 +64,7 @@ static func run_steps(rt: Node, params: Dictionary) -> Dictionary:
     if R.is_err(parsed):
         return parsed
     var state := {"steps": parsed["steps"], "index": 0, "mode": "lead", "results": [], "hold": 0, "release": {}}
+    _suppress_emulation(state, parsed)
     return {"_pending": true, "_tick": func() -> bool: return _tick_steps(rt, state)}
 
 
@@ -65,6 +73,8 @@ static func parse_steps(params: Dictionary) -> Dictionary:
     var raw: Variant = params.get("steps", [])
     if params.has("warp_mouse") and not params["warp_mouse"] is bool:
         return R.err(R.BAD_PARAMS, "input.run: warp_mouse must be a boolean.")
+    if params.has("emulate_mouse") and not params["emulate_mouse"] is bool:
+        return R.err(R.BAD_PARAMS, "input.run: emulate_mouse must be a boolean.")
     _warp_mouse = bool(params.get("warp_mouse", false))
     if not raw is Array or (raw as Array).is_empty():
         return R.err(R.BAD_PARAMS, "input.run: 'steps' must be a non-empty array.")
@@ -78,7 +88,10 @@ static func parse_steps(params: Dictionary) -> Dictionary:
             return parsed
         steps.append(parsed["step"])
         index += 1
-    return {"steps": steps}
+    return {
+        "steps": steps,
+        "suppress_emulation": params.has("emulate_mouse") and not bool(params["emulate_mouse"]),
+    }
 
 
 ## One step of a held game's input, applied now and never waiting for a frame. A tap is pressed
@@ -225,6 +238,7 @@ static func _tick_steps(rt: Node, state: Dictionary) -> bool:
     if mode == "text":
         return _tick_text(rt, state)
     if index >= steps.size():
+        _restore_emulation(state)
         rt.finish_job(R.ok({"steps": state["results"], "held": _held_summary(), "warp_mouse": _warp_mouse}))
         return false
     var step: Dictionary = steps[index]
@@ -370,8 +384,40 @@ static func _fail(rt: Node, state: Dictionary, error: Dictionary) -> bool:
         _disconnect_wait(state["until"])
     _release_everything()
     Input.flush_buffered_events()
+    _restore_emulation(state)
     rt.finish_job(error)
     return false
+
+
+## Turns mouse emulation off for this call when emulate_mouse is false, and remembers the
+## previous value. ProjectSettings.set_setting does not affect events already being parsed;
+## Input.emulate_mouse_from_touch does, and it leaves the project setting unchanged.
+static func _suppress_emulation(state: Dictionary, parsed: Dictionary) -> void:
+    if not bool(parsed.get("suppress_emulation", false)):
+        return
+    state["restore_emulation"] = Input.emulate_mouse_from_touch
+    Input.emulate_mouse_from_touch = false
+
+
+static func _restore_emulation(state: Dictionary) -> void:
+    var restore: Variant = state.get("restore_emulation", null)
+    if restore is bool:
+        Input.emulate_mouse_from_touch = bool(restore)
+        state.erase("restore_emulation")
+
+
+## Turns emulation off around a held input call. Returns the value to restore, or null.
+static func suppress_emulation(parsed: Dictionary) -> Variant:
+    if not bool(parsed.get("suppress_emulation", false)):
+        return null
+    var previous: bool = Input.emulate_mouse_from_touch
+    Input.emulate_mouse_from_touch = false
+    return previous
+
+
+static func restore_emulation(previous: Variant) -> void:
+    if previous is bool:
+        Input.emulate_mouse_from_touch = bool(previous)
 
 
 static func _note_time_scale(params: Dictionary) -> Dictionary:
@@ -514,14 +560,17 @@ static func parse_condition(raw: Variant) -> Dictionary:
     return {"cond": {"node": node_path, "property": property, "op": op, "value": spec.get("value", null)}}
 
 
-## Reads a parsed condition now. A node or property that cannot be read yet, or values that
-## cannot be compared, make it not hold: the step goes on and is bounded by its maximum.
+## Reads a parsed condition now. A node that is not in the tree yet does not hold, and the
+## step goes on. A missing segment of a property path is an error: null only means the
+## property exists and its value is null.
 static func read_condition(rt: Node, cond: Dictionary) -> Dictionary:
     var node: Node = rt.find_node(str(cond["node"]))
     if node == null or not is_instance_valid(node):
         return {"holds": false, "exists": false, "observed": null}
     var looked := _lookup(node, str(cond["property"]))
-    if R.is_err(looked) or not bool(looked.get("exists", false)):
+    if R.is_err(looked):
+        return {"holds": false, "exists": false, "observed": null, "error": looked["error"]}
+    if not bool(looked.get("exists", false)):
         return {"holds": false, "exists": false, "observed": null}
     var observed: Variant = looked.get("value", null)
     if str(cond["op"]) == "exists":
@@ -573,23 +622,30 @@ static func _lookup(node: Node, path: String) -> Dictionary:
             return named
         if index == 0:
             if not _has_public_property(node, part):
-                return {"exists": false}
+                return _missing_segment(part, "")
             current = node.get(part)
         elif current is Dictionary:
             if not (current as Dictionary).has(part):
-                return {"exists": false}
+                return _missing_segment(part, "/".join(parts.slice(0, index)))
             current = (current as Dictionary)[part]
         elif current is Array:
             return R.err(R.BAD_PARAMS, "Cannot read '%s' inside an Array." % part)
         elif current is Object and current != null:
             var object := current as Object
             if not _has_public_property(object, part):
-                return {"exists": false}
+                return _missing_segment(part, "/".join(parts.slice(0, index)))
             current = object.get(part)
         else:
             return R.err(R.BAD_PARAMS, "Cannot read '%s' inside a %s." % [part, type_string(typeof(current))])
         index += 1
     return {"exists": true, "value": current}
+
+
+## A segment that is not there. null is reserved for a property that exists and holds null.
+static func _missing_segment(part: String, owner: String) -> Dictionary:
+    if owner.is_empty():
+        return R.err(R.NOT_FOUND, "Property '%s' does not exist." % part)
+    return R.err(R.NOT_FOUND, "Property '%s' does not exist on '%s'." % [part, owner])
 
 
 static func _public_segment(part: String) -> Dictionary:
@@ -965,8 +1021,8 @@ static func _gesture_move(step: Dictionary, previous: Vector2, at: Vector2) -> v
     if str(step["pointer"]) == "touch":
         var event := InputEventScreenDrag.new()
         event.index = int(step["index"])
-        event.position = at
-        event.relative = at - previous
+        event.position = _window_point(at)
+        event.relative = _window_point(at) - _window_point(previous)
         _touches[int(step["index"])] = at
         Input.parse_input_event(event)
     else:
@@ -1185,16 +1241,26 @@ static func _unicode(code: int, pressed: bool) -> void:
 
 
 static func _mouse_motion(x: float, y: float) -> void:
+    var at := Vector2(x, y)
     var event := InputEventMouseMotion.new()
-    event.position = Vector2(x, y)
+    event.position = _window_point(at)
     event.global_position = event.position
-    event.relative = event.position - _mouse_pos
-    _mouse_pos = event.position
-    # warp_mouse moves the real cursor. The parsed event is enough for _input and
-    # Viewport.get_mouse_position, and it leaves the user's pointer where it was.
+    event.relative = event.position - _window_point(_mouse_pos)
+    _mouse_pos = at
+    # warp_mouse moves the real cursor, in window pixels. The parsed event is enough for
+    # _input and Viewport.get_mouse_position, and it leaves the user's pointer where it was.
     if _warp_mouse:
         Input.warp_mouse(event.position)
     Input.parse_input_event(event)
+
+
+## A caller position is in the root viewport's visible rectangle. parse_input_event expects a
+## window pixel; the engine then applies the inverse of this transform, so the game sees `point`.
+static func _window_point(point: Vector2) -> Vector2:
+    var tree := Engine.get_main_loop() as SceneTree
+    if tree == null or tree.root == null:
+        return point
+    return tree.root.get_final_transform() * point
 
 
 static func _mouse_button(rt: Node, button: String, phase: String, x: float, y: float) -> void:
@@ -1219,8 +1285,9 @@ static func _mouse_event(index: int, pressed: bool, x: float, y: float) -> void:
     var event := InputEventMouseButton.new()
     event.button_index = index
     event.pressed = pressed
-    event.position = Vector2(x, y)
-    event.global_position = event.position
+    var at := _window_point(Vector2(x, y))
+    event.position = at
+    event.global_position = at
     Input.parse_input_event(event)
 
 
@@ -1244,7 +1311,7 @@ static func _touch_event(index: int, pressed: bool, x: float, y: float) -> void:
     var event := InputEventScreenTouch.new()
     event.index = index
     event.pressed = pressed
-    event.position = Vector2(x, y)
+    event.position = _window_point(Vector2(x, y))
     Input.parse_input_event(event)
 
 

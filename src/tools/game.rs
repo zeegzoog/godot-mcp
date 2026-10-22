@@ -72,7 +72,7 @@ pub fn catalog() -> Vec<Tool> {
         ),
         tool(
             "godot_game_get",
-            "Reads a live node's properties, groups and, optionally, signals and methods. A property uses '/' for a Dictionary key or an Object property, the same way godot_game_wait does: get only, no method calls, and a private name or script is refused. A property whose own name contains '/' (metadata/note, theme_override_colors/font_color) is read whole. ':' steps through a Resource (material_override:shader_parameter/caustics), including a segment that starts with _. A requested script name is omitted, not rejected. A ':' step through something that is not a Resource is an error and names '/'.",
+            "Reads a live node's properties, groups and, optionally, signals and methods. A property uses '/' for a Dictionary key or an Object property, the same way godot_game_wait does: get only, no method calls, and a private name or script is refused. A missing segment anywhere in that path is an entry in property_errors that names the segment; other requested properties are still returned. null is only a value that really is null. A property whose own name contains '/' (metadata/note, theme_override_colors/font_color) is read whole. ':' steps through a Resource (material_override:shader_parameter/caustics), including a segment that starts with _. A requested script name is omitted, not rejected. A ':' step through something that is not a Resource is an error and names '/'.",
             json!({"run_id": s(""), "path": s("Node path relative to the current scene, or /root/..."), "properties": {"type": "array", "items": {"type": "string"}}, "signals": b(), "methods": b()}),
             &[],
         ),
@@ -108,8 +108,8 @@ pub fn catalog() -> Vec<Tool> {
         ),
         tool(
             "godot_game_input",
-            "Injects input into the running game. Steps: key, text, mouse_move, mouse_button, touch, joy_button, joy_axis, wait, click, click_node, swipe, path, circle, time_scale. phase is tap (default), press, or release. click is a mouse tap at x, y. click_node taps the center of a Control, Node2D, or Node3D. swipe presses at x, y and releases at to_x, to_y across frames (default 8, pointer mouse or touch). path presses once at the first of points ([[x, y], ...], 2 to 256), moves through them, and releases at the last; frames_per_point is the frames spent on each step between points (default 1); a path takes at most 600 frames in all (points - 1 times frames_per_point). circle is that same drag around center [x, y]: radius, turns (default 1, max 8) and points_per_turn (default 16, 4 to 64). pointer is mouse or touch, and touch may set index. Mouse steps are Godot input events and do not move the OS cursor unless warp_mouse is true. time_scale sets Engine.time_scale (0 through 8) until another call changes it. A failed step releases every button and touch this server is still holding. More than 20 steps return ok_count and failed instead of one object per step, unless verbose is true. In a held game the steps are applied at once: key, mouse_button, touch and joy_button taps stay down for hold_ticks ticks (default 2) and are released at the start of the tick they fall due on, so how the ticks are split into steps does not change what the game sees; wait, text, swipe, path and circle steps are refused while held. Leaving the hold releases everything still held.",
-            json!({"run_id": s(""), "steps": {"type": "array", "items": step_schema()}, "warp_mouse": {"type": "boolean", "description": "Move the real OS cursor to each mouse event. Default false."}, "verbose": {"type": "boolean", "description": "Return every step when there are more than 20. Default false, which answers with ok_count and failed."}, "hold_ticks": ir("Held game only: how many ticks a tap stays down before it is released. 1 to 600, default 2.", 1, Some(600))}),
+            "Injects input into the running game. Steps: key, text, mouse_move, mouse_button, touch, joy_button, joy_axis, wait, click, click_node, swipe, path, circle, time_scale. phase is tap (default), press, or release. click is a mouse tap at x, y. click_node taps the center of a Control, Node2D, or Node3D. swipe presses at x, y and releases at to_x, to_y across frames (default 8, pointer mouse or touch). path presses once at the first of points ([[x, y], ...], 2 to 256), moves through them, and releases at the last; frames_per_point is the frames spent on each step between points (default 1); a path takes at most 600 frames in all (points - 1 times frames_per_point). circle is that same drag around center [x, y]: radius, turns (default 1, max 8) and points_per_turn (default 16, 4 to 64). pointer is mouse or touch, and touch may set index. Every pointer position (mouse_move, mouse_button, touch, click, swipe, path, circle) is a pixel of the root viewport's visible rectangle, the same space _input and _unhandled_input see after content scale. It is not an OS screen pixel and not a world coordinate. A touch step, and a swipe, path or circle with pointer touch, also emits the engine's emulated mouse event when Input.emulate_mouse_from_touch is on (project setting input_devices/pointing/emulate_mouse_from_touch, on by default). The engine delivers that InputEventMouseButton or InputEventMouseMotion first, with device InputEvent.DEVICE_ID_EMULATION, then the touch, both at the same viewport position. emulate_mouse false turns that emulation off for this call and restores the previous value afterwards, including when a step fails. Mouse steps do not move the OS cursor unless warp_mouse is true. time_scale sets Engine.time_scale (0 through 8) until another call changes it. A failed step releases every button and touch this server is still holding. More than 20 steps return ok_count and failed instead of one object per step, unless verbose is true. In a held game the steps are applied at once: key, mouse_button, touch and joy_button taps stay down for hold_ticks ticks (default 2) and are released at the start of the tick they fall due on, so how the ticks are split into steps does not change what the game sees; wait, text, swipe, path and circle steps are refused while held. Leaving the hold releases everything still held.",
+            json!({"run_id": s(""), "steps": {"type": "array", "items": step_schema()}, "warp_mouse": {"type": "boolean", "description": "Move the real OS cursor to each mouse event. Default false."}, "emulate_mouse": {"type": "boolean", "description": "When false, touch steps do not also emit the engine's emulated mouse events. The previous value is restored when the call finishes. Default: leave the project setting (on unless the project turned it off)."}, "verbose": {"type": "boolean", "description": "Return every step when there are more than 20. Default false, which answers with ok_count and failed."}, "hold_ticks": ir("Held game only: how many ticks a tap stays down before it is released. 1 to 600, default 2.", 1, Some(600))}),
             &["steps"],
         ),
         tool(
@@ -120,7 +120,7 @@ pub fn catalog() -> Vec<Tool> {
         ),
         tool(
             "godot_game_wait",
-            "Waits in the running game. frames waits process frames (default 1). node waits until that node exists. signal waits until that signal fires on node (timeout frames, default 180; not combined with a property or scene_generation). property reads a public node property, including nested Dictionary keys or Object properties separated by /, using get only: no expressions and no method calls. op is eq, ne, lt, lte, gt, gte, or exists. eq and ne require the same type (a JSON number that is a whole number may match an int; a fraction against an int is a type error; strings are never coerced). Ordering is int-with-int or float-with-float, and float equality is exact. Private names, script, and anything inside an Array are refused. scene_generation waits until the running generation is greater than the given one, and can be combined with node and property. The result and a timeout include the observed value and the scene context. time_scale sets Engine.time_scale from 0 through 8 and keeps it until changed again; the runtime restores the previous scale when the game exits. Refused while the game is held, because no frame would pass: step with godot_game_physics instead.",
+            "Waits in the running game. frames waits process frames (default 1). node waits until that node exists. signal waits until that signal fires on node (timeout frames, default 180; not combined with a property or scene_generation). property reads a public node property, including nested Dictionary keys or Object properties separated by /, using get only: no expressions and no method calls. A missing segment anywhere in that path is an error that names the segment; null is returned only when the property exists and its value is null. op is eq, ne, lt, lte, gt, gte, or exists. eq and ne require the same type (a JSON number that is a whole number may match an int; a fraction against an int is a type error; strings are never coerced). Ordering is int-with-int or float-with-float, and float equality is exact. Private names, script, and anything inside an Array are refused. scene_generation waits until the running generation is greater than the given one, and can be combined with node and property. The result and a timeout include the observed value and the scene context. time_scale sets Engine.time_scale from 0 through 8 and keeps it until changed again; the runtime restores the previous scale when the game exits. Refused while the game is held, because no frame would pass: step with godot_game_physics instead.",
             json!({"run_id": s(""), "frames": i("Default 1. Ignored when node, signal, property, or scene_generation is set, except as the default timeout."), "node": s("Wait until this node exists. Required when property is set."), "signal": s("Wait until this signal fires on node."), "property": s("Public property path. Use / for a Dictionary key or an Object property."), "op": s("eq, ne, lt, lte, gt, gte, or exists."), "value": {"description": "Value to compare. Same type as the property. No string coercion. A whole JSON number may match an int."}, "scene_generation": i("Wait until the running scene generation is greater than this."), "timeout": i("Frame limit for node, signal, property, or scene_generation. Default 180, max 600."), "time_scale": n("Engine.time_scale, from 0 through 8.")}),
             &[],
         ),
@@ -132,7 +132,7 @@ pub fn catalog() -> Vec<Tool> {
         ),
         tool(
             "godot_game_screenshot",
-            "Captures the running game window, a viewport, or a Camera2D/Camera3D as one PNG. frames (1 to 8) stitches shots taken every process frames into a single sheet. For a longer series saved as PNG files, use godot_game_record. The text says how many pixels changed since the previous capture of this run, and where (a sheet compares its last frame, and only against a capture of the same size). save_baseline stores the returned image under a name (at most 8, each at most 512×512 pixels). baseline compares the returned image with a saved one. roi is x, y, w, h in pixels of that returned image (roi_space returned_image), including a sheet. tolerance (0 to 255) is the allowed per-channel difference; a larger difference counts as changed. The text reports changed, sampled, ratio, bounds, tolerance, the baseline name, and whether the pixel count is exact or sampled. Fails instead of returning an empty image. Headless games have nothing to capture. While the game is held a single capture shows the last frame it drew (a sheet with frames above 1, or a camera switch, is refused: take one capture, step, take the next). A missing baseline, a bad name, or an roi outside the image is an error and does not replace a saved image.",
+            "Captures the running game window, a viewport, or a Camera2D/Camera3D as one PNG. frames (1 to 8) stitches shots taken every process frames into a single sheet. For a longer series saved as PNG files, use godot_game_record. The text names the godot_game_input coordinate space (the root viewport's visible width and height, after content scale) and the scale from returned image pixels to that space: multiply an image pixel by the scale. A sheet uses that scale per frame, after subtracting the cell origin; roi is in returned-image pixels (roi_space returned_image) and the same scale applies inside a frame. A camera capture uses the camera's viewport; when that viewport is not the root, the text also names the captured viewport and the scale to it. The text says how many pixels changed since the previous capture of this run, and where (a sheet compares its last frame, and only against a capture of the same size). save_baseline stores the returned image under a name (at most 8, each at most 512×512 pixels). baseline compares the returned image with a saved one. roi is x, y, w, h in pixels of that returned image, including a sheet. tolerance (0 to 255) is the allowed per-channel difference; a larger difference counts as changed. The text reports changed, sampled, ratio, bounds, tolerance, the baseline name, and whether the pixel count is exact or sampled. Fails instead of returning an empty image. Headless games have nothing to capture. While the game is held a single capture shows the last frame it drew (a sheet with frames above 1, or a camera switch, is refused: take one capture, step, take the next). A missing baseline, a bad name, or an roi outside the image is an error and does not replace a saved image.",
             json!({"run_id": s(""), "node": s("Viewport or node whose viewport to capture."), "camera": s("Camera2D or Camera3D to make current for the shot."), "max_dimension": i("Longest side of the returned image in pixels. Default 768."), "frames": ir("How many frames to stitch. Default 1, max 8.", 1, Some(8)), "every": ir("Process frames between shots. Default 1, max 60.", 1, Some(60)), "baseline": s("Name of a saved image to compare."), "save_baseline": s("Store the returned image under this name. Letters, digits, underscore, hyphen. At most 8 names."), "roi": roi_schema(), "tolerance": ir("Per-channel difference that still counts as unchanged. 0 to 255. Default 0.", 0, Some(255))}),
             &[],
         ),
@@ -616,6 +616,10 @@ fn screenshot_note(value: &Value, width: u32, height: u32, source: &str) -> Stri
         let columns = value.get("columns").and_then(Value::as_u64).unwrap_or(1);
         note.push_str(&format!(", {frames} frames, {columns} columns"));
     }
+    if let Some(mapping) = input_mapping(value, width, height, frames) {
+        note.push_str(", ");
+        note.push_str(&mapping);
+    }
     match value
         .get("diff")
         .and_then(|diff| diff.get("compared"))
@@ -652,6 +656,90 @@ fn screenshot_note(value: &Value, width: u32, height: u32, source: &str) -> Stri
     }
     append_baseline(&mut note, value);
     note
+}
+
+/// How returned image pixels map onto the coordinate space `godot_game_input` uses.
+///
+/// Absent when the capture did not report an input size. A sheet's scale is per frame.
+/// A capture of some other viewport names that viewport and scales to it.
+fn input_mapping(value: &Value, image_w: u32, image_h: u32, frames: u64) -> Option<String> {
+    let input_w = json_u32(value, "input_width")?;
+    let input_h = json_u32(value, "input_height")?;
+    let frame_w = json_u32(value, "frame_width").unwrap_or(image_w);
+    let frame_h = json_u32(value, "frame_height").unwrap_or(image_h);
+    if frame_w == 0 || frame_h == 0 {
+        return None;
+    }
+    let captured_w = json_u32(value, "captured_width").unwrap_or(input_w);
+    let captured_h = json_u32(value, "captured_height").unwrap_or(input_h);
+    let same_viewport = captured_w == input_w && captured_h == input_h;
+    let (scale_x, scale_y) = if same_viewport {
+        (
+            f64::from(input_w) / f64::from(frame_w),
+            f64::from(input_h) / f64::from(frame_h),
+        )
+    } else {
+        (
+            f64::from(captured_w) / f64::from(frame_w),
+            f64::from(captured_h) / f64::from(frame_h),
+        )
+    };
+    let per_frame = if frames > 1 {
+        format!(" per frame (frame {frame_w}x{frame_h})")
+    } else {
+        String::new()
+    };
+    let scale = scale_phrase(scale_x, scale_y);
+    if same_viewport {
+        Some(format!(
+            "input space {input_w}x{input_h}, image scale {scale}{per_frame}"
+        ))
+    } else {
+        Some(format!(
+            "input space {input_w}x{input_h}, captured viewport {captured_w}x{captured_h}, image scale {scale} to the captured viewport{per_frame}"
+        ))
+    }
+}
+
+fn scale_phrase(scale_x: f64, scale_y: f64) -> String {
+    if !scale_x.is_finite() || !scale_y.is_finite() {
+        return "?".into();
+    }
+    if (scale_x - scale_y).abs() < 0.005 {
+        format_scale(scale_x)
+    } else {
+        format!("{} by {}", format_scale(scale_x), format_scale(scale_y))
+    }
+}
+
+fn format_scale(value: f64) -> String {
+    if !value.is_finite() || value <= 0.0 {
+        return "?".into();
+    }
+    let rounded = (value * 1000.0).round() / 1000.0;
+    if (rounded - rounded.round()).abs() < 1e-9 {
+        return format!("{}", rounded.round() as i64);
+    }
+    format!("{rounded:.3}")
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_string()
+}
+
+fn json_u32(value: &Value, key: &str) -> Option<u32> {
+    let item = value.get(key)?;
+    if let Some(number) = item.as_u64() {
+        return u32::try_from(number).ok();
+    }
+    if let Some(number) = item.as_i64() {
+        return u32::try_from(number).ok();
+    }
+    let number = item.as_f64()?;
+    if number.is_finite() && number >= 0.0 && number <= f64::from(u32::MAX) {
+        Some(number.round() as u32)
+    } else {
+        None
+    }
 }
 
 fn append_baseline(note: &mut String, value: &Value) {
@@ -1623,19 +1711,30 @@ mod tests {
     #[test]
     fn screenshot_note_names_a_sheet_and_the_changed_rect() {
         let first = screenshot_note(
-            &json!({"frames": 1, "diff": {"compared": false}}),
+            &json!({
+                "frames": 1,
+                "input_width": 32,
+                "input_height": 16,
+                "frame_width": 32,
+                "frame_height": 16,
+                "diff": {"compared": false}
+            }),
             32,
             16,
             "main window",
         );
         assert_eq!(
             first,
-            "Game screenshot 32x16 (main window), no earlier capture to compare"
+            "Game screenshot 32x16 (main window), input space 32x16, image scale 1, no earlier capture to compare"
         );
         let sheet = screenshot_note(
             &json!({
                 "frames": 4,
                 "columns": 2,
+                "input_width": 64,
+                "input_height": 64,
+                "frame_width": 32,
+                "frame_height": 32,
                 "diff": {"compared": true, "changed": 12, "rect": {"x": 1, "y": 2, "w": 3, "h": 4}}
             }),
             64,
@@ -1644,7 +1743,66 @@ mod tests {
         );
         assert_eq!(
             sheet,
-            "Game screenshot 64x64 (main window), 4 frames, 2 columns, changed 12 px in 1,2,3x4"
+            "Game screenshot 64x64 (main window), 4 frames, 2 columns, input space 64x64, image scale 2 per frame (frame 32x32), changed 12 px in 1,2,3x4"
+        );
+    }
+
+    #[test]
+    fn screenshot_note_maps_image_pixels_onto_the_input_space() {
+        let scaled = screenshot_note(
+            &json!({
+                "frames": 1,
+                "input_width": 540,
+                "input_height": 900,
+                "captured_width": 540,
+                "captured_height": 900,
+                "frame_width": 360,
+                "frame_height": 600,
+                "diff": {"compared": false}
+            }),
+            360,
+            600,
+            "main window",
+        );
+        assert_eq!(
+            scaled,
+            "Game screenshot 360x600 (main window), input space 540x900, image scale 1.5, no earlier capture to compare"
+        );
+        let other = screenshot_note(
+            &json!({
+                "frames": 1,
+                "input_width": 540,
+                "input_height": 900,
+                "captured_width": 200,
+                "captured_height": 100,
+                "frame_width": 100,
+                "frame_height": 50
+            }),
+            100,
+            50,
+            "SubViewport",
+        );
+        assert!(
+            other.contains(
+                "input space 540x900, captured viewport 200x100, image scale 2 to the captured viewport"
+            ),
+            "{other}"
+        );
+        let uneven = screenshot_note(
+            &json!({
+                "frames": 1,
+                "input_width": 100,
+                "input_height": 40,
+                "frame_width": 50,
+                "frame_height": 10
+            }),
+            50,
+            10,
+            "main window",
+        );
+        assert!(
+            uneven.contains("input space 100x40, image scale 2 by 4"),
+            "{uneven}"
         );
     }
 
@@ -1653,6 +1811,10 @@ mod tests {
         let note = screenshot_note(
             &json!({
                 "frames": 1,
+                "input_width": 32,
+                "input_height": 16,
+                "frame_width": 32,
+                "frame_height": 16,
                 "diff": {"compared": false},
                 "baseline": {
                     "compared": true,
@@ -1674,7 +1836,7 @@ mod tests {
         );
         assert_eq!(
             note,
-            "Game screenshot 32x16 (main window), no earlier capture to compare, saved baseline menu, baseline menu changed 4 px, sampled 10, ratio 0.4, tolerance 8, exact, roi_space returned_image, roi 1,2,3x4, bounds 1,2,3x4"
+            "Game screenshot 32x16 (main window), input space 32x16, image scale 1, no earlier capture to compare, saved baseline menu, baseline menu changed 4 px, sampled 10, ratio 0.4, tolerance 8, exact, roi_space returned_image, roi 1,2,3x4, bounds 1,2,3x4"
         );
         let sampled = screenshot_note(
             &json!({
@@ -1705,6 +1867,8 @@ mod tests {
         let note = screenshot_note(
             &json!({
                 "frames": 1,
+                "input_width": 64,
+                "input_height": 64,
                 "diff": {"compared": false, "reason": "the previous capture had another size"}
             }),
             64,
@@ -1713,7 +1877,7 @@ mod tests {
         );
         assert_eq!(
             note,
-            "Game screenshot 64x64 (main window), not compared: the previous capture had another size"
+            "Game screenshot 64x64 (main window), input space 64x64, image scale 1, not compared: the previous capture had another size"
         );
     }
 

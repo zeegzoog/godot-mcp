@@ -3,7 +3,7 @@
 //! Ignored by default because they need a Godot 4.5+ executable. Run them with:
 //!
 //! ```bash
-//! GODOT_PATH=/path/to/godot cargo test --test editor_e2e_test -- --ignored
+//! GODOT_PATH=/path/to/godot cargo test --test editor_e2e_test -- --ignored --test-threads=1
 //! ```
 //!
 //! `GODOT_PATH` may also come from a `.env` file. `GODOT_CONSOLE_PATH` (Windows) is used

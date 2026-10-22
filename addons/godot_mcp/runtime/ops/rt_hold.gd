@@ -98,13 +98,16 @@ static func run_input(rt: Node, params: Dictionary) -> Dictionary:
     var parsed := Inputs.parse_steps(params)
     if R.is_err(parsed):
         return parsed
+    var restore_emulation: Variant = Inputs.suppress_emulation(parsed)
     var results: Array = []
     for step: Dictionary in parsed["steps"]:
         var applied := Inputs.apply_held_step(rt, step, _total_ticks + int(hold_ticks))
         if R.is_err(applied):
             Inputs.release_everything()
+            Inputs.restore_emulation(restore_emulation)
             return applied
         results.append(applied["result"])
+    Inputs.restore_emulation(restore_emulation)
     return R.ok({
         "steps": results,
         "held": Inputs.held_summary(),
@@ -240,6 +243,11 @@ static func _step_lets_tick_run(rt: Node) -> bool:
     var reading := {}
     if not _cond.is_empty():
         reading = Inputs.read_condition(rt, _cond)
+        if reading.has("error"):
+            _until_met = false
+            _finish_step(reading)
+            _step_report["error"] = reading["error"]
+            return false
         _until_met = bool(reading["holds"])
     if _until_met or _ticks_run >= _limit:
         _finish_step(reading)

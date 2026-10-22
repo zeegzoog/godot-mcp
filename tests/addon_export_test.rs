@@ -2,7 +2,7 @@
 //! ignored by default, like the editor end-to-end tests:
 //!
 //! ```bash
-//! GODOT_PATH=/path/to/godot cargo test --test addon_export_test -- --ignored
+//! GODOT_PATH=/path/to/godot cargo test --test addon_export_test -- --ignored --test-threads=1
 //! ```
 //!
 //! A pack export needs no export templates, so no extra setup is required.

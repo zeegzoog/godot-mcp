@@ -947,16 +947,6 @@ fn list_paths(paths: &[String]) -> String {
     }
 }
 
-fn same_directory(editor: &Path, project: &Path) -> bool {
-    match (
-        std::fs::canonicalize(editor),
-        std::fs::canonicalize(project),
-    ) {
-        (Ok(editor), Ok(project)) => editor == project,
-        _ => false,
-    }
-}
-
 /// Turns a bridge failure into a tool error whose recovery hints match what actually failed.
 fn bridge_error_result(error: &McpError) -> ToolResult {
     match error {

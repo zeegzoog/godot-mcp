@@ -10,5 +10,5 @@ mod variant;
 
 pub use debug_ctl::{DebugCtl, StopInfo, split_breakpoint};
 pub use debug_session::DebugSession;
-pub use runs::{GameHub, Run, RunInfo, json_id_eq};
+pub use runs::{GameHub, ProcessStart, Run, RunInfo, json_id_eq};
 pub use variant::{PacketReader, decode_variant, encode_variant, frame_packet};

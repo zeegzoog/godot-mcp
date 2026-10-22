@@ -114,9 +114,13 @@ static func get_node(rt: Node, params: Dictionary) -> Dictionary:
     if wanted is Array and not (wanted as Array).is_empty():
         for key: Variant in wanted:
             var name := str(key)
-            if name == "script":
+            var located := _locate(node, name, false)
+            if bool(located.get("skip", false)):
                 continue
-            props[name] = rt.encode(node.get(name))
+            if located.has("error"):
+                return located["error"]
+            var target: Object = located["target"]
+            props[name] = rt.encode(target.get(str(located["leaf"])))
     else:
         for info: Dictionary in node.get_property_list():
             if int(info.get("usage", 0)) & PROPERTY_USAGE_SCRIPT_VARIABLE == 0 and int(info.get("usage", 0)) & PROPERTY_USAGE_EDITOR == 0:
@@ -159,13 +163,64 @@ static func set_props(rt: Node, params: Dictionary) -> Dictionary:
     var readback := {}
     for key: Variant in properties:
         var name := str(key)
-        if name == "script" or name.begins_with("_") or name.contains(":"):
-            return R.err(R.DENIED, "Refusing to set '%s'." % name)
-        var current: Variant = node.get(name)
+        var located := _locate(node, name, true)
+        if located.has("error"):
+            return located["error"]
+        var target: Object = located["target"]
+        var leaf := str(located["leaf"])
+        var current: Variant = target.get(leaf)
         var decoded: Variant = _coerce(properties[key], typeof(current) if current != null else TYPE_NIL)
-        node.set(name, decoded)
-        readback[name] = rt.encode(node.get(name))
+        target.set(leaf, decoded)
+        readback[name] = rt.encode(target.get(leaf))
     return R.ok({"path": rt.path_of(node), "properties": readback})
+
+
+## A property path is a node property, then zero or more resource properties separated by `:`.
+## `shader_parameter/caustics` is one Godot property name, so `/` stays inside a segment.
+## Only a Resource can be stepped through, so a path cannot walk from one node to another.
+## Writing refuses `script`, a segment that starts with `_`, and an empty segment. Reading
+## allows a `_` segment. A requested `script` is skipped, which is what a property list did
+## before paths could step into a resource.
+static func _locate(root: Object, path: String, writing: bool) -> Dictionary:
+    if path.is_empty() or path.begins_with(":") or path.ends_with(":") or path.contains("::"):
+        return {"error": _refused_path(path, writing)}
+    var segments := path.split(":", false)
+    if segments.is_empty():
+        return {"error": _refused_path(path, writing)}
+    for segment: String in segments:
+        var problem := _segment_problem(segment, writing)
+        if problem == "script" and not writing:
+            return {"skip": true}
+        if not problem.is_empty():
+            return {"error": _refused_path(path, writing)}
+    var target: Object = root
+    for index in segments.size() - 1:
+        var current: Variant = target.get(segments[index])
+        if not current is Resource:
+            var verb := "changed" if writing else "read"
+            return {"error": R.err(R.BAD_PARAMS, "Property '%s' is not a resource, so '%s' cannot be %s through it." % [segments[index], path, verb])}
+        target = current
+    return {"target": target, "leaf": segments[segments.size() - 1]}
+
+
+static func _refused_path(path: String, writing: bool) -> Dictionary:
+    var verb := "set" if writing else "read"
+    return R.err(R.DENIED, "Refusing to %s '%s'." % [verb, path])
+
+
+## "" when the segment may be used. "script" and "private" are refused on write.
+## "script" on a read is reported so the caller can skip that name. "empty" is always refused.
+static func _segment_problem(segment: String, writing: bool) -> String:
+    if segment.is_empty() or segment.begins_with("/") or segment.ends_with("/") or segment.contains("//"):
+        return "empty"
+    for part: String in segment.split("/", false):
+        if part.is_empty():
+            return "empty"
+        if part == "script":
+            return "script"
+        if writing and part.begins_with("_"):
+            return "private"
+    return ""
 
 
 static func call_method(rt: Node, params: Dictionary) -> Dictionary:

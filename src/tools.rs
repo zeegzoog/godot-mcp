@@ -2,7 +2,7 @@ use crate::bridge::BridgeClient;
 use crate::cli_runner::CliRunner;
 use crate::config::FeedbackMode;
 use crate::error::McpError;
-use crate::godot::GameHub;
+use crate::godot::{GameHub, ProcessStart};
 use crate::journal::EvidenceKind;
 use crate::lsp::LspHub;
 use crate::paths::{
@@ -273,8 +273,23 @@ impl ToolManager {
                 ],
             );
         }
+        let user_args = match user_args_of(&args) {
+            Ok(user_args) => user_args,
+            Err(result) => return result,
+        };
+        if user_args.is_some() && mode != "process" {
+            return ToolResult::error(
+                "user_args is only passed to a managed process. Editor Play and mode \"auto\" cannot receive them.",
+                &[
+                    "Pass mode: \"process\" to start a game this server launches",
+                    "The strings are placed after --, so the game reads them with OS.get_cmdline_user_args() and Godot does not treat them as engine options",
+                ],
+            );
+        }
         if mode == "process" {
-            return self.spawn_managed(&args, scene).await;
+            return self
+                .spawn_managed(&args, scene, user_args.as_deref().unwrap_or(&[]))
+                .await;
         }
 
         // Prefer the live editor: it can be stopped/queried later via
@@ -292,10 +307,16 @@ impl ToolManager {
             Err(error) => return bridge_error_result(&error),
         }
 
-        self.spawn_managed(&args, scene).await
+        self.spawn_managed(&args, scene, user_args.as_deref().unwrap_or(&[]))
+            .await
     }
 
-    async fn spawn_managed(&self, args: &Value, scene: Option<&str>) -> ToolResult {
+    async fn spawn_managed(
+        &self,
+        args: &Value,
+        scene: Option<&str>,
+        user_args: &[String],
+    ) -> ToolResult {
         let path = match self.host_project(args) {
             Ok(path) => path,
             Err(result) => return result,
@@ -312,7 +333,17 @@ impl ToolManager {
         let held = args.get("held").and_then(Value::as_bool).unwrap_or(false);
         match self
             .games
-            .start(&path, scene, &breakpoints, headless, break_on_errors, held)
+            .start(
+                &path,
+                ProcessStart {
+                    scene,
+                    breakpoints: &breakpoints,
+                    headless,
+                    break_on_errors,
+                    held,
+                    user_args,
+                },
+            )
             .await
         {
             Ok(info) => ToolResult::text(format!(
@@ -742,6 +773,51 @@ fn str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(Value::as_str)
 }
 
+const MAX_USER_ARGS: usize = 32;
+const MAX_USER_ARG_CHARS: usize = 256;
+
+/// `Some` when the caller sent `user_args`, including an empty array. `None` when the key is absent.
+fn user_args_of(args: &Value) -> Result<Option<Vec<String>>, ToolResult> {
+    let Some(value) = args.get("user_args").filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let Some(items) = value.as_array() else {
+        return Err(ToolResult::error(
+            "user_args must be an array of strings",
+            &["Pass user_args: [\"--caustics\"] with mode: \"process\""],
+        ));
+    };
+    if items.len() > MAX_USER_ARGS {
+        return Err(ToolResult::error(
+            format!("user_args accepts at most {MAX_USER_ARGS} strings"),
+            &["Pass only the flags the game itself reads"],
+        ));
+    }
+    let mut user_args = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(text) = item.as_str() else {
+            return Err(ToolResult::error(
+                "Every user_args item must be a string",
+                &["Pass user_args: [\"--caustics\"]"],
+            ));
+        };
+        if text.chars().count() > MAX_USER_ARG_CHARS {
+            return Err(ToolResult::error(
+                format!("Each user_args string must be at most {MAX_USER_ARG_CHARS} characters"),
+                &["Shorten the argument"],
+            ));
+        }
+        if text.chars().any(char::is_control) {
+            return Err(ToolResult::error(
+                "user_args cannot contain control characters",
+                &["Pass plain text the game reads with OS.get_cmdline_user_args()"],
+            ));
+        }
+        user_args.push(text.to_string());
+    }
+    Ok(Some(user_args))
+}
+
 fn string_list(value: Option<&Value>) -> Vec<String> {
     value
         .and_then(Value::as_array)
@@ -916,7 +992,7 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
         ),
         tool(
             "godot_run_project",
-            "Runs the Godot project or a specific scene. Uses the live editor's Play mode when the bridge is connected. Otherwise starts a managed process (debugger attached) that godot_stop_project can stop. held true (with mode process) starts the game held at its first physics tick at a fixed frame rate equal to the project's tick rate, so godot_game_physics steps are exact.",
+            "Runs the Godot project or a specific scene. Uses the live editor's Play mode when the bridge is connected. Otherwise starts a managed process (debugger attached) that godot_stop_project can stop. held true (with mode process) starts the game held at its first physics tick at a fixed frame rate equal to the project's tick rate, so godot_game_physics steps are exact. user_args (mode process only) are strings placed after --, so the game reads them with OS.get_cmdline_user_args() and Godot does not treat them as engine options. mode auto and editor Play reject user_args instead of dropping them.",
             json!({
                 "project_path": {
                     "type": "string",
@@ -947,6 +1023,12 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
                     "type": "string",
                     "enum": ["auto", "process"],
                     "description": "auto (default) uses the live editor when the bridge is connected. process always starts a managed debugger-attached process that godot_stop_project can stop."
+                },
+                "user_args": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 32,
+                    "description": "Process mode only. Up to 32 strings, each at most 256 characters, passed to the game after --. They are never Godot engine options. Refused unless mode is process."
                 }
             }),
             &[],
@@ -961,7 +1043,7 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
         ),
         tool(
             "godot_get_run_status",
-            "Reports whether a scene is playing in the editor and lists managed process runs.",
+            "Reports whether a scene is playing in the editor and lists managed process runs, including each run's user_args.",
             json!({}),
             &[],
         ),

@@ -55,6 +55,10 @@ const RUNTIME_FILES: &[(&str, &str)] = &[
         "addons/godot_mcp/runtime/ops/rt_output.gd",
         include_str!("../../addons/godot_mcp/runtime/ops/rt_output.gd"),
     ),
+    (
+        "addons/godot_mcp/runtime/ops/rt_record.gd",
+        include_str!("../../addons/godot_mcp/runtime/ops/rt_record.gd"),
+    ),
 ];
 
 /// Where the game loads the runtime from.
@@ -101,6 +105,8 @@ pub struct Run {
     id: String,
     project: PathBuf,
     scene: String,
+    /// Arguments placed after `--`, so the game reads them and Godot does not.
+    user_args: Vec<String>,
     headless: bool,
     pid: AtomicU32,
     session: Arc<DebugSession>,
@@ -123,6 +129,16 @@ pub struct GameHub {
     runs: Mutex<Vec<Arc<Run>>>,
 }
 
+/// How one managed process run is started. `user_args` are placed after `--`.
+pub struct ProcessStart<'a> {
+    pub scene: Option<&'a str>,
+    pub breakpoints: &'a [String],
+    pub headless: bool,
+    pub break_on_errors: bool,
+    pub held: bool,
+    pub user_args: &'a [String],
+}
+
 impl GameHub {
     pub fn new(godot: PathBuf) -> Self {
         Self {
@@ -131,15 +147,7 @@ impl GameHub {
         }
     }
 
-    pub async fn start(
-        &self,
-        project: &Path,
-        scene: Option<&str>,
-        breakpoints: &[String],
-        headless: bool,
-        break_on_errors: bool,
-        held: bool,
-    ) -> Result<RunInfo> {
+    pub async fn start(&self, project: &Path, launch: ProcessStart<'_>) -> Result<RunInfo> {
         let id = Uuid::new_v4().simple().to_string();
         let id = id[..8].to_string();
         let source = ensure_runtime(project, &id)?;
@@ -151,6 +159,14 @@ impl GameHub {
                 return Err(err);
             }
         };
+        let ProcessStart {
+            scene,
+            breakpoints,
+            headless,
+            break_on_errors,
+            held,
+            user_args,
+        } = launch;
         session.set_ignore_error_breaks(!break_on_errors);
         let debug = DebugCtl::new(Arc::clone(&session));
         debug.seed(breakpoints);
@@ -158,6 +174,7 @@ impl GameHub {
             id: id.clone(),
             project: project.to_path_buf(),
             scene: scene.unwrap_or("").to_string(),
+            user_args: user_args.to_vec(),
             headless,
             pid: AtomicU32::new(0),
             session: Arc::clone(&session),
@@ -199,6 +216,13 @@ impl GameHub {
                 .arg("--")
                 .arg(format!("--godot-mcp-fixed-fps={rate}"))
                 .arg("--godot-mcp-hold");
+        } else if !user_args.is_empty() {
+            // Everything after this separator is a game argument. A value that starts with `-`
+            // cannot become a Godot engine option.
+            command.arg("--");
+        }
+        for argument in user_args {
+            command.arg(argument);
         }
         command
             .stdin(Stdio::null())
@@ -358,6 +382,7 @@ impl Run {
             "pid": self.pid.load(Ordering::Acquire),
             "project": self.project.display().to_string(),
             "scene": self.scene,
+            "user_args": self.user_args,
             "headless": self.headless,
             "running": self.is_alive(),
             "held": self.is_held(),
@@ -940,6 +965,7 @@ mod tests {
         let copy = project.path().join(".godot/godot_mcp/run-abc12345");
         assert!(copy.join("mcp_runtime.gd").is_file());
         assert!(copy.join("ops/rt_input.gd").is_file());
+        assert!(copy.join("ops/rt_record.gd").is_file());
         assert!(
             !project.path().join("addons").exists(),
             "the runtime was copied into the project's addons folder"
@@ -980,6 +1006,33 @@ mod tests {
                 "{relative} was removed"
             );
         }
+        assert!(!project.path().join(".godot").exists());
+    }
+
+    #[test]
+    fn a_project_missing_the_record_script_gets_the_servers_copy() {
+        let project = project();
+        for (relative, _) in RUNTIME_FILES {
+            if relative.ends_with("rt_record.gd") {
+                continue;
+            }
+            write(&project.path().join(relative), "extends Node\n");
+        }
+        let source = ensure_runtime(project.path(), "abc12345").unwrap();
+        assert!(
+            source.copied.is_some(),
+            "an addon that lacks a runtime file must not be used in place of this server's copy"
+        );
+        assert!(source.autoload.contains(".godot/godot_mcp/"));
+        let state = inject_override(project.path(), &source).unwrap();
+        restore_override(&state);
+        assert!(
+            !project
+                .path()
+                .join("addons/godot_mcp/runtime/ops/rt_record.gd")
+                .exists(),
+            "the project's addon was completed with the missing file"
+        );
         assert!(!project.path().join(".godot").exists());
     }
 

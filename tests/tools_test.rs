@@ -187,6 +187,38 @@ async fn rejects_a_project_path_without_project_godot() {
 }
 
 #[tokio::test]
+async fn run_project_warns_when_an_imported_source_is_newer_than_its_cache() {
+    let project = project_dir();
+    let root = project.path();
+    std::fs::create_dir_all(root.join("shaders")).unwrap();
+    std::fs::create_dir_all(root.join(".godot/imported")).unwrap();
+    let source = root.join("shaders/flow.glsl");
+    let cache = root.join(".godot/imported/flow.glsl-abc.res");
+    std::fs::write(&source, "void main() {}\n").unwrap();
+    std::fs::write(&cache, "old").unwrap();
+    std::fs::write(
+        root.join("shaders/flow.glsl.import"),
+        "path=\"res://.godot/imported/flow.glsl-abc.res\"\n",
+    )
+    .unwrap();
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    std::fs::File::open(&cache)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    let result = call(
+        "godot_run_project",
+        json!({"project_path": root, "mode": "process"}),
+    )
+    .await;
+    let message = text(&result);
+    assert!(result.is_error, "{message}");
+    assert!(message.contains("res://shaders/flow.glsl"), "{message}");
+    assert!(message.contains("godot_resave_resources"), "{message}");
+    assert!(!message.contains("res://shaders/plain"), "{message}");
+}
+
+#[tokio::test]
 async fn run_project_rejects_a_scene_that_looks_like_an_engine_option() {
     let project = project_dir();
     let result = call(

@@ -112,6 +112,7 @@ signal pinged(value)
 func _ready() -> void:
     firefly_law = Law.new()
     swatch = Tone.new()
+    set_meta("note", "hi")
     print("mcp-probe-ready")
     push_error("mcp-probe-error")
 
@@ -301,6 +302,27 @@ async fn running_game_accepts_input_and_can_be_inspected() {
     );
     assert_eq!(nested_values["bag/count"], 2, "{}", text_of(&nested));
     assert_eq!(nested_values["swatch:level"], 4, "{}", text_of(&nested));
+    // A property whose own name has a slash is read whole, not walked as a path.
+    let slashed = call(
+        &tools,
+        "godot_game_get",
+        json!({"run_id": run_id, "path": ".", "properties": ["metadata/note"]}),
+    )
+    .await;
+    assert!(!slashed.is_error, "{}", text_of(&slashed));
+    assert_eq!(
+        json_of(&slashed)["properties"]["metadata/note"],
+        "hi",
+        "{}",
+        text_of(&slashed)
+    );
+    let waited = call(
+        &tools,
+        "godot_game_wait",
+        json!({"run_id": run_id, "node": ".", "property": "metadata/note", "op": "eq", "value": "hi", "timeout": 30}),
+    )
+    .await;
+    assert!(!waited.is_error, "{}", text_of(&waited));
     let through_colon = call(
         &tools,
         "godot_game_get",

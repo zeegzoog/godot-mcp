@@ -554,6 +554,14 @@ static func _lookup(node: Node, path: String) -> Dictionary:
     var parts: PackedStringArray = path.split("/", false)
     if parts.is_empty():
         return R.err(R.BAD_PARAMS, "property must name a public property.")
+    # Some properties carry the slash in their own name (metadata/note,
+    # theme_override_colors/font_color). Read those whole before walking the path.
+    if parts.size() > 1 and _has_public_property(node, path):
+        for part: String in parts:
+            var whole := _public_segment(part)
+            if R.is_err(whole):
+                return whole
+        return {"exists": true, "value": node.get(path)}
     var current: Variant = node
     var index := 0
     for part: String in parts:

@@ -26,7 +26,7 @@ const IDLE_MSEC := 2
 ## How long a hold request waits for the game to reach a physics tick.
 const ARM_TIMEOUT_MSEC := 5000
 ## Input steps that last over frames; a held game takes the rest at once.
-const TIMED_STEPS: Array[String] = ["wait", "text", "swipe"]
+const TIMED_STEPS: Array[String] = ["wait", "text", "swipe", "path"]
 ## The runtime methods that answer at once and are therefore safe to serve while held.
 const SERVED: Array[String] = [
     "game.tree", "game.get", "game.set", "game.call", "game.signals", "game.snapshot",

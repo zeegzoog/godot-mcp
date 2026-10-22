@@ -726,16 +726,41 @@ fn every_text_that_reaches_github_is_checked_for_credentials() {
     assert!(ok, "board.sh must queue a clean status update:\n{text}");
 
     // The step that applies a queue checks every line again: a line written by hand is skipped.
+    // `apply` asks GitHub who owns the repository before it reads the queue, so a stand-in `gh`
+    // that answers only that question goes first on PATH; any other call it makes fails.
+    let stub = tempfile::tempdir().expect("stub gh directory");
+    std::fs::write(
+        stub.path().join("gh"),
+        "#!/bin/bash\ncase \"$1 $2\" in \"api users/\"*) echo Organization; exit 0 ;; esac\n\
+         echo \"unexpected gh call: $*\" >&2\nexit 1\n",
+    )
+    .expect("write stub gh");
+    // Git for Windows' bash runs a script only when bash itself marked it executable.
+    let status = Command::new(&bash)
+        .args(["-c", "chmod +x gh"])
+        .current_dir(stub.path())
+        .status()
+        .expect("chmod the stub gh");
+    assert!(status.success(), "cannot mark the stub gh executable");
+    let path = std::env::join_paths(std::iter::once(stub.path().to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .expect("PATH");
+    let path = path.to_string_lossy().into_owned();
     let applied = dir.path().join("hand-written.txt");
     std::fs::write(&applied, format!("status\tBoard: {token}\n")).expect("write queue");
     let (_, text) = run_script(
         &bash,
         "board.sh",
         &["apply", &applied.to_string_lossy()],
-        &[("STEWARD_OFFLINE", "1")],
+        &[("PATH", path.as_str())],
     );
     assert!(
         text.contains("skipped") && !text.contains("status update posted"),
         "board.sh apply must skip a queued status update with a token:\n{text}"
+    );
+    assert!(
+        !text.contains("unexpected gh call"),
+        "a refused status update still reached GitHub:\n{text}"
     );
 }

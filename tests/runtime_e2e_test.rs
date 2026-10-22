@@ -104,11 +104,25 @@ var last_mouse := Vector2.ZERO
 var scale_seen := 1.0
 var pad_presses := 0
 var tiny_presses := 0
+var firefly_law: RefCounted
+var bag := {"count": 2}
+var swatch: Resource
 signal pinged(value)
 
 func _ready() -> void:
+    firefly_law = Law.new()
+    swatch = Tone.new()
     print("mcp-probe-ready")
     push_error("mcp-probe-error")
+
+class Law:
+    extends RefCounted
+    var births := 3
+    var _hidden := 1
+
+class Tone:
+    extends Resource
+    var level := 4
 
 func _process(_delta: float) -> void:
     hits += 1
@@ -266,6 +280,51 @@ async fn running_game_accepts_input_and_can_be_inspected() {
         "{props_json}"
     );
     assert!(values["hits"].as_i64().unwrap_or(0) > 0, "{props_json}");
+
+    let nested = call(
+        &tools,
+        "godot_game_get",
+        json!({
+            "run_id": run_id,
+            "path": ".",
+            "properties": ["firefly_law/births", "bag/count", "swatch:level"]
+        }),
+    )
+    .await;
+    assert!(!nested.is_error, "{}", text_of(&nested));
+    let nested_values = &json_of(&nested)["properties"];
+    assert_eq!(
+        nested_values["firefly_law/births"],
+        3,
+        "{}",
+        text_of(&nested)
+    );
+    assert_eq!(nested_values["bag/count"], 2, "{}", text_of(&nested));
+    assert_eq!(nested_values["swatch:level"], 4, "{}", text_of(&nested));
+    let through_colon = call(
+        &tools,
+        "godot_game_get",
+        json!({"run_id": run_id, "path": ".", "properties": ["firefly_law:births"]}),
+    )
+    .await;
+    assert!(through_colon.is_error, "{}", text_of(&through_colon));
+    let colon_text = text_of(&through_colon);
+    assert!(
+        colon_text.contains("not a resource") && colon_text.contains("firefly_law/births"),
+        "{colon_text}"
+    );
+    let hidden = call(
+        &tools,
+        "godot_game_get",
+        json!({"run_id": run_id, "path": ".", "properties": ["firefly_law/_hidden"]}),
+    )
+    .await;
+    assert!(hidden.is_error, "{}", text_of(&hidden));
+    assert!(
+        text_of(&hidden).to_lowercase().contains("refus"),
+        "{}",
+        text_of(&hidden)
+    );
 
     let called = call(
         &tools,

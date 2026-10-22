@@ -72,7 +72,7 @@ pub fn catalog() -> Vec<Tool> {
         ),
         tool(
             "godot_game_get",
-            "Reads a live node's properties, groups and, optionally, signals and methods. A property may step through resources with ':' (material_override:shader_parameter/caustics), including a segment that starts with _. A requested script name is omitted, not rejected. A path that is not a resource is refused.",
+            "Reads a live node's properties, groups and, optionally, signals and methods. A property uses '/' for a Dictionary key or an Object property, the same way godot_game_wait does: get only, no method calls, and a private name or script is refused. ':' steps through a Resource (material_override:shader_parameter/caustics), including a segment that starts with _. A requested script name is omitted, not rejected. A ':' step through something that is not a Resource is an error and names '/'.",
             json!({"run_id": s(""), "path": s("Node path relative to the current scene, or /root/..."), "properties": {"type": "array", "items": {"type": "string"}}, "signals": b(), "methods": b()}),
             &[],
         ),

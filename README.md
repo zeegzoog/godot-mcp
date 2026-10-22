@@ -161,7 +161,7 @@ To report a vulnerability, follow [SECURITY.md](SECURITY.md). Never open a publi
 | `godot_run_output` | Running game | Logs, warnings and errors, with stack traces, from a managed process run or the editor's running game (`since`, `level`). |
 | `godot_game_tree` | Running game | Live nodes of the running game: path, class, position, visible text. Filter by `name`, `class`, `group` or `text`. |
 | `godot_game_get` | Running game | A live node's properties, groups and, optionally, signals and methods. `/` reads a Dictionary key or an Object property (get only; private names are refused). A missing segment is that property's entry in `property_errors` and names the segment; other properties are still returned. `null` is a value that really is null. `:` steps through a Resource (`material:shader_parameter/caustics`), including a name that starts with `_`. A requested `script` is omitted. A non-resource `:` step names the `/` form. |
-| `godot_game_set` | Running game | Sets properties on a live node, including a resource property reached with `:`. Refuses `script` and private names. Nothing is saved to disk. |
+| `godot_game_set` | Running game | Sets properties on a live node. `/` writes an Object field or a Dictionary key; an unknown property is an error that names the segment. `:` steps through a Resource. Refuses `script`, private names, and a Node in the middle of a `/` path. Nothing is saved to disk. |
 | `godot_game_call` | Running game | Calls one method on a live node. The method must be listed in `permit`; methods that can quit, evaluate code, call other methods by name, set properties by name or free or replace the node are refused. A JSON string is passed as a `StringName` or a `NodePath` where the method asks for one. |
 | `godot_game_signals` | Running game | A live node's signals and their connections. |
 | `godot_game_observe` | Running game | Watches signals for a few frames, returns the ones that fired, then disconnects. |
@@ -219,13 +219,14 @@ A named baseline is the returned image, so `roi` uses that image's pixels (`roi_
 {"baseline": "menu", "roi": {"x": 0, "y": 0, "w": 80, "h": 24}, "tolerance": 8}
 ```
 
-`godot_game_set` can write a property of a resource on the node. Separate the node property and the resource property with `:`. A `/` stays inside one Godot property name, which is how a shader uniform is spelled:
+`godot_game_set` writes a property of the live node. `/` writes a field of an Object or a key of a Dictionary, the same way `godot_game_get` reads one. A missing property or key is an error that names the segment, and a new Dictionary key is not created. The value is read back; a write that did not take is an error, not success with `null`. Floats, vectors, colors and transforms are compared approximately, because many engine floats are 32-bit. `:` steps through a Resource. A `/` that belongs to one Godot property name stays that name, which is how a shader uniform is spelled. A `/` step stays inside the object it starts from, so a Node along the way is an error and that node is named with `path`.
 
 ```json
+{"path": ".", "properties": {"round_state/letter_index": 22}}
 {"path": "WaterPaper", "properties": {"material_override:shader_parameter/caustics": true}}
 ```
 
-`script`, a segment that starts with `_`, and a value that is not a resource are refused. The change lasts until the game exits. It is not saved. A shader uniform that nothing has written yet reads as null; Godot does not return the default declared in the shader until a value is stored.
+`script`, a segment that starts with `_`, and a `:` step through something that is not a resource are refused. The change lasts until the game exits. It is not saved. A shader uniform that nothing has written yet reads as null; Godot does not return the default declared in the shader until a value is stored.
 
 `godot_game_record` writes that motion to disk when eight screenshot frames are not enough. `frames` is 1 to 240, `every` is the process frames between shots, and `frames * every` is at most 480. Each frame only grabs an image. The PNG files are written after the last frame, so the timings are the capture times, and `frames × width × height × 4` must stay within 512 MB after `max_dimension`. `directory` must be an absolute path below the system temporary directory (nothing is written elsewhere); omit it for a new one. The reply has no image bytes. `format` `gif` or `mp4` runs `ffmpeg` when it is installed; otherwise the PNG files are still there.
 

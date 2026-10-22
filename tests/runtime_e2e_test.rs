@@ -106,14 +106,21 @@ var pad_presses := 0
 var tiny_presses := 0
 var firefly_law: RefCounted
 var river: RefCounted
+var round_state: RefCounted
+var mark_ref: Node
 var bag := {"count": 2}
 var quiet = null
 var swatch: Resource
+var locked := 1:
+    set(value):
+        pass
 signal pinged(value)
 
 func _ready() -> void:
     firefly_law = Law.new()
     river = River.new()
+    round_state = Round.new()
+    mark_ref = $Mark
     swatch = Tone.new()
     set_meta("note", "hi")
     print("mcp-probe-ready")
@@ -127,6 +134,10 @@ class Law:
 class River:
     extends RefCounted
     var camera_x := 1.5
+
+class Round:
+    extends RefCounted
+    var letter_index := 0
 
 class Tone:
     extends Resource
@@ -3317,6 +3328,196 @@ async fn a_baseline_is_compared_at_its_own_size_by_default() {
         "{}",
         text_of(&compared)
     );
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+}
+
+/// A `/` write follows an Object field or a Dictionary key. A missing leaf, a private
+/// segment, a Node in the middle, and a write that does not stick are errors. A `:`
+/// resource path still writes the resource property.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn game_set_writes_through_an_object_and_refuses_a_missing_leaf() {
+    let _ = IGNORE;
+    let project = project();
+    let tools = manager(project.path());
+    let started = call(
+        &tools,
+        "godot_run_project",
+        json!({
+            "project_path": project.path(),
+            "scene": "res://scenes/main.tscn",
+            "mode": "process",
+            "headless": true
+        }),
+    )
+    .await;
+    assert!(!started.is_error, "{}", text_of(&started));
+    let run_id = run_id_of(&started);
+
+    let letter = call(
+        &tools,
+        "godot_game_set",
+        json!({"run_id": run_id, "path": ".", "properties": {"round_state/letter_index": 22}}),
+    )
+    .await;
+    assert!(!letter.is_error, "{}", text_of(&letter));
+    assert_eq!(
+        json_of(&letter)["properties"]["round_state/letter_index"],
+        22,
+        "{}",
+        text_of(&letter)
+    );
+    let letter_read = call(
+        &tools,
+        "godot_game_get",
+        json!({"run_id": run_id, "path": ".", "properties": ["round_state/letter_index"]}),
+    )
+    .await;
+    assert_eq!(
+        json_of(&letter_read)["properties"]["round_state/letter_index"],
+        22,
+        "{}",
+        text_of(&letter_read)
+    );
+
+    let count = call(
+        &tools,
+        "godot_game_set",
+        json!({"run_id": run_id, "path": ".", "properties": {"bag/count": 9}}),
+    )
+    .await;
+    assert!(!count.is_error, "{}", text_of(&count));
+    assert_eq!(
+        json_of(&count)["properties"]["bag/count"],
+        9,
+        "{}",
+        text_of(&count)
+    );
+
+    let missing = call(
+        &tools,
+        "godot_game_set",
+        json!({"run_id": run_id, "path": ".", "properties": {"round_state/nope": 1}}),
+    )
+    .await;
+    assert!(missing.is_error, "{}", text_of(&missing));
+    assert!(text_of(&missing).contains("nope"), "{}", text_of(&missing));
+    let spelled = call(
+        &tools,
+        "godot_game_set",
+        json!({"run_id": run_id, "path": ".", "properties": {"not_a_property": 1}}),
+    )
+    .await;
+    assert!(spelled.is_error, "{}", text_of(&spelled));
+    assert!(
+        text_of(&spelled).contains("not_a_property"),
+        "{}",
+        text_of(&spelled)
+    );
+    let extra = call(
+        &tools,
+        "godot_game_set",
+        json!({"run_id": run_id, "path": ".", "properties": {"bag/extra": 1}}),
+    )
+    .await;
+    assert!(extra.is_error, "{}", text_of(&extra));
+    assert!(text_of(&extra).contains("extra"), "{}", text_of(&extra));
+
+    let private = call(
+        &tools,
+        "godot_game_set",
+        json!({"run_id": run_id, "path": ".", "properties": {"firefly_law/_hidden": 0}}),
+    )
+    .await;
+    assert!(private.is_error, "{}", text_of(&private));
+    assert!(
+        text_of(&private).to_lowercase().contains("refus"),
+        "{}",
+        text_of(&private)
+    );
+
+    let through_node = call(
+        &tools,
+        "godot_game_set",
+        json!({"run_id": run_id, "path": ".", "properties": {"mark_ref/position": [1, 2]}}),
+    )
+    .await;
+    assert!(through_node.is_error, "{}", text_of(&through_node));
+    let through_text = text_of(&through_node);
+    assert!(
+        through_text.contains("path") && through_text.contains("mark_ref"),
+        "{through_text}"
+    );
+    let mark = call(
+        &tools,
+        "godot_game_get",
+        json!({"run_id": run_id, "path": "Mark", "properties": ["position"]}),
+    )
+    .await;
+    assert!(!mark.is_error, "{}", text_of(&mark));
+    let position = &json_of(&mark)["properties"]["position"];
+    assert_eq!(position[0].as_f64(), Some(40.0), "{position}");
+    assert_eq!(position[1].as_f64(), Some(70.0), "{position}");
+
+    // Node2D.rotation is a 32-bit float: 0.1 reads back as 0.10000000149 and is still a write that took.
+    let turned = call(
+        &tools,
+        "godot_game_set",
+        json!({"run_id": run_id, "path": "Mark", "properties": {"rotation": 0.1}}),
+    )
+    .await;
+    assert!(!turned.is_error, "{}", text_of(&turned));
+    let angle = json_of(&turned)["properties"]["rotation"].as_f64();
+    assert!(
+        angle.is_some_and(|a| (a - 0.1).abs() < 1e-6),
+        "{}",
+        text_of(&turned)
+    );
+
+    let level = call(
+        &tools,
+        "godot_game_set",
+        json!({"run_id": run_id, "path": ".", "properties": {"swatch:level": 7}}),
+    )
+    .await;
+    assert!(!level.is_error, "{}", text_of(&level));
+    assert_eq!(
+        json_of(&level)["properties"]["swatch:level"],
+        7,
+        "{}",
+        text_of(&level)
+    );
+
+    let rejected = call(
+        &tools,
+        "godot_game_set",
+        json!({"run_id": run_id, "path": ".", "properties": {"locked": 5}}),
+    )
+    .await;
+    assert!(rejected.is_error, "{}", text_of(&rejected));
+    let still = call(
+        &tools,
+        "godot_game_get",
+        json!({
+            "run_id": run_id,
+            "path": ".",
+            "properties": ["round_state/letter_index", "bag/count", "swatch:level", "locked", "firefly_law/births"]
+        }),
+    )
+    .await;
+    assert!(!still.is_error, "{}", text_of(&still));
+    let kept = &json_of(&still)["properties"];
+    assert_eq!(kept["round_state/letter_index"], 22, "{kept}");
+    assert_eq!(kept["bag/count"], 9, "{kept}");
+    assert_eq!(kept["swatch:level"], 7, "{kept}");
+    assert_eq!(kept["locked"], 1, "{kept}");
+    assert_eq!(kept["firefly_law/births"], 3, "{kept}");
+    assert!(
+        kept.get("bag/extra").is_none(),
+        "a missing dictionary key was created: {kept}"
+    );
+
     let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
     assert!(!stopped.is_error, "{}", text_of(&stopped));
 }

@@ -186,20 +186,66 @@ static func set_props(rt: Node, params: Dictionary) -> Dictionary:
         if located.has("error"):
             return located["error"]
         var target: Object = located["target"]
-        var leaf := str(located["leaf"])
-        var current: Variant = target.get(leaf)
-        var decoded: Variant = _coerce(properties[key], typeof(current) if current != null else TYPE_NIL)
-        target.set(leaf, decoded)
-        readback[name] = rt.encode(target.get(leaf))
+        # The same walk a read uses. It stops on a missing segment instead of letting
+        # Object.set ignore a name that is not a property.
+        var looked := Inputs._lookup(target, str(located["leaf"]), true)
+        if R.is_err(looked):
+            return looked
+        var written := _assign_leaf(name, looked, properties[key])
+        if R.is_err(written):
+            return written
+        readback[name] = rt.encode(written["value"])
     return R.ok({"path": rt.path_of(node), "properties": readback})
 
 
+## Writes the leaf `_lookup` found and reads it back. A Dictionary is updated in place.
+## A value that is not the one written is an error, never a successful null.
+static func _assign_leaf(name: String, looked: Dictionary, raw: Variant) -> Dictionary:
+    var current: Variant = looked.get("value", null)
+    var decoded: Variant = _coerce(raw, typeof(current) if current != null else TYPE_NIL)
+    var container: Variant = looked.get("container", null)
+    var leaf := str(looked.get("leaf", ""))
+    var stored: Variant = null
+    if container is Dictionary:
+        var dict := container as Dictionary
+        var dict_key: Variant = leaf
+        for existing: Variant in dict:
+            if str(existing) == leaf:
+                dict_key = existing
+                break
+        dict[dict_key] = decoded
+        stored = dict[dict_key]
+    elif container is Object and container != null:
+        var holder := container as Object
+        holder.set(leaf, decoded)
+        stored = holder.get(leaf)
+    else:
+        return R.err(R.BAD_PARAMS, "Cannot write '%s'." % name)
+    if not _same(stored, decoded):
+        return R.err(R.BAD_PARAMS, "Property '%s' is %s after writing %s. The write did not take." % [name, stored, decoded])
+    return {"value": stored}
+
+
+## Many engine floats are 32-bit (Node2D.rotation, Camera3D.fov), so 0.1 comes back as
+## 0.10000000149. Floats and float-based values are compared approximately, the rest exactly.
+static func _same(stored: Variant, written: Variant) -> bool:
+    if typeof(stored) != typeof(written):
+        return stored == written
+    match typeof(stored):
+        TYPE_FLOAT:
+            return is_equal_approx(stored, written)
+        TYPE_VECTOR2, TYPE_VECTOR3, TYPE_VECTOR4, TYPE_COLOR, TYPE_QUATERNION, TYPE_PLANE, TYPE_RECT2, TYPE_AABB, TYPE_BASIS, TYPE_TRANSFORM2D, TYPE_TRANSFORM3D:
+            return stored.is_equal_approx(written)
+    return stored == written
+
+
 ## A property path is a node property, then zero or more resource properties separated by `:`.
-## `shader_parameter/caustics` is one Godot property name, so `/` stays inside a segment.
-## Only a Resource can be stepped through, so a path cannot walk from one node to another.
-## Writing refuses `script`, a segment that starts with `_`, and an empty segment. Reading
-## allows a `_` segment. A requested `script` is skipped, which is what a property list did
-## before paths could step into a resource.
+## Only a Resource can be stepped through with `:`. `/` inside the last segment is an Object
+## field or a Dictionary key, resolved by the same walk as a read (`Inputs._lookup`), except
+## that a `/` step may not enter another Node. A property whose own name contains `/`
+## (`shader_parameter/caustics`) stays one name. Writing refuses `script`, a segment that
+## starts with `_`, and an empty segment. Reading allows a `_` segment. A requested `script`
+## is skipped, which is what a property list did before paths could step into a resource.
 static func _locate(root: Object, path: String, writing: bool) -> Dictionary:
     if path.is_empty() or path.begins_with(":") or path.ends_with(":") or path.contains("::"):
         return {"error": _refused_path(path, writing)}

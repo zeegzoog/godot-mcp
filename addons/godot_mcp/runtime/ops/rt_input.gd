@@ -602,43 +602,57 @@ static func _with_scene(result: Dictionary, scene: Dictionary, observed: Variant
     return result
 
 
-static func _lookup(node: Node, path: String) -> Dictionary:
+## `writing` refuses to step into a Node: another node is named with the call's path
+## parameter, not with `/`. The result carries `container` and `leaf` so a write can
+## set that field and read it back. Readers ignore those two.
+static func _lookup(object: Object, path: String, writing: bool = false) -> Dictionary:
     var parts: PackedStringArray = path.split("/", false)
     if parts.is_empty():
         return R.err(R.BAD_PARAMS, "property must name a public property.")
     # Some properties carry the slash in their own name (metadata/note,
-    # theme_override_colors/font_color). Read those whole before walking the path.
-    if parts.size() > 1 and _has_public_property(node, path):
+    # theme_override_colors/font_color, shader_parameter/caustics). Read those whole
+    # before walking the path.
+    if parts.size() > 1 and _has_public_property(object, path):
         for part: String in parts:
             var whole := _public_segment(part)
             if R.is_err(whole):
                 return whole
-        return {"exists": true, "value": node.get(path)}
-    var current: Variant = node
+        return {"exists": true, "value": object.get(path), "container": object, "leaf": path}
+    var current: Variant = object
+    var container: Variant = object
+    var leaf := ""
     var index := 0
     for part: String in parts:
         var named := _public_segment(part)
         if R.is_err(named):
             return named
+        if writing and index > 0 and current is Node:
+            return R.err(R.BAD_PARAMS, "Property '%s' is a Node. A '/' step stays inside the object it starts from. Name that node with the path parameter." % "/".join(parts.slice(0, index)))
         if index == 0:
-            if not _has_public_property(node, part):
+            if not _has_public_property(object, part):
                 return _missing_segment(part, "")
-            current = node.get(part)
+            container = object
+            leaf = part
+            current = object.get(part)
         elif current is Dictionary:
             if not (current as Dictionary).has(part):
                 return _missing_segment(part, "/".join(parts.slice(0, index)))
+            container = current
+            leaf = part
             current = (current as Dictionary)[part]
         elif current is Array:
             return R.err(R.BAD_PARAMS, "Cannot read '%s' inside an Array." % part)
         elif current is Object and current != null:
-            var object := current as Object
-            if not _has_public_property(object, part):
+            var holder := current as Object
+            if not _has_public_property(holder, part):
                 return _missing_segment(part, "/".join(parts.slice(0, index)))
-            current = object.get(part)
+            container = holder
+            leaf = part
+            current = holder.get(part)
         else:
             return R.err(R.BAD_PARAMS, "Cannot read '%s' inside a %s." % [part, type_string(typeof(current))])
         index += 1
-    return {"exists": true, "value": current}
+    return {"exists": true, "value": current, "container": container, "leaf": leaf}
 
 
 ## A segment that is not there. null is reserved for a property that exists and holds null.

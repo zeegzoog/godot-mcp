@@ -5,7 +5,7 @@
 
 use super::{ToolManager, str_arg, string_list};
 use crate::error::McpError;
-use crate::paths::resolve_in_project;
+use crate::paths::{resolve_in_project, same_directory};
 use crate::protocol::{Tool, ToolResult};
 use serde_json::{Value, json};
 use std::path::{Component, Path, PathBuf};
@@ -751,7 +751,12 @@ impl ToolManager {
                 Err(error) => return Err(error),
             }
         }
-        editor_runtime(self, method, params).await
+        if method == "game.record" {
+            return editor_runtime(self, method, params, RECORD_WAIT)
+                .await
+                .map_err(record_timeout);
+        }
+        editor_runtime(self, method, params, Duration::from_secs(20)).await
     }
 }
 
@@ -874,6 +879,7 @@ async fn editor_runtime(
     tools: &ToolManager,
     method: &str,
     params: Value,
+    wait: Duration,
 ) -> Result<Value, McpError> {
     let mut events = tools.bridge.subscribe_events();
     let session = ready_editor_session(tools).await?;
@@ -886,7 +892,7 @@ async fn editor_runtime(
             json!({"command": "mcp:request", "data": [payload], "session": session}),
         )
         .await?;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let deadline = tokio::time::Instant::now() + wait;
     loop {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
         if left.is_zero() {
@@ -1127,19 +1133,25 @@ fn prepare_record_dir(requested: Option<&str>) -> Result<PathBuf, ToolResult> {
         }
         // A tool call must not write files anywhere on the machine: the recording goes below the
         // system temporary directory, links in the part that exists included.
-        resolve_in_project(&temp_root, text).map_err(|_| {
+        let inside = resolve_in_project(&temp_root, text)
+            .ok()
+            .filter(|resolved| !same_directory(resolved, &temp_root));
+        inside.ok_or_else(|| {
             ToolResult::error(
                 format!(
-                    "directory must be inside the system temporary directory {}",
+                    "directory must be a folder inside the system temporary directory {}",
                     temp_root.display()
                 ),
                 &[hint.as_str()],
             )
         })?
     } else {
-        std::env::temp_dir()
-            .join("godot-mcp-records")
-            .join(uuid::Uuid::new_v4().simple().to_string())
+        // Straight into the temporary directory, with an unguessable name: a shared parent folder
+        // could be made by another user beforehand and then swapped under the recording.
+        temp_root.join(format!(
+            "godot-mcp-record-{}",
+            uuid::Uuid::new_v4().simple()
+        ))
     };
     if directory.is_file() {
         return Err(ToolResult::error(
@@ -1147,7 +1159,7 @@ fn prepare_record_dir(requested: Option<&str>) -> Result<PathBuf, ToolResult> {
             &["Pass a directory, or omit directory for a temporary one"],
         ));
     }
-    if let Err(error) = std::fs::create_dir_all(&directory) {
+    if let Err(error) = create_private_dir(&directory) {
         return Err(ToolResult::error(
             format!("Could not create the recording directory: {error}"),
             &["Choose a directory you can write to"],
@@ -1164,7 +1176,8 @@ fn prepare_record_dir(requested: Option<&str>) -> Result<PathBuf, ToolResult> {
     };
     let occupied = entries.flatten().any(|entry| {
         let name = entry.file_name();
-        let name = name.to_string_lossy();
+        // Compared without case: a Windows or macOS volume treats Recording.GIF as recording.gif.
+        let name = name.to_string_lossy().to_lowercase();
         (name.starts_with("frame-") && name.ends_with(".png")) || name.starts_with("recording.")
     });
     if occupied {
@@ -1174,6 +1187,16 @@ fn prepare_record_dir(requested: Option<&str>) -> Result<PathBuf, ToolResult> {
         ));
     }
     Ok(directory)
+}
+
+/// Creates the folder and its missing parents readable by this user only (`0700` on Unix), so the
+/// frames of a game are not listed to the other accounts of a shared machine.
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(path)
 }
 
 fn is_png(path: &Path) -> bool {
@@ -1493,5 +1516,137 @@ mod tests {
         let video = encode_video_with(dir.path(), "gif", 1, "10", "godot-mcp-ffmpeg-missing").await;
         assert_eq!(video["ffmpeg"], "not_found");
         assert!(video.get("path").is_none());
+    }
+
+    #[test]
+    fn the_recording_rate_follows_the_capture_times_and_stays_in_range() {
+        let frames = |times: &[f64]| {
+            times
+                .iter()
+                .map(|msec| json!({"msec": msec}))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(recording_rate(&frames(&[0.0, 100.0, 200.0])), "10.00");
+        assert_eq!(recording_rate(&frames(&[0.0, 1.0, 2.0])), "60.00");
+        assert_eq!(recording_rate(&frames(&[0.0, 5000.0])), "1.00");
+        assert_eq!(recording_rate(&frames(&[3.0, 3.0, 3.0])), "10.00");
+        assert_eq!(recording_rate(&frames(&[7.0])), "10.00");
+        assert_eq!(recording_rate(&[]), "10.00");
+    }
+
+    #[test]
+    fn a_directory_with_frames_or_a_recording_is_refused_whatever_its_case() {
+        for name in [
+            "frame-0001.png",
+            "FRAME-0001.PNG",
+            "recording.mp4",
+            "Recording.GIF",
+        ] {
+            let dir = tempfile::tempdir().expect("record dir");
+            std::fs::write(dir.path().join(name), b"earlier").expect("write");
+            assert!(prepare_record_dir(dir.path().to_str()).is_err(), "{name}");
+            assert_eq!(
+                std::fs::read(dir.path().join(name)).expect("read"),
+                b"earlier"
+            );
+        }
+    }
+
+    #[test]
+    fn the_temporary_directory_itself_is_not_a_recording_directory() {
+        let root = std::env::temp_dir();
+        assert!(prepare_record_dir(root.to_str()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_recording_directory_is_private_and_directly_in_the_temporary_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(directory) = prepare_record_dir(None) else {
+            panic!("no default recording directory");
+        };
+        let mode = std::fs::metadata(&directory)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        let parent = directory.parent().map(Path::to_path_buf);
+        let name = directory
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+        std::fs::remove_dir(&directory).expect("remove");
+        assert_eq!(mode, 0o700);
+        assert_eq!(parent, Some(std::env::temp_dir()));
+        assert!(name.starts_with("godot-mcp-record-"), "{name}");
+    }
+
+    /// Runs `encode_video_with` against a shell script that stands in for ffmpeg. A script written
+    /// a moment ago can still be "busy" on Linux while another test forks, so that is retried.
+    #[cfg(unix)]
+    async fn encode_with_stub(dir: &Path, format: &str, count: i64, script: &str) -> Value {
+        use std::os::unix::fs::PermissionsExt;
+        let stub = dir.join("stub-ffmpeg.sh");
+        std::fs::write(&stub, script).expect("write stub");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let program = stub.to_string_lossy().to_string();
+        for _ in 0..40 {
+            let video = encode_video_with(dir, format, count, "12.50", &program).await;
+            let busy = video["error"]
+                .as_str()
+                .is_some_and(|text| text.to_lowercase().contains("busy"));
+            if !busy {
+                return video;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("the stub stayed busy");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ffmpeg_is_given_the_frames_and_the_movie_is_reported() {
+        let dir = tempfile::tempdir().expect("record dir");
+        let script = "#!/bin/sh\necho \"$@\" > args.txt\nfor last; do :; done\n: > \"$last\"\n";
+        let video = encode_with_stub(dir.path(), "mp4", 3, script).await;
+        assert_eq!(video["ffmpeg"], "used", "{video}");
+        assert_eq!(
+            video["path"],
+            dir.path().join("recording.mp4").display().to_string()
+        );
+        let arguments = std::fs::read_to_string(dir.path().join("args.txt")).expect("args");
+        for expected in [
+            "-framerate 12.50",
+            "-start_number 1",
+            "-i frame-%04d.png",
+            "-frames:v 3",
+            "yuv420p",
+        ] {
+            assert!(arguments.contains(expected), "{expected}: {arguments}");
+        }
+        assert!(
+            arguments.trim_end().ends_with("recording.mp4"),
+            "{arguments}"
+        );
+
+        let gif = encode_with_stub(dir.path(), "gif", 3, script).await;
+        assert_eq!(gif["ffmpeg"], "used", "{gif}");
+        let arguments = std::fs::read_to_string(dir.path().join("args.txt")).expect("args");
+        assert!(!arguments.contains("yuv420p"), "{arguments}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failing_ffmpeg_is_reported_with_its_first_line_and_leaves_no_movie() {
+        let dir = tempfile::tempdir().expect("record dir");
+        let script = "#!/bin/sh\necho 'Unable to find a suitable output format' >&2\necho second >&2\nexit 1\n";
+        let video = encode_with_stub(dir.path(), "gif", 2, script).await;
+        assert_eq!(video["ffmpeg"], "failed", "{video}");
+        assert_eq!(video["error"], "Unable to find a suitable output format");
+        assert!(video.get("path").is_none());
+
+        let silent = encode_with_stub(dir.path(), "gif", 2, "#!/bin/sh\nexit 0\n").await;
+        assert_eq!(silent["ffmpeg"], "failed", "{silent}");
+        assert!(silent.get("path").is_none());
     }
 }

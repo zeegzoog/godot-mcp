@@ -813,6 +813,17 @@ fn user_args_of(args: &Value) -> Result<Option<Vec<String>>, ToolResult> {
                 &["Pass plain text the game reads with OS.get_cmdline_user_args()"],
             ));
         }
+        // The runtime reads these two from the same list: a caller's copy would hold or retime a
+        // game the server believes is running freely.
+        if text.starts_with("--godot-mcp-") {
+            return Err(ToolResult::error(
+                "user_args cannot start with --godot-mcp-: the server reserves those for itself",
+                &[
+                    "Use held: true on godot_run_project to start the game held",
+                    "Pass only the flags the game itself reads",
+                ],
+            ));
+        }
         user_args.push(text.to_string());
     }
     Ok(Some(user_args))

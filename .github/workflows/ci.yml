@@ -69,6 +69,7 @@ jobs:
           $GODOT_PATH --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_output.gd
           $GODOT_PATH --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_result.gd
           $GODOT_PATH --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_view.gd
+          $GODOT_PATH --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_record.gd
 
       - name: End-to-end tests against a real editor
         run: cargo test --test editor_e2e_test -- --ignored --test-threads=2

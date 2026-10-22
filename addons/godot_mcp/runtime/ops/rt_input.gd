@@ -11,6 +11,9 @@ extends RefCounted
 
 const R := preload("rt_result.gd")
 
+## The most frames one path or circle step may take; the same bound as a wait step.
+const MAX_PATH_FRAMES := 600
+
 const MOUSE_BUTTONS := {
     "left": MOUSE_BUTTON_LEFT,
     "right": MOUSE_BUTTON_RIGHT,
@@ -1065,6 +1068,9 @@ static func _parse(step: Dictionary, index: int) -> Dictionary:
             var per := int(step.get("frames_per_point", 1))
             if per < 1 or per > 60:
                 return R.err(R.BAD_PARAMS, "steps[%d]: frames_per_point must be from 1 to 60." % index)
+            # A gesture lasts as long as the longest wait, so the call returns before the server gives up.
+            if ((points as Array).size() - 1) * per > MAX_PATH_FRAMES:
+                return R.err(R.BAD_PARAMS, "steps[%d]: a path may take at most %d frames (points - 1 times frames_per_point)." % [index, MAX_PATH_FRAMES])
             var parsed_points: Array = []
             for item: Variant in points:
                 if not item is Array or (item as Array).size() < 2:

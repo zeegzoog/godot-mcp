@@ -543,6 +543,25 @@ async fn running_game_accepts_input_and_can_be_inspected() {
     );
     assert!(compact_json.get("steps").is_none(), "{compact_json}");
 
+    // A drag lasts at most as long as the longest wait, so the call returns while the game still
+    // answers; a longer one is refused before anything is pressed.
+    let long_points: Vec<Value> = (0..12).map(|index| json!([10 + index, 12])).collect();
+    let too_long = call(
+        &tools,
+        "godot_game_input",
+        json!({
+            "run_id": run_id,
+            "steps": [{"type": "path", "points": long_points, "frames_per_point": 60}]
+        }),
+    )
+    .await;
+    let too_long_text = text_of(&too_long);
+    assert!(
+        too_long.is_error,
+        "a path of 660 frames must be refused: {too_long_text}"
+    );
+    assert!(too_long_text.contains("600"), "{too_long_text}");
+
     let slowed = call(
         &tools,
         "godot_game_wait",

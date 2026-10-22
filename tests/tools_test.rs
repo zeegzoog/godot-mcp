@@ -220,7 +220,9 @@ async fn run_project_warns_when_an_imported_source_is_newer_than_its_cache() {
     )
     .unwrap();
     let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
-    std::fs::File::open(&cache)
+    std::fs::File::options()
+        .write(true)
+        .open(&cache)
         .unwrap()
         .set_modified(old)
         .unwrap();

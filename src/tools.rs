@@ -378,7 +378,11 @@ impl ToolManager {
     /// Reimports stale imports through the editor when it has this project open, and otherwise
     /// returns a warning that names `godot_resave_resources`. Empty when nothing is stale.
     async fn import_notice(&self, project: &Path) -> String {
-        let stale = stale_imports(project);
+        let root = project.to_path_buf();
+        // The walk reads every folder of the project, so it runs off the async workers.
+        let stale = tokio::task::spawn_blocking(move || stale_imports(&root))
+            .await
+            .unwrap_or_default();
         if stale.is_empty() {
             return String::new();
         }

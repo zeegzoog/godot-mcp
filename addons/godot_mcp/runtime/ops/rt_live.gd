@@ -1,12 +1,32 @@
 extends RefCounted
 ## Live scene inspection. Property writes and method calls are intentionally narrow:
 ## `script` cannot be set, and a method runs only when the caller lists it in `permit`
-## and it is not on the denylist (no eval, no quit, no trampoline through call/rpc).
+## and it is not on the denylist: no eval, no quit, no calling another method by name, no setting
+## a property or the script by name, no emitting a signal or sending a notification, and nothing
+## that frees or replaces a node. The list must equal DENY_METHODS in src/tools/game.rs.
 
 const R := preload("rt_result.gd")
 const Hold := preload("rt_hold.gd")
 const DENY: Array[String] = [
-    "quit", "set_script", "call", "callv", "call_deferred", "rpc", "rpc_id", "free",
+    "quit",
+    "set_script",
+    "call",
+    "callv",
+    "call_deferred",
+    "call_group",
+    "call_group_flags",
+    "propagate_call",
+    "rpc",
+    "rpc_id",
+    "set",
+    "set_deferred",
+    "set_indexed",
+    "emit_signal",
+    "notification",
+    "propagate_notification",
+    "free",
+    "queue_free",
+    "replace_by",
 ]
 const MAX_NODES := 400
 const MAX_DEPTH := 32
@@ -162,8 +182,6 @@ static func call_method(rt: Node, params: Dictionary) -> Dictionary:
         return R.err(R.DENIED, "Method '%s' was not explicitly permitted. Pass permit: [\"%s\"]." % [method, method])
     if not node.has_method(method):
         return R.err(R.NOT_FOUND, "Node '%s' has no method '%s'." % [rt.path_of(node), method])
-    if method == "queue_free" and (node == rt.get_tree().root or node == rt or node == rt.scene_root()):
-        return R.err(R.DENIED, "Refusing to free the scene root or the runtime.")
     var raw: Variant = params.get("args", [])
     if raw == null:
         raw = []
@@ -442,6 +460,10 @@ static func _coerce(value: Variant, expected: int) -> Variant:
             return Color(float(items[0]), float(items[1]), float(items[2]), alpha)
         if expected == TYPE_NIL and items.size() == 2 and (items[0] is float or items[0] is int):
             return Vector2(float(items[0]), float(items[1]))
+    if value is String and expected == TYPE_STRING_NAME:
+        return StringName(value)
+    if value is String and expected == TYPE_NODE_PATH:
+        return NodePath(value)
     if value is String and (expected == TYPE_VECTOR2 or expected == TYPE_VECTOR3 or expected == TYPE_COLOR):
         var parsed: Variant = str_to_var(value)
         if parsed != null:

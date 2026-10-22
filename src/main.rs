@@ -1,6 +1,7 @@
 use godot_mcp::config::Config;
 use godot_mcp::error::Result;
 use godot_mcp::server::McpServer;
+use std::io::IsTerminal;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
@@ -11,7 +12,13 @@ async fn main() -> Result<()> {
             EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| EnvFilter::new("godot_mcp=info,warn")),
         )
-        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                // Colour codes only for a person reading a terminal; a client that stores the log
+                // gets plain text.
+                .with_ansi(std::io::stderr().is_terminal()),
+        )
         .init();
 
     let config = Config::load();

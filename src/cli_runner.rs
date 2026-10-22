@@ -7,6 +7,35 @@ use tokio::time::timeout;
 
 const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 const VALIDATE_TIMEOUT: Duration = Duration::from_secs(30);
+const CLASS_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// What the engine can create under a built-in class name (CA-11).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClassKind {
+    /// A `Node` class that can be instantiated: a valid scene root.
+    Scene,
+    /// A `Resource` class that can be instantiated: a valid resource class.
+    Resource,
+    /// Anything else, including a name the engine does not know.
+    Other,
+}
+
+/// The script the class check runs. Fixed text: the class name reaches it only as a user
+/// argument after `--`, never inside the source.
+const CLASS_CHECK_SCRIPT: &str = "extends SceneTree
+
+func _init() -> void:
+	var args: PackedStringArray = OS.get_cmdline_user_args()
+	var name: String = args[0] if args.size() > 0 else \"\"
+	var kind: String = \"no\"
+	if name != \"\" and ClassDB.class_exists(name) and ClassDB.can_instantiate(name):
+		if ClassDB.is_parent_class(name, \"Node\"):
+			kind = \"scene\"
+		elif ClassDB.is_parent_class(name, \"Resource\"):
+			kind = \"resource\"
+	print(\"GODOT_MCP_CLASS=\", kind)
+	quit()
+";
 
 #[derive(Clone, Debug)]
 pub struct CliRunner {
@@ -53,6 +82,69 @@ impl CliRunner {
                 "Godot --version exited with error: {}",
                 String::from_utf8_lossy(&output.stderr)
             )))
+        }
+    }
+
+    /// Asks the engine whether `class` is a built-in class it can create, and of which kind.
+    ///
+    /// One bounded call of the Godot executable in a throw-away project of its own: the fixed
+    /// script and an empty `project.godot` are written to a new directory under the system's
+    /// temporary folder, so no project file is read or written and no project code runs. The class
+    /// name must be an identifier and travels as a user argument.
+    pub async fn class_kind(&self, class: &str) -> Result<ClassKind> {
+        if !crate::paths::is_valid_identifier(class) {
+            return Err(McpError::Validation(format!(
+                "{class:?} is not a class name: use letters, digits and underscores only"
+            )));
+        }
+        let dir = create_scratch_dir()?;
+        let outcome = self.run_class_check(&dir, class).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        outcome
+    }
+
+    async fn run_class_check(&self, dir: &Path, class: &str) -> Result<ClassKind> {
+        std::fs::write(dir.join("project.godot"), "config_version=5\n")?;
+        let script = dir.join("class_check.gd");
+        std::fs::write(&script, CLASS_CHECK_SCRIPT)?;
+        let mut command = Command::new(&self.godot_binary);
+        command
+            .arg("--headless")
+            .arg("--path")
+            .arg(dir)
+            .arg("--script")
+            .arg(&script)
+            .arg("--")
+            .arg(class)
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
+        let output = timeout(CLASS_CHECK_TIMEOUT, command.output())
+            .await
+            .map_err(|_| {
+                McpError::Process(format!(
+                    "Godot did not answer the class check within {}s",
+                    CLASS_CHECK_TIMEOUT.as_secs()
+                ))
+            })?
+            .map_err(|e| {
+                McpError::Process(format!(
+                    "Failed to run the Godot executable at '{}' to check the class: {e}",
+                    self.godot_binary.display()
+                ))
+            })?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        match stdout
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("GODOT_MCP_CLASS="))
+            .map(str::trim)
+        {
+            Some("scene") => Ok(ClassKind::Scene),
+            Some("resource") => Ok(ClassKind::Resource),
+            Some("no") => Ok(ClassKind::Other),
+            _ => Err(McpError::Process(format!(
+                "Godot gave no answer to the class check (exit {})",
+                output.status
+            ))),
         }
     }
 
@@ -125,6 +217,27 @@ impl CliRunner {
             Err(McpError::Validation(report.join("\n")))
         }
     }
+}
+
+/// Creates a new, empty directory for one engine call; it is removed by the caller.
+fn create_scratch_dir() -> Result<PathBuf> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    for attempt in 0..16u32 {
+        let dir = std::env::temp_dir().join(format!(
+            "godot-mcp-class-check-{}-{nanos:x}-{attempt:x}",
+            std::process::id()
+        ));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(McpError::Process(
+        "no free name for a temporary directory".into(),
+    ))
 }
 
 fn spawn_detached(command: &mut Command, what: &str) -> Result<u32> {

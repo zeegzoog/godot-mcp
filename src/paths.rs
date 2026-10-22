@@ -72,6 +72,36 @@ pub fn find_project(cwd: &Path) -> Result<PathBuf, String> {
     }
 }
 
+/// A file of the project as the caller knows it, `res://relative/path`; the path as it is when
+/// the file is not inside the project.
+pub fn res_display(project: &Path, file: &Path) -> String {
+    match file.strip_prefix(project) {
+        Ok(relative) => format!("res://{}", relative.to_string_lossy().replace('\\', "/")),
+        Err(_) => file.display().to_string(),
+    }
+}
+
+/// Whether two paths name the same directory: compared after resolving links where the
+/// directory exists, with `\` read as `/`, no trailing separator, no Windows verbatim prefix and,
+/// on Windows, no difference of case.
+pub fn same_directory(a: &Path, b: &Path) -> bool {
+    fn normalized(path: &Path) -> String {
+        let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let mut text = resolved.to_string_lossy().replace('\\', "/");
+        if let Some(rest) = text.strip_prefix("//?/") {
+            text = rest.to_string();
+        }
+        while text.len() > 1 && text.ends_with('/') {
+            text.pop();
+        }
+        if cfg!(windows) {
+            text = text.to_lowercase();
+        }
+        text
+    }
+    normalized(a) == normalized(b)
+}
+
 /// Resolves a `res://` path, a project-relative path, or an absolute path to a location
 /// inside `project`.
 ///
@@ -137,6 +167,26 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         std::fs::write(dir.path().join("project.godot"), "config_version=5\n").expect("write");
         dir
+    }
+
+    #[test]
+    fn the_same_directory_is_recognized_in_any_spelling() {
+        let dir = project();
+        let other = project();
+        let plain = dir.path().to_path_buf();
+        let slashed = PathBuf::from(format!("{}/", plain.to_string_lossy().replace('\\', "/")));
+        assert!(same_directory(&plain, &slashed));
+        assert!(same_directory(&plain, &plain.join(".")));
+        assert!(!same_directory(&plain, other.path()));
+        // A directory that does not exist is compared by its spelling.
+        assert!(same_directory(
+            Path::new("/no/such/dir"),
+            Path::new("/no/such/dir/")
+        ));
+        assert!(!same_directory(
+            Path::new("/no/such/a"),
+            Path::new("/no/such/b")
+        ));
     }
 
     #[test]

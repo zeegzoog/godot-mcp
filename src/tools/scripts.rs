@@ -4,7 +4,7 @@
 //! holds, including text that is not saved yet. Only when no editor is connected do the tools
 //! fall back to the file itself.
 
-use super::{ToolManager, str_arg};
+use super::{EditorChoice, ToolManager, str_arg};
 use crate::error::McpError;
 use crate::paths::resolve_in_project;
 use crate::protocol::{Tool, ToolResult};
@@ -33,7 +33,7 @@ pub fn catalog() -> Vec<Tool> {
         ),
         super::tool(
             "godot_edit_script",
-            "Replaces one fragment of an existing .gd script: old_text must occur exactly once (any other count is refused with the count), and new_text takes its place. With the editor connected the change is one undoable editor action and the script is saved; it is refused while the script has unsaved changes in the editor. Without an editor the file is replaced as a whole. Pass the version from godot_read_script to refuse the edit if the script changed since. Never creates a file (use godot_create_script); run godot_validate_script after an edit.",
+            "Replaces one fragment of an existing .gd script: old_text must occur exactly once (any other count is refused with the count), and new_text takes its place. With the editor connected the change is one undoable editor action and the script is saved; it is refused while the script has unsaved changes in the editor. Without an editor the file is replaced as a whole. Pass the version from godot_read_script to refuse the edit if the script changed since. Never creates a file (use godot_create_script); run godot_validate_script after an edit. The text is data to this tool, but a script is code: Godot runs a @tool script in the editor as soon as it is saved.",
             json!({
                 "script_path": {"type": "string", "description": "res:// path to an existing .gd file."},
                 "old_text": {"type": "string", "description": "The exact fragment to replace; it must occur once."},
@@ -55,8 +55,17 @@ pub async fn call(tools: &ToolManager, name: &str, args: Value) -> ToolResult {
 }
 
 async fn read(tools: &ToolManager, args: &Value) -> ToolResult {
+    let choice = match tools.editor_choice(args, false).await {
+        Ok(choice) => choice,
+        Err(result) => return result,
+    };
+    if matches!(choice, EditorChoice::Host) {
+        return read_file(tools, args).await;
+    }
     match tools.bridge.send_command("read_script", args.clone()).await {
-        Ok(value) => ToolResult::text(serde_json::to_string_pretty(&value).unwrap_or_default()),
+        Ok(value) => ToolResult::text(
+            serde_json::to_string_pretty(&choice.name_project(value)).unwrap_or_default(),
+        ),
         Err(McpError::BridgeUnavailable(_)) => read_file(tools, args).await,
         Err(error) => super::bridge_error_result(&error),
     }
@@ -75,14 +84,24 @@ async fn read_file(tools: &ToolManager, args: &Value) -> ToolResult {
             "dirty": false,
             "editor_consulted": false,
             "version": label(&script.text),
+            "project_dir": script.project.display().to_string(),
         }))
         .unwrap_or_default(),
     )
 }
 
 async fn edit(tools: &ToolManager, args: &Value) -> ToolResult {
+    let choice = match tools.editor_choice(args, true).await {
+        Ok(choice) => choice,
+        Err(result) => return result,
+    };
+    if matches!(choice, EditorChoice::Host) {
+        return edit_file(tools, args).await;
+    }
     match tools.bridge.send_command("edit_script", args.clone()).await {
-        Ok(value) => ToolResult::text(serde_json::to_string_pretty(&value).unwrap_or_default()),
+        Ok(value) => ToolResult::text(
+            serde_json::to_string_pretty(&choice.name_project(value)).unwrap_or_default(),
+        ),
         Err(McpError::BridgeUnavailable(_)) => edit_file(tools, args).await,
         Err(error) => super::bridge_error_result(&error),
     }
@@ -150,6 +169,7 @@ async fn edit_file(tools: &ToolManager, args: &Value) -> ToolResult {
             "version": label(&edited),
             "source": "file",
             "editor_consulted": false,
+            "project_dir": script.project.display().to_string(),
         }))
         .unwrap_or_default(),
     )
@@ -260,6 +280,7 @@ async fn create_temporary(
 /// back the way it was.
 struct Script {
     res_path: String,
+    project: PathBuf,
     file: PathBuf,
     text: String,
     crlf: bool,
@@ -337,6 +358,7 @@ async fn load(tools: &ToolManager, args: &Value) -> Result<Script, ToolResult> {
     let body = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
     Ok(Script {
         res_path,
+        project,
         file,
         text: body.replace("\r\n", "\n"),
         crlf: body.contains("\r\n"),

@@ -71,6 +71,7 @@ Choose the branch for your pull request:
    | JSON-RPC framing, session, configuration | `tests/stdio_protocol_test.rs` |
    | A tool's host-side logic | `tests/tools_test.rs` |
    | Agent feedback channel | `tests/feedback_test.rs` |
+   | Tool catalog shape, JSON-RPC result helpers | `tests/server_test.rs` |
    | Bridge client | `tests/bridge_client_test.rs` |
    | Editor command behaviour | `tests/editor_e2e_test.rs` |
    | Addon kept out of exported games | `tests/addon_export_test.rs` |

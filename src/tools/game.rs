@@ -1562,9 +1562,9 @@ mod tests {
     #[test]
     fn a_new_recording_directory_is_private_and_directly_in_the_temporary_directory() {
         use std::os::unix::fs::PermissionsExt;
-        let directory = prepare_record_dir(None)
-            .ok()
-            .expect("a default recording directory");
+        let Ok(directory) = prepare_record_dir(None) else {
+            panic!("no default recording directory");
+        };
         let mode = std::fs::metadata(&directory)
             .expect("metadata")
             .permissions()

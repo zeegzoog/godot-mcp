@@ -16,10 +16,10 @@ Each godot-mcp release holds the files for every supported Godot minor version. 
 
 | Your Godot | Branch | Files to download |
 | --- | --- | --- |
+| 4.8 (pre-release) | `master` | none; build from source |
 | 4.7.x | `godot-v4.7` | the files ending in `-godot4.7` |
 | 4.6.x | `godot-v4.6` | the files ending in `-godot4.6` |
 | 4.5.x | `godot-v4.5` | the files ending in `-godot4.5` |
-| 4.8 (pre-release) | `master` | none; build from source |
 
 Release 0.4.0 and older are one build for Godot 4.5 and newer, with file names that have no `-godotM.N` suffix.
 

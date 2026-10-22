@@ -84,6 +84,12 @@ impl ToolManager {
         }
     }
 
+    /// Probes an already-running language server on `port` instead of `GODOT_MCP_LSP_PORT`.
+    pub fn with_lsp_port(mut self, port: u16) -> Self {
+        self.lsp = LspHub::with_port(self.cli.binary().to_path_buf(), port);
+        self
+    }
+
     /// Sets how much of the agent feedback channel is active and where the GitHub client is.
     pub fn with_feedback(mut self, mode: FeedbackMode, gh_path: Option<PathBuf>) -> Self {
         self.feedback = feedback::FeedbackState::new(mode, gh_path);
@@ -636,14 +642,14 @@ impl ToolManager {
             );
         }
 
-        let project_dir =
+        let (project_dir, from_editor) =
             if str_arg(&args, "project_path").is_some() || script_path.starts_with("res://") {
                 match self.resolve_project(&args).await {
-                    Ok(project) => Some(project.dir),
+                    Ok(project) => (Some(project.dir), project.from_editor),
                     Err(result) => return result,
                 }
             } else {
-                None
+                (None, false)
             };
 
         let file = match &project_dir {
@@ -669,12 +675,45 @@ impl ToolManager {
             );
         }
 
+        // Set when a language server was reached but did not answer; the headless check runs instead.
+        let mut lsp_problem = None;
+        if let Some(dir) = &project_dir {
+            let external_ok = from_editor || self.editor_may_serve(dir).await;
+            match self
+                .lsp
+                .diagnostics_if_reachable(dir, external_ok, &file)
+                .await
+            {
+                Ok(Some(value)) => {
+                    let report = code::report_diagnostics(script_path, &value);
+                    return if report.failed {
+                        ToolResult::error(
+                            report.text,
+                            &[
+                                "Fix the error lines. A warning is listed and does not by itself fail this check",
+                                "godot_code_diagnostics returns the same diagnostics",
+                            ],
+                        )
+                    } else {
+                        ToolResult::text(report.text)
+                    };
+                }
+                Ok(None) => {}
+                Err(error) => lsp_problem = Some(error),
+            }
+        }
+
         match self
             .cli
             .validate_script(project_dir.as_deref(), Path::new(script_path))
             .await
         {
-            Ok(msg) => ToolResult::text(msg),
+            Ok(msg) => match lsp_problem {
+                Some(error) => ToolResult::text(format!(
+                    "No parse errors (headless check). Analyzer warnings were not checked: the language server was reached but did not answer ({error}); retry, or use godot_code_diagnostics."
+                )),
+                None => ToolResult::text(msg),
+            },
             // The engine could not be run at all: that is a path problem, not a script problem.
             Err(e @ McpError::Process(_)) => ToolResult::error(
                 format!("Script validation failed: {e}"),
@@ -1298,7 +1337,7 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
         ),
         tool(
             "godot_validate_script",
-            "Performs syntax checking and static validation on a GDScript file without execution.",
+            "Checks a GDScript file. When a language server is already running (the open editor, or one godot_code_diagnostics started), returns its errors and warnings as file:line:col, code and message, with 1-based lines. A warning does not fail the check; an error does. Without a language server, runs godot --headless --check-only, which sees parse errors only, and says that analyzer warnings were not checked. godot_code_diagnostics is the tool that starts a language server when none is running.",
             json!({
                 "script_path": {
                     "type": "string",

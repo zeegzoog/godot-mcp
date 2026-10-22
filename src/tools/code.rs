@@ -24,7 +24,7 @@ pub fn catalog() -> Vec<Tool> {
     vec![
         tool(
             "godot_code_diagnostics",
-            "GDScript diagnostics from Godot's language server (1-based lines). Does not report a clean file if the server never answers.",
+            "GDScript errors and warnings from Godot's language server (1-based lines), including analyzer warnings such as SHADOWED_GLOBAL_IDENTIFIER. Uses an editor already listening on GODOT_MCP_LSP_PORT (default 6005) or starts a private headless one. Does not report a clean file if the server never answers. godot_validate_script reports the same diagnostics when this server is already running, and otherwise only a headless parse check.",
             json!({"script_path": s("res:// path of a .gd file."), "project_path": s("")}),
             &["script_path"],
         ),
@@ -213,6 +213,80 @@ fn position(description: &str) -> Value {
     json!({"type": "integer", "minimum": 1, "description": description})
 }
 
+/// How `godot_validate_script` presents one language-server answer.
+pub(super) struct AnalyzerReport {
+    pub text: String,
+    pub failed: bool,
+}
+
+/// Turns the JSON from [`crate::lsp::LspHub::diagnostics`] into lines of
+/// `file:line:col severity code: message`. A warning does not fail the check; an error does.
+/// Information and hints are left out. Lines and columns are already 1-based.
+pub(super) fn report_diagnostics(script_path: &str, value: &Value) -> AnalyzerReport {
+    let Some(items) = value.get("diagnostics").and_then(Value::as_array) else {
+        return AnalyzerReport {
+            text: "The language server returned no diagnostics list.".into(),
+            failed: true,
+        };
+    };
+    let mut lines = Vec::new();
+    let mut errors = 0_usize;
+    for item in items {
+        let Some(line) = diagnostic_line(script_path, item) else {
+            continue;
+        };
+        if line.starts_with_error {
+            errors += 1;
+        }
+        lines.push(line.text);
+    }
+    if lines.is_empty() {
+        return AnalyzerReport {
+            text: "No errors or analyzer warnings.".into(),
+            failed: false,
+        };
+    }
+    let head = if errors == 0 {
+        "No errors. Analyzer warnings:".to_string()
+    } else {
+        format!(
+            "{errors} error{} from the language server:",
+            if errors == 1 { "" } else { "s" }
+        )
+    };
+    AnalyzerReport {
+        text: format!("{head}\n{}", lines.join("\n")),
+        failed: errors > 0,
+    }
+}
+
+struct DiagnosticLine {
+    text: String,
+    starts_with_error: bool,
+}
+
+fn diagnostic_line(script_path: &str, item: &Value) -> Option<DiagnosticLine> {
+    let severity = item.get("severity").and_then(Value::as_i64).unwrap_or(1);
+    let kind = match severity {
+        1 => "error",
+        2 => "warning",
+        _ => return None,
+    };
+    let start = item.pointer("/range/start")?;
+    let line = start.get("line").and_then(Value::as_u64)?;
+    let column = start.get("character").and_then(Value::as_u64).unwrap_or(1);
+    let code = match item.get("code") {
+        Some(Value::String(code)) => code.clone(),
+        Some(Value::Number(code)) => code.to_string(),
+        _ => "diagnostic".to_string(),
+    };
+    let message = item.get("message").and_then(Value::as_str).unwrap_or("");
+    Some(DiagnosticLine {
+        text: format!("{script_path}:{line}:{column} {kind} {code}: {message}"),
+        starts_with_error: severity == 1,
+    })
+}
+
 /// A 1-based line or column the caller named, 1 when absent. A number too large for the
 /// protocol's 32 bits is kept at the largest value instead of wrapping around to a small one.
 fn position_arg(args: &Value, key: &str) -> u32 {
@@ -233,6 +307,70 @@ mod tests {
         assert_eq!(
             position_arg(&json!({"line": (1_u64 << 32) + 5}), "line"),
             u32::MAX
+        );
+    }
+
+    #[test]
+    fn a_warning_is_listed_and_an_error_fails_the_check() {
+        let warning = report_diagnostics(
+            "res://scripts/seed.gd",
+            &json!({
+                "diagnostics": [{
+                    "range": {"start": {"line": 4, "character": 9}, "end": {"line": 4, "character": 13}},
+                    "severity": 2,
+                    "code": "SHADOWED_GLOBAL_IDENTIFIER",
+                    "message": "The local variable \"seed\" is shadowing a global."
+                }, {
+                    "range": {"start": {"line": 5, "character": 1}},
+                    "severity": 4,
+                    "code": "UNUSED_SIGNAL",
+                    "message": "left out"
+                }]
+            }),
+        );
+        assert!(!warning.failed, "{}", warning.text);
+        assert!(
+            warning.text.contains("No errors. Analyzer warnings:"),
+            "{}",
+            warning.text
+        );
+        assert!(
+            warning
+                .text
+                .contains("res://scripts/seed.gd:4:9 warning SHADOWED_GLOBAL_IDENTIFIER:"),
+            "{}",
+            warning.text
+        );
+        assert!(!warning.text.contains("UNUSED_SIGNAL"), "{}", warning.text);
+
+        let error = report_diagnostics(
+            "res://scripts/seed.gd",
+            &json!({
+                "diagnostics": [{
+                    "range": {"start": {"line": 2, "character": 1}},
+                    "severity": 1,
+                    "code": "PARSE_ERROR",
+                    "message": "Expected expression."
+                }, {
+                    "range": {"start": {"line": 4, "character": 9}},
+                    "severity": 2,
+                    "code": "SHADOWED_GLOBAL_IDENTIFIER",
+                    "message": "still listed"
+                }]
+            }),
+        );
+        assert!(error.failed, "{}", error.text);
+        assert!(
+            error
+                .text
+                .contains("res://scripts/seed.gd:2:1 error PARSE_ERROR:"),
+            "{}",
+            error.text
+        );
+        assert!(
+            error.text.contains("SHADOWED_GLOBAL_IDENTIFIER"),
+            "{}",
+            error.text
         );
     }
 }

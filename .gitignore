@@ -43,8 +43,8 @@ Desktop.ini
 # Skills (each skill directory is ignored unless listed below)
 /.*/skills/*
 !/.*/skills/release
-# Only the canonical copy; a local link such as .claude/skills/repo-steward stays ignored.
-!/.agents/skills/repo-steward
+!/.*/skills/repo-steward
+!/.*/skills/agents-init
 
 # SDD engine
 /.magic/

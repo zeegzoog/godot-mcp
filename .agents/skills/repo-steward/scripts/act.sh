@@ -20,6 +20,8 @@ set -euo pipefail
 export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'
 
 here=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=guard.sh
+. "$here/guard.sh"
 dry_run=0
 args=()
 for arg in "$@"; do
@@ -38,6 +40,10 @@ number() { case "$1" in '' | *[!0-9]*) fail "'$1' is not a number" ;; esac; }
 one_line() {
 	case "$1" in *$'\n'* | *$'\r'* | *$'\t'*) fail "'$2' must be one line" ;; esac
 	[ -n "$1" ] || fail "'$2' is empty"
+	# A title, a branch name or a merge subject is public text too.
+	if credential_shaped "$1"; then
+		fail "'$2' contains something shaped like a credential; nothing was sent"
+	fi
 }
 
 body() {
@@ -48,7 +54,7 @@ body() {
 	printf '%s' "$text" | awk 'NF { last = $0 } END { exit !(last ~ /^<!-- repo-steward:v1 kind=[a-z-]+ /) }' ||
 		fail "the message must end with the repo-steward marker (reference/replies.md)"
 	# Credentials never belong in a message, whoever asked for them.
-	if printf '%s' "$text" | grep -Eq 'gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-ant-[A-Za-z0-9_-]{10,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|xox[abpr]-[A-Za-z0-9-]{10,}'; then
+	if credential_shaped "$text"; then
 		fail "the message contains something shaped like a credential; it was not posted"
 	fi
 }

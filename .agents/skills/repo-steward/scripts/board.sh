@@ -26,6 +26,8 @@ export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'
 queue=${STEWARD_BOARD_QUEUE:-}
 
 here=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=guard.sh
+. "$here/guard.sh"
 command=${1:-}
 [ $# -eq 0 ] || shift
 dry_run=0
@@ -78,6 +80,11 @@ valid_pair() {
 	case "$1" in *=*) ;; *) echo "board.sh: '$1' is not Field=Value" >&2; return 1 ;; esac
 	case "$value" in *$'\t'* | *$'\n'* | *$'\r'*) echo "board.sh: the value of $field must be one line" >&2; return 1 ;; esac
 	[ "${#value}" -le 200 ] || { echo "board.sh: the value of $field is longer than 200 characters" >&2; return 1; }
+	# A field is public text on the board: a credential never belongs in one.
+	if credential_shaped "$value"; then
+		echo "board.sh: the value of $field contains something shaped like a credential; nothing was sent" >&2
+		return 1
+	fi
 	case "$field" in
 	Status)
 		case "$value" in Triage | Backlog | Ready | "In Progress" | "In Review" | Done) return 0 ;; esac
@@ -396,6 +403,11 @@ status_update() {
 	local text=${1:?board.sh status-update needs the text} number project_id
 	[ "${#text}" -le 2000 ] || { echo "board.sh: a status update is at most 2000 characters" >&2; exit 2; }
 	case "$text" in *$'\t'* | *$'\r'*) echo "board.sh: a status update has no tabs" >&2; exit 2 ;; esac
+	# Checked before the text is queued and again when a queue is applied, which runs this too.
+	if credential_shaped "$text"; then
+		echo "board.sh: a status update contains something shaped like a credential; nothing was sent" >&2
+		exit 2
+	fi
 	if [ -n "$queue" ]; then
 		# One queue line per update: newlines are stored as the two characters \n.
 		printf 'status\t%s\n' "$(printf '%s' "$text" | awk '{ printf "%s%s", (NR > 1 ? "\\n" : ""), $0 }')" >>"$queue"

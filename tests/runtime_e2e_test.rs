@@ -3103,6 +3103,48 @@ async fn headless_game_sets_a_shader_parameter_on_a_material() {
         text_of(&still)
     );
 
+    // A path may only step through a Resource, and nothing in it may name a script, a private
+    // member or an empty segment. Every refused write leaves the game as it was.
+    for (path, properties) in [
+        (".", json!({"mark:x": 5})),
+        (".", json!({"name:x": "Other"})),
+        ("Swatch", json!({"owner:name": "Other"})),
+        (".", json!({":mark": 5})),
+        (".", json!({"mark:": 5})),
+        (".", json!({"pack::_tone": 5})),
+        (".", json!({"_secret:x": 5})),
+        (".", json!({"pack:_tone": 5})),
+        (".", json!({"behavior:source_code": "extends Node\n"})),
+    ] {
+        let denied = call(
+            &tools,
+            "godot_game_set",
+            json!({"run_id": run_id, "path": path, "properties": properties}),
+        )
+        .await;
+        assert!(denied.is_error, "{properties}: {}", text_of(&denied));
+        let message = text_of(&denied).to_lowercase();
+        assert!(
+            message.contains("refus") || message.contains("not a resource"),
+            "{properties}: {message}"
+        );
+    }
+    let unchanged = call(
+        &tools,
+        "godot_game_get",
+        json!({"run_id": run_id, "path": ".", "properties": ["mark", "_secret", "pack:_tone", "behavior:resource_path"]}),
+    )
+    .await;
+    assert!(!unchanged.is_error, "{}", text_of(&unchanged));
+    let kept = &json_of(&unchanged)["properties"];
+    assert_eq!(kept["mark"], 2, "{kept}");
+    assert_eq!(kept["_secret"], 9, "{kept}");
+    assert_eq!(kept["pack:_tone"], 4, "{kept}");
+    assert_eq!(
+        kept["behavior:resource_path"], "res://scripts/pack.gd",
+        "reading through a script resource still works: {kept}"
+    );
+
     let shots = tempfile::tempdir().expect("record dir");
     let recorded = call(
         &tools,
@@ -3238,9 +3280,11 @@ fn material_project() -> tempfile::TempDir {
 var _secret := 9
 var mark := 1
 var pack: Resource
+var behavior: Script
 
 func _ready() -> void:
     pack = load("res://scripts/pack.gd").new()
+    behavior = load("res://scripts/pack.gd")
     var paper := MeshInstance3D.new()
     paper.name = "WaterPaper"
     var shader3 := Shader.new()

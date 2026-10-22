@@ -797,6 +797,20 @@ async fn user_args_reject_the_wrong_shape() {
     .await;
     assert!(control.is_error, "{}", text(&control));
     assert!(text(&control).contains("control"), "{}", text(&control));
+
+    for reserved in ["--godot-mcp-hold", "--godot-mcp-fixed-fps=5"] {
+        let refused = call(
+            "godot_run_project",
+            json!({"mode": "process", "user_args": [reserved]}),
+        )
+        .await;
+        assert!(refused.is_error, "{reserved}: {}", text(&refused));
+        assert!(
+            text(&refused).contains("--godot-mcp-"),
+            "{}",
+            text(&refused)
+        );
+    }
 }
 
 #[tokio::test]

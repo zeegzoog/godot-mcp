@@ -629,3 +629,113 @@ fn skill_directory_is_tracked() {
         "{skill} is ignored; .gitignore needs the exception !/.agents/skills/repo-steward"
     );
 }
+
+#[test]
+fn every_text_that_reaches_github_is_checked_for_credentials() {
+    let Some(bash) = bash() else {
+        eprintln!("skipped: no bash found (Git for Windows' bash on Windows)");
+        return;
+    };
+    let token = format!("ghs_{}", "a".repeat(36));
+    let ending = "_Written by an AI assistant on behalf of the maintainers._\n\
+                  <!-- repo-steward:v1 kind=answer state=answered round=0 -->";
+    let good_body = format!("The answer.\n\n{ending}");
+
+    // act.sh: the title of a pull request and the subject of a merge are public text too.
+    let leaking_title = format!("fix: use {token}");
+    let (ok, text) = run_script(
+        &bash,
+        "act.sh",
+        &[
+            "open-pr",
+            "master",
+            "topic",
+            &leaking_title,
+            &good_body,
+            "--dry-run",
+        ],
+        &[],
+    );
+    assert!(!ok, "act.sh must refuse a title with a token:\n{text}");
+    assert!(text.contains("credential"), "{text}");
+    let (ok, text) = run_script(
+        &bash,
+        "act.sh",
+        &["merge", "1", "squash", &leaking_title, "--dry-run"],
+        &[],
+    );
+    assert!(
+        !ok,
+        "act.sh must refuse a merge subject with a token:\n{text}"
+    );
+    let (ok, text) = run_script(
+        &bash,
+        "act.sh",
+        &[
+            "open-pr",
+            "master",
+            "topic",
+            "fix: a title",
+            &good_body,
+            "--dry-run",
+        ],
+        &[],
+    );
+    assert!(ok, "act.sh must accept a clean title:\n{text}");
+
+    // board.sh: a status update and a field value, queued or applied.
+    let (ok, repo) = run_script(&bash, "context.sh", &["get", "repo"], &[]);
+    assert!(ok, "context.sh get repo failed:\n{repo}");
+    let url = format!("https://github.com/{}/issues/1", repo.trim());
+    let dir = tempfile::tempdir().expect("queue directory");
+    let queue = dir.path().join("queue.txt");
+    let queue_env = queue.to_string_lossy().into_owned();
+    let envs = [("STEWARD_BOARD_QUEUE", queue_env.as_str())];
+
+    let leaking_update = format!("Board: done\nRelease: {token}");
+    let (ok, text) = run_script(
+        &bash,
+        "board.sh",
+        &["status-update", &leaking_update],
+        &envs,
+    );
+    assert!(
+        !ok,
+        "board.sh must refuse a status update with a token:\n{text}"
+    );
+    let blocked = format!("Blocked={token}");
+    let (ok, text) = run_script(&bash, "board.sh", &["item", &url, &blocked], &envs);
+    assert!(
+        !ok,
+        "board.sh must refuse a field value with a token:\n{text}"
+    );
+    assert!(
+        !queue.exists()
+            || std::fs::read_to_string(&queue)
+                .unwrap_or_default()
+                .is_empty(),
+        "a refused text was queued"
+    );
+
+    let (ok, text) = run_script(
+        &bash,
+        "board.sh",
+        &["status-update", "Board: 2 in review\nRelease: v0.7.0 due"],
+        &envs,
+    );
+    assert!(ok, "board.sh must queue a clean status update:\n{text}");
+
+    // The step that applies a queue checks every line again: a line written by hand is skipped.
+    let applied = dir.path().join("hand-written.txt");
+    std::fs::write(&applied, format!("status\tBoard: {token}\n")).expect("write queue");
+    let (_, text) = run_script(
+        &bash,
+        "board.sh",
+        &["apply", &applied.to_string_lossy()],
+        &[("STEWARD_OFFLINE", "1")],
+    );
+    assert!(
+        text.contains("skipped") && !text.contains("status update posted"),
+        "board.sh apply must skip a queued status update with a token:\n{text}"
+    );
+}

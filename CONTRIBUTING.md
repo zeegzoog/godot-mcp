@@ -93,7 +93,7 @@ cargo fmt --all -- --check
 cargo test --all-targets
 ```
 
-When you changed anything in `addons/godot_mcp/`, also check the GDScript and run the editor tests with the Godot build of the branch (`.github/godot-version`):
+When you changed anything in `addons/godot_mcp/`, also check the GDScript and run the editor tests with the Godot build of the branch (`.github/godot-version`). The `--ignored` end-to-end suites need `--test-threads=1`: windowed tests and process-heavy tests interfere when they run in parallel.
 
 ```bash
 godot --headless --path . --import   # first run only, or after script changes
@@ -111,14 +111,14 @@ godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_
 godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_result.gd
 godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_view.gd
 godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_record.gd
-GODOT_PATH=/path/to/godot cargo test --test editor_e2e_test -- --ignored
-GODOT_PATH=/path/to/godot cargo test --test addon_export_test -- --ignored
+GODOT_PATH=/path/to/godot cargo test --test editor_e2e_test -- --ignored --test-threads=1
+GODOT_PATH=/path/to/godot cargo test --test addon_export_test -- --ignored --test-threads=1
 ```
 
 When the running-game tools, the debugger client, or the GDScript language-server client changed, also run that with the same Godot build:
 
 ```bash
-GODOT_PATH=/path/to/godot cargo test --test runtime_e2e_test -- --ignored
+GODOT_PATH=/path/to/godot cargo test --test runtime_e2e_test -- --ignored --test-threads=1
 ```
 
 ## Commits and Pull Requests

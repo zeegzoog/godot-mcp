@@ -2301,3 +2301,144 @@ async fn a_setting_key_with_a_dot_segment_is_refused_and_the_settings_answer_mat
     assert_eq!(answer["truncated"], false, "{answer}");
     assert_eq!(answer["source"], "project.godot", "{answer}");
 }
+
+#[tokio::test]
+async fn run_script_refuses_a_path_outside_the_project_and_a_bad_timeout() {
+    let project = project_dir();
+    write_script(project.path(), "ok.gd", b"extends SceneTree\n");
+    let tools = manager_in(
+        project.path(),
+        PathBuf::from("godot-binary-that-does-not-exist"),
+    );
+    let outside_path = std::env::temp_dir().join("godot-mcp-outside-script.gd");
+    std::fs::write(&outside_path, b"extends SceneTree\n").expect("outside script");
+    let outside = call_with(
+        &tools,
+        json!({
+            "script": outside_path,
+            "project_path": project.path()
+        }),
+    )
+    .await;
+    assert!(outside.is_error, "{}", text(&outside));
+    assert!(
+        text(&outside).contains("outside the project"),
+        "{}",
+        text(&outside)
+    );
+    let too_long = call_with(
+        &tools,
+        json!({
+            "script": "ok.gd",
+            "project_path": project.path(),
+            "timeout_seconds": 601
+        }),
+    )
+    .await;
+    assert!(text(&too_long).contains("600"), "{}", text(&too_long));
+}
+
+#[tokio::test]
+async fn run_script_parses_script_errors_and_kills_a_hang() {
+    let project = project_dir();
+    write_script(
+        project.path(),
+        "boom.gd",
+        b"extends SceneTree\nfunc _initialize():\n\tassert(false)\n",
+    );
+    write_script(
+        project.path(),
+        "hang.gd",
+        b"extends SceneTree\nfunc _initialize():\n\tprint('HANGING')\n",
+    );
+    let godot = scripted_godot(project.path());
+    let tools = manager_in(project.path(), godot);
+
+    let failed = call_with(
+        &tools,
+        json!({
+            "script": "boom.gd",
+            "project_path": project.path(),
+            "user_args": ["--from-test"],
+            "timeout_seconds": 10
+        }),
+    )
+    .await;
+    assert!(failed.is_error, "{}", text(&failed));
+    let failed_text = text(&failed);
+    assert!(
+        failed_text.contains("res://scripts/boom.gd") && failed_text.contains("\"line\": 4"),
+        "{failed_text}"
+    );
+    assert!(failed_text.contains("exit_code"), "{failed_text}");
+    assert!(
+        failed_text.contains("--from-test"),
+        "user args were not passed after --: {failed_text}"
+    );
+
+    let started = std::time::Instant::now();
+    let hung = call_with(
+        &tools,
+        json!({
+            "script": "hang.gd",
+            "project_path": project.path(),
+            "timeout_seconds": 1
+        }),
+    )
+    .await;
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "the hang was not killed"
+    );
+    assert!(hung.is_error, "{}", text(&hung));
+    let hung_text = text(&hung);
+    assert!(
+        hung_text.contains("killed the process tree") && hung_text.contains("HANGING"),
+        "{hung_text}"
+    );
+    assert!(hung_text.contains("\"timed_out\": true"), "{hung_text}");
+}
+
+async fn call_with(tools: &Arc<ToolManager>, args: Value) -> ToolResult {
+    Arc::clone(tools).call_tool("godot_run_script", args).await
+}
+
+/// A Godot stand-in: prints a SCRIPT ERROR for boom.gd, and sleeps (with a child) for hang.gd.
+fn scripted_godot(dir: &Path) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("scripted_godot.sh");
+        std::fs::write(
+            &path,
+            r#"#!/bin/sh
+echo "ARGS $*"
+case "$*" in
+  *hang.gd*)
+    echo HANGING
+    sleep 30 &
+    wait
+    ;;
+  *)
+    echo 'SCRIPT ERROR: Assertion failed.'
+    echo '   at: _initialize (res://scripts/boom.gd:4)'
+    exit 3
+    ;;
+esac
+"#,
+        )
+        .expect("write scripted godot");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        path
+    }
+    #[cfg(windows)]
+    {
+        let path = dir.join("scripted_godot.bat");
+        std::fs::write(
+            &path,
+            "@echo off\r\necho ARGS %*\r\necho %* | findstr hang.gd >nul\r\nif %errorlevel%==0 (\r\n  echo HANGING\r\n  ping -n 30 127.0.0.1 >nul\r\n  exit /b 0\r\n)\r\necho SCRIPT ERROR: Assertion failed.\r\necho    at: _initialize (res://scripts/boom.gd:4)\r\nexit /b 3\r\n",
+        )
+        .expect("write scripted godot");
+        path
+    }
+}

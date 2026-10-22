@@ -162,6 +162,7 @@ static func _compose(state: Dictionary) -> Dictionary:
         return applied
     var diff := _diff_against(last, _previous as Image)
     _previous = last.duplicate()
+    var space := _input_space(state)
     var body := {
         "mime_type": "image/png",
         "data": Marshalls.raw_to_base64(bytes),
@@ -172,12 +173,46 @@ static func _compose(state: Dictionary) -> Dictionary:
         "columns": cols,
         "frame_width": frame_w,
         "frame_height": frame_h,
+        "input_width": space["input_width"],
+        "input_height": space["input_height"],
+        "captured_width": space["captured_width"],
+        "captured_height": space["captured_height"],
         "diff": diff,
     }
     var report: Dictionary = applied.get("report", {})
     if not report.is_empty():
         body["baseline"] = report
     return R.ok(body)
+
+
+## The coordinate space godot_game_input uses, and the viewport this image was taken from.
+## Input positions are the root viewport's visible rectangle (after content scale). The image
+## is a downscale of the captured viewport, so image pixels map back by input_size / frame_size
+## when that viewport is the root.
+static func _input_space(state: Dictionary) -> Dictionary:
+    var input_w := 0
+    var input_h := 0
+    var captured_w := 0
+    var captured_h := 0
+    var tree := Engine.get_main_loop() as SceneTree
+    if tree != null and tree.root != null:
+        var input_size := tree.root.get_visible_rect().size
+        input_w = int(round(input_size.x))
+        input_h = int(round(input_size.y))
+    var viewport: Viewport = state.get("viewport")
+    if viewport != null and is_instance_valid(viewport):
+        var captured_size := viewport.get_visible_rect().size
+        captured_w = int(round(captured_size.x))
+        captured_h = int(round(captured_size.y))
+    if input_w <= 0 or input_h <= 0:
+        input_w = captured_w
+        input_h = captured_h
+    return {
+        "input_width": input_w,
+        "input_height": input_h,
+        "captured_width": captured_w,
+        "captured_height": captured_h,
+    }
 
 
 static func _diff_against(image: Image, previous: Image) -> Dictionary:

@@ -100,11 +100,11 @@ Before submitting or committing changes, agents must execute and pass the comple
    godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_record.gd
    ```
 
-5. **Editor End-to-End Tests** (whenever `addons/godot_mcp/` changed; needs the Godot build named in `.github/godot-version`, ignored by default):
+5. **Editor End-to-End Tests** (whenever `addons/godot_mcp/` changed; needs the Godot build named in `.github/godot-version`, ignored by default). Run the ignored end-to-end suites with `--test-threads=1`: windowed tests and process-heavy tests interfere when they run in parallel.
 
    ```bash
-   GODOT_PATH=/path/to/godot cargo test --test editor_e2e_test -- --ignored
-   GODOT_PATH=/path/to/godot cargo test --test addon_export_test -- --ignored
+   GODOT_PATH=/path/to/godot cargo test --test editor_e2e_test -- --ignored --test-threads=1
+   GODOT_PATH=/path/to/godot cargo test --test addon_export_test -- --ignored --test-threads=1
    ```
 
    Set `GODOT_CONSOLE_PATH` as well on Windows to get editor logs in failure output (the editor is started from the console binary when it is set, and `.env` values fill in variables you did not export, so set both when testing a specific Godot version). A `.env` file with double-quoted Windows paths does not load (see `.env.example`) — export the variables instead.
@@ -112,7 +112,7 @@ Before submitting or committing changes, agents must execute and pass the comple
 6. **Running game** (whenever the running-game tools, the debugger client, or the GDScript language-server client changed; same Godot build, ignored by default):
 
    ```bash
-   GODOT_PATH=/path/to/godot cargo test --test runtime_e2e_test -- --ignored
+   GODOT_PATH=/path/to/godot cargo test --test runtime_e2e_test -- --ignored --test-threads=1
    ```
 
 ## Tool Invocation Protocols for AI Agents

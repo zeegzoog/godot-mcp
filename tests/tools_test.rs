@@ -259,6 +259,74 @@ async fn launch_editor_requires_a_godot_project_directory() {
 }
 
 #[tokio::test]
+async fn validate_script_says_warnings_were_not_checked_when_no_language_server_listens() {
+    let project = project_dir();
+    write_script(
+        project.path(),
+        "seed.gd",
+        b"extends Node\nfunc _ready() -> void:\n    var seed := 1\n",
+    );
+    let engine = tempfile::tempdir().expect("engine dir");
+    let cwd = tempfile::tempdir().expect("working dir");
+    let tools = Arc::new(
+        ToolManager::new(
+            BridgeClient::new(free_port()),
+            CliRunner::new(quiet_godot(engine.path())),
+        )
+        .with_working_dir(cwd.path().to_path_buf())
+        .with_lsp_port(free_port()),
+    );
+    let result = tools
+        .call_tool(
+            "godot_validate_script",
+            json!({"script_path": "res://seed.gd", "project_path": project.path()}),
+        )
+        .await;
+    assert!(!result.is_error, "{}", text(&result));
+    let shown = text(&result);
+    assert!(
+        shown.contains("No parse errors (headless check)"),
+        "{shown}"
+    );
+    assert!(shown.contains("warnings were not checked"), "{shown}");
+    assert!(shown.contains("godot_code_diagnostics"), "{shown}");
+    assert!(!shown.contains("SHADOWED_GLOBAL_IDENTIFIER"), "{shown}");
+
+    let tools = ToolManager::list_tools();
+    let validate = tools
+        .iter()
+        .find(|tool| tool.name == "godot_validate_script")
+        .expect("validate tool");
+    assert!(validate.description.contains("godot_code_diagnostics"));
+    assert!(validate.description.contains("warning"));
+    let diagnostics = tools
+        .iter()
+        .find(|tool| tool.name == "godot_code_diagnostics")
+        .expect("diagnostics tool");
+    assert!(diagnostics.description.contains("godot_validate_script"));
+    assert!(diagnostics.description.contains("warning"));
+}
+
+/// A Godot stand-in that exits cleanly and prints nothing, so a headless check looks successful.
+fn quiet_godot(dir: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let path = dir.join("quiet_godot.bat");
+        std::fs::write(&path, "@echo off\r\nexit /b 0\r\n").expect("quiet godot");
+        path
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("quiet_godot.sh");
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").expect("quiet godot");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod quiet godot");
+        path
+    }
+}
+
+#[tokio::test]
 async fn validate_script_reports_a_missing_file_without_spawning_godot() {
     let project = project_dir();
     let result = call(
@@ -2030,11 +2098,22 @@ async fn each_failure_class_gets_its_own_hint_and_never_the_generic_one() {
 async fn a_godot_executable_that_cannot_run_names_godot_path_not_syntax() {
     let project = project_dir();
     write_script(project.path(), "ok.gd", b"extends Node\n");
-    let result = call(
-        "godot_validate_script",
-        json!({"script_path": "res://ok.gd", "project_path": project.path()}),
-    )
-    .await;
+    let cwd = tempfile::tempdir().expect("working dir");
+    // A language server already listening must not answer this: the check is the missing binary.
+    let tools = Arc::new(
+        ToolManager::new(
+            BridgeClient::new(free_port()),
+            CliRunner::new(PathBuf::from("godot-binary-that-does-not-exist")),
+        )
+        .with_working_dir(cwd.path().to_path_buf())
+        .with_lsp_port(free_port()),
+    );
+    let result = tools
+        .call_tool(
+            "godot_validate_script",
+            json!({"script_path": "res://ok.gd", "project_path": project.path()}),
+        )
+        .await;
     assert!(result.is_error);
     let shown = text(&result);
     assert!(shown.contains("GODOT_PATH"), "{shown}");

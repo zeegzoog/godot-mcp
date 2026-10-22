@@ -168,6 +168,9 @@ impl CliRunner {
         spawn_detached(&mut cmd, "Godot project")
     }
 
+    /// What a clean `godot --headless --check-only` means: parse errors only.
+    pub const HEADLESS_PARSE_CLEAN: &str = "No parse errors (headless check). Analyzer warnings were not checked: no language server is running; use godot_code_diagnostics, which starts one.";
+
     /// Validate a GDScript file syntax using headless Godot check
     pub async fn validate_script(
         &self,
@@ -202,7 +205,7 @@ impl CliRunner {
         let stderr = strip_banner(&String::from_utf8_lossy(&output.stderr));
 
         if output.status.success() && stderr.is_empty() {
-            Ok("GDScript validation passed successfully with no errors.".into())
+            Ok(Self::HEADLESS_PARSE_CLEAN.into())
         } else {
             let mut report = Vec::new();
             if !stdout.is_empty() {

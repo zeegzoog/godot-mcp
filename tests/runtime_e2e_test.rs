@@ -1569,6 +1569,44 @@ async fn language_server_reports_a_real_script_error() {
 
 #[tokio::test]
 #[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn validate_script_lists_a_shadowed_global_when_the_language_server_is_up() {
+    let project = project();
+    let source = "extends Node\n\nfunc _ready() -> void:\n    var seed := 1\n";
+    let script = project.path().join("scripts/seed.gd");
+    std::fs::write(&script, source).unwrap();
+    let line = source
+        .lines()
+        .position(|entry| entry.contains("var seed"))
+        .expect("seed line")
+        + 1;
+    let tools = manager(project.path());
+    // Starts the language server (or attaches to one already listening) and keeps it on this
+    // manager, which is what makes the server reachable for the check below.
+    let primed = call(
+        &tools,
+        "godot_code_diagnostics",
+        json!({"project_path": project.path(), "script_path": "res://scripts/seed.gd"}),
+    )
+    .await;
+    assert!(!primed.is_error, "{}", text_of(&primed));
+    let result = call(
+        &tools,
+        "godot_validate_script",
+        json!({"project_path": project.path(), "script_path": "res://scripts/seed.gd"}),
+    )
+    .await;
+    assert!(!result.is_error, "{}", text_of(&result));
+    let shown = text_of(&result);
+    assert!(shown.contains("SHADOWED_GLOBAL_IDENTIFIER"), "{shown}");
+    assert!(
+        shown.contains(&format!("res://scripts/seed.gd:{line}:")),
+        "{shown}"
+    );
+    assert!(shown.contains("warning"), "{shown}");
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
 async fn language_server_answers_the_same_script_again() {
     let project = project();
     let tools = manager(project.path());

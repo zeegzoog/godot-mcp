@@ -155,7 +155,7 @@ To report a vulnerability, follow [SECURITY.md](SECURITY.md). Never open a publi
 | `godot_create_script` | — | Writes a `.gd` file from an `extends` / `class_name` / `_ready()` template into the project (`res://` path; the project is `project_path`, the editor's, or the one the server runs in). Refuses to overwrite unless `overwrite: true`. |
 | `godot_read_script` | — | Reads an existing `.gd` script as the editor would save it: the editor's unsaved text when the script is open with unsaved changes (`dirty: true`), otherwise the file. Returns the text and a `version` label for it. Without the editor it reads the file. Scripts over 1 MiB are not handled. |
 | `godot_edit_script` | — | Replaces one fragment of an existing `.gd` script: `old_text` must occur exactly once, and `new_text` takes its place. With the editor the change is one undoable action and the script is saved; it is refused while the script has unsaved changes in the editor (save or discard them, then read again). Pass the `version` from `godot_read_script` to refuse the edit if the script changed since. Without the editor the file is replaced as a whole and keeps its line endings. Never creates a file. |
-| `godot_validate_script` | — | Syntax-checks a `.gd` file with `godot --headless --check-only`. |
+| `godot_validate_script` | — | Checks a `.gd` file. When a language server is already running, lists its errors and warnings (`file:line:col`, code, message); a warning does not fail the check. Without one, `godot --headless --check-only` sees parse errors only and the answer says analyzer warnings were not checked. |
 | `godot_resave_resources` | Editor | Refreshes the given `res://` files after external edits: assets are re-imported (synchronous), other files re-scanned. Without paths, rescans the whole project (background). |
 | `godot_run_output` | Running game | Logs, warnings and errors, with stack traces, from a managed process run or the editor's running game (`since`, `level`). |
 | `godot_game_tree` | Running game | Live nodes of the running game: path, class, position, visible text. Filter by `name`, `class`, `group` or `text`. |
@@ -174,7 +174,7 @@ To report a vulnerability, follow [SECURITY.md](SECURITY.md). Never open a publi
 | `godot_debug_breakpoints` | Process run | Lists, adds, removes or clears breakpoints (`res://script.gd:LINE`). Editor Play uses the editor's own debugger. |
 | `godot_debug_control` | Process run | Pauses, resumes or steps (into, over, out) and waits for the next stop. |
 | `godot_debug_state` | Process run | Stack frames and variables of a stopped run. |
-| `godot_code_diagnostics` | Godot binary | GDScript diagnostics from Godot's language server, which runs in a private headless editor started on first use. Never reports a clean file when the server does not answer. |
+| `godot_code_diagnostics` | Godot binary | Errors and warnings from Godot's language server, including analyzer warnings that `godot_validate_script` only sees when this server is already running. Uses an editor already listening, or starts a private headless one. Never reports a clean file when the server does not answer. |
 | `godot_code_complete` | Godot binary | Code completion at a line and column. |
 | `godot_code_symbols` | Godot binary | Symbols of a GDScript file. |
 | `godot_code_definition` | Godot binary | Go to definition at a position. |

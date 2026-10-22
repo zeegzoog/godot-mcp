@@ -58,6 +58,9 @@ impl Drop for Live {
 
 pub struct LspHub {
     godot: PathBuf,
+    /// Port an editor's language server may already be using. A private editor, when one is
+    /// started, gets its own port.
+    port: u16,
     live: Mutex<Option<Live>>,
     /// Held while an editor is being started, so that calls arriving meanwhile wait for it
     /// instead of starting another one that would replace it.
@@ -68,8 +71,15 @@ type StartResult = Result<(Arc<ClientInner>, Option<Child>)>;
 
 impl LspHub {
     pub fn new(godot: PathBuf) -> Self {
+        Self::with_port(godot, port_from_env())
+    }
+
+    /// Same as [`Self::new`], but the port an already-running editor is probed on is `port`
+    /// instead of `GODOT_MCP_LSP_PORT`.
+    pub fn with_port(godot: PathBuf, port: u16) -> Self {
         Self {
             godot,
+            port,
             live: Mutex::new(None),
             starting: tokio::sync::Mutex::new(()),
         }
@@ -82,38 +92,43 @@ impl LspHub {
         file: &Path,
     ) -> Result<Value> {
         let client = self.client_for(project, external_ok).await?;
-        let text = tokio::fs::read_to_string(file).await?;
-        let uri = path_to_uri(file);
-        let key = uri_key(&uri);
-        lock(&client.diagnostics).remove(&key);
-        client
-            .notify(
-                "textDocument/didOpen",
-                json!({
-                    "textDocument": {"uri": uri, "languageId": "gdscript", "version": 1, "text": text}
-                }),
-            )
-            .await?;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
-        let diagnostics = loop {
-            if let Some(items) = lock(&client.diagnostics).get(&key).cloned() {
-                break items;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(McpError::Process(format!(
-                    "the GDScript language server did not publish diagnostics for the project {}",
-                    project.display()
-                )));
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+        publish_diagnostics(&client, project, file).await
+    }
+
+    /// Diagnostics when a language server is already running for `project`: one this hub
+    /// started, or an editor listening on the configured port. Does not start an editor.
+    /// `Ok(None)` means nothing was listening.
+    pub async fn diagnostics_if_reachable(
+        &self,
+        project: &Path,
+        external_ok: bool,
+        file: &Path,
+    ) -> Result<Option<Value>> {
+        let project = std::fs::canonicalize(project).unwrap_or_else(|_| project.to_path_buf());
+        if let Some(client) = self.live_client(&project, external_ok) {
+            return publish_diagnostics(&client, &project, file).await.map(Some);
+        }
+        if !external_ok {
+            return Ok(None);
+        }
+        let client = match connect_client(self.port, &project).await {
+            Ok(client) => client,
+            Err(_) => return Ok(None),
         };
-        let _ = client
-            .notify(
-                "textDocument/didClose",
-                json!({"textDocument": {"uri": uri}}),
-            )
-            .await;
-        Ok(json!({"uri": uri, "diagnostics": shift_diagnostics(&diagnostics)}))
+        let value = publish_diagnostics(&client, &project, file).await?;
+        // A private editor is never replaced: dropping its entry kills it, even while another
+        // project still uses it.
+        let mut live = lock(&self.live);
+        if live.as_ref().is_none_or(|current| {
+            current.child.is_none() && !(current.root == project && current.client.is_open())
+        }) {
+            *live = Some(Live {
+                client,
+                child: None,
+                root: project,
+            });
+        }
+        Ok(Some(value))
     }
 
     pub async fn symbols(&self, project: &Path, external_ok: bool, file: &Path) -> Result<Value> {
@@ -232,8 +247,9 @@ impl LspHub {
 
     async fn client_for(&self, project: &Path, external_ok: bool) -> Result<Arc<ClientInner>> {
         let godot = self.godot.clone();
+        let port = self.port;
         self.client_with(project, external_ok, |root, external_ok| async move {
-            connect_or_start(&godot, &root, external_ok).await
+            connect_or_start(&godot, &root, external_ok, port).await
         })
         .await
     }
@@ -320,15 +336,54 @@ impl ClientInner {
     }
 }
 
+fn port_from_env() -> u16 {
+    std::env::var("GODOT_MCP_LSP_PORT")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(DEFAULT_PORT)
+}
+
+async fn publish_diagnostics(client: &ClientInner, project: &Path, file: &Path) -> Result<Value> {
+    let text = tokio::fs::read_to_string(file).await?;
+    let uri = path_to_uri(file);
+    let key = uri_key(&uri);
+    lock(&client.diagnostics).remove(&key);
+    client
+        .notify(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {"uri": uri, "languageId": "gdscript", "version": 1, "text": text}
+            }),
+        )
+        .await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let diagnostics = loop {
+        if let Some(items) = lock(&client.diagnostics).get(&key).cloned() {
+            break items;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(McpError::Process(format!(
+                "the GDScript language server did not publish diagnostics for the project {}",
+                project.display()
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let _ = client
+        .notify(
+            "textDocument/didClose",
+            json!({"textDocument": {"uri": uri}}),
+        )
+        .await;
+    Ok(json!({"uri": uri, "diagnostics": shift_diagnostics(&diagnostics)}))
+}
+
 async fn connect_or_start(
     godot: &Path,
     project: &Path,
     external_ok: bool,
+    port: u16,
 ) -> Result<(Arc<ClientInner>, Option<Child>)> {
-    let port = std::env::var("GODOT_MCP_LSP_PORT")
-        .ok()
-        .and_then(|value| value.trim().parse().ok())
-        .unwrap_or(DEFAULT_PORT);
     if external_ok {
         if let Ok(client) = connect_client(port, project).await {
             return Ok((client, None));

@@ -15,9 +15,20 @@ const DENY_METHODS: &[&str] = &[
     "call",
     "callv",
     "call_deferred",
+    "call_group",
+    "call_group_flags",
+    "propagate_call",
     "rpc",
     "rpc_id",
+    "set",
+    "set_deferred",
+    "set_indexed",
+    "emit_signal",
+    "notification",
+    "propagate_notification",
     "free",
+    "queue_free",
+    "replace_by",
 ];
 
 pub fn handles(name: &str) -> bool {
@@ -70,7 +81,7 @@ pub fn catalog() -> Vec<Tool> {
         ),
         tool(
             "godot_game_call",
-            "Calls one method on a live node. The method must be listed in permit and is rejected if it can quit, eval, or trampoline (call/rpc/free).",
+            "Calls one method on a live node. The method must be listed in permit and is refused if it can quit, evaluate code, call another method by name (call, callv, call_group, propagate_call, rpc, emit_signal, notification), set a property by name (set, set_deferred, set_indexed), or free or replace a node (free, queue_free, replace_by). A JSON string is passed as a StringName or NodePath where the method asks for one.",
             json!({"run_id": s(""), "path": s(""), "method": s(""), "args": {"type": "array"}, "permit": {"type": "array", "items": {"type": "string"}, "description": "Methods this call is allowed to invoke. Must include method."}}),
             &["method", "permit"],
         ),
@@ -95,7 +106,7 @@ pub fn catalog() -> Vec<Tool> {
         tool(
             "godot_game_input",
             "Injects input into the running game. Steps: key, text, mouse_move, mouse_button, touch, joy_button, joy_axis, wait, click, click_node, swipe, time_scale. phase is tap (default), press, or release. click is a mouse tap at x, y. click_node taps the center of a Control, Node2D, or Node3D. swipe presses at x, y and releases at to_x, to_y across frames (default 8, pointer mouse or touch). Mouse steps are Godot input events and do not move the OS cursor unless warp_mouse is true. time_scale sets Engine.time_scale (0 through 8) until another call changes it. A failed step releases every button and touch this server is still holding. In a held game the steps are applied at once: key, mouse_button, touch and joy_button taps stay down for hold_ticks ticks (default 2) and are released at the start of the tick they fall due on, so how the ticks are split into steps does not change what the game sees; wait, text and swipe steps are refused while held. Leaving the hold releases everything still held.",
-            json!({"run_id": s(""), "steps": {"type": "array", "items": {"type": "object"}}, "warp_mouse": {"type": "boolean", "description": "Move the real OS cursor to each mouse event. Default false."}, "hold_ticks": i("Held game only: how many ticks a tap stays down before it is released. 1 to 600, default 2.")}),
+            json!({"run_id": s(""), "steps": {"type": "array", "items": step_schema()}, "warp_mouse": {"type": "boolean", "description": "Move the real OS cursor to each mouse event. Default false."}, "hold_ticks": ir("Held game only: how many ticks a tap stays down before it is released. 1 to 600, default 2.", 1, Some(600))}),
             &["steps"],
         ),
         tool(
@@ -113,13 +124,13 @@ pub fn catalog() -> Vec<Tool> {
         tool(
             "godot_game_physics",
             "Controls game time. action hold stops the game at the start of a physics tick: no tick, frame, timer or signal advances, even in nodes that ignore pause, while reads (tree, get, set, call with permit, signals, snapshot, output, one-frame screenshot) are still answered. While held, step ticks runs exactly that many physics ticks (1 to 600) and holds again; step with until (node, property, op, value, checked before every tick, as in godot_game_wait) and max (1 to 3600) runs until the condition holds and says until_met; resume lets the game run. Held steps are exact only when the game was started with godot_run_project held true: the answer carries deterministic and, when false, deterministic_reason (not_started_held, fixed_rate_differs or frames_did_not_follow_ticks). A hold entered later, or in the editor, still stands still but is not exact. A held game refuses what needs time to pass (godot_game_wait, godot_game_observe, a screenshot sheet or camera, input wait, text and swipe steps) and says to step instead. Without a hold, step advances 1 to 120 real engine physics iterations, then leaves the tree paused (resume clears that pause); it sets max_physics_steps_per_frame to 1 while it runs, does not call node _physics_process, does not step idle _process or nodes that ignore pause, and does not make the game deterministic. status reports held, deterministic and the timing settings",
-            json!({"run_id": s(""), "action": s("step (default), hold, resume, or status. hold stops the game at the start of a physics tick until it is stepped or resumed."), "ticks": i("Physics iterations for step: 1 to 120, or 1 to 600 while the game is held."), "until": {"type": "object", "description": "Held game only. Step until a public node property satisfies a condition: node, property, op (eq, ne, lt, lte, gt, gte, exists) and value, as in godot_game_wait. Checked before every tick. Use max instead of ticks."}, "max": i("With until: the most ticks to run. 1 to 3600, default 600.")}),
+            json!({"run_id": s(""), "action": s("step (default), hold, resume, or status. hold stops the game at the start of a physics tick until it is stepped or resumed."), "ticks": ir("Physics iterations for step: 1 to 120, or 1 to 600 while the game is held.", 1, None), "until": until_schema(), "max": ir("With until: the most ticks to run. 1 to 3600, default 600.", 1, Some(3600))}),
             &[],
         ),
         tool(
             "godot_game_screenshot",
             "Captures the running game window, a viewport, or a Camera2D/Camera3D as one PNG. frames (1 to 8) stitches shots taken every process frames into a single sheet. The text says how many pixels changed since the previous capture of this run, and where (a sheet compares its last frame, and only against a capture of the same size). save_baseline stores the returned image under a name (at most 8, each at most 512×512 pixels). baseline compares the returned image with a saved one. roi is x, y, w, h in pixels of that returned image (roi_space returned_image), including a sheet. tolerance (0 to 255) is the allowed per-channel difference; a larger difference counts as changed. The text reports changed, sampled, ratio, bounds, tolerance, the baseline name, and whether the pixel count is exact or sampled. Fails instead of returning an empty image. Headless games have nothing to capture. While the game is held a single capture shows the last frame it drew (a sheet with frames above 1, or a camera switch, is refused: take one capture, step, take the next). A missing baseline, a bad name, or an roi outside the image is an error and does not replace a saved image.",
-            json!({"run_id": s(""), "node": s("Viewport or node whose viewport to capture."), "camera": s("Camera2D or Camera3D to make current for the shot."), "max_dimension": i("Longest side of the returned image in pixels. Default 768."), "frames": i("How many frames to stitch. Default 1, max 8."), "every": i("Process frames between shots. Default 1, max 60."), "baseline": s("Name of a saved image to compare."), "save_baseline": s("Store the returned image under this name. Letters, digits, underscore, hyphen. At most 8 names."), "roi": {"type": "object", "description": "Region of the returned image: integer x, y, w, h. w and h are at least 1."}, "tolerance": i("Per-channel difference that still counts as unchanged. 0 to 255. Default 0.")}),
+            json!({"run_id": s(""), "node": s("Viewport or node whose viewport to capture."), "camera": s("Camera2D or Camera3D to make current for the shot."), "max_dimension": i("Longest side of the returned image in pixels. Default 768."), "frames": ir("How many frames to stitch. Default 1, max 8.", 1, Some(8)), "every": ir("Process frames between shots. Default 1, max 60.", 1, Some(60)), "baseline": s("Name of a saved image to compare."), "save_baseline": s("Store the returned image under this name. Letters, digits, underscore, hyphen. At most 8 names."), "roi": roi_schema(), "tolerance": ir("Per-channel difference that still counts as unchanged. 0 to 255. Default 0.", 0, Some(255))}),
             &[],
         ),
         tool(
@@ -161,6 +172,69 @@ fn i(description: &str) -> Value {
 
 fn b() -> Value {
     json!({"type": "boolean"})
+}
+
+/// The fields of one `godot_game_input` step, so a caller does not have to guess them. The
+/// runtime checks each step; this describes it.
+fn step_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "One input step. type is required; the other fields depend on it (key: key, phase; text: text; mouse_move, mouse_button, touch: x, y, button, index, phase; click: x, y, button; click_node: node, pointer, button; swipe: x, y, to_x, to_y, frames, pointer, button; joy_button: button, device, phase; joy_axis: axis, value, device; wait: frames, node, signal, timeout; time_scale: scale).",
+        "properties": {
+            "type": {"type": "string", "enum": ["key", "text", "mouse_move", "mouse_button", "touch", "click", "click_node", "swipe", "joy_button", "joy_axis", "wait", "time_scale"]},
+            "phase": {"type": "string", "enum": ["tap", "press", "release"], "description": "Default tap."},
+            "key": {"type": "string", "description": "An engine key name such as Right, Space or A."},
+            "text": {"type": "string"},
+            "x": {"type": "number"}, "y": {"type": "number"},
+            "to_x": {"type": "number"}, "to_y": {"type": "number"},
+            "button": {"type": "string", "description": "A mouse button (left, right, middle, ...) or a joypad button name."},
+            "index": {"type": "integer"},
+            "pointer": {"type": "string", "enum": ["mouse", "touch"]},
+            "node": {"type": "string", "description": "A node path in the running game."},
+            "signal": {"type": "string"},
+            "frames": {"type": "integer", "description": "wait: frames to wait (0 to 600); swipe: frames the swipe takes (1 to 60, default 8)."},
+            "timeout": {"type": "integer", "description": "wait for a node or signal: frames before giving up (1 to 600)."},
+            "axis": {"type": "string"}, "value": {"type": "number", "description": "joy_axis: -1 to 1."},
+            "device": {"type": "integer"},
+            "scale": {"type": "number", "description": "time_scale: 0 to 8."}
+        },
+        "required": ["type"]
+    })
+}
+
+/// The condition of a held step, as in `godot_game_wait`.
+fn until_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Held game only. Step until a public node property satisfies a condition, checked before every tick. Use max instead of ticks.",
+        "properties": {
+            "node": {"type": "string", "description": "Node path; '.' is the current scene."},
+            "property": {"type": "string", "description": "A public property, or a path such as stats/hp."},
+            "op": {"type": "string", "enum": ["eq", "ne", "lt", "lte", "gt", "gte", "exists"]},
+            "value": {"description": "The value to compare with."}
+        }
+    })
+}
+
+/// A region of the returned screenshot, in its pixels.
+fn roi_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Region of the returned image: integer x, y, w, h. w and h are at least 1.",
+        "properties": {
+            "x": {"type": "integer"}, "y": {"type": "integer"},
+            "w": {"type": "integer", "minimum": 1}, "h": {"type": "integer", "minimum": 1}
+        }
+    })
+}
+
+/// An integer parameter with the range the tool documents.
+fn ir(description: &str, minimum: i64, maximum: Option<i64>) -> Value {
+    let mut schema = json!({"type": "integer", "description": description, "minimum": minimum});
+    if let Some(maximum) = maximum {
+        schema["maximum"] = json!(maximum);
+    }
+    schema
 }
 
 fn n(description: &str) -> Value {
@@ -255,13 +329,32 @@ async fn output(tools: &ToolManager, args: &Value) -> ToolResult {
                             json!({
                                 "script_sha256": null,
                                 "script_sha256_basis": "unavailable",
-                                "script_sha256_note": "This line was kept by the debugger buffer without a scene stamp from the moment it was written. It is not the script currently on disk.",
                             }),
                         );
                     }
                 }
+                if !lines.is_empty() {
+                    value["script_sha256_note"] = json!(
+                        "These lines were kept by the debugger buffer without a scene stamp from the moment they were written. script_sha256 is not the script currently on disk."
+                    );
+                }
             }
             ToolResult::text(serde_json::to_string_pretty(&value).unwrap_or_default())
+        }
+        // Asking what a run printed when none runs and no editor is connected is not a failure
+        // of the question (TL-11).
+        Err(_) if matches!(runtime_failure, McpError::BridgeUnavailable(_)) => {
+            if str_arg(args, "run_id").is_none() {
+                return ToolResult::text(
+                    json!({
+                        "running": false,
+                        "lines": [],
+                        "message": "Nothing is running, so there is no output. Start a game with godot_run_project.",
+                    })
+                    .to_string(),
+                );
+            }
+            runtime_error(&runtime_failure)
         }
         Err(_) => runtime_error(&runtime_failure),
     }
@@ -439,7 +532,36 @@ fn json_number(value: Option<&Value>) -> String {
         .unwrap_or_else(|| "0".into())
 }
 
+/// A breakpoint location is `res://path/to/script.gd:LINE`: a project file, no parent segments,
+/// a line from 1 (TL-5).
+pub(super) fn check_breakpoint(spec: &str) -> Result<(), ToolResult> {
+    let refused = |problem: String| {
+        Err(ToolResult::error(
+            problem,
+            &["Use a location such as res://scripts/player.gd:12"],
+        ))
+    };
+    let Some((file, _line)) = crate::godot::split_breakpoint(spec) else {
+        return refused(format!(
+            "'{spec}' is not a breakpoint: expected res://script.gd:LINE with a line of at least 1"
+        ));
+    };
+    if !file.starts_with("res://") || file.split(['/', '\\']).any(|part| part == "..") {
+        return refused(format!(
+            "'{spec}' is not inside the project: a breakpoint file is a res:// path without parent segments"
+        ));
+    }
+    Ok(())
+}
+
 async fn breakpoints(tools: &ToolManager, args: &Value) -> ToolResult {
+    if matches!(str_arg(args, "action"), Some("add" | "remove")) {
+        if let Some(spec) = str_arg(args, "breakpoint") {
+            if let Err(result) = check_breakpoint(spec) {
+                return result;
+            }
+        }
+    }
     let run = match tools.games.debug(str_arg(args, "run_id")) {
         Ok(run) => run,
         Err(error) => return runtime_error(&error),
@@ -815,6 +937,63 @@ fn base64_decode(text: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The names `rt_live.gd` refuses, read from its source.
+    fn runtime_deny_list() -> Vec<String> {
+        let source = include_str!("../../addons/godot_mcp/runtime/ops/rt_live.gd");
+        let start = source
+            .find("const DENY: Array[String] = [")
+            .expect("DENY list");
+        let list = &source[start..];
+        let list = &list[list.find("= [").expect("list start") + 3..];
+        let list = &list[..list.find(']').expect("list end")];
+        let mut names: Vec<String> = list
+            .split(',')
+            .map(|item| item.trim().trim_matches('"').to_string())
+            .filter(|item| !item.is_empty())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn the_server_and_the_runtime_refuse_the_same_methods_and_the_ones_the_concept_names() {
+        let mut server: Vec<String> = DENY_METHODS.iter().map(|name| name.to_string()).collect();
+        server.sort();
+        assert_eq!(server, runtime_deny_list(), "the two refusal lists differ");
+        // RO-6: quit, evaluate, call by name (directly, on a group, through a signal or a
+        // notification), set by name, free or replace a node.
+        for name in [
+            "quit",
+            "set_script",
+            "call",
+            "callv",
+            "call_deferred",
+            "call_group",
+            "call_group_flags",
+            "propagate_call",
+            "rpc",
+            "rpc_id",
+            "set",
+            "set_deferred",
+            "set_indexed",
+            "emit_signal",
+            "notification",
+            "propagate_notification",
+            "free",
+            "queue_free",
+            "replace_by",
+        ] {
+            assert!(
+                server.iter().any(|item| item == name),
+                "{name} is not refused"
+            );
+        }
+        // Changing the tree around a node stays allowed (RO-1: only the running game changes).
+        for name in ["add_child", "remove_child", "reparent"] {
+            assert!(!server.iter().any(|item| item == name), "{name} is refused");
+        }
+    }
 
     #[test]
     fn a_held_step_that_times_out_is_still_running_in_the_game() {

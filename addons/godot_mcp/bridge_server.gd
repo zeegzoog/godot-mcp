@@ -101,10 +101,22 @@ func read_configuration() -> void:
         if env_port.is_valid_int():
             port = int(env_port)
 
+## Shows an error in the editor itself, not only in the Output panel, where a person may not look.
+func _toast_error(message: String) -> void:
+    if not EditorInterface.has_method("get_editor_toaster"):
+        return
+    var toaster: Object = EditorInterface.call("get_editor_toaster")
+    if toaster != null:
+        toaster.call("push_toast", message, 2)
+
 func start_server() -> void:
     var err: Error = server.listen(port, LOOPBACK_ADDRESS)
     if err != OK:
-        printerr("[Godot MCP] Failed to start bridge server on port ", port, ": ", error_string(err))
+        var failure: String = "Failed to start bridge server on port %d: %s." % [port, error_string(err)]
+        if err == ERR_ALREADY_IN_USE:
+            failure += " Probably another editor already uses this port; a godot-mcp server connected to it talks to that editor, not to this one. Set the project setting godot_mcp/bridge_port or the environment variable GODOT_DEBUG_PORT to a free port."
+        printerr("[Godot MCP] ", failure)
+        _toast_error(failure)
         return
     prepare_token()
     _index_open_scenes()
@@ -369,7 +381,9 @@ func property_type_name(info: Dictionary) -> String:
 func describe_value(value: Variant) -> String:
     var text: String
     if typeof(value) == TYPE_OBJECT:
-        if not is_instance_valid(value):
+        if value == null:
+            text = "null"
+        elif not is_instance_valid(value):
             text = "<freed object>"
         elif value is Resource and not (value as Resource).resource_path.is_empty():
             text = 'Resource("%s")' % (value as Resource).resource_path
@@ -1027,6 +1041,18 @@ func _undo_version(scene_path: String) -> int:
 
 # --- Authoring ------------------------------------------------------------------------
 
+## Creates the folders a new file needs. Returns "" when they exist afterwards, else the error text
+## naming the folder.
+func _ensure_folder(res_path: String) -> String:
+    var folder: String = res_path.get_base_dir()
+    var absolute: String = ProjectSettings.globalize_path(folder)
+    if DirAccess.dir_exists_absolute(absolute):
+        return ""
+    var err: Error = DirAccess.make_dir_recursive_absolute(absolute)
+    if err != OK or not DirAccess.dir_exists_absolute(absolute):
+        return "Could not create the folder %s (%s)" % [folder, error_string(err)]
+    return ""
+
 func create_scene(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
     var scene_path: String = to_res_path(str(params.get("scene_path", "")))
     var root_type: String = str(params.get("root_type", "Node"))
@@ -1036,6 +1062,10 @@ func create_scene(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> vo
         return
     if FileAccess.file_exists(scene_path):
         send_error(peer, cmd_id, "Scene already exists: " + scene_path)
+        return
+    var made_folder: String = _ensure_folder(scene_path)
+    if not made_folder.is_empty():
+        send_error(peer, cmd_id, made_folder)
         return
     var created: Dictionary = instantiate_node(root_type)
     if created.has("error"):
@@ -1178,7 +1208,16 @@ func list_signals(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> vo
         var connections: Array = []
         for connection: Dictionary in node.get_signal_connection_list(signal_name):
             var callable: Callable = connection.get("callable", Callable())
-            connections.append(callable.get_method() if callable.is_valid() else "")
+            if not callable.is_valid():
+                continue
+            # Only connections to nodes of the edited scene; the editor's own panels listen to
+            # many signals and are not the scene's business.
+            var target: Object = callable.get_object()
+            if not target is Node:
+                continue
+            if target != root and not root.is_ancestor_of(target as Node):
+                continue
+            connections.append({"target": str(root.get_path_to(target as Node)), "method": callable.get_method()})
         signals.append({"name": signal_name, "connections": connections})
     send_success(peer, cmd_id, {"signals": signals})
 
@@ -1198,6 +1237,10 @@ func create_resource(peer: WebSocketPeer, cmd_id: String, params: Dictionary) ->
     if not ClassDB.class_exists(resource_class) or not ClassDB.can_instantiate(resource_class) or not ClassDB.is_parent_class(resource_class, "Resource"):
         send_error(peer, cmd_id, "Unknown resource class: " + resource_class)
         return
+    var made_folder: String = _ensure_folder(resource_path)
+    if not made_folder.is_empty():
+        send_error(peer, cmd_id, made_folder)
+        return
     var resource: Resource = ClassDB.instantiate(resource_class)
     var save_err: Error = ResourceSaver.save(resource, resource_path)
     if save_err != OK:
@@ -1209,8 +1252,11 @@ func create_resource(peer: WebSocketPeer, cmd_id: String, params: Dictionary) ->
 const SETTING_KEY_CHARS: String = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_/.-"
 
 func _is_setting_key(key: String) -> bool:
-    if key.is_empty() or not key.contains("/") or key.begins_with("/") or key.ends_with("/") or key.contains("//"):
+    if key.is_empty() or not key.contains("/"):
         return false
+    for part: String in key.split("/"):
+        if part.is_empty() or part == "." or part == "..":
+            return false
     for character: String in key:
         if not SETTING_KEY_CHARS.contains(character):
             return false

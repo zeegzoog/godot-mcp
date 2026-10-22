@@ -44,6 +44,7 @@ func edit(res_path: String, old_text: String, new_text: String, version: String)
     if loaded.has("error"):
         return loaded
     var file_lf: String = str(loaded["text"])
+    var had_bom: bool = bool(loaded.get("bom", false))
     var pair: Dictionary = _pair_editor(res_path)
     var problem: String = _editor_problem(res_path, file_lf, pair)
     if not problem.is_empty():
@@ -89,7 +90,11 @@ func edit(res_path: String, old_text: String, new_text: String, version: String)
     base.tag_saved_version()
     EditorInterface.get_resource_filesystem().update_file(res_path)
     script.reload(true)
-    return {"path": res_path, "replaced": 1, "version": label(base.text), "source": "editor"}
+    var answer: Dictionary = {"path": res_path, "replaced": 1, "version": label(base.text), "source": "editor"}
+    if had_bom:
+        # Godot saves a script without the mark; say so instead of leaving the person to find out.
+        answer["bom_removed"] = not _file_starts_with_bom(res_path)
+    return answer
 
 ## Why an edit must not go ahead given the editor's state for the file, or "".
 func _editor_problem(res_path: String, file_lf: String, pair: Dictionary) -> String:
@@ -151,7 +156,16 @@ func _count(text: String, fragment: String) -> int:
         from = at + 1
     return found
 
-## {"text": file text with "\n" line endings} or {"error": ...}.
+func _file_starts_with_bom(res_path: String) -> bool:
+    var file: FileAccess = FileAccess.open(res_path, FileAccess.READ)
+    if file == null:
+        return false
+    var head: PackedByteArray = file.get_buffer(3)
+    file.close()
+    return head.size() == 3 and head[0] == 0xEF and head[1] == 0xBB and head[2] == 0xBF
+
+## {"text": file text with "\n" line endings, "bom": whether it starts with a byte order mark} or
+## {"error": ...}.
 func _file_text(res_path: String) -> Dictionary:
     if not res_path.ends_with(".gd"):
         return {"error": "Only .gd scripts can be read or edited: " + res_path}
@@ -164,7 +178,12 @@ func _file_text(res_path: String) -> Dictionary:
         return {"error": "%s is larger than 1 MiB, which the script tools do not handle. Edit it with your own file tools." % res_path}
     var bytes: PackedByteArray = file.get_buffer(file.get_length())
     file.close()
+    # A UTF-8 byte order mark is not part of the text (Godot's decoder skips it, so the round
+    # trip below would otherwise call the file invalid).
+    var has_bom: bool = bytes.size() >= 3 and bytes[0] == 0xEF and bytes[1] == 0xBB and bytes[2] == 0xBF
+    if has_bom:
+        bytes = bytes.slice(3)
     var text: String = bytes.get_string_from_utf8()
     if text.to_utf8_buffer() != bytes:
         return {"error": "%s is not valid UTF-8, so it is not read as text." % res_path}
-    return {"text": text.replace("\r\n", "\n")}
+    return {"text": text.replace("\r\n", "\n"), "bom": has_bom}

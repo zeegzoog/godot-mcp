@@ -33,6 +33,15 @@ async fn call(tool: &str, args: Value) -> ToolResult {
     .await
 }
 
+/// Like `call`, with a stand-in engine that answers the class check of the authoring fallbacks.
+async fn call_classified(tool: &str, args: Value) -> ToolResult {
+    let cwd = tempfile::tempdir().expect("working dir");
+    let engine = tempfile::tempdir().expect("engine dir");
+    manager_in(cwd.path(), common::classifying_godot(engine.path()))
+        .call_tool(tool, args)
+        .await
+}
+
 fn text(result: &ToolResult) -> String {
     tool_text(&json!({"result": serde_json::to_value(result).expect("serialize result")}))
 }
@@ -310,7 +319,7 @@ fn launch_editor_schema_no_longer_requires_project_path() {
 #[tokio::test]
 async fn create_scene_without_an_editor_writes_a_scene_file() {
     let project = project_dir();
-    let result = call(
+    let result = call_classified(
         "godot_create_scene",
         json!({
             "scene_path": "res://scenes/main.tscn",
@@ -338,12 +347,12 @@ async fn create_resource_without_an_editor_never_replaces_a_file() {
             "project_path": project.path(),
         })
     };
-    let first = call("godot_create_resource", args("Curve")).await;
+    let first = call_classified("godot_create_resource", args("Curve")).await;
     assert!(!first.is_error, "{}", text(&first));
     let written = std::fs::read_to_string(project.path().join("made.tres")).expect("resource");
     assert!(written.contains("type=\"Curve\""), "{written}");
 
-    let second = call("godot_create_resource", args("Gradient")).await;
+    let second = call_classified("godot_create_resource", args("Gradient")).await;
     assert!(second.is_error, "{}", text(&second));
     assert!(
         text(&second).contains("already exists"),
@@ -790,7 +799,11 @@ async fn read_script_asks_the_editor_first_and_does_not_hide_its_errors() {
     use common::{MockBridge, Reply};
     let project = project_dir();
     write_script(project.path(), "other.gd", b"extends Node\n");
-    let bridge = MockBridge::start(|command| {
+    let open_dir = project.path().to_string_lossy().replace('\\', "/");
+    let bridge = MockBridge::start(move |command| {
+        if command["type"] == "get_project_info" {
+            return Reply::Ok(json!({"project_dir": open_dir}));
+        }
         match command["params"]["script_path"]
             .as_str()
             .unwrap_or_default()
@@ -836,10 +849,9 @@ async fn read_script_asks_the_editor_first_and_does_not_hide_its_errors() {
         text(&refused)
     );
     assert!(
-        bridge
-            .received()
-            .iter()
-            .all(|command| command["type"] == "read_script")
+        bridge.received().iter().all(
+            |command| command["type"] == "read_script" || command["type"] == "get_project_info"
+        )
     );
 }
 
@@ -1051,7 +1063,11 @@ async fn edit_script_asks_the_editor_first_and_does_not_hide_its_refusals() {
     use common::{MockBridge, Reply};
     let project = project_dir();
     write_script(project.path(), "other.gd", TWO_VARS.as_bytes());
-    let bridge = MockBridge::start(|command| {
+    let open_dir = project.path().to_string_lossy().replace('\\', "/");
+    let bridge = MockBridge::start(move |command| {
+        if command["type"] == "get_project_info" {
+            return Reply::Ok(json!({"project_dir": open_dir}));
+        }
         match command["params"]["script_path"].as_str().unwrap_or_default() {
             "res://ok.gd" => Reply::Ok(json!({
                 "path": "res://ok.gd", "replaced": 1, "version": "0123456789abcdef", "source": "editor"
@@ -1075,7 +1091,11 @@ async fn edit_script_asks_the_editor_first_and_does_not_hide_its_refusals() {
         )
         .await;
     assert_eq!(script_answer(&done)["source"], "editor");
-    let sent = bridge.received();
+    let sent: Vec<Value> = bridge
+        .received()
+        .into_iter()
+        .filter(|command| command["type"] == "edit_script")
+        .collect();
     assert_eq!(sent[0]["type"], "edit_script");
     assert_eq!(
         sent[0]["params"]["old_text"], tricky,
@@ -1140,4 +1160,755 @@ async fn edit_script_never_follows_a_planted_link() {
         "{}",
         text(&refused)
     );
+}
+
+// TL-10: a named project wins over a connected editor.
+
+/// A manager connected to a fake editor that has `open_project` open and answers `get_project_info`
+/// and, for the commands in `served`, a canned success; any other command is an error.
+async fn manager_with_editor(
+    open_project: &Path,
+    served: &'static [&'static str],
+    engine: PathBuf,
+) -> (common::MockBridge, Arc<ToolManager>) {
+    use common::{MockBridge, Reply};
+    let dir = open_project.to_string_lossy().replace('\\', "/");
+    let bridge = MockBridge::start(move |command| {
+        let kind = command["type"].as_str().unwrap_or_default();
+        if kind == "get_project_info" {
+            Reply::Ok(json!({"project_dir": dir, "name": "Open"}))
+        } else if served.contains(&kind) {
+            Reply::Ok(json!({"from_editor": kind}))
+        } else {
+            Reply::Err(format!("unexpected editor command {kind}"))
+        }
+    })
+    .await;
+    let manager = Arc::new(ToolManager::new(
+        BridgeClient::new(bridge.port),
+        CliRunner::new(engine),
+    ));
+    (bridge, manager)
+}
+
+fn sent_types(bridge: &common::MockBridge) -> Vec<String> {
+    bridge
+        .received()
+        .iter()
+        .filter_map(|command| command["type"].as_str().map(str::to_string))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_named_project_wins_over_a_connected_editor() {
+    let open = project_dir();
+    let named = project_dir();
+    for project in [open.path(), named.path()] {
+        write_script(project, "a.gd", b"extends Node\nvar x = 1\n");
+    }
+    let engine = tempfile::tempdir().expect("engine dir");
+    let (bridge, manager) =
+        manager_with_editor(open.path(), &[], common::classifying_godot(engine.path())).await;
+
+    let read = manager
+        .clone()
+        .call_tool(
+            "godot_read_script",
+            json!({"script_path": "res://a.gd", "project_path": named.path()}),
+        )
+        .await;
+    let read = script_answer(&read);
+    assert_eq!(read["source"], "file");
+    assert_eq!(read["editor_consulted"], false);
+
+    let edit = manager
+        .clone()
+        .call_tool(
+            "godot_edit_script",
+            edit_args(named.path(), "res://a.gd", "var x = 1", "var x = 2"),
+        )
+        .await;
+    let edit = script_answer(&edit);
+    assert_eq!(edit["replaced"], 1);
+    assert!(
+        edit["project_dir"]
+            .as_str()
+            .is_some_and(|dir| godot_mcp::paths::same_directory(Path::new(dir), named.path())),
+        "the answer names the project it changed: {edit}"
+    );
+    assert!(
+        std::fs::read_to_string(named.path().join("a.gd"))
+            .expect("named script")
+            .contains("var x = 2")
+    );
+    assert!(
+        std::fs::read_to_string(open.path().join("a.gd"))
+            .expect("open script")
+            .contains("var x = 1"),
+        "the project the editor has open was changed"
+    );
+
+    let scene = manager
+        .clone()
+        .call_tool(
+            "godot_create_scene",
+            json!({"scene_path": "res://s.tscn", "project_path": named.path()}),
+        )
+        .await;
+    assert!(!scene.is_error, "{}", text(&scene));
+    assert!(named.path().join("s.tscn").is_file());
+    assert!(!open.path().join("s.tscn").exists());
+
+    let resource = manager
+        .clone()
+        .call_tool(
+            "godot_create_resource",
+            json!({"resource_path": "res://r.tres", "class_name": "Curve",
+                   "project_path": named.path()}),
+        )
+        .await;
+    assert!(!resource.is_error, "{}", text(&resource));
+    assert!(named.path().join("r.tres").is_file());
+    assert!(!open.path().join("r.tres").exists());
+
+    let set = manager
+        .clone()
+        .call_tool(
+            "godot_set_project_setting",
+            json!({"key": "custom/answer", "value": 7, "project_path": named.path()}),
+        )
+        .await;
+    assert!(!set.is_error, "{}", text(&set));
+    assert!(
+        std::fs::read_to_string(named.path().join("project.godot"))
+            .expect("project.godot")
+            .contains("answer=7")
+    );
+    assert!(
+        !std::fs::read_to_string(open.path().join("project.godot"))
+            .expect("open project.godot")
+            .contains("answer=7")
+    );
+
+    let settings = manager
+        .clone()
+        .call_tool(
+            "godot_get_project_settings",
+            json!({"prefix": "application/config/name", "project_path": named.path()}),
+        )
+        .await;
+    assert!(!settings.is_error, "{}", text(&settings));
+    assert!(
+        text(&settings).contains("project.godot"),
+        "{}",
+        text(&settings)
+    );
+
+    assert!(
+        sent_types(&bridge)
+            .iter()
+            .all(|kind| kind == "get_project_info"),
+        "the editor was sent a command for another project: {:?}",
+        sent_types(&bridge)
+    );
+}
+
+#[tokio::test]
+async fn the_editors_own_project_still_goes_to_the_editor() {
+    let open = project_dir();
+    let (bridge, manager) = manager_with_editor(
+        open.path(),
+        &["edit_script", "read_script"],
+        PathBuf::from("unused-godot"),
+    )
+    .await;
+
+    // The same directory, spelled with a trailing separator, and with no project_path at all.
+    let spelled = format!("{}/", open.path().to_string_lossy().replace('\\', "/"));
+    for project_path in [Some(spelled), None] {
+        let mut args = json!({"script_path": "res://a.gd", "old_text": "a", "new_text": "b"});
+        if let Some(path) = &project_path {
+            args["project_path"] = json!(path);
+        }
+        let done = manager.clone().call_tool("godot_edit_script", args).await;
+        let done = script_answer(&done);
+        assert_eq!(done["from_editor"], "edit_script", "{done}");
+        assert!(
+            done["project_dir"]
+                .as_str()
+                .is_some_and(|dir| godot_mcp::paths::same_directory(Path::new(dir), open.path())),
+            "an editor answer that changed a file names the project: {done}"
+        );
+    }
+    let read = manager
+        .clone()
+        .call_tool(
+            "godot_read_script",
+            json!({"script_path": "res://a.gd", "project_path": open.path()}),
+        )
+        .await;
+    assert_eq!(script_answer(&read)["from_editor"], "read_script");
+    assert_eq!(
+        sent_types(&bridge)
+            .iter()
+            .filter(|kind| *kind == "edit_script")
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn an_editor_that_cannot_name_its_project_is_not_sent_a_file_change() {
+    use common::{MockBridge, Reply};
+    let bridge = MockBridge::start(|_| Reply::Err("no project info".into())).await;
+    let manager = Arc::new(ToolManager::new(
+        BridgeClient::new(bridge.port),
+        CliRunner::new(PathBuf::from("unused-godot")),
+    ));
+    let result = manager
+        .clone()
+        .call_tool(
+            "godot_edit_script",
+            json!({"script_path": "res://a.gd", "old_text": "a", "new_text": "b"}),
+        )
+        .await;
+    assert!(result.is_error, "{}", text(&result));
+    assert!(
+        sent_types(&bridge)
+            .iter()
+            .all(|kind| kind == "get_project_info"),
+        "{:?}",
+        sent_types(&bridge)
+    );
+}
+
+// TL-11 and RO-3: stopping and asking about runs.
+
+/// Starts a managed run with the manager's (fake) Godot executable and returns its id.
+async fn start_fake_run(manager: &Arc<ToolManager>, project: &Path) -> String {
+    let started = manager
+        .clone()
+        .call_tool(
+            "godot_run_project",
+            json!({"mode": "process", "headless": true, "project_path": project}),
+        )
+        .await;
+    assert!(!started.is_error, "{}", text(&started));
+    text(&started)
+        .split("run_id: ")
+        .nth(1)
+        .and_then(|rest| rest.split(')').next())
+        .expect("the answer names the run id")
+        .to_string()
+}
+
+async fn status_of(manager: &Arc<ToolManager>) -> Value {
+    let status = manager
+        .clone()
+        .call_tool("godot_get_run_status", json!({}))
+        .await;
+    script_answer(&status)
+}
+
+fn run_in(status: &Value, id: &str) -> Value {
+    status["process_runs"]
+        .as_array()
+        .and_then(|runs| runs.iter().find(|run| run["run_id"] == id))
+        .cloned()
+        .unwrap_or_else(|| panic!("run {id} not in {status}"))
+}
+
+#[tokio::test]
+async fn a_finished_run_keeps_its_exit_code_and_says_who_ended_it() {
+    let project = project_dir();
+    let tools = tempfile::tempdir().expect("tools dir");
+
+    let by_itself = manager_in(project.path(), common::exiting_godot(tools.path(), 3));
+    let id = start_fake_run(&by_itself, project.path()).await;
+    let mut run = run_in(&status_of(&by_itself).await, &id);
+    for _ in 0..100 {
+        if run["running"] == false {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        run = run_in(&status_of(&by_itself).await, &id);
+    }
+    assert_eq!(run["running"], false, "{run}");
+    assert_eq!(run["exit_code"], 3, "{run}");
+    assert_eq!(run["ended_by"], "game", "{run}");
+    assert!(run["ended_at"].as_u64().is_some_and(|at| at > 0), "{run}");
+
+    let sleepers = tempfile::tempdir().expect("tools dir");
+    let stopped_by_us = manager_in(project.path(), common::sleeping_godot(sleepers.path()));
+    let id = start_fake_run(&stopped_by_us, project.path()).await;
+    let alive = run_in(&status_of(&stopped_by_us).await, &id);
+    assert_eq!(alive["running"], true, "{alive}");
+    assert!(
+        alive["ended_by"].is_null() && alive["ended_at"].is_null(),
+        "{alive}"
+    );
+    let stopped = stopped_by_us
+        .clone()
+        .call_tool("godot_stop_project", json!({"run_id": id}))
+        .await;
+    assert!(!stopped.is_error, "{}", text(&stopped));
+    let gone = run_in(&status_of(&stopped_by_us).await, &id);
+    assert_eq!(gone["running"], false, "{gone}");
+    assert_eq!(gone["ended_by"], "server", "{gone}");
+    assert!(gone["exit_code"].is_number(), "{gone}");
+    assert!(gone["ended_at"].as_u64().is_some_and(|at| at > 0), "{gone}");
+}
+
+fn run_state_bridge(playing: bool) -> impl Fn(&Value) -> common::Reply + Send + Sync + 'static {
+    move |command| match command["type"].as_str().unwrap_or_default() {
+        "get_run_status" => common::Reply::Ok(json!({"running": playing, "scene": "res://m.tscn"})),
+        "stop_project" => common::Reply::Ok(json!({"stopped": true})),
+        other => common::Reply::Err(format!("unexpected {other}")),
+    }
+}
+
+#[tokio::test]
+async fn stop_without_a_run_id_stops_every_run_and_says_what_it_stopped() {
+    let project = project_dir();
+    let tools = tempfile::tempdir().expect("tools dir");
+    let bridge = common::MockBridge::start(run_state_bridge(false)).await;
+    let manager = Arc::new(
+        ToolManager::new(
+            BridgeClient::new(bridge.port),
+            CliRunner::new(common::sleeping_godot(tools.path())),
+        )
+        .with_working_dir(project.path().to_path_buf()),
+    );
+    let first = start_fake_run(&manager, project.path()).await;
+    let second = start_fake_run(&manager, project.path()).await;
+
+    let stopped = manager
+        .clone()
+        .call_tool("godot_stop_project", json!({}))
+        .await;
+    let answer = script_answer(&stopped);
+    assert_eq!(answer["stopped"]["editor_play"], false, "{answer}");
+    let ids: Vec<&str> = answer["stopped"]["runs"]
+        .as_array()
+        .expect("runs")
+        .iter()
+        .filter_map(|run| run["run_id"].as_str())
+        .collect();
+    assert!(
+        ids.contains(&first.as_str()) && ids.contains(&second.as_str()),
+        "{answer}"
+    );
+    let status = status_of(&manager).await;
+    for id in [&first, &second] {
+        assert_eq!(run_in(&status, id)["running"], false, "{status}");
+    }
+    assert!(
+        sent_types(&bridge)
+            .iter()
+            .all(|kind| kind != "stop_project"),
+        "the editor was not playing, so it was not told to stop: {:?}",
+        sent_types(&bridge)
+    );
+
+    // Nothing left: not an error, and it says so.
+    let again = manager
+        .clone()
+        .call_tool("godot_stop_project", json!({}))
+        .await;
+    let again = script_answer(&again);
+    assert!(
+        again["message"]
+            .as_str()
+            .is_some_and(|m| m.to_lowercase().contains("nothing was running")),
+        "{again}"
+    );
+}
+
+#[tokio::test]
+async fn stop_without_a_run_id_also_stops_the_editors_play_mode() {
+    let bridge = common::MockBridge::start(run_state_bridge(true)).await;
+    let manager = Arc::new(ToolManager::new(
+        BridgeClient::new(bridge.port),
+        CliRunner::new(PathBuf::from("unused-godot")),
+    ));
+    let stopped = manager
+        .clone()
+        .call_tool("godot_stop_project", json!({}))
+        .await;
+    let answer = script_answer(&stopped);
+    assert_eq!(answer["stopped"]["editor_play"], true, "{answer}");
+    assert!(sent_types(&bridge).contains(&"stop_project".to_string()));
+}
+
+#[tokio::test]
+async fn asking_about_runs_with_nothing_running_and_no_editor_is_not_a_failure() {
+    let cwd = tempfile::tempdir().expect("cwd");
+    let manager = manager_in(cwd.path(), PathBuf::from("unused-godot"));
+    for tool in [
+        "godot_get_run_status",
+        "godot_stop_project",
+        "godot_run_output",
+    ] {
+        let result = manager.clone().call_tool(tool, json!({})).await;
+        assert!(!result.is_error, "{tool}: {}", text(&result));
+        assert!(
+            text(&result).to_lowercase().contains("nothing"),
+            "{tool}: {}",
+            text(&result)
+        );
+    }
+}
+
+// TL-1, TL-5 and the script_path alias.
+
+#[tokio::test]
+async fn a_position_below_the_first_is_refused_before_any_language_server_is_asked() {
+    for (tool, args) in [
+        (
+            "godot_code_complete",
+            json!({"script_path": "res://a.gd", "line": 0, "character": 1}),
+        ),
+        (
+            "godot_code_definition",
+            json!({"script_path": "res://a.gd", "line": 1, "character": -3}),
+        ),
+        (
+            "godot_code_references",
+            json!({"script_path": "res://a.gd", "line": -1, "character": 1}),
+        ),
+    ] {
+        let result = call(tool, args).await;
+        assert!(result.is_error, "{tool}");
+        assert!(
+            text(&result).contains("at least 1"),
+            "{tool}: {}",
+            text(&result)
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_breakpoint_location_is_a_res_path_inside_the_project() {
+    let project = project_dir();
+    let tools = tempfile::tempdir().expect("tools dir");
+    let manager = manager_in(project.path(), common::sleeping_godot(tools.path()));
+    let _run = start_fake_run(&manager, project.path()).await;
+    for bad in [
+        "res://../x.gd:1",
+        "res://a/../../x.gd:3",
+        "/etc/passwd.gd:1",
+        "C:/x/y.gd:1",
+        "a.gd:1",
+        "res://a.gd:0",
+        "res://a.gd",
+    ] {
+        let result = manager
+            .clone()
+            .call_tool(
+                "godot_debug_breakpoints",
+                json!({"action": "add", "breakpoint": bad}),
+            )
+            .await;
+        assert!(result.is_error, "{bad}: {}", text(&result));
+        assert!(text(&result).contains("res://"), "{bad}: {}", text(&result));
+    }
+    let listed = manager
+        .clone()
+        .call_tool("godot_debug_breakpoints", json!({"action": "list"}))
+        .await;
+    assert!(!listed.is_error, "{}", text(&listed));
+    assert_eq!(script_answer(&listed)["breakpoints"], json!([]));
+
+    let refused_at_start = manager
+        .clone()
+        .call_tool(
+            "godot_run_project",
+            json!({"mode": "process", "headless": true, "project_path": project.path(),
+                   "breakpoints": ["res://../x.gd:1"]}),
+        )
+        .await;
+    assert!(refused_at_start.is_error, "{}", text(&refused_at_start));
+}
+
+#[tokio::test]
+async fn create_script_accepts_script_path_and_names_both_when_neither_is_given() {
+    let project = project_dir();
+    let made = call(
+        "godot_create_script",
+        json!({"script_path": "res://by_new_name.gd", "project_path": project.path()}),
+    )
+    .await;
+    assert!(!made.is_error, "{}", text(&made));
+    assert!(project.path().join("by_new_name.gd").is_file());
+
+    let neither = call(
+        "godot_create_script",
+        json!({"project_path": project.path()}),
+    )
+    .await;
+    assert!(neither.is_error);
+    let message = text(&neither);
+    assert!(
+        message.contains("script_path") && message.contains("file_path"),
+        "{message}"
+    );
+}
+
+// TL-7: hints by failure class, and project files named by their res:// path.
+
+#[tokio::test]
+async fn each_failure_class_gets_its_own_hint_and_never_the_generic_one() {
+    use common::{MockBridge, Reply};
+    let cases: &[(&str, &str)] = &[
+        (
+            r#"{"code":"DENIED","message":"Refusing to set 'script'."}"#,
+            "by design",
+        ),
+        (
+            r#"{"code":"UNSUPPORTED","message":"This game is headless, so there is no image to capture."}"#,
+            "start the game",
+        ),
+        (
+            r#"{"code":"NOT_FOUND","message":"Node not found at 'Player'."}"#,
+            "godot_game_tree",
+        ),
+        (
+            r#"{"code":"BAD_PARAMS","message":"steps[0]: unknown type 'action'."}"#,
+            "inputSchema",
+        ),
+        (
+            "res://a.gd has unsaved changes in the script editor. Save it in the editor, or discard the changes.",
+            "Save the script",
+        ),
+        (
+            "The editor's text of res://a.gd differs from the file on disk. Save or reload it in the editor.",
+            "reload",
+        ),
+        (
+            "The script editor's state for res://a.gd cannot be matched (the editor lists 2 open scripts but 1 script tabs).",
+            "Close the extra tabs",
+        ),
+        ("Failed to save resource: Can't open", "folder"),
+        (
+            "This setting expects a int; a value of another type is not stored.",
+            "type the setting already has",
+        ),
+        ("File already exists: res://a.tres", "another path"),
+    ];
+    for (message, expected) in cases {
+        let message = message.to_string();
+        let bridge = MockBridge::start(move |_| Reply::Err(message.clone())).await;
+        let manager = Arc::new(ToolManager::new(
+            BridgeClient::new(bridge.port),
+            CliRunner::new(PathBuf::from("unused-godot")),
+        ));
+        let result = manager.call_tool("godot_get_scene_tree", json!({})).await;
+        let shown = text(&result);
+        assert!(result.is_error, "{shown}");
+        assert!(
+            shown.contains(expected),
+            "expected {expected:?} in: {shown}"
+        );
+        assert!(
+            !shown.contains("Correct the arguments"),
+            "generic hint used: {shown}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_godot_executable_that_cannot_run_names_godot_path_not_syntax() {
+    let project = project_dir();
+    write_script(project.path(), "ok.gd", b"extends Node\n");
+    let result = call(
+        "godot_validate_script",
+        json!({"script_path": "res://ok.gd", "project_path": project.path()}),
+    )
+    .await;
+    assert!(result.is_error);
+    let shown = text(&result);
+    assert!(shown.contains("GODOT_PATH"), "{shown}");
+    assert!(!shown.contains("syntax"), "{shown}");
+}
+
+#[tokio::test]
+async fn a_setting_of_the_wrong_type_does_not_get_the_key_example_as_its_hint() {
+    let project = project_dir();
+    std::fs::write(
+        project.path().join("project.godot"),
+        "config_version=5\n\n[application]\n\nconfig/name=\"Old\"\n",
+    )
+    .expect("project.godot");
+    let wrong = call(
+        "godot_set_project_setting",
+        json!({"key": "application/config/name", "value": 5, "project_path": project.path()}),
+    )
+    .await;
+    assert!(wrong.is_error);
+    assert!(
+        text(&wrong).contains("type the setting already has"),
+        "{}",
+        text(&wrong)
+    );
+    assert!(!text(&wrong).contains("Use a key like"), "{}", text(&wrong));
+}
+
+#[tokio::test]
+async fn errors_name_project_files_by_their_res_path() {
+    let project = project_dir();
+    let dir = project.path().to_string_lossy().to_string();
+    let args = |tool: &str| match tool {
+        "godot_create_script" => {
+            json!({"script_path": "res://keep.gd", "project_path": project.path()})
+        }
+        "godot_create_scene" => {
+            json!({"scene_path": "res://keep.tscn", "project_path": project.path()})
+        }
+        _ => {
+            json!({"resource_path": "res://keep.tres", "class_name": "Curve", "project_path": project.path()})
+        }
+    };
+    for (tool, file) in [
+        ("godot_create_script", "keep.gd"),
+        ("godot_create_scene", "keep.tscn"),
+        ("godot_create_resource", "keep.tres"),
+    ] {
+        std::fs::write(project.path().join(file), "x").expect("seed");
+        let refused = call_classified(tool, args(tool)).await;
+        assert!(refused.is_error, "{tool}");
+        let shown = text(&refused);
+        assert!(shown.contains(&format!("res://{file}")), "{tool}: {shown}");
+        assert!(!shown.contains(&dir), "{tool} shows the host path: {shown}");
+    }
+    let missing = call(
+        "godot_validate_script",
+        json!({"script_path": "res://nope.gd", "project_path": project.path()}),
+    )
+    .await;
+    assert!(
+        text(&missing).contains("res://nope.gd"),
+        "{}",
+        text(&missing)
+    );
+    assert!(!text(&missing).contains(&dir), "{}", text(&missing));
+}
+
+// CA-11: the file fallbacks accept what the editor accepts.
+
+#[tokio::test]
+async fn the_fallbacks_refuse_a_class_the_engine_cannot_use_and_write_no_file() {
+    let project = project_dir();
+    let scene_with = |class: &str, name: &str| json!({"scene_path": format!("res://{name}.tscn"), "root_type": class, "project_path": project.path()});
+    let resource_with = |class: &str, name: &str| json!({"resource_path": format!("res://{name}.tres"), "class_name": class, "project_path": project.path()});
+
+    for (class, name) in [("Resource", "bad_scene"), ("Nope", "unknown_scene")] {
+        let refused = call_classified("godot_create_scene", scene_with(class, name)).await;
+        assert!(refused.is_error, "{class}: {}", text(&refused));
+        assert!(text(&refused).contains("not a Node"), "{}", text(&refused));
+        assert!(
+            !project.path().join(format!("{name}.tscn")).exists(),
+            "{class}"
+        );
+    }
+    for (class, name) in [("Node", "bad_resource"), ("Nope", "unknown_resource")] {
+        let refused = call_classified("godot_create_resource", resource_with(class, name)).await;
+        assert!(refused.is_error, "{class}: {}", text(&refused));
+        assert!(
+            text(&refused).contains("Unknown resource class"),
+            "{}",
+            text(&refused)
+        );
+        assert!(
+            !project.path().join(format!("{name}.tres")).exists(),
+            "{class}"
+        );
+    }
+    let scene = call_classified("godot_create_scene", scene_with("Node3D", "good_scene")).await;
+    assert!(!scene.is_error, "{}", text(&scene));
+    let resource = call_classified(
+        "godot_create_resource",
+        resource_with("Gradient", "good_resource"),
+    )
+    .await;
+    assert!(!resource.is_error, "{}", text(&resource));
+
+    // An engine that cannot run is not a reason to write a file that may not load.
+    let unrunnable = call(
+        "godot_create_scene",
+        json!({"scene_path": "res://unchecked.tscn", "project_path": project.path()}),
+    )
+    .await;
+    assert!(unrunnable.is_error);
+    assert!(
+        text(&unrunnable).contains("GODOT_PATH"),
+        "{}",
+        text(&unrunnable)
+    );
+    assert!(!project.path().join("unchecked.tscn").exists());
+}
+
+#[tokio::test]
+async fn a_root_name_is_data_in_the_file_fallback_as_it_is_in_the_editor() {
+    let project = project_dir();
+    for (name, expected) in [
+        ("with space", "with space"),
+        ("bad name!", "bad name!"),
+        ("a.b:c@d/e%f", "a_b_c_d_e_f"),
+        ("quote\"inside", "quote_inside"),
+        ("new\nline", "new_line"),
+    ] {
+        let file = format!("n_{}.tscn", expected.len());
+        let made = call_classified(
+            "godot_create_scene",
+            json!({"scene_path": format!("res://{file}"), "root_name": name,
+                   "project_path": project.path()}),
+        )
+        .await;
+        assert!(!made.is_error, "{name:?}: {}", text(&made));
+        let body = std::fs::read_to_string(project.path().join(&file)).expect("scene");
+        assert!(
+            body.contains(&format!("[node name=\"{expected}\" type=\"Node2D\"]")),
+            "{name:?}: {body}"
+        );
+        assert_eq!(
+            body.matches("[node").count(),
+            1,
+            "{name:?} added a node: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_setting_key_with_a_dot_segment_is_refused_and_the_settings_answer_matches_the_editors() {
+    let project = project_dir();
+    std::fs::write(
+        project.path().join("project.godot"),
+        "config_version=5\n\n[application]\n\nconfig/name=\"Open\"\n\n[simqa]\n\nanswer=42\nflag=true\n",
+    )
+    .expect("project.godot");
+    for key in ["simqa/../evil", "simqa/./x", "../x/y", "simqa/a/../b"] {
+        let refused = call(
+            "godot_set_project_setting",
+            json!({"key": key, "value": 1, "project_path": project.path()}),
+        )
+        .await;
+        assert!(refused.is_error, "{key}: {}", text(&refused));
+    }
+    let after = std::fs::read_to_string(project.path().join("project.godot")).expect("project");
+    assert!(!after.contains("evil") && !after.contains("../"), "{after}");
+
+    let settings = call(
+        "godot_get_project_settings",
+        json!({"prefix": "", "project_path": project.path()}),
+    )
+    .await;
+    let answer = script_answer(&settings);
+    assert_eq!(
+        answer["settings"]["application/config/name"], "Open",
+        "{answer}"
+    );
+    assert_eq!(answer["settings"]["simqa/answer"], "42", "{answer}");
+    assert_eq!(answer["settings"]["simqa/flag"], "true", "{answer}");
+    assert_eq!(answer["truncated"], false, "{answer}");
+    assert_eq!(answer["source"], "project.godot", "{answer}");
 }

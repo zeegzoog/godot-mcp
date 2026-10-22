@@ -1910,3 +1910,204 @@ async fn edit_script_replaces_one_fragment_and_never_overwrites_typing() {
     );
     assert_eq!(file("notes.txt"), "hello\n");
 }
+
+/// What the amended concepts ask of the editor commands: a script with a byte order mark is read
+/// and edited, a new file's folders are created, an unset object property is `null`, a node's
+/// signals list only connections inside the scene, and a setting key has no dot segment.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn the_editor_commands_follow_the_amended_concepts() {
+    let editor = start_editor_with(
+        None,
+        "",
+        &[("bom.gd", "\u{feff}extends Node\n\nvar bom_var: int = 1\n")],
+        "",
+    )
+    .await;
+    let bridge = &editor.bridge;
+    let call = |command: &'static str, params: Value| async move {
+        bridge.send_command(command, params).await
+    };
+
+    // A byte order mark does not make the script "not UTF-8" (CA-7).
+    let read = call("read_script", json!({"script_path": "res://bom.gd"}))
+        .await
+        .expect("read a script with a byte order mark");
+    assert!(
+        read["text"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("extends Node"),
+        "{read}"
+    );
+    let edited = call(
+        "edit_script",
+        json!({"script_path": "res://bom.gd", "old_text": "bom_var: int = 1",
+               "new_text": "bom_var: int = 2"}),
+    )
+    .await
+    .expect("edit a script with a byte order mark");
+    let bytes = std::fs::read(editor.project.join("bom.gd")).expect("bom.gd");
+    let kept = bytes.starts_with(&[0xEF, 0xBB, 0xBF]);
+    assert_eq!(
+        edited["bom_removed"],
+        json!(!kept),
+        "the answer says what the save did to the mark: {edited}"
+    );
+    assert!(
+        String::from_utf8_lossy(&bytes).contains("bom_var: int = 2"),
+        "the edit is on disk"
+    );
+
+    // The folders of a new file are created (CA-6) and a folder that cannot be is named.
+    call(
+        "create_scene",
+        json!({"scene_path": "res://newdir/deep/scene.tscn", "root_type": "Node2D"}),
+    )
+    .await
+    .expect("create a scene in a new folder");
+    assert!(editor.project.join("newdir/deep/scene.tscn").is_file());
+    call(
+        "create_resource",
+        json!({"resource_path": "res://other/deep/g.tres", "class_name": "Gradient"}),
+    )
+    .await
+    .expect("create a resource in a new folder");
+    assert!(editor.project.join("other/deep/g.tres").is_file());
+    std::fs::write(editor.project.join("blocker"), "a file, not a folder").expect("blocker");
+    expect_error(
+        call(
+            "create_scene",
+            json!({"scene_path": "res://blocker/x.tscn", "root_type": "Node2D"}),
+        )
+        .await,
+        "blocker",
+    );
+
+    // An unset object property is null, not a "freed object".
+    call("open_scene", json!({"scene_path": "res://main.tscn"}))
+        .await
+        .expect("open the main scene");
+    let properties = call("get_node_properties", json!({"node_path": "Player/Body"}))
+        .await
+        .expect("properties of a sprite");
+    assert_eq!(
+        properties["properties"]["texture"]["value"], "null",
+        "{properties}"
+    );
+    assert!(
+        !properties.to_string().contains("freed object"),
+        "an unset property was reported as freed"
+    );
+
+    // A node's signal list holds only connections to nodes of the scene (BR-6 spirit), with the
+    // target's scene-relative path.
+    std::fs::write(
+        editor.project.join("listener.gd"),
+        "extends Node2D
+
+func on_ready() -> void:
+\tpass
+",
+    )
+    .expect("listener.gd");
+    call(
+        "attach_script",
+        json!({"node_path": ".", "script_path": "res://listener.gd"}),
+    )
+    .await
+    .expect("attach the listener");
+    call(
+        "connect_signal",
+        json!({"node_path": "Player", "signal_name": "ready", "target_path": ".",
+               "method": "on_ready"}),
+    )
+    .await
+    .expect("connect ready");
+    let signals = call("list_signals", json!({"node_path": "Player"}))
+        .await
+        .expect("list signals");
+    let all = signals["signals"].as_array().expect("signals");
+    let ready = all
+        .iter()
+        .find(|entry| entry["name"] == "ready")
+        .expect("ready signal");
+    assert_eq!(
+        ready["connections"],
+        json!([{"target": ".", "method": "on_ready"}]),
+        "{signals}"
+    );
+    for entry in all {
+        for connection in entry["connections"].as_array().expect("connections") {
+            assert!(
+                connection["target"].is_string() && connection["method"].is_string(),
+                "{entry}"
+            );
+            assert!(
+                !connection.to_string().contains("::"),
+                "an editor-internal connection is listed: {connection}"
+            );
+        }
+    }
+
+    // A setting key has no empty, "." or ".." segment.
+    for key in ["simqa/../evil", "simqa/./x", "../x/y", "simqa/a/../b"] {
+        expect_error(
+            call("set_project_setting", json!({"key": key, "value": 1})).await,
+            "key",
+        );
+    }
+}
+
+/// A second editor on a port that is taken says so, and says what it means for the server.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn a_second_editor_on_a_taken_port_says_that_the_server_talks_to_the_other_one() {
+    let first = start_editor(false).await;
+    let second_dir = tempfile::tempdir().expect("second project");
+    let addon = second_dir.path().join("addons/godot_mcp");
+    copy_dir(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("addons/godot_mcp"),
+        &addon,
+    );
+    std::fs::write(
+        second_dir.path().join("project.godot"),
+        "config_version=5
+
+[editor_plugins]
+
+enabled=PackedStringArray(\"res://addons/godot_mcp/plugin.cfg\")
+",
+    )
+    .expect("project.godot");
+    let (_godot, console) = godot_binaries();
+    let output = timeout(
+        Duration::from_secs(180),
+        Command::new(&console)
+            .args(["--headless", "--path"])
+            .arg(second_dir.path())
+            .arg("--import")
+            .env("GODOT_DEBUG_PORT", first.port.to_string())
+            .stdin(Stdio::null())
+            .output(),
+    )
+    .await
+    .expect("second editor timed out")
+    .expect("run the second editor");
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(log.contains("Already in use"), "{log}");
+    assert!(
+        log.contains("another editor"),
+        "the message does not say who answers on the port: {log}"
+    );
+    // The first editor still answers, with its own token.
+    first
+        .bridge
+        .send_command("ping", json!({}))
+        .await
+        .expect("the first editor still answers");
+}

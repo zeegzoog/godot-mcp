@@ -134,6 +134,82 @@ sleep 8
     }
 }
 
+/// A stand-in for the Godot executable that answers the class check of the authoring fallbacks:
+/// it reads the class name after `--` (the last argument) and prints `GODOT_MCP_CLASS=scene` for
+/// a few Node classes, `resource` for a few Resource classes and `no` for anything else.
+pub fn classifying_godot(dir: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let path = dir.join("classifying_godot.bat");
+        std::fs::write(
+            &path,
+            "@echo off
+for %%a in (%*) do set LAST=%%a
+for %%c in (Node Node2D Node3D Control) do if \"%LAST%\"==\"%%c\" (echo GODOT_MCP_CLASS=scene& exit /b 0)
+for %%c in (Resource Curve Gradient) do if \"%LAST%\"==\"%%c\" (echo GODOT_MCP_CLASS=resource& exit /b 0)
+echo GODOT_MCP_CLASS=no
+",
+        )
+        .expect("write classifying godot");
+        path
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("classifying_godot.sh");
+        std::fs::write(
+            &path,
+            "#!/bin/sh
+for last; do :; done
+case \"$last\" in
+  Node|Node2D|Node3D|Control) echo GODOT_MCP_CLASS=scene ;;
+  Resource|Curve|Gradient) echo GODOT_MCP_CLASS=resource ;;
+  *) echo GODOT_MCP_CLASS=no ;;
+esac
+",
+        )
+        .expect("write classifying godot");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod classifying godot");
+        path
+    }
+}
+
+/// A stand-in for the Godot executable that ends at once with the given exit code.
+pub fn exiting_godot(dir: &Path, code: i32) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let path = dir.join("exiting_godot.bat");
+        std::fs::write(
+            &path,
+            format!(
+                "@echo off
+exit /b {code}
+"
+            ),
+        )
+        .expect("write exiting godot");
+        path
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("exiting_godot.sh");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh
+exit {code}
+"
+            ),
+        )
+        .expect("write exiting godot");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod exiting godot");
+        path
+    }
+}
+
 /// Concatenated text content of a `tools/call` response.
 pub fn tool_text(response: &Value) -> String {
     response["result"]["content"]

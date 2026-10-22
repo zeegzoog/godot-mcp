@@ -5,7 +5,10 @@ use crate::error::McpError;
 use crate::godot::GameHub;
 use crate::journal::EvidenceKind;
 use crate::lsp::LspHub;
-use crate::paths::{ensure_project_dir, find_project, is_valid_identifier, resolve_in_project};
+use crate::paths::{
+    ensure_project_dir, find_project, is_valid_identifier, res_display, resolve_in_project,
+    same_directory,
+};
 use crate::protocol::{Tool, ToolResult};
 use crate::validation::validate_arguments;
 use serde_json::{Value, json};
@@ -36,6 +39,30 @@ pub struct ToolManager {
     feedback: feedback::FeedbackState,
     games: GameHub,
     lsp: LspHub,
+}
+
+/// Where a live-first call goes (TL-10).
+enum EditorChoice {
+    /// To the connected editor; `project_dir` is the project it reported, when it was asked.
+    Editor { project_dir: Option<String> },
+    /// Not to the editor: the caller names a project the editor does not have open.
+    Host,
+}
+
+impl EditorChoice {
+    /// The editor's answer with the project it acted on added, when it is an object.
+    fn name_project(&self, mut answer: Value) -> Value {
+        if let (
+            Self::Editor {
+                project_dir: Some(dir),
+            },
+            Value::Object(map),
+        ) = (self, &mut answer)
+        {
+            map.entry("project_dir").or_insert_with(|| json!(dir));
+        }
+        answer
+    }
 }
 
 /// A project directory plus whether it came from the live editor.
@@ -231,6 +258,11 @@ impl ToolManager {
                 );
             }
         }
+        for spec in string_list(args.get("breakpoints")) {
+            if let Err(result) = game::check_breakpoint(&spec) {
+                return result;
+            }
+        }
         let mode = str_arg(&args, "mode").unwrap_or("auto");
         if args.get("held").and_then(Value::as_bool).unwrap_or(false) && mode != "process" {
             return ToolResult::error(
@@ -308,43 +340,83 @@ impl ToolManager {
                 ),
             };
         }
-        match self.bridge.send_command("stop_project", json!({})).await {
-            Ok(result) => ToolResult::text(format!(
-                "Project stopped via live editor:\n{}",
-                serde_json::to_string_pretty(&result).unwrap_or_default()
-            )),
-            Err(McpError::BridgeUnavailable(detail)) => match self.games.stop(None).await {
-                Ok(summary) => ToolResult::text(format!(
-                    "Stopped managed Godot process:\n{}",
-                    serde_json::to_string_pretty(&summary).unwrap_or_default()
-                )),
-                Err(_) => bridge_error_result(&McpError::BridgeUnavailable(detail)),
-            },
-            Err(error) => bridge_error_result(&error),
+        // TL-11: stop everything that runs, and say what was stopped. The managed runs are
+        // independent of the editor, so they are stopped first and an editor failure cannot
+        // leave them running.
+        let runs = self.games.stop_all().await;
+        let mut editor_play = false;
+        let mut editor_error = None;
+        match self.bridge.send_command("get_run_status", json!({})).await {
+            Ok(status) if status.get("running").and_then(Value::as_bool) == Some(true) => {
+                match self.bridge.send_command("stop_project", json!({})).await {
+                    Ok(_) => editor_play = true,
+                    Err(error) => editor_error = Some(error),
+                }
+            }
+            Ok(_) | Err(McpError::BridgeUnavailable(_)) => {}
+            Err(error) => editor_error = Some(error),
         }
+        if let Some(error) = editor_error {
+            if runs.is_empty() {
+                return bridge_error_result(&error);
+            }
+            return ToolResult::error(
+                format!(
+                    "Stopped {} managed run(s), but the editor's Play mode could not be stopped: {error}",
+                    runs.len()
+                ),
+                &["Call godot_stop_project again to stop the editor's Play mode"],
+            );
+        }
+        let message = match (editor_play, runs.len()) {
+            (false, 0) => "Nothing was running.".to_string(),
+            (true, 0) => "Stopped the editor's Play mode.".to_string(),
+            (false, count) => format!("Stopped {count} managed run(s)."),
+            (true, count) => format!("Stopped the editor's Play mode and {count} managed run(s)."),
+        };
+        ToolResult::text(
+            serde_json::to_string_pretty(&json!({
+                "message": message,
+                "stopped": {"editor_play": editor_play, "runs": runs},
+            }))
+            .unwrap_or_default(),
+        )
     }
 
     async fn handle_run_status(&self) -> ToolResult {
         let processes = self.games.status();
-        match self.bridge.send_command("get_run_status", json!({})).await {
-            Ok(result) => {
-                let mut combined = result;
+        let answer = match self.bridge.send_command("get_run_status", json!({})).await {
+            Ok(mut combined) => {
                 if let Value::Object(map) = &mut combined {
                     map.insert("process_runs".into(), Value::Array(processes));
                 }
-                ToolResult::text(serde_json::to_string_pretty(&combined).unwrap_or_default())
+                combined
             }
-            Err(McpError::BridgeUnavailable(detail)) if !processes.is_empty() => ToolResult::text(
-                serde_json::to_string_pretty(&json!({"editor": detail, "process_runs": processes}))
-                    .unwrap_or_default(),
-            ),
-            Err(error) => bridge_error_result(&error),
-        }
+            // No editor is not a failure of this question: managed runs are still reported.
+            Err(McpError::BridgeUnavailable(detail)) => {
+                let nothing = processes.iter().all(|run| run["running"] != true);
+                let mut answer = json!({
+                    "running": false,
+                    "editor": format!("not connected ({detail})"),
+                    "process_runs": processes,
+                });
+                if nothing {
+                    answer["message"] = json!("Nothing is running.");
+                }
+                answer
+            }
+            Err(error) => return bridge_error_result(&error),
+        };
+        ToolResult::text(serde_json::to_string_pretty(&answer).unwrap_or_default())
     }
 
     async fn handle_create_script(&self, args: Value) -> ToolResult {
-        let Some(file_path) = str_arg(&args, "file_path") else {
-            return missing_argument("file_path");
+        let Some(file_path) = str_arg(&args, "script_path").or_else(|| str_arg(&args, "file_path"))
+        else {
+            return ToolResult::error(
+                "Missing required parameter: script_path (or its older name file_path)",
+                &["Pass script_path: a res:// path ending in .gd"],
+            );
         };
         if !file_path.ends_with(".gd") {
             return ToolResult::error(
@@ -415,12 +487,18 @@ impl ToolManager {
         if let Err(err) = write_result {
             return if err.kind() == ErrorKind::AlreadyExists {
                 ToolResult::error(
-                    format!("File already exists: {}", target.display()),
+                    format!(
+                        "File already exists: {}",
+                        res_display(&project.dir, &target)
+                    ),
                     &["Pass overwrite: true to replace it, or choose another file name"],
                 )
             } else {
                 ToolResult::error(
-                    format!("Failed to write script file {}: {err}", target.display()),
+                    format!(
+                        "Failed to write script file {}: {err}",
+                        res_display(&project.dir, &target)
+                    ),
                     &["Check that the project directory is writable"],
                 )
             };
@@ -480,8 +558,12 @@ impl ToolManager {
             None => PathBuf::from(script_path),
         };
         if !file.is_file() {
+            let shown = match &project_dir {
+                Some(dir) => res_display(dir, &file),
+                None => file.display().to_string(),
+            };
             return ToolResult::error(
-                format!("Script file not found: {}", file.display()),
+                format!("Script file not found: {shown}"),
                 &["Check the path; res:// paths are resolved against the project directory"],
             );
         }
@@ -492,6 +574,14 @@ impl ToolManager {
             .await
         {
             Ok(msg) => ToolResult::text(msg),
+            // The engine could not be run at all: that is a path problem, not a script problem.
+            Err(e @ McpError::Process(_)) => ToolResult::error(
+                format!("Script validation failed: {e}"),
+                &[
+                    "Verify GODOT_PATH points to a working Godot executable",
+                    "Run the executable with --version to see whether it starts",
+                ],
+            ),
             Err(e) => ToolResult::error(
                 format!("Script validation failed: {e}"),
                 &[
@@ -499,6 +589,67 @@ impl ToolManager {
                     "Ensure base class and node types exist in the engine",
                 ],
             ),
+        }
+    }
+
+    /// Decides whether a live-first call goes to the connected editor (TL-10).
+    ///
+    /// A call that names a `project_path` goes to the editor only when the editor has that
+    /// project open; otherwise the caller takes its file path. `wants_dir` also asks the editor
+    /// for its project when no path is named, so an answer that changed something can name the
+    /// project it changed. An editor that cannot say which project it has open is not sent the call.
+    async fn editor_choice(
+        &self,
+        args: &Value,
+        wants_dir: bool,
+    ) -> Result<EditorChoice, ToolResult> {
+        let named = str_arg(args, "project_path");
+        if named.is_none() && !wants_dir {
+            return Ok(EditorChoice::Editor { project_dir: None });
+        }
+        match self
+            .bridge
+            .send_command("get_project_info", json!({}))
+            .await
+        {
+            Ok(info) => {
+                let Some(dir) = info.get("project_dir").and_then(Value::as_str) else {
+                    return Err(ToolResult::error(
+                        "The editor did not report which project it has open, so the call was not sent to it",
+                        &[
+                            "Update the Godot MCP Bridge addon to the same version as the server",
+                            "Or close the editor and repeat the call to use the project files directly",
+                        ],
+                    ));
+                };
+                match named {
+                    Some(named) if !same_directory(Path::new(named), Path::new(dir)) => {
+                        Ok(EditorChoice::Host)
+                    }
+                    _ => Ok(EditorChoice::Editor {
+                        project_dir: Some(dir.to_string()),
+                    }),
+                }
+            }
+            // No editor: the caller's own command fails the same way and its fallback runs.
+            Err(McpError::BridgeUnavailable(_)) => Ok(EditorChoice::Editor { project_dir: None }),
+            Err(error) => Err(bridge_error_result(&error)),
+        }
+    }
+
+    /// False only when the bridge shows that the connected editor has another project open than
+    /// `project` (CI-7). With no editor, or an editor that cannot say, nothing shows a mismatch.
+    async fn editor_may_serve(&self, project: &Path) -> bool {
+        match self
+            .bridge
+            .send_command("get_project_info", json!({}))
+            .await
+        {
+            Ok(info) => info
+                .get("project_dir")
+                .and_then(Value::as_str)
+                .is_none_or(|dir| same_directory(project, Path::new(dir))),
+            Err(_) => true,
         }
     }
 
@@ -641,11 +792,43 @@ fn bridge_error_result(error: &McpError) -> ToolResult {
         McpError::ToolExecution(message) => {
             ToolResult::error(message.clone(), editor_error_hints(message))
         }
-        other => ToolResult::error(other.to_string(), &[]),
+        McpError::Process(detail) => ToolResult::error(
+            format!("Engine process error: {detail}"),
+            &["Verify GODOT_PATH points to a working Godot executable"],
+        ),
+        other => ToolResult::error(
+            other.to_string(),
+            &["This is unexpected: retry once, and note it with godot_note_feedback if it repeats"],
+        ),
     }
 }
 
+/// The `code` of a failure the running game reported, which arrives as a JSON object.
+fn runtime_code(message: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(message).ok()?;
+    value.get("code")?.as_str().map(str::to_string)
+}
+
 fn editor_error_hints(message: &str) -> &'static [&'static str] {
+    if let Some(code) = runtime_code(message) {
+        return match code.as_str() {
+            "DENIED" => &[
+                "The runtime refuses this by design: the script property, private names, and methods that quit, evaluate code, call other methods or free nodes",
+                "Use a public property or a gameplay method named in permit",
+            ],
+            "UNSUPPORTED" => &[
+                "If the message says the game has no window, start the game without headless with godot_run_project",
+                "Otherwise read the message for what the running game needs",
+            ],
+            "NOT_FOUND" => &[
+                "Look up the node path with godot_game_tree; paths are relative to the current scene",
+            ],
+            "BAD_PARAMS" => &[
+                "Fix the parameter the message names; its shape is in the tool's inputSchema from tools/list",
+            ],
+            _ => &["Read the message; the running game refused the request"],
+        };
+    }
     let lower = message.to_lowercase();
     if lower.contains("unauthorized") {
         &[
@@ -654,6 +837,28 @@ fn editor_error_hints(message: &str) -> &'static [&'static str] {
         ]
     } else if lower.contains("no active scene") {
         &["Open a scene first with godot_open_scene"]
+    } else if lower.contains("unsaved changes") {
+        &[
+            "Save the script in the editor (Ctrl+S) or discard its changes, then call godot_read_script again and repeat the edit",
+        ]
+    } else if lower.contains("differs from the file") {
+        &[
+            "Save or reload the script in the editor so that it matches the file, then call godot_read_script again",
+        ]
+    } else if lower.contains("cannot be matched") {
+        &[
+            "Close the extra tabs in the script editor (help pages, text files), or save the script, then read it again",
+        ]
+    } else if lower.contains("already exists") {
+        &["Choose another path; an existing file is never replaced"]
+    } else if lower.contains("can't open") || lower.contains("failed to save") {
+        &[
+            "Check that the folder exists or can be created inside the project and that it is writable, then retry",
+        ]
+    } else if lower.contains("expects a") {
+        &[
+            "Send a value of the type the setting already has, or change it in the editor's Project Settings",
+        ]
     } else if lower.contains("not found")
         || lower.contains("does not exist")
         || lower.contains("not currently open")
@@ -748,9 +953,9 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
         ),
         tool(
             "godot_stop_project",
-            "Stops the project currently running via the live editor's Play mode, or a managed process run when the editor is closed. Pass run_id to stop one process run.",
+            "Stops what runs: without run_id, the editor's Play mode when it plays and every managed process run that is still running, and the answer lists each one it stopped (or says that nothing was running). Pass run_id to stop one process run.",
             json!({
-                "run_id": {"type": "string", "description": "Optional id of a managed process run. Omit to stop the editor Play mode, or the newest process run when the editor is closed."}
+                "run_id": {"type": "string", "description": "Optional id of a managed process run. Omit to stop everything that runs."}
             }),
             &[],
         ),
@@ -876,11 +1081,15 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
         ),
         tool(
             "godot_create_script",
-            "Creates a new GDScript file with a standard header inside a Godot project. Refuses to overwrite an existing file unless overwrite is true.",
+            "Creates a new GDScript file with a standard header inside a Godot project. Refuses to overwrite an existing file unless overwrite is true. script_path is the same parameter the other script tools use; file_path is its older name.",
             json!({
-                "file_path": {
+                "script_path": {
                     "type": "string",
                     "description": "Path of the .gd script: a res:// path or a path relative to the project directory."
+                },
+                "file_path": {
+                    "type": "string",
+                    "description": "The older name of script_path; both are accepted."
                 },
                 "extends_class": {
                     "type": "string",
@@ -899,7 +1108,7 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
                     "description": "Replace the file if it already exists. Defaults to false."
                 }
             }),
-            &["file_path"],
+            &[],
         ),
         tool(
             "godot_validate_script",

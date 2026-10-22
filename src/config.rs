@@ -78,8 +78,9 @@ impl FeedbackMode {
     }
 }
 
-/// An empty value means "not set" and an unknown one is reported and ignored: a setting that
-/// is wrong must never keep the server from starting.
+/// An empty value means "not set" and an unknown one is reported and read as drafting only: a
+/// setting that is wrong must never keep the server from starting, and a typo of a restriction
+/// (`drafts`, `of`) must never switch submission on (FB-10).
 fn parse_feedback_mode(raw: &str) -> Result<FeedbackMode, Infallible> {
     if raw.trim().is_empty() {
         return Ok(FeedbackMode::default());
@@ -87,9 +88,9 @@ fn parse_feedback_mode(raw: &str) -> Result<FeedbackMode, Infallible> {
     Ok(FeedbackMode::parse(raw).unwrap_or_else(|| {
         warn!(
             "Ignoring GODOT_MCP_FEEDBACK={raw:?}: use off, draft or full. Using {}.",
-            FeedbackMode::default().as_str()
+            FeedbackMode::Draft.as_str()
         );
-        FeedbackMode::default()
+        FeedbackMode::Draft
     }))
 }
 
@@ -282,9 +283,16 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_or_unknown_feedback_mode_selects_full_instead_of_stopping_the_server() {
+    fn an_empty_feedback_mode_is_the_default_and_an_unknown_one_never_widens_the_channel() {
         assert_eq!(parse(&["--feedback", ""]).feedback, FeedbackMode::Full);
-        assert_eq!(parse(&["--feedback", "bogus"]).feedback, FeedbackMode::Full);
+        // A typo of a restriction must not switch submission on.
+        for typo in ["bogus", "drafts", "of", "fulll", "0", "no"] {
+            assert_eq!(
+                parse(&["--feedback", typo]).feedback,
+                FeedbackMode::Draft,
+                "{typo:?}"
+            );
+        }
     }
 
     #[test]

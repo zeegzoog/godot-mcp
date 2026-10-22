@@ -104,11 +104,26 @@ var last_mouse := Vector2.ZERO
 var scale_seen := 1.0
 var pad_presses := 0
 var tiny_presses := 0
+var firefly_law: RefCounted
+var bag := {"count": 2}
+var swatch: Resource
 signal pinged(value)
 
 func _ready() -> void:
+    firefly_law = Law.new()
+    swatch = Tone.new()
+    set_meta("note", "hi")
     print("mcp-probe-ready")
     push_error("mcp-probe-error")
+
+class Law:
+    extends RefCounted
+    var births := 3
+    var _hidden := 1
+
+class Tone:
+    extends Resource
+    var level := 4
 
 func _process(_delta: float) -> void:
     hits += 1
@@ -267,6 +282,72 @@ async fn running_game_accepts_input_and_can_be_inspected() {
     );
     assert!(values["hits"].as_i64().unwrap_or(0) > 0, "{props_json}");
 
+    let nested = call(
+        &tools,
+        "godot_game_get",
+        json!({
+            "run_id": run_id,
+            "path": ".",
+            "properties": ["firefly_law/births", "bag/count", "swatch:level"]
+        }),
+    )
+    .await;
+    assert!(!nested.is_error, "{}", text_of(&nested));
+    let nested_values = &json_of(&nested)["properties"];
+    assert_eq!(
+        nested_values["firefly_law/births"],
+        3,
+        "{}",
+        text_of(&nested)
+    );
+    assert_eq!(nested_values["bag/count"], 2, "{}", text_of(&nested));
+    assert_eq!(nested_values["swatch:level"], 4, "{}", text_of(&nested));
+    // A property whose own name has a slash is read whole, not walked as a path.
+    let slashed = call(
+        &tools,
+        "godot_game_get",
+        json!({"run_id": run_id, "path": ".", "properties": ["metadata/note"]}),
+    )
+    .await;
+    assert!(!slashed.is_error, "{}", text_of(&slashed));
+    assert_eq!(
+        json_of(&slashed)["properties"]["metadata/note"],
+        "hi",
+        "{}",
+        text_of(&slashed)
+    );
+    let waited = call(
+        &tools,
+        "godot_game_wait",
+        json!({"run_id": run_id, "node": ".", "property": "metadata/note", "op": "eq", "value": "hi", "timeout": 30}),
+    )
+    .await;
+    assert!(!waited.is_error, "{}", text_of(&waited));
+    let through_colon = call(
+        &tools,
+        "godot_game_get",
+        json!({"run_id": run_id, "path": ".", "properties": ["firefly_law:births"]}),
+    )
+    .await;
+    assert!(through_colon.is_error, "{}", text_of(&through_colon));
+    let colon_text = text_of(&through_colon);
+    assert!(
+        colon_text.contains("not a resource") && colon_text.contains("firefly_law/births"),
+        "{colon_text}"
+    );
+    let hidden = call(
+        &tools,
+        "godot_game_get",
+        json!({"run_id": run_id, "path": ".", "properties": ["firefly_law/_hidden"]}),
+    )
+    .await;
+    assert!(hidden.is_error, "{}", text_of(&hidden));
+    assert!(
+        text_of(&hidden).to_lowercase().contains("refus"),
+        "{}",
+        text_of(&hidden)
+    );
+
     let called = call(
         &tools,
         "godot_game_call",
@@ -389,6 +470,97 @@ async fn running_game_accepts_input_and_can_be_inspected() {
         (played_values["scale_seen"].as_f64().unwrap_or(0.0) - 0.5).abs() < 0.01,
         "{played_json}"
     );
+
+    let drags = call(
+        &tools,
+        "godot_game_input",
+        json!({
+            "run_id": run_id,
+            "steps": [
+                {"type": "path", "points": [[10, 12], [40, 12], [40, 30]], "frames_per_point": 1},
+                {"type": "circle", "center": [80, 80], "radius": 20, "turns": 1, "points_per_turn": 8}
+            ]
+        }),
+    )
+    .await;
+    assert!(!drags.is_error, "{}", text_of(&drags));
+    assert_eq!(
+        json_of(&drags)["steps"].as_array().map(Vec::len),
+        Some(2),
+        "{}",
+        text_of(&drags)
+    );
+    let after_drag = call(
+        &tools,
+        "godot_game_get",
+        json!({"run_id": run_id, "path": ".", "properties": ["mouse_presses", "mouse_releases", "swipe_moves", "mouse_down", "last_mouse"]}),
+    )
+    .await;
+    let drag_values = &json_of(&after_drag)["properties"];
+    assert!(
+        drag_values["mouse_presses"].as_i64().unwrap_or(0) >= 5,
+        "{}",
+        text_of(&after_drag)
+    );
+    assert!(
+        drag_values["mouse_releases"].as_i64().unwrap_or(0)
+            >= drag_values["mouse_presses"].as_i64().unwrap_or(0) - 1,
+        "a path must release: {}",
+        text_of(&after_drag)
+    );
+    assert_eq!(drag_values["mouse_down"], false, "{}", text_of(&after_drag));
+    assert!(
+        drag_values["swipe_moves"].as_i64().unwrap_or(0) >= 4,
+        "{}",
+        text_of(&after_drag)
+    );
+    let end = drag_values["last_mouse"].as_array().expect("last_mouse");
+    let end_x = end[0].as_f64().unwrap_or(0.0);
+    let end_y = end[1].as_f64().unwrap_or(0.0);
+    assert!(
+        (end_x - 100.0).abs() <= 1.0 && (end_y - 80.0).abs() <= 1.0,
+        "circle did not finish where it started: {}",
+        text_of(&after_drag)
+    );
+
+    let mut many = Vec::new();
+    for _ in 0..21 {
+        many.push(json!({"type": "key", "key": "B", "phase": "tap"}));
+    }
+    let compact = call(
+        &tools,
+        "godot_game_input",
+        json!({"run_id": run_id, "steps": many}),
+    )
+    .await;
+    assert!(!compact.is_error, "{}", text_of(&compact));
+    let compact_json = json_of(&compact);
+    assert_eq!(compact_json["ok_count"], 21, "{compact_json}");
+    assert_eq!(
+        compact_json["failed"].as_array().map(Vec::len),
+        Some(0),
+        "{compact_json}"
+    );
+    assert!(compact_json.get("steps").is_none(), "{compact_json}");
+
+    // A drag lasts at most as long as the longest wait, so the call returns while the game still
+    // answers; a longer one is refused before anything is pressed.
+    let long_points: Vec<Value> = (0..12).map(|index| json!([10 + index, 12])).collect();
+    let too_long = call(
+        &tools,
+        "godot_game_input",
+        json!({
+            "run_id": run_id,
+            "steps": [{"type": "path", "points": long_points, "frames_per_point": 60}]
+        }),
+    )
+    .await;
+    let too_long_text = text_of(&too_long);
+    assert!(
+        too_long.is_error,
+        "a path of 660 frames must be refused: {too_long_text}"
+    );
+    assert!(too_long_text.contains("600"), "{too_long_text}");
 
     let slowed = call(
         &tools,
@@ -2090,6 +2262,14 @@ async fn held_game_refuses_every_operation_that_needs_time_and_serves_the_rest()
         (
             "godot_game_input",
             json!({"steps": [{"type": "swipe", "x": 1, "y": 1, "to_x": 5, "to_y": 5}]}),
+        ),
+        (
+            "godot_game_input",
+            json!({"steps": [{"type": "path", "points": [[1, 1], [4, 1], [4, 4]]}]}),
+        ),
+        (
+            "godot_game_input",
+            json!({"steps": [{"type": "circle", "center": [20, 20], "radius": 8, "points_per_turn": 8}]}),
         ),
     ];
     for (tool, extra) in refused {

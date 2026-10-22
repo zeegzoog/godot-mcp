@@ -2,7 +2,7 @@ use crate::bridge::BridgeClient;
 use crate::cli_runner::CliRunner;
 use crate::config::FeedbackMode;
 use crate::error::McpError;
-use crate::godot::{GameHub, ProcessStart};
+use crate::godot::{GameHub, ProcessStart, stale_imports};
 use crate::journal::EvidenceKind;
 use crate::lsp::LspHub;
 use crate::paths::{
@@ -292,19 +292,28 @@ impl ToolManager {
                 .await;
         }
 
+        // Reimport before Play, so the editor's game does not keep the old cache.
+        let notice = match self.resolve_project(&args).await {
+            Ok(project) if project.from_editor => self.import_notice(&project.dir).await,
+            _ => String::new(),
+        };
+
         // Prefer the live editor: it can be stopped/queried later via
         // godot_stop_project / godot_get_run_status, unlike a spawned process.
         let bridge_params = json!({ "scene_path": scene.unwrap_or("") });
         match self.bridge.send_command("run_project", bridge_params).await {
             Ok(result) => {
-                return ToolResult::text(format!(
-                    "Project running via live editor:\n{}",
-                    serde_json::to_string_pretty(&result).unwrap_or_default()
-                ));
+                return with_notice(
+                    ToolResult::text(format!(
+                        "Project running via live editor:\n{}",
+                        serde_json::to_string_pretty(&result).unwrap_or_default()
+                    )),
+                    &notice,
+                );
             }
             // Only a missing editor justifies spawning a separate process.
             Err(McpError::BridgeUnavailable(_)) => {}
-            Err(error) => return bridge_error_result(&error),
+            Err(error) => return with_notice(bridge_error_result(&error), &notice),
         }
 
         self.spawn_managed(&args, scene, user_args.as_deref().unwrap_or(&[]))
@@ -331,6 +340,7 @@ impl ToolManager {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let held = args.get("held").and_then(Value::as_bool).unwrap_or(false);
+        let notice = self.import_notice(&path).await;
         match self
             .games
             .start(
@@ -346,16 +356,76 @@ impl ToolManager {
             )
             .await
         {
-            Ok(info) => ToolResult::text(format!(
-                "Spawned a managed Godot process (PID: {}, run_id: {}). Stop it with godot_stop_project. Project: '{}'.",
-                info.pid,
-                info.id,
-                path.display()
-            )),
-            Err(error) => ToolResult::error(
-                format!("Failed to run project: {error}"),
-                &["Verify GODOT_PATH points to a working Godot executable"],
+            Ok(info) => with_notice(
+                ToolResult::text(format!(
+                    "Spawned a managed Godot process (PID: {}, run_id: {}). Stop it with godot_stop_project. Project: '{}'.",
+                    info.pid,
+                    info.id,
+                    path.display()
+                )),
+                &notice,
             ),
+            Err(error) => with_notice(
+                ToolResult::error(
+                    format!("Failed to run project: {error}"),
+                    &["Verify GODOT_PATH points to a working Godot executable"],
+                ),
+                &notice,
+            ),
+        }
+    }
+
+    /// Reimports stale imports through the editor when it has this project open, and otherwise
+    /// returns a warning that names `godot_resave_resources`. Empty when nothing is stale.
+    async fn import_notice(&self, project: &Path) -> String {
+        let root = project.to_path_buf();
+        // The walk reads every folder of the project, so it runs off the async workers.
+        let stale = tokio::task::spawn_blocking(move || stale_imports(&root))
+            .await
+            .unwrap_or_default();
+        if stale.is_empty() {
+            return String::new();
+        }
+        let listed = list_paths(&stale);
+        match self.reimport_stale(project, &stale).await {
+            Some(Ok(())) => format!(
+                "\nReimported stale resources before the run: {listed}. The game loads the new import."
+            ),
+            Some(Err(error)) => format!(
+                "\nWarning: these imported resources are newer than the cache ({error}): {listed}. Call godot_resave_resources with those paths, then run again."
+            ),
+            None => format!(
+                "\nWarning: these imported resources are newer than the cache the game will load: {listed}. Call godot_resave_resources with those paths while the editor is open, then run again."
+            ),
+        }
+    }
+
+    /// `Some` when the connected editor has this project open (`Ok` after a reimport). `None`
+    /// when no editor is there, or it has a different project, so the caller warns instead.
+    async fn reimport_stale(&self, project: &Path, paths: &[String]) -> Option<Result<(), String>> {
+        let info = match self
+            .bridge
+            .send_command("get_project_info", json!({}))
+            .await
+        {
+            Ok(info) => info,
+            Err(McpError::BridgeUnavailable(_)) => return None,
+            Err(error) => return Some(Err(error.to_string())),
+        };
+        let Some(dir) = info.get("project_dir").and_then(Value::as_str) else {
+            return Some(Err("the editor did not report its project directory".into()));
+        };
+        if !same_directory(Path::new(dir), project) {
+            return None;
+        }
+        match self
+            .bridge
+            .send_command("resave_resources", json!({ "paths": paths }))
+            .await
+        {
+            Ok(_) => Some(Ok(())),
+            Err(McpError::BridgeUnavailable(_)) => None,
+            Err(error) => Some(Err(error.to_string())),
         }
     }
 
@@ -858,6 +928,29 @@ fn invalid_identifier(parameter: &str, value: &str) -> ToolResult {
     )
 }
 
+fn with_notice(mut result: ToolResult, notice: &str) -> ToolResult {
+    if notice.is_empty() {
+        return result;
+    }
+    if let Some(crate::protocol::ToolContent::Text { text }) = result.content.first_mut() {
+        text.push_str(notice);
+    }
+    result
+}
+
+fn list_paths(paths: &[String]) -> String {
+    const SHOWN: usize = 32;
+    if paths.len() <= SHOWN {
+        paths.join(", ")
+    } else {
+        format!(
+            "{}, and {} more",
+            paths[..SHOWN].join(", "),
+            paths.len() - SHOWN
+        )
+    }
+}
+
 /// Turns a bridge failure into a tool error whose recovery hints match what actually failed.
 fn bridge_error_result(error: &McpError) -> ToolResult {
     match error {
@@ -866,7 +959,7 @@ fn bridge_error_result(error: &McpError) -> ToolResult {
             &[
                 "Launch Godot Editor with your project (godot_launch_editor can do it)",
                 "Ensure 'Godot MCP Bridge' plugin is enabled in Project Settings -> Plugins",
-                "Verify GODOT_DEBUG_PORT matches the bridge port (default: 9333)",
+                "Set the addon's project setting godot_mcp/bridge_port to the port named in the error, or start the editor with that same GODOT_DEBUG_PORT",
             ],
         ),
         McpError::Bridge(detail) => ToolResult::error(
@@ -1003,7 +1096,7 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
         ),
         tool(
             "godot_run_project",
-            "Runs the Godot project or a specific scene. Uses the live editor's Play mode when the bridge is connected. Otherwise starts a managed process (debugger attached) that godot_stop_project can stop. held true (with mode process) starts the game held at its first physics tick at a fixed frame rate equal to the project's tick rate, so godot_game_physics steps are exact. user_args (mode process only) are strings placed after --, so the game reads them with OS.get_cmdline_user_args() and Godot does not treat them as engine options. mode auto and editor Play reject user_args instead of dropping them.",
+            "Runs the Godot project or a specific scene. Uses the live editor's Play mode when the bridge is connected. Otherwise starts a managed process (debugger attached) that godot_stop_project can stop. held true (with mode process) starts the game held at its first physics tick at a fixed frame rate equal to the project's tick rate, so godot_game_physics steps are exact. user_args (mode process only) are strings placed after --, so the game reads them with OS.get_cmdline_user_args() and Godot does not treat them as engine options. mode auto and editor Play reject user_args instead of dropping them. Before the run, files with a .import sidecar are compared with their .godot/imported cache. When the editor bridge is connected to this project, stale imports are reimported first, the same way godot_resave_resources does. Otherwise the result warns, lists the res:// paths, and names godot_resave_resources.",
             json!({
                 "project_path": {
                     "type": "string",

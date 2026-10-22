@@ -167,6 +167,24 @@ async fn only_gd_files_can_be_created() {
 }
 
 #[tokio::test]
+async fn an_offline_editor_names_the_bridge_port_the_server_is_using() {
+    let port = free_port();
+    let tools = Arc::new(ToolManager::new(
+        BridgeClient::with_port_origin(port, format!("port {port} from --debug-port")),
+        CliRunner::new(PathBuf::from("godot-binary-that-does-not-exist")),
+    ));
+    let result = tools.call_tool("godot_get_project_info", json!({})).await;
+    let message = text(&result);
+    assert!(result.is_error, "{message}");
+    assert!(message.contains(&port.to_string()), "{message}");
+    assert!(message.contains("--debug-port"), "{message}");
+    assert!(message.contains("godot_mcp/bridge_port"), "{message}");
+    assert!(message.contains("must listen"), "{message}");
+    assert!(!message.contains("default: 9333"), "{message}");
+    assert!(!message.contains("Verify GODOT_DEBUG_PORT"), "{message}");
+}
+
+#[tokio::test]
 async fn needs_a_project_when_the_editor_is_offline() {
     let result = call("godot_create_script", json!({"file_path": "res://a.gd"})).await;
     assert!(result.is_error);
@@ -184,6 +202,40 @@ async fn rejects_a_project_path_without_project_godot() {
     assert!(result.is_error);
     assert!(text(&result).contains("project.godot"), "{}", text(&result));
     assert!(!empty.path().join("a.gd").exists());
+}
+
+#[tokio::test]
+async fn run_project_warns_when_an_imported_source_is_newer_than_its_cache() {
+    let project = project_dir();
+    let root = project.path();
+    std::fs::create_dir_all(root.join("shaders")).unwrap();
+    std::fs::create_dir_all(root.join(".godot/imported")).unwrap();
+    let source = root.join("shaders/flow.glsl");
+    let cache = root.join(".godot/imported/flow.glsl-abc.res");
+    std::fs::write(&source, "void main() {}\n").unwrap();
+    std::fs::write(&cache, "old").unwrap();
+    std::fs::write(
+        root.join("shaders/flow.glsl.import"),
+        "path=\"res://.godot/imported/flow.glsl-abc.res\"\n",
+    )
+    .unwrap();
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    std::fs::File::options()
+        .write(true)
+        .open(&cache)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    let result = call(
+        "godot_run_project",
+        json!({"project_path": root, "mode": "process"}),
+    )
+    .await;
+    let message = text(&result);
+    assert!(result.is_error, "{message}");
+    assert!(message.contains("res://shaders/flow.glsl"), "{message}");
+    assert!(message.contains("godot_resave_resources"), "{message}");
+    assert!(!message.contains("res://shaders/plain"), "{message}");
 }
 
 #[tokio::test]

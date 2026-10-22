@@ -5,10 +5,12 @@
 
 mod debug_ctl;
 mod debug_session;
+mod imports;
 mod runs;
 mod variant;
 
 pub use debug_ctl::{DebugCtl, StopInfo, split_breakpoint};
 pub use debug_session::DebugSession;
+pub use imports::stale_imports;
 pub use runs::{GameHub, ProcessStart, Run, RunInfo, json_id_eq};
 pub use variant::{PacketReader, decode_variant, encode_variant, frame_packet};

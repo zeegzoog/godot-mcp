@@ -50,7 +50,7 @@ Tool names are the MCP names. Solo and Vollkorn do not use a `godot_` prefix.
 | Editor screenshot | partial `godot_capture_viewport` (pre-existing). Needs a window | `godot_game_screenshot` can target the editor view | unsupported | `capture_screenshot` | editor viewport | Left as the existing tool |
 | Breakpoints, pause, step, stack, variables | partial. Process runs only. Verified pause (`reason: pause`, no script stack, which matches `core:break`) and a line breakpoint whose stack contained `_process`. Step into/over/out and variable decode are implemented (`src/godot/debug_ctl.rs`) and not driven by the e2e | implemented `godot_debug_*`, plus evaluate | unsupported | unsupported as a real debugger. `pause_game` sets `SceneTree.paused` | `core:breakpoint`, `core:break`, `step`/`next`/`out`/`continue`, `get_stack_dump`, `get_stack_frame_vars` | Client of Godot's debugger. Editor Play stays on the editor's debugger; the relay does not receive `debug_enter` |
 | GDScript LSP | partial. `godot_code_diagnostics` and `godot_code_symbols` verified against a real script (headless `--lsp-port`; the same script is queried repeatedly). Complete, definition, references are implemented (`src/lsp/`) and not in the e2e | implemented `godot_code_diagnostics`, `godot_code_symbols`, `godot_code_lookup`, `godot_code_rename` | unsupported | unsupported | Godot's GDScript language server, TCP, `Content-Length` only | Client. No language server of our own. Rename is not ported |
-| Create / open / save scene | implemented. `godot_create_scene` (editor pack, or text if the editor is closed; both refuse to replace a scene, and both paths are tested). `godot_open_scene` reloads an already-open scene when the file bytes differ (editor e2e: node `Before` replaced by `FromDisk`). `godot_save_scene` pre-existing. Absolute paths inside the project are accepted; on macOS `/var` and `/private/var` are treated as the same directory | implemented, plus inherit, save-as, close, batch | implemented `create_scene`, `save_scene` via CLI | implemented, plus more node ops | `PackedScene.pack`, `EditorInterface.reload_scene_from_path` | Reload compares a content hash, not mtime, so a same-second edit counts. Unsaved bridge edits need `discard: true` |
+| Create / open / save scene | implemented. `godot_create_scene` (editor pack, or text if the editor is closed; both refuse to replace a scene, and both paths are tested). `godot_open_scene` reloads an already-open scene when the file bytes differ (editor e2e: node `Before` replaced by `FromDisk`). `godot_save_scene` pre-existing. Absolute paths inside the project are accepted; on macOS `/var` and `/private/var` are treated as the same directory | implemented, plus inherit, save-as, close, batch | implemented `create_scene`, `save_scene` via CLI | implemented, plus more node ops | `PackedScene.pack`, `EditorInterface.reload_scene_from_path` | Reload compares a content hash, not mtime, so a same-second edit counts. Unsaved editor changes, made by hand or by a tool, need `discard: true` |
 | Nodes add / remove / properties | implemented (pre-existing), undoable | implemented, plus rename, reparent, duplicate, instance, groups | partial `add_node` | implemented, plus those extras | `EditorUndoRedoManager` | Kept. Rename/reparent/duplicate not added |
 | Script attach | implemented `godot_attach_script` (undoable, editor only; the editor e2e test attaches, detaches, and refuses a missing script) | implemented `godot_script_attach` | unsupported | implemented `attach_script` | `Node.script` via undo | Editor only. Creating the file stays `godot_create_script` |
 | Script read / edit | implemented `godot_read_script` and `godot_edit_script`. Verified in the editor e2e test on a real editor: the unsaved editor text is read, one fragment is replaced as one undo step and saved, a stale label, zero and several matches and unsaved typing are refused, a running tool script gets the new code. Without an editor the file is changed through a temporary file (host tests: line endings, byte order mark, refusals) | not compared | not compared | not compared | `ScriptEditor` code editor, `ResourceSaver` | Fragment replacement only, refused over unsaved editor changes. No full-file overwrite |
@@ -116,20 +116,21 @@ build named in `.github/godot-version` (see the README):
 - `runtime_e2e_test`: a process run with a live tree, keyboard, mouse, touch, joypad button
   and axis, a wait step, property readback, a permitted call, signal observation, headless
   screenshot rejection, release-all, gestures (`click`, `swipe`, `click_node`), the time
-  scale, waits for a signal and for a missing node, a failed click releasing a held key, the
-  error log, pause, a line breakpoint with its stack, resume, and stop with `override.cfg`
-  restored; a windowed screenshot with a frame sheet and a pixel diff (skipped on a Linux
-  machine without a display); a windowed recording written as PNG files; a shader parameter
-  read and written through a resource path, with the refused writes; held stepping; and the
-  language server on a broken script and on a script queried again.
+  scale, waits for a signal, for a missing node, for a property value and for a newer scene
+  generation, a failed click releasing a held key, the error log, pause, a line breakpoint
+  with its stack, resume, and stop with `override.cfg` restored; a windowed screenshot with a
+  frame sheet, a pixel diff and a named baseline (skipped on a Linux machine without a
+  display); a windowed recording written as PNG files; a shader parameter read and written
+  through a resource path, with the refused writes; held stepping; and the language server on
+  a broken script and on a script queried again.
 - `editor_e2e_test`: the loopback-only, token-checked bridge; the scene and property tools,
   including the reload of an open scene whose file changed; undo and resource refresh; the
-  authoring tools; and a game tool called right after editor Play (skipped on a Linux
-  machine without a display).
+  authoring tools, including reading and editing scripts; and a game tool called right after
+  editor Play (skipped on a Linux machine without a display).
 - `addon_export_test`: the addon stays out of exported games.
 
-No end-to-end test drives: step into/over/out, language-server completion, definition and
-references, `godot_game_signals`, or `godot_game_snapshot`. A GUT / GdUnit4
+No end-to-end test drives: step into/over/out, or language-server completion, definition and
+references. `godot_game_signals` is only checked to answer in a held game. A GUT / GdUnit4
 runner was not added: it needs those addons in a fixture project, and `godot --headless --check-only` plus
 the end-to-end tests already compile the scripts.
 

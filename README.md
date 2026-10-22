@@ -4,7 +4,7 @@ A fast, cross-platform [Model Context Protocol](https://modelcontextprotocol.io)
 
 - **One native binary** for Windows, Linux, and macOS (Intel and Apple Silicon). No Node.js or Python.
 - **Live editor bridge.** A small GDScript plugin exposes the open scenes over a local WebSocket (loopback only, token-protected). Node edits go through `EditorUndoRedoManager`, so anything the AI changes can be undone with `Ctrl+Z`.
-- **Headless fallback.** Without a running editor, the server calls the Godot binary directly to report the engine version, validate scripts, create scripts, and launch the editor or the project.
+- **Headless fallback.** Without a running editor, the server calls the Godot binary directly to report the engine version, validate scripts, launch the editor, run the project as a managed game and ask Godot's language server about scripts. It writes scripts, scenes, resources and project settings as files.
 
 ## Installation
 
@@ -131,13 +131,13 @@ To report a vulnerability, follow [SECURITY.md](SECURITY.md). Never open a publi
 | Tool | Needs | What it does |
 | --- | --- | --- |
 | `godot_get_version` | — | Engine version, from the editor or the Godot binary. |
-| `godot_get_project_info` | Editor | Name, main scene, and features of the open project. |
+| `godot_get_project_info` | Editor | Name, main scene, features and directory of the open project. |
 | `godot_launch_editor` | — | Launches the editor for `project_path`, or for the project the server runs in. |
 | `godot_run_project` | — | Plays the main scene or a given `res://` scene. With the editor, uses its Play mode. Without it (or with `mode: "process"`), starts a managed game with the remote debugger attached; `held: true` (process runs only) starts it held, for exact steps. `user_args` (process only) are strings the game reads with `OS.get_cmdline_user_args()`; they are placed after `--` and refused for editor Play and `mode: "auto"`. A source newer than its `.godot/imported` cache is reimported first when the editor has this project open, and otherwise the result names the paths and `godot_resave_resources`. `godot_stop_project` stops either one. |
 | `godot_stop_project` | — | Stops what runs: the editor's Play mode when it plays and every managed process run, and lists what it stopped (or says that nothing was running). Pass `run_id` to stop one process run. |
 | `godot_get_run_status` | — | Whether a scene is playing, and the managed process runs, each with its `user_args`, exit code, `ended_by` (`game` or `server`) and `ended_at` once it has ended. Says that nothing is running when that is so. |
 | `godot_get_open_scenes` | Editor | Open scene tabs and the active one. |
-| `godot_open_scene` | Editor | Opens a scene by `res://` path. If that tab is already open and the file on disk has changed, reloads it (pass `discard: true` to drop unsaved bridge edits). |
+| `godot_open_scene` | Editor | Opens a scene by `res://` path. If that tab is already open and the file on disk has changed, reloads it and drops its undo history. A reload over unsaved editor changes, typed by hand or made by a tool, is refused unless you pass `discard: true`; `reload: true` reloads an open scene even when the file is unchanged. |
 | `godot_save_scene` | Editor | Saves the active scene. |
 | `godot_get_scene_tree` | Editor | Node hierarchy of the active scene, or of another open tab via `scene_path`. Paths are relative to the scene root. |
 | `godot_add_node` | Editor | Adds a node of any instantiable `Node` class or global script class (undoable). |

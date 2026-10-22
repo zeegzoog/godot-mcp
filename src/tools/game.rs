@@ -78,7 +78,7 @@ pub fn catalog() -> Vec<Tool> {
         ),
         tool(
             "godot_game_set",
-            "Sets properties on a live node. A name may step through resources with ':' (material_override:shader_parameter/caustics); '/' stays inside one Godot property name. Refuses script, a private segment, and a path that is not a resource. Nothing is saved to disk.",
+            "Sets properties on a live node. '/' writes a Dictionary key or an Object property, the same way godot_game_get reads one: get only, no method calls. A missing property or key is an error that names the segment; a new Dictionary key is not created. The value is read back, and a write that did not take (a read-only property, or a setter that rejects the value) is an error, never success with null. A property whose own name contains '/' (shader_parameter/caustics, metadata/note) is written whole. ':' steps through a Resource (material_override:shader_parameter/caustics). A '/' step stays inside the object it starts from: a Node along the way is an error, and that node is named with the path parameter. Refuses script, a private segment, and a ':' step that is not a Resource. Nothing is saved to disk.",
             json!({"run_id": s(""), "path": s(""), "properties": {"type": "object"}}),
             &["properties"],
         ),

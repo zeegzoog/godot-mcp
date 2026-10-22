@@ -340,6 +340,19 @@ fn an_unknown_feedback_mode_falls_back_with_a_warning_on_stderr_only() {
         stderr.contains("GODOT_MCP_FEEDBACK") && stderr.contains("bogus"),
         "{stderr}"
     );
+    // Standard error is a pipe here, not a terminal: no colour codes in the text (ESC is byte 27).
+    assert!(
+        output.stderr.iter().all(|byte| *byte != 27),
+        "colour codes in a piped log: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_feedback_mode_offers_drafting_but_never_submission() {
+    assert_eq!(
+        listed_feedback_tools(Some("drafts")).await,
+        &FEEDBACK_TOOLS[..2]
+    );
 }
 
 const FEEDBACK_TOOLS: [&str; 3] = [

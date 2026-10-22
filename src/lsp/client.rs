@@ -75,8 +75,13 @@ impl LspHub {
         }
     }
 
-    pub async fn diagnostics(&self, project: &Path, file: &Path) -> Result<Value> {
-        let client = self.client_for(project).await?;
+    pub async fn diagnostics(
+        &self,
+        project: &Path,
+        external_ok: bool,
+        file: &Path,
+    ) -> Result<Value> {
+        let client = self.client_for(project, external_ok).await?;
         let text = tokio::fs::read_to_string(file).await?;
         let uri = path_to_uri(file);
         let key = uri_key(&uri);
@@ -95,9 +100,10 @@ impl LspHub {
                 break items;
             }
             if tokio::time::Instant::now() >= deadline {
-                return Err(McpError::Process(
-                    "the GDScript language server did not publish diagnostics".into(),
-                ));
+                return Err(McpError::Process(format!(
+                    "the GDScript language server did not publish diagnostics for the project {}",
+                    project.display()
+                )));
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
@@ -110,8 +116,8 @@ impl LspHub {
         Ok(json!({"uri": uri, "diagnostics": shift_diagnostics(&diagnostics)}))
     }
 
-    pub async fn symbols(&self, project: &Path, file: &Path) -> Result<Value> {
-        let client = self.client_for(project).await?;
+    pub async fn symbols(&self, project: &Path, external_ok: bool, file: &Path) -> Result<Value> {
+        let client = self.client_for(project, external_ok).await?;
         self.open_quiet(&client, file).await?;
         let result = client
             .request(
@@ -127,16 +133,17 @@ impl LspHub {
     pub async fn complete(
         &self,
         project: &Path,
+        external_ok: bool,
         file: &Path,
         line: u32,
         character: u32,
     ) -> Result<Value> {
         self.position(
             project,
+            external_ok,
             file,
             "textDocument/completion",
-            line,
-            character,
+            (line, character),
             json!({}),
         )
         .await
@@ -145,16 +152,17 @@ impl LspHub {
     pub async fn definition(
         &self,
         project: &Path,
+        external_ok: bool,
         file: &Path,
         line: u32,
         character: u32,
     ) -> Result<Value> {
         self.position(
             project,
+            external_ok,
             file,
             "textDocument/definition",
-            line,
-            character,
+            (line, character),
             json!({}),
         )
         .await
@@ -163,16 +171,17 @@ impl LspHub {
     pub async fn references(
         &self,
         project: &Path,
+        external_ok: bool,
         file: &Path,
         line: u32,
         character: u32,
     ) -> Result<Value> {
         self.position(
             project,
+            external_ok,
             file,
             "textDocument/references",
-            line,
-            character,
+            (line, character),
             json!({"context": {"includeDeclaration": true}}),
         )
         .await
@@ -181,13 +190,13 @@ impl LspHub {
     async fn position(
         &self,
         project: &Path,
+        external_ok: bool,
         file: &Path,
         method: &str,
-        line: u32,
-        character: u32,
+        (line, character): (u32, u32),
         mut extra: Value,
     ) -> Result<Value> {
-        let client = self.client_for(project).await?;
+        let client = self.client_for(project, external_ok).await?;
         self.open_quiet(&client, file).await?;
         if let Value::Object(map) = &mut extra {
             map.insert("textDocument".into(), json!({"uri": path_to_uri(file)}));
@@ -221,30 +230,37 @@ impl LspHub {
             .await
     }
 
-    async fn client_for(&self, project: &Path) -> Result<Arc<ClientInner>> {
+    async fn client_for(&self, project: &Path, external_ok: bool) -> Result<Arc<ClientInner>> {
         let godot = self.godot.clone();
-        self.client_with(project, |root| async move {
-            connect_or_start(&godot, &root).await
+        self.client_with(project, external_ok, |root, external_ok| async move {
+            connect_or_start(&godot, &root, external_ok).await
         })
         .await
     }
 
     /// The client for `project`: the live one, or the one `start` makes when there is none
-    /// or its connection has closed. Only one start runs at a time.
-    async fn client_with<F, Fut>(&self, project: &Path, start: F) -> Result<Arc<ClientInner>>
+    /// or its connection has closed. Only one start runs at a time. `external_ok` says whether a
+    /// language server an editor already runs may be used (CI-7): when it is false, only a server
+    /// this hub started itself is reused, and `start` is told not to connect to the configured port.
+    async fn client_with<F, Fut>(
+        &self,
+        project: &Path,
+        external_ok: bool,
+        start: F,
+    ) -> Result<Arc<ClientInner>>
     where
-        F: FnOnce(PathBuf) -> Fut,
+        F: FnOnce(PathBuf, bool) -> Fut,
         Fut: Future<Output = StartResult>,
     {
         let project = std::fs::canonicalize(project).unwrap_or_else(|_| project.to_path_buf());
-        if let Some(client) = self.live_client(&project) {
+        if let Some(client) = self.live_client(&project, external_ok) {
             return Ok(client);
         }
         let _starting = self.starting.lock().await;
-        if let Some(client) = self.live_client(&project) {
+        if let Some(client) = self.live_client(&project, external_ok) {
             return Ok(client);
         }
-        let (client, child) = start(project.clone()).await?;
+        let (client, child) = start(project.clone(), external_ok).await?;
         *lock(&self.live) = Some(Live {
             client: Arc::clone(&client),
             child,
@@ -253,10 +269,14 @@ impl LspHub {
         Ok(client)
     }
 
-    fn live_client(&self, project: &Path) -> Option<Arc<ClientInner>> {
+    fn live_client(&self, project: &Path, external_ok: bool) -> Option<Arc<ClientInner>> {
         lock(&self.live)
             .as_ref()
-            .filter(|live| live.root == project && live.client.is_open())
+            .filter(|live| {
+                live.root == project
+                    && live.client.is_open()
+                    && (external_ok || live.child.is_some())
+            })
             .map(|live| Arc::clone(&live.client))
     }
 }
@@ -303,13 +323,16 @@ impl ClientInner {
 async fn connect_or_start(
     godot: &Path,
     project: &Path,
+    external_ok: bool,
 ) -> Result<(Arc<ClientInner>, Option<Child>)> {
     let port = std::env::var("GODOT_MCP_LSP_PORT")
         .ok()
         .and_then(|value| value.trim().parse().ok())
         .unwrap_or(DEFAULT_PORT);
-    if let Ok(client) = connect_client(port, project).await {
-        return Ok((client, None));
+    if external_ok {
+        if let Ok(client) = connect_client(port, project).await {
+            return Ok((client, None));
+        }
     }
     if !godot.exists() {
         return Err(McpError::Process(format!(
@@ -599,16 +622,47 @@ mod tests {
     fn counted_start(
         started: &Arc<AtomicUsize>,
         client: &Arc<ClientInner>,
-    ) -> impl FnOnce(PathBuf) -> std::pin::Pin<Box<dyn Future<Output = StartResult> + Send>> {
+    ) -> impl FnOnce(PathBuf, bool) -> std::pin::Pin<Box<dyn Future<Output = StartResult> + Send>>
+    {
         let started = Arc::clone(started);
         let client = Arc::clone(client);
-        move |_root| {
+        move |_root, _external_ok| {
             Box::pin(async move {
                 started.fetch_add(1, Ordering::SeqCst);
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 Ok((client, None))
             })
         }
+    }
+
+    #[tokio::test]
+    async fn a_server_the_hub_did_not_start_is_not_reused_for_a_project_it_may_not_serve() {
+        let hub = LspHub::new(PathBuf::from("godot"));
+        let project = tempfile::tempdir().unwrap();
+        let started = Arc::new(AtomicUsize::new(0));
+        let (external, _inbox) = fake_client();
+        hub.client_with(project.path(), true, counted_start(&started, &external))
+            .await
+            .unwrap();
+
+        // The bridge now shows that the editor has another project open (CI-7).
+        let (own, _inbox) = fake_client();
+        let replaced = hub
+            .client_with(project.path(), false, counted_start(&started, &own))
+            .await
+            .unwrap();
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            2,
+            "the external server was reused"
+        );
+        assert!(Arc::ptr_eq(&replaced, &own));
+
+        // Where an external server is acceptable again, the live one is simply kept.
+        hub.client_with(project.path(), true, counted_start(&started, &own))
+            .await
+            .unwrap();
+        assert_eq!(started.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -619,8 +673,8 @@ mod tests {
         let (client, _inbox) = fake_client();
 
         let (first, second) = tokio::join!(
-            hub.client_with(project.path(), counted_start(&started, &client)),
-            hub.client_with(project.path(), counted_start(&started, &client)),
+            hub.client_with(project.path(), true, counted_start(&started, &client)),
+            hub.client_with(project.path(), true, counted_start(&started, &client)),
         );
 
         assert_eq!(
@@ -638,10 +692,10 @@ mod tests {
         let started = Arc::new(AtomicUsize::new(0));
         let (client, _inbox) = fake_client();
 
-        hub.client_with(project.path(), counted_start(&started, &client))
+        hub.client_with(project.path(), true, counted_start(&started, &client))
             .await
             .unwrap();
-        hub.client_with(project.path(), counted_start(&started, &client))
+        hub.client_with(project.path(), true, counted_start(&started, &client))
             .await
             .unwrap();
 
@@ -654,14 +708,14 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let started = Arc::new(AtomicUsize::new(0));
         let (first, _inbox) = fake_client();
-        hub.client_with(project.path(), counted_start(&started, &first))
+        hub.client_with(project.path(), true, counted_start(&started, &first))
             .await
             .unwrap();
 
         first.closed.store(true, Ordering::Release);
         let (second, _inbox) = fake_client();
         let replaced = hub
-            .client_with(project.path(), counted_start(&started, &second))
+            .client_with(project.path(), true, counted_start(&started, &second))
             .await
             .unwrap();
 
@@ -679,7 +733,7 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let started = Arc::new(AtomicUsize::new(0));
         let (first, inbox) = fake_client();
-        hub.client_with(project.path(), counted_start(&started, &first))
+        hub.client_with(project.path(), true, counted_start(&started, &first))
             .await
             .unwrap();
 
@@ -687,7 +741,7 @@ mod tests {
         drop(inbox);
         let (second, _inbox) = fake_client();
         let replaced = hub
-            .client_with(project.path(), counted_start(&started, &second))
+            .client_with(project.path(), true, counted_start(&started, &second))
             .await
             .unwrap();
 

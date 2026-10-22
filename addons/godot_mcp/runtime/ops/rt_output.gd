@@ -57,12 +57,22 @@ static func output(_rt: Node, params: Dictionary) -> Dictionary:
     var next_seq := since
     if not page.is_empty():
         next_seq = int(page.back()["seq"]) + 1
-    return R.ok({
+    # Every line's stamp carries the same long explanation of script_sha256; say it once.
+    var note: Variant = null
+    for entry: Dictionary in page:
+        var stamp: Dictionary = entry.get("scene", {})
+        if stamp.has("script_sha256_note"):
+            note = stamp["script_sha256_note"]
+            stamp.erase("script_sha256_note")
+    var answer := {
         "lines": page,
         "next": next_seq,
         "error_count": snap["error_count"],
         "warning_count": snap["warning_count"],
-    })
+    }
+    if note != null:
+        answer["script_sha256_note"] = note
+    return R.ok(answer)
 
 
 class OutputLogger extends Logger:

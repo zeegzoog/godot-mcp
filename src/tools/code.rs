@@ -31,7 +31,7 @@ pub fn catalog() -> Vec<Tool> {
         tool(
             "godot_code_complete",
             "Code completion at a 1-based line and column, from Godot's language server.",
-            json!({"script_path": s(""), "line": i(""), "character": i(""), "project_path": s("")}),
+            json!({"script_path": s(""), "line": position("Line, counted from 1."), "character": position("Column, counted from 1."), "project_path": s("")}),
             &["script_path", "line", "character"],
         ),
         tool(
@@ -43,13 +43,13 @@ pub fn catalog() -> Vec<Tool> {
         tool(
             "godot_code_definition",
             "Go to definition at a 1-based position, from Godot's language server.",
-            json!({"script_path": s(""), "line": i(""), "character": i(""), "project_path": s("")}),
+            json!({"script_path": s(""), "line": position("Line, counted from 1."), "character": position("Column, counted from 1."), "project_path": s("")}),
             &["script_path", "line", "character"],
         ),
         tool(
             "godot_code_references",
             "Find references at a 1-based position, from Godot's language server.",
-            json!({"script_path": s(""), "line": i(""), "character": i(""), "project_path": s("")}),
+            json!({"script_path": s(""), "line": position("Line, counted from 1."), "character": position("Column, counted from 1."), "project_path": s("")}),
             &["script_path", "line", "character"],
         ),
     ]
@@ -60,14 +60,6 @@ fn s(description: &str) -> Value {
         json!({"type": "string"})
     } else {
         json!({"type": "string", "description": description})
-    }
-}
-
-fn i(description: &str) -> Value {
-    if description.is_empty() {
-        json!({"type": "integer"})
-    } else {
-        json!({"type": "integer", "description": description})
     }
 }
 
@@ -93,40 +85,56 @@ enum CodeOp {
 }
 
 async fn code_diagnostics(tools: &ToolManager, args: &Value) -> ToolResult {
-    let (project, file) = match script_file(tools, args).await {
-        Ok(pair) => pair,
+    let (project, file, external_ok) = match script_file(tools, args).await {
+        Ok(found) => found,
         Err(result) => return result,
     };
-    match tools.lsp.diagnostics(&project, &file).await {
+    match tools.lsp.diagnostics(&project, external_ok, &file).await {
         Ok(value) => ToolResult::text(serde_json::to_string_pretty(&value).unwrap_or_default()),
         Err(error) => ToolResult::error(
             error.to_string(),
             &[
-                "Open the project in the Godot editor (language server port 6005) or set GODOT_PATH so a headless editor can be started",
+                "Open this project in the Godot editor (language server port 6005): a language server of an editor with another project open is not used",
+                "Or set GODOT_PATH so that a headless editor can be started for this project",
             ],
         ),
     }
 }
 
 async fn code_symbols(tools: &ToolManager, args: &Value) -> ToolResult {
-    let (project, file) = match script_file(tools, args).await {
-        Ok(pair) => pair,
+    let (project, file, external_ok) = match script_file(tools, args).await {
+        Ok(found) => found,
         Err(result) => return result,
     };
-    text_result(tools.lsp.symbols(&project, &file).await)
+    text_result(tools.lsp.symbols(&project, external_ok, &file).await)
 }
 
 async fn code_at(tools: &ToolManager, args: &Value, op: CodeOp) -> ToolResult {
-    let (project, file) = match script_file(tools, args).await {
-        Ok(pair) => pair,
+    let (project, file, external_ok) = match script_file(tools, args).await {
+        Ok(found) => found,
         Err(result) => return result,
     };
     let line = position_arg(args, "line");
     let character = position_arg(args, "character");
     let result = match op {
-        CodeOp::Complete => tools.lsp.complete(&project, &file, line, character).await,
-        CodeOp::Definition => tools.lsp.definition(&project, &file, line, character).await,
-        CodeOp::References => tools.lsp.references(&project, &file, line, character).await,
+        CodeOp::Complete => {
+            tools
+                .lsp
+                .complete(&project, external_ok, &file, line, character)
+                .await
+        }
+        CodeOp::Definition => {
+            tools
+                .lsp
+                .definition(&project, external_ok, &file, line, character)
+                .await
+        }
+        CodeOp::References => {
+            tools
+                .lsp
+                .references(&project, external_ok, &file, line, character)
+                .await
+        }
     };
     text_result(result)
 }
@@ -134,28 +142,46 @@ async fn code_at(tools: &ToolManager, args: &Value, op: CodeOp) -> ToolResult {
 async fn script_file(
     tools: &ToolManager,
     args: &Value,
-) -> Result<(std::path::PathBuf, std::path::PathBuf), ToolResult> {
+) -> Result<(std::path::PathBuf, std::path::PathBuf, bool), ToolResult> {
     let Some(script_path) = str_arg(args, "script_path") else {
-        return Err(ToolResult::error("Missing script_path", &[]));
+        return Err(ToolResult::error(
+            "Missing script_path",
+            &["Pass script_path: a res:// path to a .gd file"],
+        ));
     };
     if !script_path.ends_with(".gd") {
-        return Err(ToolResult::error("script_path must be a .gd file", &[]));
+        return Err(ToolResult::error(
+            "script_path must be a .gd file",
+            &["Use a path such as res://scripts/player.gd"],
+        ));
     }
-    let project = match tools.resolve_project(args).await {
-        Ok(project) => project.dir,
+    let resolved = match tools.resolve_project(args).await {
+        Ok(project) => project,
         Err(result) => return Err(result),
     };
+    let project = resolved.dir.clone();
     let file = match resolve_in_project(&project, script_path) {
         Ok(file) => file,
-        Err(problem) => return Err(ToolResult::error(problem, &[])),
+        Err(problem) => {
+            return Err(ToolResult::error(
+                problem,
+                &["Use a res:// path or a path relative to the project directory"],
+            ));
+        }
     };
     if !file.is_file() {
         return Err(ToolResult::error(
-            format!("Script not found: {}", file.display()),
-            &[],
+            format!(
+                "Script not found: {}",
+                crate::paths::res_display(&project, &file)
+            ),
+            &["Check the path; res:// paths are resolved against the project directory"],
         ));
     }
-    Ok((project, file))
+    // The editor's own project is the editor's by definition; for a project the caller named,
+    // an editor with another project open must not answer for it (CI-7).
+    let external_ok = resolved.from_editor || tools.editor_may_serve(&project).await;
+    Ok((project, file, external_ok))
 }
 
 fn text_result(result: Result<Value, McpError>) -> ToolResult {
@@ -180,6 +206,11 @@ fn runtime_error(error: &McpError) -> ToolResult {
             ],
         ),
     }
+}
+
+/// A line or column parameter: an integer of at least 1, as in the editor.
+fn position(description: &str) -> Value {
+    json!({"type": "integer", "minimum": 1, "description": description})
 }
 
 /// A 1-based line or column the caller named, 1 when absent. A number too large for the

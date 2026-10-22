@@ -86,9 +86,12 @@ var joy_axis := 0.0
 var hits := 0
 var last_mouse := Vector2.ZERO
 var scale_seen := 1.0
+var pad_presses := 0
+var tiny_presses := 0
 signal pinged(value)
 
 func _ready() -> void:
+    print("mcp-probe-ready")
     push_error("mcp-probe-error")
 
 func _process(_delta: float) -> void:
@@ -123,6 +126,12 @@ func _input(event: InputEvent) -> void:
     elif event is InputEventJoypadMotion:
         joy_axis = event.axis_value
 
+func _on_pad_pressed() -> void:
+    pad_presses += 1
+
+func _on_tiny_pressed() -> void:
+    tiny_presses += 1
+
 func poke(value: int) -> int:
     pinged.emit(value)
     return value + 1
@@ -131,7 +140,7 @@ func poke(value: int) -> int:
     .unwrap();
     std::fs::write(
         root.join("scenes/main.tscn"),
-        "[gd_scene load_steps=2 format=3]\n\n[ext_resource type=\"Script\" path=\"res://scripts/probe.gd\" id=\"1\"]\n\n[node name=\"Probe\" type=\"Node2D\"]\nscript = ExtResource(\"1\")\n\n[node name=\"Mark\" type=\"Node2D\" parent=\".\"]\nposition = Vector2(40, 70)\n\n[node name=\"Pad\" type=\"Button\" parent=\".\"]\noffset_left = 100.0\noffset_top = 20.0\noffset_right = 140.0\noffset_bottom = 60.0\n",
+        "[gd_scene load_steps=2 format=3]\n\n[ext_resource type=\"Script\" path=\"res://scripts/probe.gd\" id=\"1\"]\n\n[node name=\"Probe\" type=\"Node2D\"]\nscript = ExtResource(\"1\")\n\n[node name=\"Mark\" type=\"Node2D\" parent=\".\"]\nposition = Vector2(40, 70)\n\n[node name=\"Pad\" type=\"Button\" parent=\".\"]\noffset_left = 100.0\noffset_top = 20.0\noffset_right = 140.0\noffset_bottom = 60.0\n\n[node name=\"Tiny\" type=\"Button\" parent=\".\"]\noffset_left = 4.0\noffset_top = 4.0\noffset_right = 24.0\noffset_bottom = 24.0\n\n[connection signal=\"pressed\" from=\"Pad\" to=\".\" method=\"_on_pad_pressed\"]\n[connection signal=\"pressed\" from=\"Tiny\" to=\".\" method=\"_on_tiny_pressed\"]\n",
     )
     .unwrap();
     dir
@@ -277,7 +286,7 @@ async fn running_game_accepts_input_and_can_be_inspected() {
     .await;
     assert!(too_many.is_error, "{}", text_of(&too_many));
     assert!(
-        text_of(&too_many).contains("frames must be from 1 to 8"),
+        text_of(&too_many).contains("'frames' must be at most 8"),
         "{}",
         text_of(&too_many)
     );
@@ -482,10 +491,17 @@ async fn running_game_accepts_input_and_can_be_inspected() {
     .await;
     assert!(!resumed.is_error, "{}", text_of(&resumed));
 
+    // The line of `hits += 1` in `_process`, wherever the fixture script puts it.
+    let process_line = std::fs::read_to_string(project.path().join("scripts/probe.gd"))
+        .expect("probe.gd")
+        .lines()
+        .position(|line| line.trim() == "hits += 1")
+        .expect("the hit counter line")
+        + 1;
     let armed = call(
         &tools,
         "godot_debug_breakpoints",
-        json!({"run_id": run_id, "action": "add", "breakpoint": "res://scripts/probe.gd:20"}),
+        json!({"run_id": run_id, "action": "add", "breakpoint": format!("res://scripts/probe.gd:{process_line}")}),
     )
     .await;
     assert!(!armed.is_error, "{}", text_of(&armed));
@@ -2599,6 +2615,273 @@ async fn a_breakpoint_hit_during_a_held_step_stops_the_game_as_usual() {
     assert_eq!(json_of(&finished)["ticks_run"], 3, "{}", text_of(&finished));
     assert_eq!(json_of(&finished)["held"], true, "{}", text_of(&finished));
 
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+}
+
+/// RO-6: nothing on the refusal list runs, whatever the permit list says, and a permitted call can
+/// pass the argument types the method asks for.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn game_call_refuses_what_could_take_the_game_apart_and_converts_argument_types() {
+    let project = project();
+    let tools = manager(project.path());
+    let started = call(
+        &tools,
+        "godot_run_project",
+        json!({"project_path": project.path(), "mode": "process", "headless": true}),
+    )
+    .await;
+    assert!(!started.is_error, "{}", text_of(&started));
+    let run_id = run_id_of(&started);
+
+    for method in [
+        "quit",
+        "set_script",
+        "call",
+        "callv",
+        "call_deferred",
+        "call_group",
+        "call_group_flags",
+        "propagate_call",
+        "rpc",
+        "rpc_id",
+        "set",
+        "set_deferred",
+        "set_indexed",
+        "emit_signal",
+        "notification",
+        "propagate_notification",
+        "free",
+        "queue_free",
+        "replace_by",
+    ] {
+        let refused = call(
+            &tools,
+            "godot_game_call",
+            json!({"run_id": run_id, "path": "Mark", "method": method, "permit": [method],
+                   "args": []}),
+        )
+        .await;
+        assert!(refused.is_error, "{method}: {}", text_of(&refused));
+        assert!(
+            text_of(&refused).contains("not allowed"),
+            "{method}: {}",
+            text_of(&refused)
+        );
+    }
+    let tree = call(&tools, "godot_game_tree", json!({"run_id": run_id})).await;
+    let tree = json_of(&tree);
+    let names: Vec<&str> = tree["nodes"]
+        .as_array()
+        .expect("nodes")
+        .iter()
+        .filter_map(|node| node["name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"Mark") && names.contains(&"Pad"),
+        "{names:?}"
+    );
+
+    // A permitted call with a StringName and with a NodePath argument.
+    let group = call(
+        &tools,
+        "godot_game_call",
+        json!({"run_id": run_id, "path": "Mark", "method": "is_in_group",
+               "permit": ["is_in_group"], "args": ["nobody"]}),
+    )
+    .await;
+    assert!(!group.is_error, "{}", text_of(&group));
+    assert_eq!(json_of(&group)["value"], false, "{}", text_of(&group));
+    let has = call(
+        &tools,
+        "godot_game_call",
+        json!({"run_id": run_id, "path": ".", "method": "has_node",
+               "permit": ["has_node"], "args": ["Pad"]}),
+    )
+    .await;
+    assert!(!has.is_error, "{}", text_of(&has));
+    assert_eq!(json_of(&has)["value"], true, "{}", text_of(&has));
+    // A type that cannot be converted is still a parameter error.
+    let wrong = call(
+        &tools,
+        "godot_game_call",
+        json!({"run_id": run_id, "path": ".", "method": "poke",
+               "permit": ["poke"], "args": ["three"]}),
+    )
+    .await;
+    assert!(wrong.is_error, "{}", text_of(&wrong));
+    assert!(
+        text_of(&wrong).contains("BAD_PARAMS"),
+        "{}",
+        text_of(&wrong)
+    );
+
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+}
+
+/// RO-11: a pointer step is delivered, and when its point lies outside the viewport (a game
+/// without a window has one of 64 x 64 pixels) the answer says controls there do not react.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn pointer_input_in_a_game_without_a_window_warns_when_it_lands_outside_the_viewport() {
+    let project = project();
+    let tools = manager(project.path());
+    let started = call(
+        &tools,
+        "godot_run_project",
+        json!({"project_path": project.path(), "mode": "process", "headless": true}),
+    )
+    .await;
+    assert!(!started.is_error, "{}", text_of(&started));
+    let run_id = run_id_of(&started);
+
+    let counter = |name: &'static str| {
+        let tools = Arc::clone(&tools);
+        let run_id = run_id.clone();
+        async move {
+            let got = call(
+                &tools,
+                "godot_game_get",
+                json!({"run_id": run_id, "path": ".", "properties": [name]}),
+            )
+            .await;
+            json_of(&got)["properties"][name].as_i64().unwrap_or(-1)
+        }
+    };
+
+    // Pad lies at x 100 to 140: outside the 64 x 64 viewport. The event is delivered (_input
+    // sees it) but the button cannot react, and the answer says so for every kind of step.
+    for step in [
+        json!({"type": "click_node", "node": "Pad"}),
+        json!({"type": "click", "x": 120, "y": 40}),
+        json!({"type": "mouse_button", "button": "left", "x": 120, "y": 40}),
+        json!({"type": "mouse_move", "x": 120, "y": 40}),
+        json!({"type": "swipe", "x": 10, "y": 10, "to_x": 120, "to_y": 40, "frames": 2}),
+    ] {
+        let answered = call(
+            &tools,
+            "godot_game_input",
+            json!({"run_id": run_id, "steps": [step.clone(), {"type": "wait", "frames": 3}]}),
+        )
+        .await;
+        assert!(!answered.is_error, "{step}: {}", text_of(&answered));
+        let result = &json_of(&answered)["steps"][0];
+        assert_eq!(result["ok"], true, "{step}: {result}");
+        let warning = result["warning"].as_str().unwrap_or("");
+        assert!(
+            warning.contains("outside") && warning.contains("64 x 64"),
+            "{step}: {result}"
+        );
+    }
+    assert_eq!(
+        counter("pad_presses").await,
+        0,
+        "a button outside the viewport reacted"
+    );
+
+    // Tiny lies inside it: the same steps press it, and there is no warning.
+    let inside = call(
+        &tools,
+        "godot_game_input",
+        json!({"run_id": run_id, "steps": [
+            {"type": "click_node", "node": "Tiny"}, {"type": "wait", "frames": 3}]}),
+    )
+    .await;
+    assert!(!inside.is_error, "{}", text_of(&inside));
+    assert!(json_of(&inside)["steps"][0].get("warning").is_none());
+    assert_eq!(counter("tiny_presses").await, 1);
+
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+}
+
+/// The long explanation of `script_sha256` is in an output answer once, not on every line.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn an_output_answer_explains_the_script_hash_once() {
+    let project = project();
+    let tools = manager(project.path());
+    let started = call(
+        &tools,
+        "godot_run_project",
+        json!({"project_path": project.path(), "mode": "process", "headless": true}),
+    )
+    .await;
+    assert!(!started.is_error, "{}", text_of(&started));
+    let run_id = run_id_of(&started);
+    let mut answer = Value::Null;
+    for _ in 0..50 {
+        let output = call(&tools, "godot_run_output", json!({"run_id": run_id})).await;
+        assert!(!output.is_error, "{}", text_of(&output));
+        answer = json_of(&output);
+        if answer["lines"]
+            .as_array()
+            .is_some_and(|lines| lines.len() >= 2)
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let lines = answer["lines"].as_array().expect("lines");
+    assert!(lines.len() >= 2, "{answer}");
+    let note = answer["script_sha256_note"]
+        .as_str()
+        .expect("one note per answer");
+    assert!(note.contains("not a later read"), "{note}");
+    assert_eq!(
+        text_of(&call(&tools, "godot_run_output", json!({"run_id": run_id})).await)
+            .matches("not a later read")
+            .count(),
+        1,
+        "the explanation is repeated"
+    );
+    for line in lines {
+        assert!(line["scene"].get("script_sha256_note").is_none(), "{line}");
+        assert!(line["scene"].get("script_sha256_basis").is_some(), "{line}");
+    }
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+}
+
+/// A baseline saved at a reduced size is compared at that size without repeating the option.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable and a display"]
+async fn a_baseline_is_compared_at_its_own_size_by_default() {
+    if !windowed_game_can_open() {
+        return;
+    }
+    let project = project();
+    let tools = manager(project.path());
+    let started = call(
+        &tools,
+        "godot_run_project",
+        json!({"project_path": project.path(), "mode": "process"}),
+    )
+    .await;
+    assert!(!started.is_error, "{}", text_of(&started));
+    let run_id = run_id_of(&started);
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let saved = call(
+        &tools,
+        "godot_game_screenshot",
+        json!({"run_id": run_id, "save_baseline": "small", "max_dimension": 64}),
+    )
+    .await;
+    assert!(!saved.is_error, "{}", text_of(&saved));
+    let compared = call(
+        &tools,
+        "godot_game_screenshot",
+        json!({"run_id": run_id, "baseline": "small", "tolerance": 255}),
+    )
+    .await;
+    assert!(!compared.is_error, "{}", text_of(&compared));
+    assert!(
+        text_of(&compared).contains("baseline small changed"),
+        "{}",
+        text_of(&compared)
+    );
     let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
     assert!(!stopped.is_error, "{}", text_of(&stopped));
 }

@@ -99,7 +99,7 @@ The server reads its settings from CLI flags, the environment (e.g. the MCP clie
 | `GODOT_MCP_LSP_PORT` | | `6005` | Port of a running editor's GDScript language server. The `godot_code_*` tools use it if an editor listens there, and otherwise start a private headless editor. |
 | `GODOT_MCP_TOKEN` | | generated | Shared secret for the bridge. Normally unnecessary, see [Security](#security). |
 | `GODOT_CONSOLE_PATH` | `--godot-console-path` | | Windows console wrapper. Unused by the server; the editor end-to-end tests use it for editor logs. |
-| `GODOT_MCP_FEEDBACK` | `--feedback` | `full` | Feedback channel for the maintainers: `off`, `draft` (the AI can write a report but never send one) or `full`. See [Feedback](#feedback-to-the-maintainers). |
+| `GODOT_MCP_FEEDBACK` | `--feedback` | `full` | Feedback channel for the maintainers: `off`, `draft` (the AI can write a report but never send one) or `full`. A value the server does not recognize gives `draft`. See [Feedback](#feedback-to-the-maintainers). |
 | `GODOT_MCP_GH_PATH` | `--gh-path` | `gh` on `PATH` | The [GitHub CLI](https://cli.github.com) used when you let the AI submit a report. Set it when your MCP client does not see `gh` on its `PATH`. |
 
 An empty value counts as "not set", so placeholders in a copied `.env.example` or an MCP client's `env` block are harmless.
@@ -113,9 +113,9 @@ The plugin picks its port from the project setting `godot_mcp/bridge_port` if yo
 - The bridge listens on `127.0.0.1` only, so other machines cannot reach it.
 - Every command must carry a random token. The plugin writes it when the editor starts to `<user data dir>/godot-mcp/bridge-<port>.token` (readable by your user only), and the server reads it from there. This also keeps web pages in your browser from driving the editor. Both processes must therefore run as the same OS user. If they can't (containers, Flatpak, different users), set the same `GODOT_MCP_TOKEN` for both instead.
 - `godot_create_script` only writes `.gd` files inside the project, never overwrites without `overwrite: true`, and accepts only plain identifiers for `class_name` and `extends_class`.
-- `godot_read_script` and `godot_edit_script` work on existing `.gd` files inside the project only, change nothing but the one fragment you name, and never overwrite text you have typed in the editor and not saved. Your fragment is treated as plain text, never run.
+- `godot_read_script` and `godot_edit_script` work on existing `.gd` files inside the project only, change nothing but the one fragment you name, and never overwrite text you have typed in the editor and not saved. Your fragment is treated as plain text by the tools, never run by them. But code you put into a script is code: Godot runs a `@tool` script inside the editor as soon as it is saved, so editing one runs it with your authority.
 - Node paths are resolved inside the edited scene only; the scene root can't be removed.
-- `godot_game_call` runs only the methods you list in `permit`, and never one that can quit, evaluate code, call another method or free a node. `godot_game_set` refuses `script` and private names. Nothing `godot_game_set` changes is saved to disk.
+- `godot_game_call` runs only the methods you list in `permit`, and never one that can quit, evaluate code, call another method by name (`call`, `call_group`, `propagate_call`, `emit_signal`, `notification`, …), set a property by name (`set`, `set_deferred`, `set_indexed`) or free or replace a node (`free`, `queue_free`, `replace_by`). `godot_game_set` refuses `script` and private names. Nothing `godot_game_set` changes is saved to disk.
 - The authoring tools never replace an existing scene or resource. `godot_set_project_setting` accepts only a plain `section/path` key, escapes the value, and keeps the type of a setting that exists, so it cannot add lines or sections to `project.godot`.
 
 To report a vulnerability, follow [SECURITY.md](SECURITY.md). Never open a public issue for it.
@@ -124,7 +124,7 @@ To report a vulnerability, follow [SECURITY.md](SECURITY.md). Never open a publi
 
 "Editor" means the tool needs a running Godot editor with the plugin enabled. "Running game" means a game started with `godot_run_project`, in the editor's Play mode or as a managed process. "Process run" means a managed process run, the one this server can debug.
 
-`project_path` can be omitted when the server runs inside the project: tools then use the project open in the editor, else the first folder with a `project.godot` from the server's working directory upwards, else the only subfolder that has one (such as `app/`).
+`project_path` can be omitted when the server runs inside the project: tools then use the project open in the editor, else the first folder with a `project.godot` from the server's working directory upwards, else the only subfolder that has one (such as `app/`). A `project_path` you give always wins: when the open editor has another project, the tools that can work on files (reading and editing a script, creating a scene or a resource, project settings) use the files of the project you named and leave the editor alone, and an answer that changed something names the project directory.
 
 | Tool | Needs | What it does |
 | --- | --- | --- |
@@ -132,8 +132,8 @@ To report a vulnerability, follow [SECURITY.md](SECURITY.md). Never open a publi
 | `godot_get_project_info` | Editor | Name, main scene, and features of the open project. |
 | `godot_launch_editor` | — | Launches the editor for `project_path`, or for the project the server runs in. |
 | `godot_run_project` | — | Plays the main scene or a given `res://` scene. With the editor, uses its Play mode. Without it (or with `mode: "process"`), starts a managed game with the remote debugger attached; `held: true` (process runs only) starts it held, for exact steps. `godot_stop_project` stops either one. |
-| `godot_stop_project` | — | Stops the editor's Play mode, or a managed process run (`run_id` optional). |
-| `godot_get_run_status` | — | Whether a scene is playing, and the managed process runs. |
+| `godot_stop_project` | — | Stops what runs: the editor's Play mode when it plays and every managed process run, and lists what it stopped (or says that nothing was running). Pass `run_id` to stop one process run. |
+| `godot_get_run_status` | — | Whether a scene is playing, and the managed process runs, each with its exit code, `ended_by` (`game` or `server`) and `ended_at` once it has ended. Says that nothing is running when that is so. |
 | `godot_get_open_scenes` | Editor | Open scene tabs and the active one. |
 | `godot_open_scene` | Editor | Opens a scene by `res://` path. If that tab is already open and the file on disk has changed, reloads it (pass `discard: true` to drop unsaved bridge edits). |
 | `godot_save_scene` | Editor | Saves the active scene. |
@@ -159,7 +159,7 @@ To report a vulnerability, follow [SECURITY.md](SECURITY.md). Never open a publi
 | `godot_game_tree` | Running game | Live nodes of the running game: path, class, position, visible text. Filter by `name`, `class`, `group` or `text`. |
 | `godot_game_get` | Running game | A live node's properties, groups and, optionally, signals and methods. |
 | `godot_game_set` | Running game | Sets properties on a live node. Refuses `script` and private names. Nothing is saved to disk. |
-| `godot_game_call` | Running game | Calls one method on a live node. The method must be listed in `permit`; methods that can quit, evaluate code, call other methods or free the node are refused. |
+| `godot_game_call` | Running game | Calls one method on a live node. The method must be listed in `permit`; methods that can quit, evaluate code, call other methods by name, set properties by name or free or replace the node are refused. A JSON string is passed as a `StringName` or a `NodePath` where the method asks for one. |
 | `godot_game_signals` | Running game | A live node's signals and their connections. |
 | `godot_game_observe` | Running game | Watches signals for a few frames, returns the ones that fired, then disconnects. |
 | `godot_game_snapshot` | Running game | Scene path, monotonic `scene_generation`, `scene_instance_id`, frame, pause flag, children, and the loaded root script path plus its SHA-256. |

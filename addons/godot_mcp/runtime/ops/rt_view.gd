@@ -37,6 +37,12 @@ static func screenshot(rt: Node, params: Dictionary) -> Dictionary:
     if R.is_err(picked):
         return picked
     var max_side := clampi(int(params.get("max_dimension", DEFAULT_MAX)), 16, MAX_MAX)
+    # A baseline is compared pixel for pixel, so a comparison without max_dimension is taken at
+    # the size the baseline was saved at.
+    var compare_name := str(request.get("compare", ""))
+    if not params.has("max_dimension") and not compare_name.is_empty() and frames == 1:
+        var stored: Image = _baselines[compare_name]
+        max_side = clampi(maxi(stored.get_width(), stored.get_height()), 16, MAX_MAX)
     var cols := 1
     while cols * cols < frames:
         cols += 1

@@ -1,4 +1,5 @@
-//! Minimal JSON-Schema checks for tool arguments: required keys, primitive types, enums.
+//! Minimal JSON-Schema checks for tool arguments: required keys, primitive types, enums and
+//! the numeric `minimum` / `maximum` of a parameter.
 //!
 //! Catching wrong types here gives the caller an immediate, specific error instead of a
 //! script error inside the editor that would only surface as a timeout.
@@ -69,6 +70,23 @@ fn check_value(name: &str, value: &Value, property: &Value) -> Result<(), String
         }
     }
 
+    if let Some(number) = value.as_f64() {
+        if let Some(minimum) = property.get("minimum").and_then(Value::as_f64) {
+            if number < minimum {
+                return Err(format!(
+                    "Parameter '{name}' must be at least {minimum}, got {number}"
+                ));
+            }
+        }
+        if let Some(maximum) = property.get("maximum").and_then(Value::as_f64) {
+            if number > maximum {
+                return Err(format!(
+                    "Parameter '{name}' must be at most {maximum}, got {number}"
+                ));
+            }
+        }
+    }
+
     if let Some(allowed) = property.get("enum").and_then(Value::as_array) {
         if !allowed.contains(value) {
             let options: Vec<String> = allowed.iter().map(Value::to_string).collect();
@@ -134,6 +152,26 @@ mod tests {
             },
             "required": ["path"]
         })
+    }
+
+    #[test]
+    fn a_number_outside_its_documented_range_is_refused_with_the_range() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"line": {"type": "integer", "minimum": 1, "maximum": 10}}
+        });
+        assert!(validate_arguments(&schema, &json!({"line": 1})).is_ok());
+        assert!(validate_arguments(&schema, &json!({"line": 10})).is_ok());
+        let low = validate_arguments(&schema, &json!({"line": 0})).unwrap_err();
+        assert!(
+            low.contains("'line'") && low.contains("at least 1") && low.contains("got 0"),
+            "{low}"
+        );
+        let high = validate_arguments(&schema, &json!({"line": 11})).unwrap_err();
+        assert!(high.contains("at most 10"), "{high}");
+        // A wrong type is still reported as a wrong type, not as a range.
+        let wrong = validate_arguments(&schema, &json!({"line": "3"})).unwrap_err();
+        assert!(wrong.contains("must be an integer"), "{wrong}");
     }
 
     #[test]

@@ -112,6 +112,8 @@ pub struct Run {
     /// Whether the game last said it is held (or was started held).
     held: AtomicBool,
     exit_code: Mutex<Option<i32>>,
+    /// Who ended the run (`game` or `server`) and when (seconds since the Unix epoch); set once.
+    ended: Mutex<Option<(&'static str, u64)>>,
     override_state: OverrideState,
     restored: AtomicBool,
 }
@@ -170,6 +172,7 @@ impl GameHub {
             running: AtomicBool::new(true),
             held: AtomicBool::new(held),
             exit_code: Mutex::new(None),
+            ended: Mutex::new(None),
             override_state,
             restored: AtomicBool::new(false),
         });
@@ -248,6 +251,21 @@ impl GameHub {
 
     pub fn status(&self) -> Vec<Value> {
         lock(&self.runs).iter().map(|run| run.summary()).collect()
+    }
+
+    /// Stops every managed run that is still alive and returns the summary of each.
+    pub async fn stop_all(&self) -> Vec<Value> {
+        let alive: Vec<Arc<Run>> = lock(&self.runs)
+            .iter()
+            .filter(|run| run.is_alive())
+            .cloned()
+            .collect();
+        let mut stopped = Vec::with_capacity(alive.len());
+        for run in alive {
+            run.kill().await;
+            stopped.push(run.summary());
+        }
+        stopped
     }
 
     pub async fn stop(&self, run_id: Option<&str>) -> Result<Value> {
@@ -345,6 +363,8 @@ impl Run {
             "held": self.is_held(),
             "debugger_connected": self.session.is_connected(),
             "exit_code": lock(&self.exit_code).clone(),
+            "ended_by": lock(&self.ended).map(|(who, _)| who),
+            "ended_at": lock(&self.ended).map(|(_, at)| at),
             "stopped": self.debug.stop().map(|stop| json!({
                 "reason": stop.reason,
                 "error": stop.error,
@@ -358,10 +378,26 @@ impl Run {
         let child = lock(&self.child).take();
         if let Some(mut child) = child {
             let _ = child.start_kill();
-            let _ = child.wait().await;
+            if let Ok(status) = child.wait().await {
+                self.record_end("server", status.code());
+            }
         }
         self.running.store(false, Ordering::Release);
         self.restore();
+    }
+
+    /// Records how the process ended, once: the first writer (the watcher for a game that quit by
+    /// itself, `kill` for a stop) wins. A process without an exit code (killed by a signal) is -1.
+    fn record_end(&self, who: &'static str, code: Option<i32>) {
+        let mut ended = lock(&self.ended);
+        if ended.is_some() {
+            return;
+        }
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        *ended = Some((who, at));
+        *lock(&self.exit_code) = Some(code.unwrap_or(-1));
     }
 
     fn restore(&self) {
@@ -517,7 +553,7 @@ impl Run {
 
     fn note_exit(&self, code: Option<i32>) {
         self.running.store(false, Ordering::Release);
-        *lock(&self.exit_code) = Some(code.unwrap_or(-1));
+        self.record_end("game", code);
         self.restore();
     }
 }

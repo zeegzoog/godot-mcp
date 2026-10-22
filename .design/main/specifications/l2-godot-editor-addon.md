@@ -1,6 +1,6 @@
 # Godot Editor Addon
 
-**Version:** 1.4.2
+**Version:** 1.6.0
 **Status:** Stable
 **Layer:** implementation
 **Implements:** l1-editor-bridge.md
@@ -72,8 +72,10 @@ addons/godot_mcp/
 - `capture_viewport`: refuses headless editors; switches the main screen to 2D or 3D (`auto` picks 3D for a `Node3D` root), waits two frames, forces a draw (an idle editor in low-processor mode would otherwise never redraw), rejects images under 16 px, downscales to `max_dimension` (default 1568) with Lanczos, returns base64 PNG with width, height and view.
 - `resave_resources`: refuses while an import is running (`is_import_running`: guarded call before 4.7, direct call from 4.7); with no paths starts a background `scan()`; otherwise re-imports importable files synchronously and calls `update_file` for others; reports reimported, refreshed, missing and invalid paths.
 - `add_node`: native classes must derive from `Node` and be instantiable; global script classes are looked up in the project's class list; non-Node script instances are freed.
-- `get_node_properties`: only properties with editor usage; values in Godot text form, truncated at 2000 characters.
-- `create_scene`, `create_resource`: refuse an existing file; the scene is packed and opened, the resource saved with `ResourceSaver` and registered with the file system. `attach_script`, `connect_signal`: one undo action each; the script must exist in the project, the target must have the method, a connection that exists is refused. `set_project_setting`: the key is a plain `section/path`, only strings, numbers and booleans, the type of an existing setting is kept, the old value is restored if saving fails.
+- `get_node_properties`: only properties with editor usage; values in Godot text form, truncated at 2000 characters. A property that holds no object (an unset `material`) is read as `null`, not as a freed object. [MODIFIED]
+- `list_signals`: for each signal, `connections` is a list of `{target, method}` for the connections whose target is a node of the edited scene (`target` is the scene-relative path); connections the editor made to its own panels are left out. [MODIFIED]
+- `create_scene`, `create_resource`: create the missing folders of the path first (`make_dir_recursive_absolute`); a failure to create one is reported with the folder; refuse an existing file; the scene is packed and opened, the resource saved with `ResourceSaver` and registered with the file system. `attach_script`, `connect_signal`: one undo action each; the script must exist in the project, the target must have the method, a connection that exists is refused. `set_project_setting`: the key is a plain `section/path` without an empty, `.` or `..` segment, only strings, numbers and booleans, the type of an existing setting is kept, the old value is restored if saving fails.
+- `bridge_server.gd` start-up: when the port is taken (`Already in use`, typically a second editor), the failure message says that probably another editor uses the port and that a server connected to it talks to that editor, and names the two settings that change the port. It is printed to the Output and, when the editor has a toaster (`has_method` guard, not measured in a window), shown as an error toast. [MODIFIED]
 - `plugin.gd`: with the environment variable `GODOT_MCP_NO_BRIDGE=1` the plugin still registers the export exclusion but opens no bridge and says so in the log; the server sets it for the private editor of the language server.
 - `game_status`, relay: the plugin lists the played games and their `hello`; the host waits for it before it sends anything to a game started by Play.
 
@@ -91,7 +93,7 @@ Facts the design rests on, measured on Godot 4.8-beta1 in the headless editor (`
 
 Pairing rule: an editor is paired with a path only when both lists have the same length and, where the editor names its tab (the `_tab_name` metadata, present in Godot 4.8-beta1 and absent in 4.5.2, as the carry to the older lines showed), that name starts with the file name. Where the metadata is absent the equal lengths are the only check. Other tabs (a help page, a text file) can make the lists differ in a real window; that case was not measured headless, so it is handled by refusing: the answer says the editor state cannot be matched and names the fix (close the extra tabs, or save the script, then read again).
 
-`read_script` (`script_path`): the path must end in `.gd`, name an existing file and be at most 1 MiB. The answer is `{path, text, source, dirty, version}`: `source` is `editor` and `dirty` is true when the paired editor has unsaved changes (the text is the `CodeEdit`'s, line endings as `\n`); otherwise `source` is `file`, `dirty` is false and the text is the file's. `version` is the label of the returned text. An unpaired or unmatched editor is read as the file; the answer does not claim `dirty: false` for a script whose editor state is unknown, it carries `editor_state: "unknown"` and the reason.
+`read_script` (`script_path`): the path must end in `.gd`, name an existing file and be at most 1 MiB; a leading UTF-8 byte order mark is removed before the text is checked, so the file is not refused as invalid UTF-8. The answer is `{path, text, source, dirty, version}`: `source` is `editor` and `dirty` is true when the paired editor has unsaved changes (the text is the `CodeEdit`'s, line endings as `\n`); otherwise `source` is `file`, `dirty` is false and the text is the file's. `version` is the label of the returned text. An unpaired or unmatched editor is read as the file; the answer does not claim `dirty: false` for a script whose editor state is unknown, it carries `editor_state: "unknown"` and the reason.
 
 `edit_script` (`script_path`, `old_text`, `new_text`, optional `version`):
 
@@ -100,6 +102,8 @@ Pairing rule: an editor is paired with a path only when both lists have the same
 3. The text to edit is the paired editor's, else the file's, with `\r\n` read as `\n`. If `version` is given it must equal the label of that text, otherwise refuse (CA-8). Count the occurrences of `old_text`: zero or more than one → refuse with the count.
 4. Apply: open the script in the editor when it is not open (`edit_script`; this adds a tab, which is visible to the person and acceptable), replace the fragment on its `CodeEdit` as one complex operation (one undo step), then save as in the facts above so the editor, the file and the loaded script agree (CA-10). A failure after the change started (the save) undoes the operation before replying.
 5. The answer is `{path, replaced: 1, version, source: "editor"}` with the label of the new text.
+
+A file that started with a byte order mark is saved the way Godot saves a script, and the answer says whether the mark is gone (`bom_removed`), by looking at the first bytes of the file after the save; the mark is not written back. Measured on Godot 4.8-beta1: `ResourceSaver` writes no mark, so `bom_removed` is true. Godot writes none itself, so restoring it would make the editor and the file disagree on the next save.
 
 The editor writes the file with its own line-ending setting, so a script edited through the editor ends up with the editor's endings; the file fallback keeps the file's.
 
@@ -139,3 +143,6 @@ Every reply path sends exactly one answer (BR-3); the parameters are read untype
 | 1.4.0 | 2026-10-21 | Agent (magic.run) | [ADDED] §5.3: the `read_script` and `edit_script` commands, the measured script-editor facts they rest on, the pairing rule between an editor and a path, the refusal while unsaved changes exist, and the new file `editor/script_ops.gd`. Stable → RFC → Stable after Post-Update Review. The canonical reference for the new file is added with the file. |
 | 1.4.1 | 2026-10-21 | Agent (magic.run) | Added the script operations file to Canonical References now that it exists. No requirement changed. |
 | 1.4.2 | 2026-10-21 | Agent (magic.run) | The tab-name check of the pairing rule applies only where the editor names its tab: the carry to the 4.5, 4.6 and 4.7 lines failed because those editors have no `_tab_name` metadata. No other requirement changed. |
+| 1.5.0 | 2026-10-21 | Agent (magic.spec) | [MODIFIED] Handler notes: unset object properties, scene-only signal connections, missing folders created, settings key segments, a port clash shown as an editor notification, byte order mark on read, and the open measurement of the byte order mark on save. Source: simulation QA of 2026-10-21 (Q7, Q8, Q13, Q15, Q17, Q28). The line-ending difference of §5.3 stays as written. Stable → RFC → Stable after Post-Update Review. |
+| 1.5.1 | 2026-10-21 | Agent (magic.spec) | §5.3: the byte order mark is reported when a save drops it and is not restored; the answer measures it instead of the specification guessing. No other requirement changed. |
+| 1.6.0 | 2026-10-22 | Agent (magic.run) | [MODIFIED] `list_signals` answers objects with `target` and `method`; the byte order mark note records the measurement; the port clash message and toast as built. Stable → RFC → Stable after Post-Update Review. |

@@ -1,6 +1,6 @@
 # Content Authoring
 
-**Version:** 1.1.0
+**Version:** 1.2.1
 **Status:** Stable
 **Layer:** concept
 
@@ -24,7 +24,7 @@ Without these tools an agent can add nodes to an open scene and write a script f
 - With the editor connected, every tool goes through it: changes to a scene that is open are undoable editor actions, new files are registered with the editor file system so they get a UID at once.
 - Without an editor, creating a scene, creating a resource, and reading or setting a project setting fall back to the file itself. Attaching a script, connecting a signal and listing signals need the editor, because they act on an open scene.
 - A project setting value is a string, a number or a boolean. Structured values (vectors, arrays, resources) are changed in the editor's Project Settings.
-- Script reading and editing are two further tools, `godot_read_script` and `godot_edit_script`, planned and not yet implemented. `godot_create_script` stays the only way to create a script from a template; the edit tool never creates a file.
+- Script reading and editing are two further tools, `godot_read_script` and `godot_edit_script`. `godot_create_script` stays the only way to create a script from a template; the edit tool never creates a file. [MODIFIED]
 - [DR] An edit is a replacement of one fragment, given as the old text and the new text. Rejected: sending the whole file (large and stale if the content changed since it was read), and line-range patches (line numbers shift as soon as anything else changes the file).
 - [DR] A script open in the editor with unsaved changes is never edited: the edit is refused with the file and the fix. Rejected: applying the edit to the editor's unsaved text (ties the tool to the script editor's internals), and writing the file anyway (loses the person's typing).
 - **Assumption (forecast):** with the editor connected, an edit goes through the editor as one undoable action and the file is saved, so what the editor shows, what is on disk and what the syntax check and a running game see agree. Runner-up: leave the changed script unsaved in the editor for the person to save. Override: `/magic.spec amend l1-content-authoring "leave edited scripts unsaved"`.
@@ -33,19 +33,21 @@ Without these tools an agent can add nodes to an open scene and write a script f
 
 - **CA-1** No authoring tool replaces an existing file. Creating a scene or a resource that already exists is refused, also when the file appears between the check and the write.
 - **CA-2** Attaching or detaching a script and connecting a signal in an open scene are each a single undoable editor action.
-- **CA-3** Caller text is only ever data. It is not executed and not interpolated into generated code; a project setting value is written as one escaped value on one line, and a setting key is a plain path of letters, digits and `_ / . -` that starts with a section, so no call can add an entry or a section to `project.godot`.
+- **CA-3** Caller text is only ever data to the tools. They do not execute it and do not interpolate it into generated code; a project setting value is written as one escaped value on one line, and a setting key is a plain path of letters, digits and `_ / . -` that starts with a section, with no empty, `.` or `..` segment, so no call can add an entry or a section to `project.godot`. What a script does once it is in the project is not the tools' to control: Godot runs a `@tool` script inside the editor as soon as it loads, so writing or editing one is running code in the editor with the person's authority. The tool descriptions and the user documentation say so. [MODIFIED]
 - **CA-4** A project setting that exists keeps its type: a value of another type is refused, in the editor and in the file fallback.
 - **CA-5** A link is checked before it is made: the script exists in the project, the signal exists on the node, the target has the method, and the connection is not already there. Each failure names the fix.
-- **CA-6** Paths stay inside the project: scenes end in `.tscn`, resources in `.tres` (or `.res` through the editor), scripts in `.gd`, and `res://` paths cannot leave the project.
-- **CA-7** Reading a script returns the text the editor would save: the editor's unsaved text when the script is open with unsaved changes, otherwise the file. The answer says which one it is and carries a version label of the returned text, so a caller can tell that what it read is not what is on disk.
+- **CA-6** Paths stay inside the project: scenes end in `.tscn`, resources in `.tres` (or `.res` through the editor), scripts in `.gd`, and `res://` paths cannot leave the project. Folders that a new scene or resource needs are created with it. [MODIFIED]
+- **CA-7** Reading a script returns the text the editor would save: the editor's unsaved text when the script is open with unsaved changes, otherwise the file. The answer says which one it is and carries a version label of the returned text, so a caller can tell that what it read is not what is on disk. A script that starts with a UTF-8 byte order mark is read and edited like any other, with the editor and without it. [MODIFIED]
 - **CA-8** An edit changes a script only when the old text occurs exactly once. No match or more than one match is refused and the answer says how many were found. A version label supplied with the edit must match the current text, otherwise the edit is refused and the caller reads again. A refused edit leaves the script untouched.
 - **CA-9** An edit never overwrites unsaved typing: a script open in the editor with unsaved changes is refused with its path and the fix (save it in the editor or discard the changes, then read again). The old and new text are data under CA-3: never executed and never interpolated into generated code.
 - **CA-10** With the editor connected an edit is a single undoable editor action (CA-2) and the editor and the file agree afterwards; without it the file is replaced as a whole so no half-written script is ever seen.
+- **CA-11** With and without the editor the same input is accepted or refused. What the file fallback accepts equals what the editor accepts: a scene root is a `Node` class the engine can create and a resource a built-in `Resource` class, and anything else is refused before a file is written; a setting key is held to CA-3 in both paths; and a settings answer has the same shape from the editor and from the file. [ADDED]
 
 ## 7. Drawbacks & Alternatives
 
 - **Free-form script editing** stays limited to one fragment replacement under CA-8 and CA-9; whole-file rewrites and line-range patches are rejected in §2.
 - **An edit applied over the editor's unsaved text** would let an agent and a person change one script at once and would depend on how the script editor keeps its text; the refusal in CA-9 costs the person one save.
+- **Refusing a script that is or becomes `@tool`**, or asking the caller to opt in, would stop silent code execution in the editor, but a script written without `@tool` that an autoload or a scene loads reaches the same effect, so the refusal would add friction to editor-tool development and no safety. Decided against; CA-3 states the consequence instead and the documents say it. Override: `/magic.spec amend l1-content-authoring.md "refuse @tool edits"`.
 - **A structured-value setting editor** would need a value syntax a caller can get wrong in ways that break project loading; scalars cover the common cases safely.
 
 ## Canonical References
@@ -64,3 +66,5 @@ Without these tools an agent can add nodes to an open scene and write a script f
 | 0.1.0 | 2026-10-16 | Agent (magic.analyze first-time) | Draft collected from the README roadmap. |
 | 1.0.0 | 2026-10-21 | Agent (magic.spec) | Seven tools implemented (pull request 7, reviewed and hardened). Constraints resolved: scene creation works with or without the editor. Invariants rewritten around what the tools guarantee; script reading and updating stays an open question. Draft → Stable. |
 | 1.1.0 | 2026-10-21 | Agent (magic.spec) | [ADDED] Reading an existing script and editing it by one fragment replacement (CA-7 to CA-10), resolving the open question: replacement of a fragment, not whole-file or line-range edits; an edit is refused while the editor holds unsaved changes to the script; a separate read tool that reports the editor's unsaved text and a version label. Tools planned, not yet implemented. Stable → RFC → Stable after Post-Update Review. |
+| 1.2.0 | 2026-10-21 | Agent (magic.spec) | [MODIFIED] CA-3 (the tools never run caller text, but a `@tool` script runs in the editor once written; settings keys reject `.`/`..`), CA-6 (new folders are created), CA-7 (byte order mark), and the stale note that the script tools were not implemented; [ADDED] CA-11 (same acceptance with and without the editor) and an open question on `@tool` edits. A refusal to edit the addon's own files was considered and dropped: any new `@tool` script reaches the same effect, so the refusal would only cost contributors who edit this repository with the tools. The line-ending difference between the editor path and the file path stays as documented in the addon specification. Source: simulation QA of 2026-10-21 (Q3, Q7, Q8, Q10, Q14, Q15). Stable → RFC → Stable after Post-Update Review. |
+| 1.2.1 | 2026-10-21 | Agent (magic.spec) | Closed the open question on `@tool` edits: no refusal, the consequence is stated in CA-3 and in the user documentation. No requirement changed. |

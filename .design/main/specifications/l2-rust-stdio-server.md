@@ -1,6 +1,6 @@
 # Rust Stdio Server
 
-**Version:** 1.2.0
+**Version:** 1.3.0
 **Status:** Stable
 **Layer:** implementation
 **Implements:** l1-mcp-server.md
@@ -23,7 +23,7 @@ Records how the concept's guarantees map onto this crate so a change to the sess
 ## 2. Constraints & Assumptions
 
 - Rust edition 2024, minimum toolchain 1.85; async runtime Tokio (multi-threaded).
-- Command-line parsing with `clap` (flags with `env` fallbacks); `.env` loading with `dotenvy`; diagnostics with `tracing` written to standard error, filter `godot_mcp=info,warn` unless `RUST_LOG` overrides it.
+- Command-line parsing with `clap` (flags with `env` fallbacks); `.env` loading with `dotenvy`; diagnostics with `tracing` written to standard error, filter `godot_mcp=info,warn` unless `RUST_LOG` overrides it; colour codes are written only when standard error is a terminal, so a client that stores the log gets plain text. [MODIFIED]
 - Observed conventions: `unwrap()` / `expect()` appear only in tests; mutexes are locked through a helper that recovers from poisoning; no lock is held across an `await` on the editor.
 
 ## 4. Invariant Compliance
@@ -36,7 +36,7 @@ Records how the concept's guarantees map onto this crate so a change to the sess
 | MCP-4 Cancellation | In-flight tasks are registered in a map keyed by the JSON text of the request id (registration happens under the lock before the task can finish); `notifications/cancelled` removes the entry and aborts the task, so no response is sent. |
 | MCP-5 Error contract | `parse_message` maps input to parse error (-32700), invalid request (-32600), method not found (-32601) and invalid params (-32602); tool failures are `ToolResult::error(message, hints)` with an "Actionable recovery suggestions" list and `isError: true`. |
 | MCP-6 Version negotiation | `SUPPORTED_PROTOCOL_VERSIONS` (newest first); the requested version is echoed when present in the list, else the first entry. |
-| MCP-7 Forgiving configuration | Path flags use an infallible parser (empty means unset), the port parser maps an empty value to 9333; `.env` parse errors are logged as a warning with the single-quote hint and otherwise ignored; the removed `--mcp-url` flag is rejected while a stale `GODOT_MCP_URL` variable is ignored. `GODOT_MCP_FEEDBACK` accepts `off`, `draft` and `full` in any case, and an unknown value logs a warning and selects `full`; `GODOT_MCP_GH_PATH` is parsed like the other path settings. [ADDED] |
+| MCP-7 Forgiving configuration | Path flags use an infallible parser (empty means unset), the port parser maps an empty value to 9333; `.env` parse errors are logged as a warning with the single-quote hint and otherwise ignored; the removed `--mcp-url` flag is rejected while a stale `GODOT_MCP_URL` variable is ignored. `GODOT_MCP_FEEDBACK` accepts `off`, `draft` and `full` in any case, and an unknown value logs a warning and selects `draft` (FB-10); `GODOT_MCP_GH_PATH` is parsed like the other path settings. [ADDED] |
 | MCP-8 No crash paths | All fallible operations return `McpError`; `util::lock` recovers poisoned mutexes; serialization failures of a tool result become an internal-error tool result. |
 | MCP-9 Graceful shutdown | On stdin EOF the loop awaits every remaining task, then drops the writer channel and waits for the writer to flush. |
 
@@ -105,3 +105,4 @@ src/
 | 1.0.0 | 2026-10-16 | Agent (magic.analyze first-time) | Reverse-engineered from the code at 94e4540. |
 | 1.1.0 | 2026-10-16 | Agent (magic.spec) | [ADDED] Two modules and two settings of the feedback channel in the module map and the configuration row; link to its implementation. |
 | 1.2.0 | 2026-10-20 | Agent (magic.spec) | [MODIFIED] A configured engine path is used as given even when the file is missing (was: silently replaced by the platform scan). Reason: with one release line per engine version, running a different installed version is a silent wrong result. |
+| 1.3.0 | 2026-10-21 | Agent (magic.spec) | [MODIFIED] Plain diagnostics when standard error is not a terminal; an unknown feedback mode selects `draft`. Source: simulation QA of 2026-10-21 (Q11, Q23). Stable → RFC → Stable after Post-Update Review. |

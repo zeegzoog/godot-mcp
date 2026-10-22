@@ -3,9 +3,10 @@
 //! The editor path goes through the bridge and is undoable. With no editor, creating
 //! a scene, a resource or a project setting falls back to writing the file.
 
-use super::{ToolManager, str_arg};
+use super::{EditorChoice, ToolManager, str_arg};
+use crate::cli_runner::ClassKind;
 use crate::error::McpError;
-use crate::paths::resolve_in_project;
+use crate::paths::{res_display, resolve_in_project};
 use crate::protocol::{Tool, ToolResult};
 use serde_json::{Value, json};
 use std::io::{ErrorKind, Write};
@@ -96,13 +97,25 @@ pub async fn call(tools: &ToolManager, name: &str, args: Value) -> ToolResult {
     }
 }
 
+/// The editor's answer as text, with the project it acted on named when it was asked.
+fn editor_answer(choice: &EditorChoice, value: Value) -> ToolResult {
+    ToolResult::text(serde_json::to_string_pretty(&choice.name_project(value)).unwrap_or_default())
+}
+
 async fn create_scene(tools: &ToolManager, args: &Value) -> ToolResult {
+    let choice = match tools.editor_choice(args, true).await {
+        Ok(choice) => choice,
+        Err(result) => return result,
+    };
+    if matches!(choice, EditorChoice::Host) {
+        return write_scene(tools, args).await;
+    }
     match tools
         .bridge
         .send_command("create_scene", args.clone())
         .await
     {
-        Ok(value) => ToolResult::text(serde_json::to_string_pretty(&value).unwrap_or_default()),
+        Ok(value) => editor_answer(&choice, value),
         Err(McpError::BridgeUnavailable(_)) => write_scene(tools, args).await,
         Err(error) => super::bridge_error_result(&error),
     }
@@ -110,17 +123,34 @@ async fn create_scene(tools: &ToolManager, args: &Value) -> ToolResult {
 
 async fn write_scene(tools: &ToolManager, args: &Value) -> ToolResult {
     let Some(scene_path) = str_arg(args, "scene_path") else {
-        return ToolResult::error("Missing scene_path", &[]);
+        return ToolResult::error(
+            "Missing scene_path",
+            &["Pass scene_path: a res:// path ending in .tscn"],
+        );
     };
     if !scene_path.ends_with(".tscn") {
-        return ToolResult::error("scene_path must end in .tscn", &[]);
+        return ToolResult::error(
+            "scene_path must end in .tscn",
+            &["Use a path such as res://scenes/main.tscn"],
+        );
     }
     let root_type = str_arg(args, "root_type").unwrap_or("Node2D");
-    let root_name = str_arg(args, "root_name").unwrap_or("Root");
-    if !crate::paths::is_valid_identifier(root_type)
-        || !crate::paths::is_valid_identifier(root_name)
-    {
-        return ToolResult::error("root_type and root_name must be identifiers", &[]);
+    let root_name = node_name(str_arg(args, "root_name").unwrap_or("Root"));
+    if !crate::paths::is_valid_identifier(root_type) {
+        return ToolResult::error(
+            format!("Invalid root_type {root_type:?}: use letters, digits and underscores only"),
+            &["Example: Node2D, CharacterBody3D, Control"],
+        );
+    }
+    match tools.cli.class_kind(root_type).await {
+        Ok(ClassKind::Scene) => {}
+        Ok(_) => {
+            return ToolResult::error(
+                format!("Class '{root_type}' is not a Node type"),
+                &["Use a Node class the engine can create, such as Node2D, Node3D or Control"],
+            );
+        }
+        Err(error) => return class_check_failed(&error),
     }
     let project = match tools.host_project(args) {
         Ok(path) => path,
@@ -128,43 +158,90 @@ async fn write_scene(tools: &ToolManager, args: &Value) -> ToolResult {
     };
     let file = match resolve_in_project(&project, scene_path) {
         Ok(file) => file,
-        Err(problem) => return ToolResult::error(problem, &[]),
+        Err(problem) => {
+            return ToolResult::error(
+                problem,
+                &["Use a res:// path or a path relative to the project directory"],
+            );
+        }
     };
     let body = format!("[gd_scene format=3]\n\n[node name=\"{root_name}\" type=\"{root_type}\"]\n");
     match create_new_file(&file, &body) {
         Ok(()) => {}
         Err(error) if error.kind() == ErrorKind::AlreadyExists => {
             return ToolResult::error(
-                format!("Scene already exists: {}", file.display()),
+                format!("Scene already exists: {}", res_display(&project, &file)),
                 &["Pick another scene_path, or edit the existing scene with the node tools"],
             );
         }
-        Err(_) => return ToolResult::error(format!("Failed to write {}", file.display()), &[]),
+        Err(_) => {
+            return ToolResult::error(
+                format!("Failed to write {}", res_display(&project, &file)),
+                &["Check that the folder can be created inside the project and is writable"],
+            );
+        }
     }
     ToolResult::text(format!(
-        "Created {scene_path} ({root_type}). The editor was closed, so this was written as text."
+        "Created {scene_path} ({root_type}) in {} as text, because no editor has this project open.",
+        project.display()
     ))
 }
 
 async fn create_resource(tools: &ToolManager, args: &Value) -> ToolResult {
-    match tools
-        .bridge
-        .send_command("create_resource", args.clone())
-        .await
-    {
-        Ok(value) => ToolResult::text(serde_json::to_string_pretty(&value).unwrap_or_default()),
+    let choice = match tools.editor_choice(args, true).await {
+        Ok(choice) => choice,
+        Err(result) => return result,
+    };
+    let sent = if matches!(choice, EditorChoice::Host) {
+        Err(McpError::BridgeUnavailable(
+            "another project than the editor's was named".into(),
+        ))
+    } else {
+        tools
+            .bridge
+            .send_command("create_resource", args.clone())
+            .await
+    };
+    match sent {
+        Ok(value) => editor_answer(&choice, value),
         Err(McpError::BridgeUnavailable(_)) => {
             let Some(path) = str_arg(args, "resource_path") else {
-                return ToolResult::error("Missing resource_path", &[]);
+                return ToolResult::error(
+                    "Missing resource_path",
+                    &["Pass resource_path: a res:// path ending in .tres"],
+                );
             };
             let Some(class_name) = str_arg(args, "class_name") else {
-                return ToolResult::error("Missing class_name", &[]);
-            };
-            if !crate::paths::is_valid_identifier(class_name) || !path.ends_with(".tres") {
                 return ToolResult::error(
-                    "class_name must be an identifier and resource_path must end in .tres",
-                    &[],
+                    "Missing class_name",
+                    &["Pass class_name: a built-in Resource class such as Curve"],
                 );
+            };
+            if !path.ends_with(".tres") {
+                return ToolResult::error(
+                    "resource_path must end in .tres",
+                    &["Use a path such as res://materials/wood.tres"],
+                );
+            }
+            match tools.cli.class_kind(class_name).await {
+                Ok(ClassKind::Resource) => {}
+                Ok(_) => {
+                    return ToolResult::error(
+                        format!("Unknown resource class: {class_name}"),
+                        &[
+                            "Use a built-in Resource class the engine can create, such as Curve or Gradient",
+                        ],
+                    );
+                }
+                Err(McpError::Validation(problem)) => {
+                    return ToolResult::error(
+                        format!("Unknown resource class: {problem}"),
+                        &[
+                            "Use a built-in Resource class the engine can create, such as Curve or Gradient",
+                        ],
+                    );
+                }
+                Err(error) => return class_check_failed(&error),
             }
             let project = match tools.host_project(args) {
                 Ok(path) => path,
@@ -172,26 +249,68 @@ async fn create_resource(tools: &ToolManager, args: &Value) -> ToolResult {
             };
             let file = match resolve_in_project(&project, path) {
                 Ok(file) => file,
-                Err(problem) => return ToolResult::error(problem, &[]),
+                Err(problem) => {
+                    return ToolResult::error(
+                        problem,
+                        &["Use a res:// path or a path relative to the project directory"],
+                    );
+                }
             };
             let body = format!("[gd_resource type=\"{class_name}\" format=3]\n");
             match create_new_file(&file, &body) {
                 Ok(()) => {}
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => {
                     return ToolResult::error(
-                        format!("Resource already exists: {}", file.display()),
+                        format!("Resource already exists: {}", res_display(&project, &file)),
                         &["Pick another resource_path; an existing resource is never replaced"],
                     );
                 }
                 Err(_) => {
-                    return ToolResult::error(format!("Failed to write {}", file.display()), &[]);
+                    return ToolResult::error(
+                        format!("Failed to write {}", res_display(&project, &file)),
+                        &[
+                            "Check that the folder can be created inside the project and is writable",
+                        ],
+                    );
                 }
             }
             ToolResult::text(format!(
-                "Created {path} ({class_name}) as text. Open the editor to let Godot import it."
+                "Created {path} ({class_name}) in {} as text. Open the editor to let Godot import it.",
+                project.display()
             ))
         }
         Err(error) => super::bridge_error_result(&error),
+    }
+}
+
+/// The class could not be checked because the engine could not be run; nothing was written.
+fn class_check_failed(error: &McpError) -> ToolResult {
+    ToolResult::error(
+        format!("The class could not be checked with the engine, so no file was written: {error}"),
+        &[
+            "Verify GODOT_PATH points to a working Godot executable",
+            "Or open the project in the editor with the Godot MCP Bridge plugin, which checks the class itself",
+        ],
+    )
+}
+
+/// A node name as Godot keeps it: the characters it forbids in a name become `_`. The name is
+/// data and goes into the scene file as a quoted value (TL-5).
+fn node_name(requested: &str) -> String {
+    let cleaned: String = requested
+        .chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '.' | ':' | '@' | '/' | '"' | '%') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    if cleaned.trim().is_empty() {
+        "Root".to_string()
+    } else {
+        cleaned
     }
 }
 
@@ -203,18 +322,34 @@ async fn editor_or_error(tools: &ToolManager, command: &str, args: &Value) -> To
 }
 
 async fn set_setting(tools: &ToolManager, args: &Value) -> ToolResult {
-    match tools
-        .bridge
-        .send_command("set_project_setting", args.clone())
-        .await
-    {
-        Ok(value) => ToolResult::text(serde_json::to_string_pretty(&value).unwrap_or_default()),
+    let choice = match tools.editor_choice(args, true).await {
+        Ok(choice) => choice,
+        Err(result) => return result,
+    };
+    let sent = if matches!(choice, EditorChoice::Host) {
+        Err(McpError::BridgeUnavailable(
+            "another project than the editor's was named".into(),
+        ))
+    } else {
+        tools
+            .bridge
+            .send_command("set_project_setting", args.clone())
+            .await
+    };
+    match sent {
+        Ok(value) => editor_answer(&choice, value),
         Err(McpError::BridgeUnavailable(_)) => {
             let Some(key) = str_arg(args, "key") else {
-                return ToolResult::error("Missing key", &[]);
+                return ToolResult::error(
+                    "Missing key",
+                    &["Pass key: a setting such as application/config/name"],
+                );
             };
             let Some(value) = args.get("value") else {
-                return ToolResult::error("Missing value", &[]);
+                return ToolResult::error(
+                    "Missing value",
+                    &["Pass value: a string, number or boolean"],
+                );
             };
             let project = match tools.host_project(args) {
                 Ok(path) => path,
@@ -222,9 +357,21 @@ async fn set_setting(tools: &ToolManager, args: &Value) -> ToolResult {
             };
             match write_setting(&project.join("project.godot"), key, value) {
                 Ok(()) => ToolResult::text(format!(
-                    "Set {key} in project.godot. Reopen the project in the editor to pick it up."
+                    "Set {key} in {}. Reopen the project in the editor to pick it up.",
+                    project.join("project.godot").display()
                 )),
-                Err(error) => ToolResult::error(error, &["Use a key like application/config/name"]),
+                Err(error) => {
+                    let hint: &[&str] = if error.contains("expects a")
+                        || error.contains("value must be")
+                    {
+                        &[
+                            "Send a value of the type the setting already has, or change it in the editor's Project Settings",
+                        ]
+                    } else {
+                        &["Use a key like application/config/name"]
+                    };
+                    ToolResult::error(error, hint)
+                }
             }
         }
         Err(error) => super::bridge_error_result(&error),
@@ -232,11 +379,21 @@ async fn set_setting(tools: &ToolManager, args: &Value) -> ToolResult {
 }
 
 async fn get_settings(tools: &ToolManager, args: &Value) -> ToolResult {
-    match tools
-        .bridge
-        .send_command("get_project_settings", args.clone())
-        .await
-    {
+    let choice = match tools.editor_choice(args, false).await {
+        Ok(choice) => choice,
+        Err(result) => return result,
+    };
+    let sent = if matches!(choice, EditorChoice::Host) {
+        Err(McpError::BridgeUnavailable(
+            "another project than the editor's was named".into(),
+        ))
+    } else {
+        tools
+            .bridge
+            .send_command("get_project_settings", args.clone())
+            .await
+    };
+    match sent {
         Ok(value) => ToolResult::text(serde_json::to_string_pretty(&value).unwrap_or_default()),
         Err(McpError::BridgeUnavailable(_)) => {
             let project = match tools.host_project(args) {
@@ -246,8 +403,13 @@ async fn get_settings(tools: &ToolManager, args: &Value) -> ToolResult {
             let text = std::fs::read_to_string(project.join("project.godot")).unwrap_or_default();
             let prefix = str_arg(args, "prefix").unwrap_or("");
             ToolResult::text(
-                json!({"source": "project.godot", "settings": read_settings(&text, prefix)})
-                    .to_string(),
+                json!({
+                    "source": "project.godot",
+                    "project_dir": project.display().to_string(),
+                    "settings": read_settings(&text, prefix),
+                    "truncated": false,
+                })
+                .to_string(),
             )
         }
         Err(error) => super::bridge_error_result(&error),
@@ -272,9 +434,9 @@ fn create_new_file(file: &Path, body: &str) -> std::io::Result<()> {
 /// break in a key would start a new section or a new entry.
 fn is_setting_key(key: &str) -> bool {
     key.contains('/')
-        && !key.starts_with('/')
-        && !key.ends_with('/')
-        && !key.contains("//")
+        && key
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
         && key
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '/' | '.' | '-'))
@@ -429,6 +591,19 @@ fn write_setting(path: &Path, key: &str, value: &Value) -> Result<(), String> {
     std::fs::write(path, lines.join("\n") + "\n").map_err(|err| err.to_string())
 }
 
+/// A stored value as the editor reports it: a quoted string without its quotes and escapes, any
+/// other value as its text.
+fn plain_value(stored: &str) -> String {
+    let stored = stored.trim();
+    if stored.len() >= 2 && stored.starts_with('"') && stored.ends_with('"') {
+        if let Ok(text) = serde_json::from_str::<String>(stored) {
+            return text;
+        }
+        return stored[1..stored.len() - 1].to_string();
+    }
+    stored.to_string()
+}
+
 fn read_settings(text: &str, prefix: &str) -> Value {
     let mut section = String::new();
     let mut settings = serde_json::Map::new();
@@ -449,7 +624,7 @@ fn read_settings(text: &str, prefix: &str) -> Value {
         }
         let key = format!("{section}/{name}");
         if prefix.is_empty() || key.starts_with(prefix) {
-            settings.insert(key, Value::String(value.to_string()));
+            settings.insert(key, Value::String(plain_value(value)));
         }
     }
     Value::Object(settings)
@@ -474,7 +649,8 @@ mod tests {
             assert!(is_setting_key(good), "{good}");
         }
         for bad in [
-            "", "name", "/a", "a/", "a//b", "a/b c", "a/b]", "a/b\n[x", "a/b=c",
+            "", "name", "/a", "a/", "a//b", "a/b c", "a/b]", "a/b\n[x", "a/b=c", "a/../b", "a/./b",
+            "../a/b",
         ] {
             assert!(!is_setting_key(bad), "{bad:?}");
         }
@@ -496,6 +672,6 @@ mod tests {
         assert!(text.contains("[display]"), "{text}");
         assert!(text.contains("window/size/viewport_width=640"), "{text}");
         let settings = read_settings(&text, "application/");
-        assert_eq!(settings["application/config/name"], "\"New\"");
+        assert_eq!(settings["application/config/name"], "New");
     }
 }

@@ -16,10 +16,10 @@ Each godot-mcp release holds the files for every supported Godot minor version. 
 
 | Your Godot | Branch | Files to download |
 | --- | --- | --- |
+| 4.8 (pre-release) | `master` | none; build from source |
 | 4.7.x | `godot-v4.7` | the files ending in `-godot4.7` |
 | 4.6.x | `godot-v4.6` | the files ending in `-godot4.6` |
 | 4.5.x | `godot-v4.5` | the files ending in `-godot4.5` |
-| 4.8 (pre-release) | `master` | none; build from source |
 
 Release 0.4.0 and older are one build for Godot 4.5 and newer, with file names that have no `-godotM.N` suffix.
 
@@ -99,7 +99,7 @@ The server reads its settings from CLI flags, the environment (e.g. the MCP clie
 | `GODOT_MCP_LSP_PORT` | | `6005` | Port of a running editor's GDScript language server. The `godot_code_*` tools use it if an editor listens there, and otherwise start a private headless editor. |
 | `GODOT_MCP_TOKEN` | | generated | Shared secret for the bridge. Normally unnecessary, see [Security](#security). |
 | `GODOT_CONSOLE_PATH` | `--godot-console-path` | | Windows console wrapper. Unused by the server; the editor end-to-end tests use it for editor logs. |
-| `GODOT_MCP_FEEDBACK` | `--feedback` | `full` | Feedback channel for the maintainers: `off`, `draft` (the AI can write a report but never send one) or `full`. See [Feedback](#feedback-to-the-maintainers). |
+| `GODOT_MCP_FEEDBACK` | `--feedback` | `full` | Feedback channel for the maintainers: `off`, `draft` (the AI can write a report but never send one) or `full`. A value the server does not recognize gives `draft`. See [Feedback](#feedback-to-the-maintainers). |
 | `GODOT_MCP_GH_PATH` | `--gh-path` | `gh` on `PATH` | The [GitHub CLI](https://cli.github.com) used when you let the AI submit a report. Set it when your MCP client does not see `gh` on its `PATH`. |
 
 An empty value counts as "not set", so placeholders in a copied `.env.example` or an MCP client's `env` block are harmless.
@@ -113,10 +113,11 @@ The plugin picks its port from the project setting `godot_mcp/bridge_port` if yo
 - The bridge listens on `127.0.0.1` only, so other machines cannot reach it.
 - Every command must carry a random token. The plugin writes it when the editor starts to `<user data dir>/godot-mcp/bridge-<port>.token` (readable by your user only), and the server reads it from there. This also keeps web pages in your browser from driving the editor. Both processes must therefore run as the same OS user. If they can't (containers, Flatpak, different users), set the same `GODOT_MCP_TOKEN` for both instead.
 - `godot_create_script` only writes `.gd` files inside the project, never overwrites without `overwrite: true`, and accepts only plain identifiers for `class_name` and `extends_class`.
-- `godot_read_script` and `godot_edit_script` work on existing `.gd` files inside the project only, change nothing but the one fragment you name, and never overwrite text you have typed in the editor and not saved. Your fragment is treated as plain text, never run.
+- `godot_read_script` and `godot_edit_script` work on existing `.gd` files inside the project only, change nothing but the one fragment you name, and never overwrite text you have typed in the editor and not saved. Your fragment is treated as plain text by the tools, never run by them. But code you put into a script is code: Godot runs a `@tool` script inside the editor as soon as it is saved, so editing one runs it with your authority.
 - Node paths are resolved inside the edited scene only; the scene root can't be removed.
-- `godot_game_call` runs only the methods you list in `permit`, and never one that can quit, evaluate code, call another method or free a node. `godot_game_set` refuses `script` and private names, including on a resource reached with `:`. Nothing `godot_game_set` changes is saved to disk.
+- `godot_game_call` runs only the methods you list in `permit`, and never one that can quit, evaluate code, call another method by name (`call`, `call_group`, `propagate_call`, `emit_signal`, `notification`, …), set a property by name (`set`, `set_deferred`, `set_indexed`) or free or replace a node (`free`, `queue_free`, `replace_by`). `godot_game_set` refuses `script` and private names, including on a resource reached with `:`. Nothing `godot_game_set` changes is saved to disk.
 - `godot_run_project` `user_args` are placed after `--` and only for `mode: "process"`. A value that starts with `-` is a game argument, not a Godot engine option.
+- `godot_game_record` writes PNG files (and, with ffmpeg, one movie) only below the system temporary directory, never over an existing recording, and returns paths, not images.
 - The authoring tools never replace an existing scene or resource. `godot_set_project_setting` accepts only a plain `section/path` key, escapes the value, and keeps the type of a setting that exists, so it cannot add lines or sections to `project.godot`.
 
 To report a vulnerability, follow [SECURITY.md](SECURITY.md). Never open a public issue for it.
@@ -125,7 +126,7 @@ To report a vulnerability, follow [SECURITY.md](SECURITY.md). Never open a publi
 
 "Editor" means the tool needs a running Godot editor with the plugin enabled. "Running game" means a game started with `godot_run_project`, in the editor's Play mode or as a managed process. "Process run" means a managed process run, the one this server can debug.
 
-`project_path` can be omitted when the server runs inside the project: tools then use the project open in the editor, else the first folder with a `project.godot` from the server's working directory upwards, else the only subfolder that has one (such as `app/`).
+`project_path` can be omitted when the server runs inside the project: tools then use the project open in the editor, else the first folder with a `project.godot` from the server's working directory upwards, else the only subfolder that has one (such as `app/`). A `project_path` you give always wins: when the open editor has another project, the tools that can work on files (reading and editing a script, creating a scene or a resource, project settings) use the files of the project you named and leave the editor alone, and an answer that changed something names the project directory.
 
 | Tool | Needs | What it does |
 | --- | --- | --- |
@@ -133,8 +134,8 @@ To report a vulnerability, follow [SECURITY.md](SECURITY.md). Never open a publi
 | `godot_get_project_info` | Editor | Name, main scene, and features of the open project. |
 | `godot_launch_editor` | — | Launches the editor for `project_path`, or for the project the server runs in. |
 | `godot_run_project` | — | Plays the main scene or a given `res://` scene. With the editor, uses its Play mode. Without it (or with `mode: "process"`), starts a managed game with the remote debugger attached; `held: true` (process runs only) starts it held, for exact steps. `user_args` (process only) are strings the game reads with `OS.get_cmdline_user_args()`; they are placed after `--` and refused for editor Play and `mode: "auto"`. `godot_stop_project` stops either one. |
-| `godot_stop_project` | — | Stops the editor's Play mode, or a managed process run (`run_id` optional). |
-| `godot_get_run_status` | — | Whether a scene is playing, and the managed process runs, including each run's `user_args`. |
+| `godot_stop_project` | — | Stops what runs: the editor's Play mode when it plays and every managed process run, and lists what it stopped (or says that nothing was running). Pass `run_id` to stop one process run. |
+| `godot_get_run_status` | — | Whether a scene is playing, and the managed process runs, each with its `user_args`, exit code, `ended_by` (`game` or `server`) and `ended_at` once it has ended. Says that nothing is running when that is so. |
 | `godot_get_open_scenes` | Editor | Open scene tabs and the active one. |
 | `godot_open_scene` | Editor | Opens a scene by `res://` path. If that tab is already open and the file on disk has changed, reloads it (pass `discard: true` to drop unsaved bridge edits). |
 | `godot_save_scene` | Editor | Saves the active scene. |
@@ -160,7 +161,7 @@ To report a vulnerability, follow [SECURITY.md](SECURITY.md). Never open a publi
 | `godot_game_tree` | Running game | Live nodes of the running game: path, class, position, visible text. Filter by `name`, `class`, `group` or `text`. |
 | `godot_game_get` | Running game | A live node's properties, groups and, optionally, signals and methods. A property path can step through a resource with `:` (`material:shader_parameter/caustics`), including a name that starts with `_`. A requested `script` is omitted. |
 | `godot_game_set` | Running game | Sets properties on a live node, including a resource property reached with `:`. Refuses `script` and private names. Nothing is saved to disk. |
-| `godot_game_call` | Running game | Calls one method on a live node. The method must be listed in `permit`; methods that can quit, evaluate code, call other methods or free the node are refused. |
+| `godot_game_call` | Running game | Calls one method on a live node. The method must be listed in `permit`; methods that can quit, evaluate code, call other methods by name, set properties by name or free or replace the node are refused. A JSON string is passed as a `StringName` or a `NodePath` where the method asks for one. |
 | `godot_game_signals` | Running game | A live node's signals and their connections. |
 | `godot_game_observe` | Running game | Watches signals for a few frames, returns the ones that fired, then disconnects. |
 | `godot_game_snapshot` | Running game | Scene path, monotonic `scene_generation`, `scene_instance_id`, frame, pause flag, children, and the loaded root script path plus its SHA-256. |
@@ -169,7 +170,7 @@ To report a vulnerability, follow [SECURITY.md](SECURITY.md). Never open a publi
 | `godot_game_wait` | Running game | Waits for process frames, for a node to exist (`node`), for a signal (`node` and `signal`), for a public property (`property`, `op`, `value`), or for a newer `scene_generation`. `timeout` is in frames. `time_scale` (0 to 8) sets `Engine.time_scale`; the runtime restores the previous value when the game exits. |
 | `godot_game_physics` | Running game | Controls game time. `hold` stops the game at the start of a physics tick; while held, `step` runs an exact number of ticks (or until a condition holds), input is applied by tick, and `resume` lets the game run. Without a hold, `step` advances N engine physics iterations and leaves the tree paused. See [Holding a game](#holding-a-game). |
 | `godot_game_screenshot` | Running game with a window | PNG of the game window, a viewport or a camera; `frames` (up to 8) stitches shots taken every `every` frames into one sheet. Compares with the previous capture, and can save or compare a named baseline (`save_baseline`, `baseline`, `roi`, `tolerance`). An error, never an empty image; a headless game has nothing to capture. |
-| `godot_game_record` | Running game with a window | Saves up to 240 PNG frames of the game window to a directory (`frames`, `every`, `max_dimension`). The reply lists paths, sizes and timings and does not embed the images. `format` `gif` or `mp4` also builds a movie when `ffmpeg` is on `PATH`; without it the PNG files are the result. |
+| `godot_game_record` | Running game with a window | Saves up to 240 PNG frames of the game window to a directory below the system temporary directory (`frames`, `every`, `max_dimension`, `directory`). The reply lists paths, sizes and timings and does not embed the images. `format` `gif` or `mp4` also builds a movie when `ffmpeg` is on `PATH`; without it the PNG files are the result. |
 | `godot_debug_breakpoints` | Process run | Lists, adds, removes or clears breakpoints (`res://script.gd:LINE`). Editor Play uses the editor's own debugger. |
 | `godot_debug_control` | Process run | Pauses, resumes or steps (into, over, out) and waits for the next stop. |
 | `godot_debug_state` | Process run | Stack frames and variables of a stopped run. |
@@ -225,10 +226,10 @@ A named baseline is the returned image, so `roi` uses that image's pixels (`roi_
 
 `script`, a segment that starts with `_`, and a value that is not a resource are refused. The change lasts until the game exits. It is not saved. A shader uniform that nothing has written yet reads as null; Godot does not return the default declared in the shader until a value is stored.
 
-`godot_game_record` writes that motion to disk when eight screenshot frames are not enough. `frames` is 1 to 240, `every` is the process frames between shots, and `frames * every` is at most 480. Each frame only grabs an image. The PNG files are written after the last frame, so the timings are the capture times, and `frames × width × height × 4` must stay within 512 MB after `max_dimension`. Omit `directory` for a temporary one. The reply has no image bytes. `format` `gif` or `mp4` runs `ffmpeg` when it is installed; otherwise the PNG files are still there.
+`godot_game_record` writes that motion to disk when eight screenshot frames are not enough. `frames` is 1 to 240, `every` is the process frames between shots, and `frames * every` is at most 480. Each frame only grabs an image. The PNG files are written after the last frame, so the timings are the capture times, and `frames × width × height × 4` must stay within 512 MB after `max_dimension`. `directory` must be an absolute path below the system temporary directory (nothing is written elsewhere); omit it for a new one. The reply has no image bytes. `format` `gif` or `mp4` runs `ffmpeg` when it is installed; otherwise the PNG files are still there.
 
 ```json
-{"frames": 180, "every": 1, "max_dimension": 480, "directory": "/tmp/water-record"}
+{"frames": 180, "every": 1, "max_dimension": 480, "format": "png"}
 ```
 
 `user_args` on `godot_run_project` is only for `mode: "process"`. The server places them after `--`, so `--caustics` is a game flag and not a Godot option. `godot_get_run_status` lists them on the process run.

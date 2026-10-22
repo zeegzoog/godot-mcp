@@ -1,6 +1,6 @@
 # Agent Feedback Channel
 
-**Version:** 1.0.0
+**Version:** 1.1.0
 **Status:** Stable
 **Layer:** concept
 
@@ -46,7 +46,7 @@ Terms: a **note** is one observation the agent records; **evidence** is context 
 - **FB-7 One problem per issue, duplicates not filed.** A draft covers one or more related notes and carries a fingerprint derived from stable facts (kind, named tool, observed error shape, requested-but-missing tool), not from free wording. Before creating an issue, submission looks for an issue that already carries the fingerprint; when one exists it reports that issue and creates nothing, unless the caller explicitly asks for a new issue. A failed look-up never blocks submission and is reported.
 - **FB-8 A text path always exists.** In every environment (no tracker client, not signed in, offline, submission disabled) a draft yields the complete report text and, when it fits the link budget, a link that opens a prefilled new-issue page. A failed submission leaves the draft intact and retrievable within the session.
 - **FB-9 Honest outcomes.** Submission reports exactly one of: created (with the issue address), duplicate found (with its address), not created (with the reason and at least one recovery step), or unknown when the client's answer cannot be understood (with the instruction to check the tracker before retrying). It never claims creation without the tracker's confirmation.
-- **FB-10 Guidance in, switch out.** At session start and in the tool descriptions the server tells the agent: when to record a note and when to draft; what is not worth reporting; to write in English; to show the whole report to the human and offer copying it, submitting it or discarding it; and never to submit without the human's explicit yes. The human can turn the channel off, or down to drafting only, by configuration; off removes its tools and its guidance entirely.
+- **FB-10 Guidance in, switch out.** At session start and in the tool descriptions the server tells the agent: when to record a note and when to draft; what is not worth reporting; to write in English; to show the whole report to the human and offer copying it, submitting it or discarding it; and never to submit without the human's explicit yes. The human can turn the channel off, or down to drafting only, by configuration; off removes its tools and its guidance entirely. A setting value the server does not recognize never widens the channel: it gives drafting only and is reported on the diagnostic channel, while an empty value means the default. [MODIFIED]
 - **FB-11 Never in the way.** Recording evidence changes neither the result nor the order of any other tool call and adds no noticeable delay to it. A fault inside the channel never fails another tool or the session.
 
 ## 5. Detailed Design
@@ -138,3 +138,4 @@ The kind of a draft with mixed kinds is the first of: `bug`, `missing_feature`, 
 | Version | Date | Author | Description |
 | --- | --- | --- | --- |
 | 1.0.0 | 2026-10-16 | Agent (magic.spec) | Created from the request for a mechanism that lets agents report missing features, defects and improvements to the maintainers, as copyable text or by agent submission after the human's approval. |
+| 1.1.0 | 2026-10-21 | Agent (magic.spec) | [MODIFIED] FB-10: an unrecognized mode gives drafting only instead of the default (full), because a typo of a restriction (`drafts`, `of`) enabled submission. Source: simulation QA of 2026-10-21 (Q11). Stable → RFC → Stable after Post-Update Review. |

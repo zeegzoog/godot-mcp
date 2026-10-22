@@ -1,6 +1,6 @@
 # Code Intelligence
 
-**Version:** 1.0.0
+**Version:** 1.1.0
 **Status:** Stable
 **Layer:** concept
 
@@ -23,6 +23,7 @@ GDScript diagnostics, symbols, completion, definitions and references for an age
 - Godot's server speaks the Language Server Protocol over TCP and is part of the editor, so a Godot executable is required; the server does not implement a language server of its own.
 - Godot reads the length header strictly: a frame carries only `Content-Length`.
 - Lines and columns are 1-based at the tool boundary, as in the editor.
+- [DR] CI-7 compares projects through the editor bridge (its reported project directory), because the language server does not say which project it serves. Without a bridge answer nothing shows a mismatch and the server on the port is used as before. Rejected: refusing every server that cannot be proven right (a private editor start for every user whose plugin is off), and asking the language server for its root (not offered).
 
 ## 3. Core Invariants
 
@@ -32,6 +33,7 @@ GDScript diagnostics, symbols, completion, definitions and references for an age
 - **CI-4** A language server started for the tools is the server's own child: it gets no handle to the server's standard streams, does not outlive the server, and is private to it.
 - **CI-5** A query leaves no state behind in the language server: a document opened for a question is closed again, so the same script can be asked about repeatedly.
 - **CI-6** Messages are bounded in size; an oversized frame is refused.
+- **CI-7** The answer is about the project that was asked about. A language server that an editor already runs is not used when the bridge shows that editor has another project open; the tools start their own for the right project, and a timeout names the project. [ADDED]
 
 ## 7. Drawbacks & Alternatives
 
@@ -51,3 +53,4 @@ GDScript diagnostics, symbols, completion, definitions and references for an age
 | Version | Date | Author | Description |
 | --- | --- | --- | --- |
 | 1.0.0 | 2026-10-21 | Agent (magic.spec) | Specified after pull request 6 merged (diagnostics, symbols, completion, definition, references). |
+| 1.1.0 | 2026-10-21 | Agent (magic.spec) | [ADDED] CI-7 (a language server that the bridge shows to serve another project is not used). Source: simulation QA of 2026-10-21 (Q9); impossible positions are covered by TL-1 (Q22). Stable → RFC → Stable after Post-Update Review. |

@@ -1,6 +1,6 @@
 # Tool Catalog
 
-**Version:** 1.4.0
+**Version:** 1.6.0
 **Status:** Stable
 **Layer:** concept
 
@@ -27,19 +27,23 @@ Agents call tools without seeing the implementation; a tool's contract has to be
 - A tool is "editor-backed" when it needs a running editor with the bridge enabled, "host-side" when it runs without one, and "live-first" when it prefers the editor and falls back to the engine binary.
 - The headless engine is only invoked for: version lookup, script validation, editor launch, and running the project.
 - Tool names are stable public API (`godot_*`); renaming one is a breaking change.
+- [DR] Node names are not held to the identifier pattern. The pattern protects generated source and command lines, and a node name never goes into either; the editor tools already accepted `שלום` and `with space`, and rejecting them would break scenes named in any non-Latin script. Rejected: tightening the tools to the pattern (a regression for those users) and a separate stricter pattern (no threat it would stop). Override: `/magic.spec amend l1-tool-catalog.md "strict node names"`.
+- [DR] A stop without a run id ends every running game, not only the newest: the agent asked to stop "the project", and a game left running (a window, a held game that never advances) is the harm the tool exists to prevent. Rejected: stopping only the newest run (leaves the others), and refusing when several run (a stall). Override: pass `run_id`.
 - The three feedback tools are host tools that follow, besides the rules below, those of [l1-agent-feedback.md](l1-agent-feedback.md). The human can switch them off or reduce them to two by configuration, so which feedback tools `tools/list` shows is fixed at start-up by that setting. [ADDED]
 
 ## 3. Core Invariants
 
-- **TL-1 Schema-first validation.** Every tool publishes an input schema. Required parameters, primitive types, array item types and enumerations are checked before the editor or the engine is contacted; a violation names the parameter, the expected type and the received type.
+- **TL-1 Schema-first validation.** Every tool publishes an input schema. Required parameters, primitive types, array item types, enumerations and the numeric ranges the tool documents (a line, a column, a tick count) are checked before the editor or the engine is contacted; a violation names the parameter, the expected type and the received type. A parameter that is an object or a list of objects whose fields the caller must get right (`steps`, `until`, `roi`) describes those fields in its schema, so the caller does not have to guess them. [MODIFIED]
 - **TL-2 Live-first, fall back only on absence.** A live-first tool uses the engine binary only when the editor is unreachable. An editor that answered with an error is reported as such and never masked by a fallback.
 - **TL-3 Project resolution order.** When a tool needs a project directory: an explicit `project_path` wins; otherwise the project open in the connected editor (for tools that may use the editor); otherwise the nearest directory at or above the server's working directory that contains `project.godot`; otherwise the single direct subdirectory that contains one. Several candidates are an error that lists them and asks for `project_path`. A given `project_path` must contain `project.godot`.
 - **TL-4 Confined, non-destructive writes.** Host-side writes resolve inside the project only: parent-directory segments are rejected, absolute paths must land inside the project, and the existing part of the path may not leave the project through a link. An existing file is never replaced unless the caller explicitly asks for it. A write is flushed before success is reported.
-- **TL-5 No injection.** No caller-supplied string reaches the engine command line where it could be read as an option, and none is interpolated into generated source code. Class and node identifiers must match `^[A-Za-z_][A-Za-z0-9_]*$`; scene arguments must be `res://` paths without parent segments.
+- **TL-5 No injection.** No caller-supplied string reaches the engine command line where it could be read as an option, and none is interpolated into generated source code. Class identifiers must match `^[A-Za-z_][A-Za-z0-9_]*$`; a node name is data, not an identifier: it reaches the engine only as a value, never inside generated source or a command line, and any name Godot accepts is accepted (Godot replaces the characters it forbids and the answer reports the real name); every file argument that names a project file (a scene, a script, a resource, the file of a breakpoint) must be a `res://` path without parent segments. [MODIFIED]
 - **TL-6 Detached launches.** Processes started for the caller (editor, game) are detached: they receive no handle to the server's standard streams, do not inherit the server's console or process group, and keep running when the server or the client terminal is interrupted. The one exception is a managed process run (`godot_run_project` with `mode: "process"`, or without an editor), which the caller asked the server to observe and drive: it too gets no handle to the server's streams and has its own process group, but it belongs to the server, is stopped with `godot_stop_project` and ends with the server. [MODIFIED]
-- **TL-7 Hints by failure class.** Every tool error carries recovery steps matched to what failed: editor unreachable, connection broken or busy, editor-reported failure (unauthorized, no active scene, not found), invalid arguments, engine binary failure.
+- **TL-7 Hints by failure class.** Every tool error carries recovery steps matched to what failed: editor unreachable, connection broken or busy, editor-reported failure (unauthorized, no active scene, not found, unsaved changes in the editor), failure reported by the running game (denied, unsupported, not found, bad parameters), invalid arguments, engine binary failure (a missing or non-running Godot executable names `GODOT_PATH`). A generic instruction that fits every failure ("correct the arguments and retry") is not a recovery step. Project files in messages are named by their `res://` path. [MODIFIED]
 - **TL-8 Bounded engine calls.** Engine invocations expected to finish (version lookup, script validation) have a time limit and report it when exceeded; their output is stripped of the engine banner.
 - **TL-9 Editor stays in sync.** After a host-side write into the project the connected editor has open, the editor is asked to refresh that file so it is picked up (and assigned a UID) without a manual rescan.
+- **TL-10 The named project wins over the editor.** A tool given `project_path` acts on that project. When a connected editor has a different project open, the editor is not used for the call: the tool takes its host-side path when it has one (reading and editing a script, creating a scene or a resource, project settings), and otherwise refuses with both directories and the fix. An answer that changed a file or a setting names the project directory it acted on. [ADDED]
+- **TL-11 Stopping and asking about runs are honest.** `godot_stop_project` without a run id stops everything that runs: the editor's Play mode when it plays, and every managed run that is still running; the answer lists each one it stopped, or says that nothing was running. `godot_get_run_status` and `godot_run_output` answer that nothing runs when that is so, and do not report an absent editor as a failure when no editor is needed. [ADDED]
 
 ## 5. Detailed Design
 
@@ -51,7 +55,7 @@ Agents call tools without seeing the implementation; a tool's contract has to be
 | `godot_get_project_info` | editor | no | Name, main scene, features, directory |
 | `godot_launch_editor` | host | process | Starts the editor for the resolved project |
 | `godot_run_project` | live-first | process / play state | Editor Play mode; without an editor (or with `mode: "process"`) a managed game with the remote debugger attached [MODIFIED] |
-| `godot_stop_project` | live-first | play state | Stops editor Play mode or a managed run [MODIFIED] |
+| `godot_stop_project` | live-first | play state | Stops editor Play mode and managed runs, and says which [MODIFIED] |
 | `godot_get_run_status` | live-first | no | Whether a scene plays, and the managed runs [MODIFIED] |
 | `godot_get_open_scenes` | editor | no | Open tabs, active tab |
 | `godot_open_scene` | editor | editor state | Opens a scene tab |
@@ -124,3 +128,5 @@ graph TD
 | 1.3.0 | 2026-10-21 | Agent (magic.spec) | [MODIFIED] The wait, screenshot and physics rows after pull request 18. |
 | 1.3.1 | 2026-10-21 | Agent (magic.spec) | Document History rows put in version order. No requirement changed. |
 | 1.4.0 | 2026-10-21 | Agent (magic.run) | [ADDED] The `godot_read_script` and `godot_edit_script` rows; the alternative about script content now points to them. Stable → RFC → Stable after Post-Update Review. |
+| 1.5.0 | 2026-10-21 | Agent (magic.spec) | [ADDED] TL-10 (the named project wins over a connected editor) and TL-11 (honest stop and status answers); [MODIFIED] TL-1 (ranges, object schemas), TL-5 (every project file argument; node-name question left open), TL-7 (hint classes, no generic hint, `res://` spelling). Source: simulation QA of 2026-10-21 (Q1, Q4, Q12, Q20, Q21, Q22, Q24, Q25, Q26, Q28). Stable → RFC → Stable after Post-Update Review. |
+| 1.6.0 | 2026-10-21 | Agent (magic.spec) | [MODIFIED] TL-5: node names are data and any name Godot accepts is accepted; the identifier pattern stays for class identifiers. Resolves the open question of 1.5.0. `AGENTS.md` ("Identifier Sanitization") must follow. Stable → RFC → Stable after Post-Update Review. |

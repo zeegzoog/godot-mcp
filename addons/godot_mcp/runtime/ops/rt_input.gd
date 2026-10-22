@@ -102,7 +102,7 @@ static func apply_held_step(rt: Node, step: Dictionary, release_at: int) -> Dict
             _scheduled.append({"due": release_at, "step": step})
         else:
             _apply_phase(step, phase)
-        return {"result": {"type": str(step.get("label", kind)), "ok": true}}
+        return {"result": _done(step, {"type": str(step.get("label", kind)), "ok": true})}
     if kind == "mouse_move":
         _mouse_motion(float(step["x"]), float(step["y"]))
         Input.flush_buffered_events()
@@ -111,7 +111,7 @@ static func apply_held_step(rt: Node, step: Dictionary, release_at: int) -> Dict
         Input.flush_buffered_events()
     else:
         return R.err(R.BAD_PARAMS, "A held game cannot apply a '%s' step." % kind)
-    return {"result": {"type": kind, "ok": true}}
+    return {"result": _done(step, {"type": kind, "ok": true})}
 
 
 ## Lets go of the taps whose hold ticks are over, before the tick that is about to start runs.
@@ -201,7 +201,7 @@ static func _tick_steps(rt: Node, state: Dictionary) -> bool:
         _release_tap(state["release"])
         state["release"] = {}
         var done: Dictionary = steps[index]
-        (state["results"] as Array).append({"type": str(done.get("label", done["type"])), "ok": true})
+        (state["results"] as Array).append(_done(done, {"type": str(done.get("label", done["type"])), "ok": true}))
         state["index"] = index + 1
         state["mode"] = "body"
         index += 1
@@ -277,7 +277,7 @@ static func _tick_steps(rt: Node, state: Dictionary) -> bool:
             state["mode"] = "hold"
             return true
         _apply_phase(step, phase)
-        (state["results"] as Array).append({"type": str(step.get("label", kind)), "ok": true})
+        (state["results"] as Array).append(_done(step, {"type": str(step.get("label", kind)), "ok": true}))
         state["index"] = index + 1
         return true
     if kind == "mouse_move":
@@ -286,7 +286,7 @@ static func _tick_steps(rt: Node, state: Dictionary) -> bool:
     elif kind == "joy_axis":
         _joy_axis(str(step["axis"]), float(step["value"]), int(step["device"]))
         Input.flush_buffered_events()
-    (state["results"] as Array).append({"type": kind, "ok": true})
+    (state["results"] as Array).append(_done(step, {"type": kind, "ok": true}))
     state["index"] = index + 1
     return true
 
@@ -837,6 +837,38 @@ static func _viewport_point(node: Node) -> Variant:
     return R.err(R.BAD_PARAMS, "click_node needs a Control, Node2D, or Node3D.")
 
 
+## The step's result with a warning when a pointer lands outside the root viewport (RO-11).
+static func _done(step: Dictionary, result: Dictionary) -> Dictionary:
+    var note := _pointer_note(step)
+    if not note.is_empty():
+        result["warning"] = note
+    return result
+
+
+## Controls outside the viewport do not react to the pointer, although `_input` still sees the
+## event. A game without a window has a 64 x 64 viewport whatever the project sets, so most of a
+## screen lies outside it. Empty when the step is not a pointer step or lands inside.
+static func _pointer_note(step: Dictionary) -> String:
+    var kind := str(step.get("type", ""))
+    if not (kind == "mouse_button" or kind == "mouse_move" or kind == "touch" or kind == "swipe"):
+        return ""
+    var tree := Engine.get_main_loop() as SceneTree
+    if tree == null:
+        return ""
+    var rect: Rect2 = tree.root.get_visible_rect()
+    var points: Array[Vector2] = [Vector2(float(step["x"]), float(step["y"]))]
+    if kind == "swipe":
+        points.append(Vector2(float(step["to_x"]), float(step["to_y"])))
+    for point: Vector2 in points:
+        if not rect.has_point(point):
+            var headless := DisplayServer.get_name() == "headless"
+            return "The point (%d, %d) is outside the game's %d x %d viewport%s. Controls there do not react to the pointer, although _input and _unhandled_input still receive the event." % [
+                int(point.x), int(point.y), int(rect.size.x), int(rect.size.y),
+                " (a game without a window has a 64 x 64 viewport whatever the project sets; run it with a window to click controls elsewhere)" if headless else "",
+            ]
+    return ""
+
+
 static func _tick_gesture(_rt: Node, state: Dictionary) -> bool:
     var gesture: Dictionary = state["gesture"]
     var step: Dictionary = gesture["step"]
@@ -852,7 +884,7 @@ static func _tick_gesture(_rt: Node, state: Dictionary) -> bool:
     else:
         _gesture_move(step, gesture["at"], to)
         _gesture_release(step, to)
-        (state["results"] as Array).append({"type": "swipe", "ok": true})
+        (state["results"] as Array).append(_done(step, {"type": "swipe", "ok": true}))
         state["index"] = int(state["index"]) + 1
         state["mode"] = "body"
         state["gesture"] = {}

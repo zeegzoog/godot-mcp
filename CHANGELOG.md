@@ -12,6 +12,25 @@ Each Godot version has its own release line and branch (`godot-v4.5`, `godot-v4.
 
 - **Read and edit existing scripts.** `godot_read_script` returns a script as the editor would save it, including text you have typed and not saved, with a version label. `godot_edit_script` replaces one fragment of a script: with the editor it is a single undoable action and the script is saved; without it the file is replaced safely. An edit is refused, with the fix, while the editor holds unsaved changes to the script, when the fragment is not found exactly once, or when the script changed since it was read.
 
+### Changed
+
+- **A `project_path` you name always wins over the open editor.** Reading and editing a script, creating a scene or a resource, and project settings used to go to the open editor even when you named another project, and edited the wrong one while saying it succeeded. They now use the files of the project you named, and an answer that changed something names the project directory.
+- `godot_stop_project` without `run_id` stops the editor's Play mode and every managed run, and says what it stopped. It used to report success while managed games kept running. `godot_get_run_status` and `godot_run_output` say that nothing is running instead of failing when there is no editor, and an ended run shows its exit code, who ended it and when.
+- `godot_game_call` also refuses the methods that call another method by name (`call_group`, `propagate_call`, `emit_signal`, `notification`, …), set a property by name (`set`, `set_deferred`, `set_indexed`) and free or replace a node (`queue_free`, `replace_by`), as the documentation always said. A JSON string can now be passed where a method asks for a `StringName` or a `NodePath`.
+- A value of `GODOT_MCP_FEEDBACK` that is none of `off`, `draft` and `full` gives `draft` instead of `full`, so a typo can never switch report submission on.
+- Without an editor, `godot_create_scene` and `godot_create_resource` ask the engine whether the class can be created and refuse one that cannot, as the editor does (a scene with a `Resource` root used to be written and could not be opened). Settings keys with `.` or `..` segments are refused everywhere, and the settings answer has the same shape with and without the editor.
+- Parameters that have a range say so in the tool schema (`line`, `character`, ticks, `tolerance`, …), and the step, `until` and `roi` objects describe their fields. `godot_create_script` takes `script_path` like the other script tools (`file_path` still works).
+- Error hints match what failed (a refusal of the running game, unsaved changes in the editor, a Godot executable that does not start), files in messages are shown as `res://` paths, and the log on standard error has no colour codes when it is not a terminal.
+- An output answer from a running game explains `script_sha256` once instead of on every line, and a screenshot baseline is compared at its own size unless you give `max_dimension`.
+
+### Fixed
+
+- A script that starts with a byte order mark can be read and edited through the editor; the answer says when saving removed the mark.
+- `godot_create_scene` and `godot_create_resource` create the folders of a new file through the editor, and name the folder when they cannot.
+- `godot_get_node_properties` reports an unset object property as `null` instead of a freed object, `godot_list_signals` lists only connections to nodes of the scene, with their paths, and a second editor on a taken bridge port says that a server connected to that port talks to the other editor.
+- A pointer step outside the game's viewport says that controls there do not react. A game without a window has a 64 x 64 viewport whatever the project sets, so most clicks on its controls landed outside it without a word.
+- Breakpoint locations must be `res://` paths without parent segments, and the language server of an editor that has another project open is not used for a project it does not serve.
+
 ## [0.6.0] - 2026-10-21
 
 The AI can now run a game, look at it and drive it, set breakpoints and step through the code, ask Godot's own language server about its scripts, and create scenes, resources and settings. The release holds the files for Godot 4.5, 4.6 and 4.7 as before: download the files whose names end in `-godotM.N` for your Godot version, and update the server and the addon together. Everything below works on all three versions unless it says otherwise.

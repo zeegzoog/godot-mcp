@@ -321,6 +321,16 @@ async fn the_environment_block_comes_from_the_editor_and_the_project() {
         )
         .await;
     assert!(is_tool_error(&failed));
+    // A host path in a failure is replaced by a placeholder in the report (the server's own
+    // messages name project files by their res:// path, so a path outside res:// proves it).
+    let by_path = session
+        .call_tool(
+            "godot_validate_script",
+            json!({"script_path": project.path().join("gone.gd").to_string_lossy()}),
+            FAST,
+        )
+        .await;
+    assert!(is_tool_error(&by_path));
     let mut with_path = note("bug", "x");
     with_path["tool"] = json!("godot_validate_script");
     with_path["details"] = json!(format!("it failed in {}", project.path().display()));

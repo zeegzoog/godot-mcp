@@ -1,6 +1,6 @@
 # Project Context
 
-**Generated:** 2026-10-21
+**Generated:** 2026-10-22
 
 ## Active Technologies
 
@@ -86,7 +86,6 @@
 ```
 
 ## Recent Changes
-
 
 - The portable repo-steward skill: scripts for context, profile, labels, readiness, board and the one way to write to GitHub, instructions and references for triage, replies, pull requests, changes, board, readiness and setup, and templates.
 - Installed here with its profile, priorities, workflows (readiness, stale reminders, an agent run that stays off until switched on), issue forms and pull request template; contributor and agent guides describe it; `tests/steward_test.rs` guards the contracts.

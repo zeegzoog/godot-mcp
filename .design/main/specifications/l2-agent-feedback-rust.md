@@ -1,6 +1,6 @@
 # Agent Feedback Channel (Rust)
 
-**Version:** 1.0.2
+**Version:** 1.1.0
 **Status:** Stable
 **Layer:** implementation
 **Implements:** l1-agent-feedback.md
@@ -29,7 +29,7 @@ The channel touches the session loop, the dispatcher, the configuration, a child
 
 | Key | Flag | Values | Default |
 | --- | --- | --- | --- |
-| `GODOT_MCP_FEEDBACK` | `--feedback` | `off`, `draft`, `full` (case-insensitive); an unknown value logs a warning to the diagnostics channel and selects the default | `full` |
+| `GODOT_MCP_FEEDBACK` | `--feedback` | `off`, `draft`, `full` (case-insensitive); an unknown value logs a warning to the diagnostics channel and selects `draft` (never the wider default); an empty value is "not set" and means the default | `full` |
 | `GODOT_MCP_GH_PATH` | `--gh-path` | Path of the `gh` executable; `gh` on `PATH` when unset | unset |
 
 - Limits (constants in one place, each named in the rejection message):
@@ -248,7 +248,7 @@ Both calls run with prompts, colour and the update notice switched off through t
 | --- | --- |
 | Scrubber classes, Markdown neutralization, fingerprint stability, link budget, percent-encoding, evidence eviction, limits | unit tests in `src/feedback.rs` |
 | Repository address parsing, outcome mapping from `gh` output | unit tests in `src/issues.rs` |
-| Mode `off` / `draft` / `full` catalog shape; `initialize` carries `instructions` per mode and, in `draft` mode, never names the submit tool; unknown value of the setting falls back with a warning on stderr only | `tests/stdio_protocol_test.rs` |
+| Mode `off` / `draft` / `full` catalog shape; `initialize` carries `instructions` per mode and, in `draft` mode, never names the submit tool; unknown value of the setting falls back to `draft` with a warning on stderr only | `tests/stdio_protocol_test.rs` |
 | Note intake and caps; draft content with scrubbed secret, home and project paths, mentions; evidence from a failing named tool and from an unknown tool request; environment block with the mock editor and without one; link and delivery lines | `tests/feedback_test.rs` |
 | Consent gate: `confirmed` missing or false, unknown id, second submit returns the first outcome | `tests/feedback_test.rs` |
 | Submission with a stand-in `gh` (`GODOT_MCP_GH_PATH`): argument vector as in 5.8 (one argument per recorded line), body on stdin equals the draft body, created, duplicate with and without `allow_duplicate`, not signed in, `gh` missing, exit 0 without an address, timeout; two concurrent submits of one draft create once; a cancelled submit leaves the draft retriable; standard output of the server stays free of `gh` output | `tests/feedback_test.rs` |
@@ -291,3 +291,4 @@ Both calls run with prompts, colour and the update notice switched off through t
 | 1.0.0 | 2026-10-16 | Agent (magic.spec) | Created with the parent concept. |
 | 1.0.1 | 2026-10-16 | Agent (magic.run) | Clarified during implementation: brace placeholders instead of angle brackets, fenced agent text, narrower credential rule, bidirectional override characters removed. |
 | 1.0.2 | 2026-10-16 | Agent (magic.run) | Recorded implementation decisions: module map with the journal and the tool submodule, mode-to-catalog cell, home directory shortened only once the project is known, delimiter set of the path step, stand-in provided as an example target. |
+| 1.1.0 | 2026-10-21 | Agent (magic.spec) | [MODIFIED] An unknown `GODOT_MCP_FEEDBACK` value selects `draft` instead of the default `full` (FB-10). Source: simulation QA of 2026-10-21 (Q11). Stable → RFC → Stable after Post-Update Review. |

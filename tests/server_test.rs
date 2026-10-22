@@ -58,3 +58,85 @@ fn test_tool_result_helpers() {
     assert!(err_res.is_error);
     assert_eq!(err_res.content.len(), 1);
 }
+
+fn schema_of(name: &str) -> serde_json::Value {
+    ToolManager::list_tools()
+        .into_iter()
+        .find(|tool| tool.name == name)
+        .unwrap_or_else(|| panic!("tool {name} not in the catalog"))
+        .input_schema
+}
+
+/// TL-1: ranges the tool documents are in its schema, and object parameters describe their fields.
+#[test]
+fn schemas_carry_the_documented_ranges_and_describe_object_fields() {
+    let complete = schema_of("godot_code_complete");
+    assert_eq!(complete["properties"]["line"]["minimum"], 1);
+    assert_eq!(complete["properties"]["character"]["minimum"], 1);
+    assert_eq!(
+        schema_of("godot_code_definition")["properties"]["line"]["minimum"],
+        1
+    );
+    assert_eq!(
+        schema_of("godot_code_references")["properties"]["character"]["minimum"],
+        1
+    );
+
+    let shot = schema_of("godot_game_screenshot");
+    assert_eq!(shot["properties"]["tolerance"]["minimum"], 0);
+    assert_eq!(shot["properties"]["tolerance"]["maximum"], 255);
+    assert_eq!(shot["properties"]["frames"]["maximum"], 8);
+    for field in ["x", "y", "w", "h"] {
+        assert_eq!(
+            shot["properties"]["roi"]["properties"][field]["type"], "integer",
+            "roi.{field}"
+        );
+    }
+
+    let physics = schema_of("godot_game_physics");
+    assert_eq!(physics["properties"]["ticks"]["minimum"], 1);
+    assert_eq!(physics["properties"]["max"]["maximum"], 3600);
+    let until = &physics["properties"]["until"]["properties"];
+    for field in ["node", "property", "op", "value"] {
+        assert!(until.get(field).is_some(), "until.{field}");
+    }
+    assert!(
+        until["op"]["enum"]
+            .as_array()
+            .is_some_and(|ops| ops.len() >= 6)
+    );
+
+    let input = schema_of("godot_game_input");
+    assert_eq!(input["properties"]["hold_ticks"]["maximum"], 600);
+    let step = &input["properties"]["steps"]["items"];
+    let kinds: Vec<&str> = step["properties"]["type"]["enum"]
+        .as_array()
+        .expect("step types are listed")
+        .iter()
+        .filter_map(|kind| kind.as_str())
+        .collect();
+    for kind in [
+        "key",
+        "click_node",
+        "swipe",
+        "wait",
+        "time_scale",
+        "joy_axis",
+    ] {
+        assert!(kinds.contains(&kind), "step type {kind} in {kinds:?}");
+    }
+    assert_eq!(step["required"], serde_json::json!(["type"]));
+}
+
+#[test]
+fn create_script_takes_script_path_like_the_other_script_tools() {
+    let schema = schema_of("godot_create_script");
+    assert!(schema["properties"].get("script_path").is_some());
+    assert!(schema["properties"].get("file_path").is_some());
+    assert!(
+        schema
+            .get("required")
+            .is_none_or(|required| required.as_array().is_some_and(|r| r.is_empty())),
+        "neither name may be required alone: {schema}"
+    );
+}

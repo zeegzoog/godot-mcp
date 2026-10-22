@@ -30,7 +30,7 @@ Agents must treat the Godot Editor as a live, stateful environment while ensurin
 - **Path Traversal**: Strictly validate all file paths against directory traversal (`../`). Paths must resolve within the target project's `res://` directory or designated export folders. Host-side file access goes through `src/paths.rs` (`resolve_in_project`); editor-side paths go through `to_res_path` and `find_scene_node` in `bridge_server.gd`.
 - **Argument Injection**: Never pass user-controlled strings to the Godot CLI as bare arguments (a value starting with `-` becomes an engine option) or interpolate them into generated GDScript. Validate identifiers with `is_valid_identifier` and require `res://` for scene arguments.
 - **Multi-OS Normalization**: Always handle differences in path separators across Windows (`\`), Linux (`/`), and macOS (`/`). Normalize paths before passing them to the engine or returning them via the protocol.
-- **Identifier Sanitization**: Validate node names and class identifiers using strict alphanumeric patterns (`^[A-Za-z_][A-Za-z0-9_]*$`).
+- **Identifier Sanitization**: Validate class identifiers (`extends_class`, `class_name`, `root_type`, resource classes) using the strict pattern `^[A-Za-z_][A-Za-z0-9_]*$`. A node name is data, not an identifier: it reaches the engine only as a value (never inside generated source or a command line), and Godot replaces the characters it forbids and reports the final name.
 - **Resource Integrity**: Maintain Godot UID tracking (`.uid` files and `uid://` references) whenever modifying scenes or assets to prevent broken dependencies in Godot 4.x.
 
 ## Implementation Standards
@@ -135,11 +135,11 @@ When interacting with a Godot project, agents must adhere to the following workf
    - Use `godot_capture_viewport` to visually inspect scene changes, layouts, and rendering quality when performing level design or UI assembly.
 
 4. **Runtime Monitoring**:
-   - After `godot_run_project`, check `godot_get_run_status` and stop the run with `godot_stop_project` when done.
+   - After `godot_run_project`, check `godot_get_run_status` and stop the run with `godot_stop_project` when done: without `run_id` it stops the editor's Play mode and every managed run, and lists what it stopped.
    - Read logs and errors with `godot_run_output`. Inspect the live tree with `godot_game_tree` before `godot_game_set` or `godot_game_call`.
    - Capture the game with `godot_game_screenshot`. A headless game returns an error and no image; do not treat that error as a picture. For a series of frames on disk, use `godot_game_record`.
    - Pass game flags with `godot_run_project` `user_args` and `mode: "process"`. They go after `--`. Do not put Godot engine options there.
-   - `godot_game_call` runs only a method named in `permit`.
+   - `godot_game_call` runs only a method named in `permit`, and never one that quits, evaluates, calls another method by name, sets a property by name or frees or replaces a node.
    - To act, advance a known amount and look, hold the game with `godot_game_physics` (`hold`, then `step`, `resume`), starting it with `godot_run_project` `held: true` when the steps must be exact. Check `deterministic` in the answers. A held game refuses waits, signal watches, screenshot sheets and timed input; step instead. Resume or stop the run when done: a held game does not advance on its own.
 
 5. **Feedback to the Maintainers**:

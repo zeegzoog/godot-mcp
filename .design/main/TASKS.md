@@ -1,8 +1,8 @@
 # Master Task Index (Registry)
 
-**Version:** 1.6.0
+**Version:** 1.7.1
 **Generated:** 2026-10-21
-**Based on:** .design/main/PLAN.md v1.6.0
+**Based on:** .design/main/PLAN.md v1.7.1
 **Based on RULES:** .design/RULES.md v1.4.0
 **Execution Mode:** Parallel
 **Status:** Active
@@ -24,6 +24,7 @@ Tactical registry of all phases and their statuses. Check individual phase files
 | [Phase 6](archives/tasks/phase-6.md) | Game runtime, authoring and code intelligence: the contributor pull request series (running-game tools, debugger, language-server client, authoring tools, scene reload) reviewed, fixed, merged and carried to the release lines, and its specifications | `Done (Archived)` |
 | [Phase 7](archives/tasks/phase-7.md) | Controlled time: hold a running game at the start of a physics tick over the debugger channel, exact and conditional held steps, tick-scheduled input, refusal of time-driven operations while held, exactness through a server-declared fixed rate; feasibility test first, then the lines | `Done (Archived)` |
 | [Phase 8](archives/tasks/phase-8.md) | Script reading and editing: a feasibility check of the script editor, specification notes, editor handlers and host tools with a file fallback (read, replace one fragment, refuse while the editor holds unsaved typing), user-facing text, validation, then the release lines; pushing gated on approval | `Done (Archived)` |
+| [Phase 9](archives/tasks/phase-9.md) | Simulation QA remediation: the named project wins over the editor, honest stop and status answers, schema ranges, hints by failure class, fallbacks that accept what the editor accepts, a feedback mode that fails closed, language-server project check, the game-call refusal list and typed arguments, pointer input without a window, then user-facing text, validation and the release lines; pushing gated on approval | `Done (Archived)` |
 
 ## Meta Information
 

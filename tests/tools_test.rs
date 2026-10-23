@@ -2568,7 +2568,7 @@ esac
         let path = dir.join("scripted_godot.bat");
         std::fs::write(
             &path,
-            "@echo off\r\necho ARGS %*\r\necho %* | findstr hang.gd >nul\r\nif %errorlevel%==0 (\r\n  echo HANGING\r\n  ping -n 30 127.0.0.1 >nul\r\n  exit /b 0\r\n)\r\necho %* | findstr idle.gd >nul\r\nif %errorlevel%==0 (\r\n  echo SCRIPT ERROR: Parse Error: unexpected.\r\n  echo    at: _init (res://idle.gd:3)\r\n  ping -n 30 127.0.0.1 >nul\r\n  exit /b 0\r\n)\r\necho SCRIPT ERROR: Assertion failed.\r\necho    at: _initialize (res://scripts/boom.gd:4)\r\nexit /b 3\r\n",
+            "@echo off\r\necho ARGS %*\r\necho %* | findstr hang.gd >nul\r\nif %errorlevel%==0 (\r\n  echo HANGING\r\n  ping -n 30 127.0.0.1 >nul\r\n  exit /b 0\r\n)\r\necho %* | findstr idle.gd >nul\r\nif %errorlevel%==0 (\r\n  echo SCRIPT ERROR: Parse Error: unexpected.\r\n  echo    at: _init ^(res://idle.gd:3^)\r\n  ping -n 30 127.0.0.1 >nul\r\n  exit /b 0\r\n)\r\necho SCRIPT ERROR: Assertion failed.\r\necho    at: _initialize (res://scripts/boom.gd:4)\r\nexit /b 3\r\n",
         )
         .expect("write scripted godot");
         path

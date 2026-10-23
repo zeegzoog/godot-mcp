@@ -15,6 +15,10 @@ const SCRIPT_OUTPUT_CAP: usize = 64 * 1024;
 /// How long to keep reading after the process tree was killed. A grandchild that
 /// survived the kill must not hold the tool open.
 const READER_DRAIN: Duration = Duration::from_secs(2);
+/// After a `SCRIPT ERROR`, this much silence means the main loop is idle and the
+/// process is not going to quit on its own. A script error in `_init` leaves Godot running.
+const SCRIPT_ERROR_IDLE: Duration = Duration::from_millis(400);
+const IMPORT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// One `SCRIPT ERROR` block from a headless script run.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,9 +33,21 @@ pub struct ScriptErrorLoc {
 pub struct ScriptRun {
     pub exit_code: Option<i32>,
     pub timed_out: bool,
+    /// A `SCRIPT ERROR` was printed and the process then sat idle, so it was stopped
+    /// instead of waiting out the timeout.
+    pub stopped_idle: bool,
     pub stdout: String,
     pub stderr: String,
     pub script_errors: Vec<ScriptErrorLoc>,
+}
+
+/// What `godot --headless --path <project> --import` printed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImportRun {
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    pub stdout: String,
+    pub stderr: String,
 }
 
 /// What the engine can create under a built-in class name (CA-11).
@@ -248,27 +264,67 @@ impl CliRunner {
             Arc::clone(&stderr_buf),
         ));
 
-        let waited = timeout(Duration::from_secs(timeout_seconds), child.wait()).await;
-        let (timed_out, status, wait_error) = match waited {
-            Ok(Ok(status)) => (false, Some(status), None),
-            Ok(Err(err)) => {
-                kill_process_tree(pid);
-                let _ = child.start_kill();
-                (true, None, Some(err))
-            }
-            Err(_elapsed) => {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_seconds);
+        let mut quiet_since: Option<tokio::time::Instant> = None;
+        let mut last_len = 0usize;
+        let mut timed_out = false;
+        let mut stopped_idle = false;
+        let mut status = None;
+        let mut wait_error = None;
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
                 kill_process_tree(pid);
                 let _ = child.start_kill();
                 let _ = timeout(Duration::from_secs(2), child.wait()).await;
-                (true, None, None)
+                timed_out = true;
+                break;
             }
-        };
+            let slice = Duration::from_millis(50).min(deadline - now);
+            match timeout(slice, child.wait()).await {
+                Ok(Ok(code)) => {
+                    status = Some(code);
+                    break;
+                }
+                Ok(Err(err)) => {
+                    kill_process_tree(pid);
+                    let _ = child.start_kill();
+                    wait_error = Some(err);
+                    timed_out = true;
+                    break;
+                }
+                Err(_elapsed) => {
+                    let len = buf_len(stdout_buf.as_ref()) + buf_len(stderr_buf.as_ref());
+                    if len != last_len {
+                        last_len = len;
+                        quiet_since = None;
+                        continue;
+                    }
+                    let since = *quiet_since.get_or_insert_with(tokio::time::Instant::now);
+                    if since.elapsed() < SCRIPT_ERROR_IDLE {
+                        continue;
+                    }
+                    let stdout_now = text_of(peek_tail(stdout_buf.as_ref()));
+                    let stderr_now = text_of(peek_tail(stderr_buf.as_ref()));
+                    if script_errors_in(&stdout_now).is_empty()
+                        && script_errors_in(&stderr_now).is_empty()
+                    {
+                        continue;
+                    }
+                    kill_process_tree(pid);
+                    let _ = child.start_kill();
+                    let _ = timeout(Duration::from_secs(2), child.wait()).await;
+                    stopped_idle = true;
+                    break;
+                }
+            }
+        }
         let (stdout, stderr) = finish_readers(
             stdout_task,
             stderr_task,
             stdout_buf.as_ref(),
             stderr_buf.as_ref(),
-            timed_out,
+            timed_out || stopped_idle,
         )
         .await;
         if let Some(err) = wait_error {
@@ -281,10 +337,44 @@ impl CliRunner {
         Ok(ScriptRun {
             exit_code: status.and_then(|status| status.code()),
             timed_out,
+            stopped_idle,
             stdout,
             stderr,
             script_errors,
         })
+    }
+
+    /// Imports every new or changed resource: `godot --headless --path <project> --import`.
+    ///
+    /// The process exits when the import finishes, so the caller can tell which sidecars
+    /// appeared. On timeout the process is killed.
+    pub async fn import_project(&self, project_path: &Path) -> Result<ImportRun> {
+        let mut command = Command::new(&self.godot_binary);
+        command
+            .arg("--headless")
+            .arg("--path")
+            .arg(project_path)
+            .arg("--import")
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
+        match timeout(IMPORT_TIMEOUT, command.output()).await {
+            Ok(Ok(output)) => Ok(ImportRun {
+                exit_code: output.status.code(),
+                timed_out: false,
+                stdout: strip_banner(&String::from_utf8_lossy(&output.stdout)),
+                stderr: strip_banner(&String::from_utf8_lossy(&output.stderr)),
+            }),
+            Ok(Err(err)) => Err(McpError::Process(format!(
+                "failed to run `godot --headless --path {} --import` ({}): {err}",
+                project_path.display(),
+                self.godot_binary.display()
+            ))),
+            Err(_elapsed) => Err(McpError::Process(format!(
+                "`godot --headless --path {} --import` did not finish within {}s",
+                project_path.display(),
+                IMPORT_TIMEOUT.as_secs()
+            ))),
+        }
     }
 
     /// What a clean `godot --headless --check-only` means: parse errors only.
@@ -472,6 +562,20 @@ async fn finish_readers(
         text_of(take_tail(stdout_buf)),
         text_of(take_tail(stderr_buf)),
     )
+}
+
+fn buf_len(buf: &Mutex<Vec<u8>>) -> usize {
+    match buf.lock() {
+        Ok(guard) => guard.len(),
+        Err(poisoned) => poisoned.into_inner().len(),
+    }
+}
+
+fn peek_tail(buf: &Mutex<Vec<u8>>) -> Vec<u8> {
+    match buf.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
 }
 
 fn take_tail(buf: &Mutex<Vec<u8>>) -> Vec<u8> {

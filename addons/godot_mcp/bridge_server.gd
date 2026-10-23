@@ -19,6 +19,9 @@ const INBOUND_BUFFER_SIZE: int = 1 << 22
 const OUTBOUND_BUFFER_SIZE: int = 1 << 25
 
 const MAX_VALUE_CHARS: int = 2000
+## A full scan with wait, or the first import of a file the editor has never scanned, blocks
+## the call for at most this long. The MCP client waits slightly longer than this.
+const RESAVE_WAIT_MSEC: int = 60000
 const SCRIPT_OPS_PATH: String = "res://addons/godot_mcp/editor/script_ops.gd"
 const MAX_CAPTURE_DIMENSION: int = 1568
 const MIN_CAPTURE_SIZE: int = 16
@@ -40,7 +43,7 @@ const PARAM_TYPES: Dictionary = {
     "capture_viewport": {"view": TYPE_STRING, "max_dimension": TYPE_FLOAT},
     "open_scene": {"scene_path": TYPE_STRING, "reload": TYPE_BOOL, "discard": TYPE_BOOL},
     "run_project": {"scene_path": TYPE_STRING},
-    "resave_resources": {"paths": TYPE_ARRAY},
+    "resave_resources": {"paths": TYPE_ARRAY, "wait": TYPE_BOOL},
     "create_scene": {"scene_path": TYPE_STRING, "root_type": TYPE_STRING, "root_name": TYPE_STRING},
     "attach_script": {"node_path": TYPE_STRING, "script_path": TYPE_STRING},
     "read_script": {"script_path": TYPE_STRING},
@@ -884,6 +887,29 @@ func is_importable(res_path: String) -> bool:
 func is_import_running(fs: EditorFileSystem) -> bool:
     return fs.is_importing()
 
+## True when the editor's file system already has this file. reimport_files() on a path it
+## has never scanned does not write a .import, and load() then fails.
+func _filesystem_has(fs: EditorFileSystem, res_path: String) -> bool:
+    var directory: EditorFileSystemDirectory = fs.get_filesystem_path(res_path.get_base_dir())
+    if directory == null:
+        return false
+    return directory.find_file_index(res_path.get_file()) != -1
+
+## Waits until scanning and importing have both been idle for a few frames, so a scan that
+## starts the importer a moment later is not reported as finished. False on timeout.
+func _wait_for_filesystem(fs: EditorFileSystem, timeout_msec: int) -> bool:
+    var deadline: int = Time.get_ticks_msec() + timeout_msec
+    var quiet: int = 0
+    while Time.get_ticks_msec() < deadline:
+        await get_tree().process_frame
+        if fs.is_scanning() or is_import_running(fs):
+            quiet = 0
+            continue
+        quiet += 1
+        if quiet >= 3:
+            return true
+    return false
+
 func resave_resources(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
     var fs: EditorFileSystem = EditorInterface.get_resource_filesystem()
 
@@ -893,15 +919,35 @@ func resave_resources(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -
 
     var requested: Array = params.get("paths", [])
     if requested.is_empty():
-        # No specific paths: rescan the whole project for new/changed/removed
-        # files. This runs on a background thread, so it is not finished by
-        # the time this response is sent.
+        # No specific paths: rescan the whole project. Without wait the scan keeps
+        # running after this reply. With wait the reply is held until it finishes.
+        var wait: bool = bool(params.get("wait", false))
+        if not wait:
+            fs.scan()
+            send_success(peer, cmd_id, {"mode": "full_scan", "scanning": fs.is_scanning()})
+            return
+        var imported_paths: Array[String] = []
+        var on_reimported := func(resources: PackedStringArray) -> void:
+            for resource_path: String in resources:
+                if not imported_paths.has(resource_path):
+                    imported_paths.append(resource_path)
+        fs.resources_reimported.connect(on_reimported)
         fs.scan()
-        send_success(peer, cmd_id, {"mode": "full_scan", "scanning": fs.is_scanning()})
+        var finished: bool = await _wait_for_filesystem(fs, RESAVE_WAIT_MSEC)
+        if fs.resources_reimported.is_connected(on_reimported):
+            fs.resources_reimported.disconnect(on_reimported)
+        send_success(peer, cmd_id, {
+            "mode": "full_scan",
+            "scanning": fs.is_scanning() or is_import_running(fs),
+            "waited": true,
+            "timed_out": not finished,
+            "imported": imported_paths.size(),
+        })
         return
 
     var to_reimport: PackedStringArray = PackedStringArray()
     var to_refresh: PackedStringArray = PackedStringArray()
+    var unseen: PackedStringArray = PackedStringArray()
     var missing_paths: PackedStringArray = PackedStringArray()
     var invalid_paths: PackedStringArray = PackedStringArray()
     for item: Variant in requested:
@@ -910,35 +956,93 @@ func resave_resources(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -
             invalid_paths.append(str(item))
         elif not FileAccess.file_exists(res_path):
             missing_paths.append(res_path)
+        elif not _filesystem_has(fs, res_path):
+            unseen.append(res_path)
         elif is_importable(res_path):
             to_reimport.append(res_path)
         else:
             to_refresh.append(res_path)
 
+    var not_scanned: PackedStringArray = PackedStringArray()
+    var timed_out: bool = false
+    if not unseen.is_empty():
+        for res_path: String in unseen:
+            fs.update_file(res_path)
+        var finished: bool = await _wait_for_filesystem(fs, RESAVE_WAIT_MSEC)
+        var still: PackedStringArray = PackedStringArray()
+        for res_path: String in unseen:
+            if _filesystem_has(fs, res_path):
+                if is_importable(res_path):
+                    to_reimport.append(res_path)
+                else:
+                    to_refresh.append(res_path)
+            else:
+                still.append(res_path)
+        # update_file does not see a directory the editor has never scanned. One scan does.
+        if not still.is_empty():
+            if not finished:
+                timed_out = true
+            else:
+                fs.scan()
+                finished = await _wait_for_filesystem(fs, RESAVE_WAIT_MSEC)
+                if not finished:
+                    timed_out = true
+            for res_path: String in still:
+                if _filesystem_has(fs, res_path):
+                    if is_importable(res_path):
+                        to_reimport.append(res_path)
+                    else:
+                        to_refresh.append(res_path)
+                else:
+                    not_scanned.append(res_path)
+
     if to_reimport.is_empty() and to_refresh.is_empty():
+        if not not_scanned.is_empty():
+            send_success(peer, cmd_id, {
+                "mode": "not_scanned",
+                "reimported": PackedStringArray(),
+                "refreshed": PackedStringArray(),
+                "not_scanned": not_scanned,
+                "skipped_missing": missing_paths,
+                "skipped_invalid": invalid_paths,
+                "timed_out": timed_out,
+            })
+            return
         send_error(peer, cmd_id, "None of the given paths exist inside the project: " + ", ".join(missing_paths + invalid_paths))
         return
 
     # Unlike scan(), reimport_files() runs on the main thread and blocks
     # until it finishes, so the reimport is genuinely done by the time we
     # respond. Files that are not importable (scripts, scenes, resources) are
-    # only refreshed in the editor's file system.
+    # only refreshed in the editor's file system. A path is reimported only
+    # once it is in the file system; otherwise it stays in not_scanned.
     if not to_reimport.is_empty():
         fs.reimport_files(to_reimport)
     for res_path in to_refresh:
         fs.update_file(res_path)
 
+    var reimported: PackedStringArray = PackedStringArray()
+    for res_path: String in to_reimport:
+        if FileAccess.file_exists(res_path + ".import"):
+            reimported.append(res_path)
+        else:
+            not_scanned.append(res_path)
+
     var mode: String = "reimport"
-    if to_reimport.is_empty():
+    if reimported.is_empty() and to_refresh.is_empty():
+        mode = "not_scanned"
+    elif reimported.is_empty():
         mode = "refresh"
-    elif not to_refresh.is_empty():
+    elif not to_refresh.is_empty() or not not_scanned.is_empty():
         mode = "mixed"
     send_success(peer, cmd_id, {
         "mode": mode,
-        "reimported": to_reimport,
+        "reimported": reimported,
         "refreshed": to_refresh,
+        "not_scanned": not_scanned,
         "skipped_missing": missing_paths,
-        "skipped_invalid": invalid_paths
+        "skipped_invalid": invalid_paths,
+        "timed_out": timed_out,
     })
 
 # --- Scene freshness ------------------------------------------------------------------

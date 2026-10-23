@@ -2397,6 +2397,133 @@ async fn run_script_parses_script_errors_and_kills_a_hang() {
         "{hung_text}"
     );
     assert!(hung_text.contains("\"timed_out\": true"), "{hung_text}");
+
+    write_script(
+        project.path(),
+        "idle.gd",
+        b"extends SceneTree\nfunc _init():\n\tpass\n",
+    );
+    let started_idle = std::time::Instant::now();
+    let idle = call_with(
+        &tools,
+        json!({
+            "script": "idle.gd",
+            "project_path": project.path(),
+            "timeout_seconds": 30
+        }),
+    )
+    .await;
+    assert!(
+        started_idle.elapsed() < std::time::Duration::from_secs(5),
+        "a SCRIPT ERROR that leaves the process idle waited out the timeout ({:?})",
+        started_idle.elapsed()
+    );
+    let idle_text = text(&idle);
+    assert!(idle.is_error, "{idle_text}");
+    assert!(
+        idle_text.contains("main loop was idle") && idle_text.contains("res://idle.gd"),
+        "{idle_text}"
+    );
+    assert!(idle_text.contains("\"line\": 3"), "{idle_text}");
+    assert!(
+        idle_text.contains("\"timed_out\": false") && idle_text.contains("\"stopped_idle\": true"),
+        "{idle_text}"
+    );
+}
+
+#[tokio::test]
+async fn resave_without_an_editor_imports_headless_and_names_a_missing_sidecar() {
+    let project = project_dir();
+    let root = project.path();
+    std::fs::create_dir_all(root.join("art/models")).unwrap();
+    std::fs::write(root.join("art/models/x.glb"), b"glb").unwrap();
+    std::fs::write(root.join("art/models/y.glb"), b"glb").unwrap();
+    let tools = manager_in(root, importing_godot(root));
+    let result = Arc::clone(&tools)
+        .call_tool(
+            "godot_resave_resources",
+            json!({
+                "project_path": root,
+                "paths": ["res://art/models/x.glb", "res://art/models/y.glb"]
+            }),
+        )
+        .await;
+    let body = text(&result);
+    assert!(!result.is_error, "{body}");
+    let parsed: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(parsed["mode"], "headless_import");
+    assert!(
+        parsed["command"]
+            .as_str()
+            .unwrap_or("")
+            .contains("--import"),
+        "{body}"
+    );
+    let imported = parsed["imported"].as_array().expect("imported");
+    assert!(
+        imported.iter().any(|path| path == "res://art/models/x.glb"),
+        "{body}"
+    );
+    assert!(
+        !imported.iter().any(|path| path == "res://art/models/y.glb"),
+        "{body}"
+    );
+    assert_eq!(parsed["imported_count"], 1, "{body}");
+    let missing = parsed["not_scanned"].as_array().expect("not_scanned");
+    assert!(
+        missing.iter().any(|path| path == "res://art/models/y.glb"),
+        "{body}"
+    );
+    assert!(root.join("art/models/x.glb.import").is_file());
+    assert!(!root.join("art/models/y.glb.import").exists());
+}
+
+#[tokio::test]
+async fn resave_without_a_project_names_the_headless_import_command() {
+    let result = call("godot_resave_resources", json!({})).await;
+    let body = text(&result);
+    assert!(result.is_error, "{body}");
+    assert!(body.contains("godot --headless --path"), "{body}");
+    assert!(body.contains("--import"), "{body}");
+}
+
+/// A Godot stand-in that writes an `.import` sidecar for `x.glb` and leaves `y.glb` alone.
+fn importing_godot(dir: &Path) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("importing_godot.sh");
+        std::fs::write(
+            &path,
+            r#"#!/bin/sh
+prev=
+proj=
+for arg in "$@"; do
+  if [ "$prev" = "--path" ]; then
+    proj=$arg
+  fi
+  prev=$arg
+done
+if [ -n "$proj" ] && [ -f "$proj/art/models/x.glb" ]; then
+  printf '%s\n' 'path="res://.godot/imported/x.glb-deadbeef.scn"' > "$proj/art/models/x.glb.import"
+fi
+exit 0
+"#,
+        )
+        .expect("write importing godot");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        path
+    }
+    #[cfg(windows)]
+    {
+        let path = dir.join("importing_godot.bat");
+        std::fs::write(
+            &path,
+            "@echo off\r\nsetlocal enabledelayedexpansion\r\nset PREV=\r\nset PROJ=\r\nfor %%A in (%*) do (\r\n  if \"!PREV!\"==\"--path\" set PROJ=%%A\r\n  set PREV=%%A\r\n)\r\nif exist \"%PROJ%\\art\\models\\x.glb\" (\r\n  echo path=\"res://.godot/imported/x.glb-deadbeef.scn\" > \"%PROJ%\\art\\models\\x.glb.import\"\r\n)\r\nexit /b 0\r\n",
+        )
+        .expect("write importing godot");
+        path
+    }
 }
 
 async fn call_with(tools: &Arc<ToolManager>, args: Value) -> ToolResult {
@@ -2419,6 +2546,11 @@ case "$*" in
     sleep 30 &
     wait
     ;;
+  *idle.gd*)
+    echo 'SCRIPT ERROR: Parse Error: unexpected.'
+    echo '   at: _init (res://idle.gd:3)'
+    sleep 30
+    ;;
   *)
     echo 'SCRIPT ERROR: Assertion failed.'
     echo '   at: _initialize (res://scripts/boom.gd:4)'
@@ -2436,7 +2568,7 @@ esac
         let path = dir.join("scripted_godot.bat");
         std::fs::write(
             &path,
-            "@echo off\r\necho ARGS %*\r\necho %* | findstr hang.gd >nul\r\nif %errorlevel%==0 (\r\n  echo HANGING\r\n  ping -n 30 127.0.0.1 >nul\r\n  exit /b 0\r\n)\r\necho SCRIPT ERROR: Assertion failed.\r\necho    at: _initialize (res://scripts/boom.gd:4)\r\nexit /b 3\r\n",
+            "@echo off\r\necho ARGS %*\r\necho %* | findstr hang.gd >nul\r\nif %errorlevel%==0 (\r\n  echo HANGING\r\n  ping -n 30 127.0.0.1 >nul\r\n  exit /b 0\r\n)\r\necho %* | findstr idle.gd >nul\r\nif %errorlevel%==0 (\r\n  echo SCRIPT ERROR: Parse Error: unexpected.\r\n  echo    at: _init ^(res://idle.gd:3^)\r\n  ping -n 30 127.0.0.1 >nul\r\n  exit /b 0\r\n)\r\necho SCRIPT ERROR: Assertion failed.\r\necho    at: _initialize (res://scripts/boom.gd:4)\r\nexit /b 3\r\n",
         )
         .expect("write scripted godot");
         path

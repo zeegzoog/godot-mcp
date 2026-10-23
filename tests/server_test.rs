@@ -93,6 +93,27 @@ fn schemas_carry_the_documented_ranges_and_describe_object_fields() {
             "roi.{field}"
         );
     }
+    let roi = shot["properties"]["roi"]["description"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        roi.contains("baseline") && roi.contains("does not crop"),
+        "roi is the comparison region and requires a baseline: {roi}"
+    );
+    let resave = schema_of("godot_resave_resources");
+    assert!(
+        resave["properties"]["wait"]["description"]
+            .as_str()
+            .unwrap_or("")
+            .contains("imported")
+    );
+    let resave_text = ToolManager::list_tools()
+        .into_iter()
+        .find(|tool| tool.name == "godot_resave_resources")
+        .expect("resave")
+        .description;
+    assert!(resave_text.contains("not_scanned"), "{resave_text}");
+    assert!(resave_text.contains("--import"), "{resave_text}");
 
     let physics = schema_of("godot_game_physics");
     assert_eq!(physics["properties"]["ticks"]["minimum"], 1);

@@ -2,7 +2,9 @@ use crate::bridge::BridgeClient;
 use crate::cli_runner::{CliRunner, ScriptRun};
 use crate::config::FeedbackMode;
 use crate::error::McpError;
-use crate::godot::{GameHub, ProcessStart, stale_imports};
+use crate::godot::{
+    GameHub, IMPORTED_EXTENSIONS, ProcessStart, changed_imports, import_fingerprints, stale_imports,
+};
 use crate::journal::EvidenceKind;
 use crate::lsp::LspHub;
 use crate::paths::{
@@ -157,7 +159,7 @@ impl ToolManager {
             "godot_create_script" => self.handle_create_script(args).await,
             "godot_validate_script" => self.handle_validate_script(args).await,
             "godot_run_script" => self.handle_run_script(args).await,
-            "godot_resave_resources" => self.handle_bridge_call("resave_resources", args).await,
+            "godot_resave_resources" => self.handle_resave_resources(args).await,
             name if authoring::handles(name) => authoring::call(&self, name, args).await,
             name if scripts::handles(name) => scripts::call(&self, name, args).await,
             name if game::handles(name) => game::call(&self, name, args).await,
@@ -402,7 +404,7 @@ impl ToolManager {
                 "\nWarning: these imported resources are newer than the cache ({error}): {listed}. Call godot_resave_resources with those paths, then run again."
             ),
             None => format!(
-                "\nWarning: these imported resources are newer than the cache the game will load: {listed}. Call godot_resave_resources with those paths while the editor is open, then run again."
+                "\nWarning: these imported resources are newer than the cache the game will load: {listed}. Call godot_resave_resources with those paths, then run again."
             ),
         }
     }
@@ -733,6 +735,144 @@ impl ToolManager {
         }
     }
 
+    /// The editor answers a scan-and-wait within 60s, which is the addon's limit.
+    /// This waits a little longer so the addon's own timeout is the one the caller sees.
+    const RESAVE_BRIDGE_WAIT: std::time::Duration = std::time::Duration::from_secs(90);
+
+    async fn handle_resave_resources(&self, args: Value) -> ToolResult {
+        if let Some(wait) = args.get("wait") {
+            if !wait.is_null() && !wait.is_boolean() {
+                return ToolResult::error(
+                    "wait must be a boolean",
+                    &["Use wait: true to block until the scan and import finish"],
+                );
+            }
+        }
+        let named = str_arg(&args, "project_path");
+        if let Some(named) = named {
+            if !self.editor_may_serve(Path::new(named)).await {
+                return self.import_headless(&args).await;
+            }
+        }
+        let bridge = self.bridge.clone().with_timeout(Self::RESAVE_BRIDGE_WAIT);
+        match bridge.send_command("resave_resources", args.clone()).await {
+            Ok(result) => {
+                let text = serde_json::to_string_pretty(&result).unwrap_or_default();
+                if result.get("timed_out").and_then(Value::as_bool) == Some(true) {
+                    return ToolResult::error(
+                        text,
+                        &[
+                            "The editor was still scanning or importing when the wait timed out",
+                            "Retry godot_resave_resources with wait: true",
+                        ],
+                    );
+                }
+                ToolResult::text(text)
+            }
+            Err(McpError::BridgeUnavailable(_)) => self.import_headless(&args).await,
+            Err(error) => bridge_error_result(&error),
+        }
+    }
+
+    /// `godot --headless --path <project> --import`, used when the editor bridge is closed.
+    async fn import_headless(&self, args: &Value) -> ToolResult {
+        let project = match self.host_project(args) {
+            Ok(project) => project,
+            Err(_) => {
+                return ToolResult::error(
+                    "The editor bridge is not reachable, and no project was found for `godot --headless --path <project> --import`.",
+                    &[
+                        "Pass project_path: the directory that contains project.godot",
+                        "Or start the MCP server from the project directory",
+                        "Or open the project in the editor and enable the Godot MCP Bridge plugin",
+                    ],
+                );
+            }
+        };
+        let requested = match resave_paths(args) {
+            Ok(paths) => paths,
+            Err(result) => return result,
+        };
+        let mut skipped_missing = Vec::new();
+        let mut skipped_invalid = Vec::new();
+        let mut wanted: Vec<String> = Vec::new();
+        for path in &requested {
+            match resolve_in_project(&project, path) {
+                Ok(file) if file.is_file() => wanted.push(res_display(&project, &file)),
+                Ok(_) => skipped_missing.push(path.clone()),
+                Err(_) => skipped_invalid.push(path.clone()),
+            }
+        }
+        if !requested.is_empty() && wanted.is_empty() {
+            return ToolResult::error(
+                format!(
+                    "None of the given paths exist inside the project: {}",
+                    skipped_missing
+                        .iter()
+                        .chain(skipped_invalid.iter())
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                &["Pass res:// paths of files that exist in the project"],
+            );
+        }
+        let before = import_fingerprints(&project);
+        let command = format!("godot --headless --path {} --import", project.display());
+        let report = match self.cli.import_project(&project).await {
+            Ok(report) => report,
+            Err(error) => {
+                return ToolResult::error(
+                    format!("Failed to import resources with `{command}`: {error}"),
+                    &[
+                        "Verify GODOT_PATH points to a working Godot executable",
+                        "The same command is `godot --headless --path <project> --import`",
+                    ],
+                );
+            }
+        };
+        let imported = changed_imports(&before, &import_fingerprints(&project));
+        let mut not_scanned = Vec::new();
+        for path in &wanted {
+            if imported.iter().any(|item| item == path) {
+                continue;
+            }
+            let extension = Path::new(path)
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let sidecar = resolve_in_project(&project, &format!("{path}.import")).ok();
+            let has_sidecar = sidecar.as_ref().is_some_and(|file| file.is_file());
+            if IMPORTED_EXTENSIONS.contains(&extension.as_str()) && !has_sidecar {
+                not_scanned.push(path.clone());
+            }
+        }
+        let body = json!({
+            "mode": "headless_import",
+            "command": command,
+            "imported": imported,
+            "imported_count": imported.len(),
+            "not_scanned": not_scanned,
+            "skipped_missing": skipped_missing,
+            "skipped_invalid": skipped_invalid,
+            "exit_code": report.exit_code,
+            "timed_out": report.timed_out,
+        });
+        let text = serde_json::to_string_pretty(&body).unwrap_or_default();
+        if report.timed_out || report.exit_code != Some(0) {
+            let tail = last_output_lines(&report.stdout, &report.stderr, 20);
+            return ToolResult::error(
+                format!("{text}\n`{command}` did not finish cleanly.\n{tail}"),
+                &[
+                    "The command is `godot --headless --path <project> --import`",
+                    "A path in not_scanned has no .import file, so load() will not find a loader",
+                ],
+            );
+        }
+        ToolResult::text(text)
+    }
+
     async fn handle_run_script(&self, args: Value) -> ToolResult {
         let Some(script) = str_arg(&args, "script") else {
             return missing_argument("script");
@@ -962,7 +1102,17 @@ fn script_run_result(report: &ScriptRun, timeout_seconds: u64) -> ToolResult {
         .exit_code
         .map(|code| code.to_string())
         .unwrap_or_else(|| "none".into());
-    let summary = if report.timed_out {
+    let summary = if report.stopped_idle {
+        let detail = report
+            .script_errors
+            .first()
+            .map_or_else(String::new, |error| {
+                format!(" at {}:{}: {}", error.file, error.line, error.message)
+            });
+        format!(
+            "Stopped after a SCRIPT ERROR while the main loop was idle{detail}. The process was still running, so it was stopped without waiting out the {timeout_seconds}s timeout."
+        )
+    } else if report.timed_out {
         format!(
             "Timed out after {timeout_seconds}s and killed the process tree.\nLast output:\n{}",
             last_output_lines(&report.stdout, &report.stderr, 20)
@@ -979,6 +1129,7 @@ fn script_run_result(report: &ScriptRun, timeout_seconds: u64) -> ToolResult {
         "summary": summary,
         "exit_code": report.exit_code,
         "timed_out": report.timed_out,
+        "stopped_idle": report.stopped_idle,
         "stdout": report.stdout,
         "stderr": report.stderr,
         "script_errors": report.script_errors.iter().map(|error| json!({
@@ -1004,6 +1155,35 @@ fn script_run_result(report: &ScriptRun, timeout_seconds: u64) -> ToolResult {
     } else {
         ToolResult::text(text)
     }
+}
+
+fn resave_paths(args: &Value) -> std::result::Result<Vec<String>, ToolResult> {
+    let Some(value) = args.get("paths").filter(|value| !value.is_null()) else {
+        return Ok(Vec::new());
+    };
+    let Some(items) = value.as_array() else {
+        return Err(ToolResult::error(
+            "paths must be an array of res:// paths",
+            &["Omit paths for a full import, or pass paths: [\"res://art/models/x.glb\"]"],
+        ));
+    };
+    let mut paths = Vec::new();
+    for item in items {
+        let Some(path) = item.as_str() else {
+            return Err(ToolResult::error(
+                "paths must be an array of strings",
+                &["Each path is a res:// path"],
+            ));
+        };
+        if path.trim().is_empty() {
+            return Err(ToolResult::error(
+                "paths contains an empty string",
+                &["Each path is a res:// path"],
+            ));
+        }
+        paths.push(path.to_string());
+    }
+    Ok(paths)
 }
 
 fn last_output_lines(stdout: &str, stderr: &str, count: usize) -> String {
@@ -1492,7 +1672,7 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
         ),
         tool(
             "godot_run_script",
-            "Runs a GDScript that extends SceneTree with the configured Godot binary: godot --headless --path <project> -s <script> [-- user_args]. Captures stdout and stderr (they never touch this server's stdout). script_errors lists each SCRIPT ERROR with its file and line. Returns the exit code. timeout_seconds defaults to 120 and cannot exceed 600. On timeout the process tree is killed and the answer says so, with the last output lines. Paths outside the project are refused.",
+            "Runs a GDScript that extends SceneTree with the configured Godot binary: godot --headless --path <project> -s <script> [-- user_args]. Captures stdout and stderr (they never touch this server's stdout). script_errors lists each SCRIPT ERROR with its file and line. Returns the exit code. timeout_seconds defaults to 120 and cannot exceed 600. On timeout the process tree is killed and the answer says so, with the last output lines. A SCRIPT ERROR that leaves the main loop idle (the process stays up, as a script error in _init does) stops the run as soon as that idle is seen, and the answer says so, instead of waiting out the timeout. Paths outside the project are refused.",
             json!({
                 "script": {
                     "type": "string",
@@ -1518,12 +1698,20 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
         ),
         tool(
             "godot_resave_resources",
-            "Refreshes assets and resources the editor holds in memory after they were changed externally. Requires the editor bridge to be connected.",
+            "Refreshes assets and resources after they were changed externally. With the editor connected, importable files the editor already knows are re-imported synchronously and other files are re-scanned. A path the editor has never scanned is updated and, if needed, scanned first; it is listed under reimported only after a .import file exists, and otherwise under not_scanned (load() would fail with no loader). Without paths, rescans the whole project in the background. wait true holds the reply until scanning and importing finish (up to 60s) and reports how many files were imported; timed_out means they may not be loadable yet. Without the editor, runs `godot --headless --path <project> --import` and reports the sources whose .import sidecar appeared or changed.",
             json!({
                 "paths": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "res:// paths to refresh. Importable assets (images, audio, models, fonts) are re-imported synchronously; other files (scripts, scenes, resources) are re-scanned. If omitted or empty, triggers a full project filesystem rescan instead, which runs in the background and may still be in progress when this call returns."
+                    "description": "res:// paths to refresh. Importable assets (images, audio, models, fonts) the editor already knows are re-imported synchronously. A path it has never scanned is scanned first and listed under not_scanned when no .import file was written. Other files (scripts, scenes, resources) are re-scanned. If omitted or empty, triggers a full project filesystem rescan instead."
+                },
+                "wait": {
+                    "type": "boolean",
+                    "description": "Full scan only. When true, return after the editor finishes scanning and importing, or after 60s. The result includes imported (how many files were imported) and timed_out. Default false, which returns while the scan is still running. Ignored when paths is set. Without the editor, the headless import always waits until Godot exits."
+                },
+                "project_path": {
+                    "type": "string",
+                    "description": "Project directory containing project.godot. Used when the editor is closed, for `godot --headless --path <project> --import`. Optional: defaults to the project the server was started in. If the editor has a different project open, the import runs headless on this path."
                 }
             }),
             &[],

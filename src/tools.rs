@@ -1103,10 +1103,12 @@ fn script_run_result(report: &ScriptRun, timeout_seconds: u64) -> ToolResult {
         .map(|code| code.to_string())
         .unwrap_or_else(|| "none".into());
     let summary = if report.stopped_idle {
-        let detail = report.script_errors.first().map_or_else(
-            || String::new(),
-            |error| format!(" at {}:{}: {}", error.file, error.line, error.message),
-        );
+        let detail = report
+            .script_errors
+            .first()
+            .map_or_else(String::new, |error| {
+                format!(" at {}:{}: {}", error.file, error.line, error.message)
+            });
         format!(
             "Stopped after a SCRIPT ERROR while the main loop was idle{detail}. The process was still running, so it was stopped without waiting out the {timeout_seconds}s timeout."
         )

@@ -798,6 +798,65 @@ async fn undo_and_resource_refresh_behave() {
         .await
         .expect("full scan");
     assert_eq!(scan["mode"], "full_scan");
+
+    // A file written after the editor started is not in EditorFileSystem. Reporting it as
+    // reimported without a .import sidecar is the bug: load() then finds no loader.
+    let art = editor.project.join("art/models");
+    std::fs::create_dir_all(&art).expect("art dir");
+    std::fs::write(
+        art.join("x.svg"),
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"2\" height=\"2\"/>",
+    )
+    .expect("new svg");
+    let fresh = editor
+        .bridge
+        .clone()
+        .with_timeout(Duration::from_secs(90))
+        .send_command(
+            "resave_resources",
+            json!({"paths": ["res://art/models/x.svg"]}),
+        )
+        .await
+        .expect("resave unseen svg");
+    let reimported = fresh["reimported"].as_array().expect("reimported");
+    assert!(
+        reimported
+            .iter()
+            .any(|path| path == "res://art/models/x.svg"),
+        "{fresh}"
+    );
+    assert!(
+        art.join("x.svg.import").is_file(),
+        "no import sidecar was written: {fresh}"
+    );
+    let not_scanned = fresh["not_scanned"].as_array().cloned().unwrap_or_default();
+    assert!(
+        !not_scanned
+            .iter()
+            .any(|path| path == "res://art/models/x.svg"),
+        "{fresh}"
+    );
+
+    std::fs::write(
+        art.join("y.svg"),
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"2\" height=\"2\"/>",
+    )
+    .expect("second svg");
+    let waited = editor
+        .bridge
+        .clone()
+        .with_timeout(Duration::from_secs(90))
+        .send_command("resave_resources", json!({"wait": true}))
+        .await
+        .expect("full scan with wait");
+    assert_eq!(waited["mode"], "full_scan", "{waited}");
+    assert_eq!(waited["timed_out"], false, "{waited}");
+    assert_eq!(waited["scanning"], false, "{waited}");
+    assert!(waited["imported"].as_u64().unwrap_or(0) >= 1, "{waited}");
+    assert!(
+        art.join("y.svg.import").is_file(),
+        "wait did not import the new file: {waited}"
+    );
 }
 
 #[tokio::test]

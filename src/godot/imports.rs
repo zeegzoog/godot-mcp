@@ -8,6 +8,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+/// Extensions the editor imports (a `.import` file is generated next to them).
+/// Kept in step with `IMPORTED_EXTENSIONS` in the editor addon.
+pub const IMPORTED_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "webp", "svg", "bmp", "tga", "exr", "hdr", "dds", "ktx", "wav", "ogg",
+    "mp3", "glb", "gltf", "fbx", "obj", "ttf", "otf", "woff", "woff2",
+];
+
 /// `res://` paths of imported sources newer than their cache, or whose cache file is missing.
 /// Only files with a `.import` sidecar are considered. The result is sorted and has no duplicates.
 pub fn stale_imports(project: &Path) -> Vec<String> {
@@ -72,6 +79,82 @@ fn stale_source(project: &Path, import_file: &Path) -> Option<String> {
         None => newer_than(&source, import_file),
     };
     stale.then_some(res)
+}
+
+/// Fingerprint of each `.import` sidecar: the `res://` source and a hash of the sidecar text.
+/// A new or rewritten sidecar compares unequal, even when the mtime does not move.
+pub fn import_fingerprints(project: &Path) -> Vec<(String, u64)> {
+    let mut found = Vec::new();
+    walk_sidecars(project, project, &mut found);
+    found.sort();
+    found.dedup();
+    found
+}
+
+fn walk_sidecars(project: &Path, dir: &Path, found: &mut Vec<(String, u64)>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        if kind.is_dir() {
+            if is_skipped_dir(&path) {
+                continue;
+            }
+            walk_sidecars(project, &path, found);
+            continue;
+        }
+        if !kind.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".import") {
+            continue;
+        }
+        let Some(source) = source_of(&path) else {
+            continue;
+        };
+        let Some(res) = res_path(project, &source) else {
+            continue;
+        };
+        let Some(text) = read_sidecar(&path) else {
+            continue;
+        };
+        found.push((res, fnv_hash(text.as_bytes())));
+    }
+}
+
+fn fnv_hash(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    hash
+}
+
+/// Sources whose sidecar appeared or changed between two [`import_fingerprints`] snapshots.
+pub fn changed_imports(before: &[(String, u64)], after: &[(String, u64)]) -> Vec<String> {
+    let mut changed = Vec::new();
+    for (path, hash) in after {
+        let same = before
+            .iter()
+            .any(|(old, old_hash)| old == path && old_hash == hash);
+        if !same {
+            changed.push(path.clone());
+        }
+    }
+    changed.sort();
+    changed.dedup();
+    changed
 }
 
 fn source_of(import_file: &Path) -> Option<PathBuf> {
@@ -199,6 +282,24 @@ mod tests {
             touch(&cache, Duration::from_secs(10));
         }
         dir
+    }
+
+    #[test]
+    fn a_new_or_rewritten_sidecar_is_a_changed_import() {
+        let before = vec![
+            ("res://a.glb".to_string(), 1u64),
+            ("res://c.glb".to_string(), 1u64),
+        ];
+        let after = vec![
+            ("res://a.glb".to_string(), 2u64),
+            ("res://b.glb".to_string(), 3u64),
+            ("res://c.glb".to_string(), 1u64),
+        ];
+        assert_eq!(
+            changed_imports(&before, &after),
+            vec!["res://a.glb".to_string(), "res://b.glb".to_string()]
+        );
+        assert!(changed_imports(&after, &after).is_empty());
     }
 
     #[test]

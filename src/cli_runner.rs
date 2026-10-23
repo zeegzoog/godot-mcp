@@ -17,7 +17,7 @@ const SCRIPT_OUTPUT_CAP: usize = 64 * 1024;
 const READER_DRAIN: Duration = Duration::from_secs(2);
 /// After a `SCRIPT ERROR`, this much silence means the main loop is idle and the
 /// process is not going to quit on its own. A script error in `_init` leaves Godot running.
-const SCRIPT_ERROR_IDLE: Duration = Duration::from_millis(400);
+const SCRIPT_ERROR_IDLE: Duration = Duration::from_millis(1500);
 const IMPORT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// One `SCRIPT ERROR` block from a headless script run.

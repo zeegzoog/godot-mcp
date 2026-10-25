@@ -132,6 +132,7 @@ To report a vulnerability, follow [SECURITY.md](SECURITY.md). Never open a publi
 | --- | --- | --- |
 | `godot_get_version` | — | Engine version, from the editor or the Godot binary. |
 | `godot_get_project_info` | Editor | Name, main scene, features and directory of the open project. |
+| `godot_create_project` | — | Creates a minimal Godot 4 project at an absolute `project_path` with a display `name`, without needing an engine or editor. Preserves existing files and refuses to replace `project.godot`. Uses the Compatibility renderer; no main scene or bridge is installed. |
 | `godot_launch_editor` | — | Launches the editor for `project_path`, or for the project the server runs in. |
 | `godot_run_project` | — | Plays the main scene or a given `res://` scene. With the editor, uses its Play mode. Without it (or with `mode: "process"`), starts a managed game with the remote debugger attached; `held: true` (process runs only) starts it held, for exact steps. `user_args` (process only) are strings the game reads with `OS.get_cmdline_user_args()`; they are placed after `--` and refused for editor Play and `mode: "auto"`. A source newer than its `.godot/imported` cache is reimported first when the editor has this project open, and otherwise the result names the paths and `godot_resave_resources`. `godot_stop_project` stops either one. |
 | `godot_stop_project` | — | Stops what runs: the editor's Play mode when it plays and every managed process run, and lists what it stopped (or says that nothing was running). Pass `run_id` to stop one process run. |

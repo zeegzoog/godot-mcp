@@ -15,7 +15,8 @@ use std::path::Path;
 pub fn handles(name: &str) -> bool {
     matches!(
         name,
-        "godot_create_scene"
+        "godot_create_project"
+            | "godot_create_scene"
             | "godot_attach_script"
             | "godot_connect_signal"
             | "godot_list_signals"
@@ -27,6 +28,12 @@ pub fn handles(name: &str) -> bool {
 
 pub fn catalog() -> Vec<Tool> {
     vec![
+        tool(
+            "godot_create_project",
+            "Creates a minimal Godot 4 project without an engine or editor. Accepts a new or existing directory (documentation and assets are preserved). Never replaces project.godot. Does not install the editor bridge or create a main scene.",
+            json!({"project_path": s("Absolute directory path, without parent traversal."), "name": s("Non-empty project display name.")}),
+            &["project_path", "name"],
+        ),
         tool(
             "godot_create_scene",
             "Creates a .tscn with one root node and opens it in the editor when the bridge is connected. Refuses to replace an existing scene. Without the editor, writes the file directly.",
@@ -86,6 +93,7 @@ fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> 
 
 pub async fn call(tools: &ToolManager, name: &str, args: Value) -> ToolResult {
     match name {
+        "godot_create_project" => create_project(&args),
         "godot_create_scene" => create_scene(tools, &args).await,
         "godot_attach_script" => editor_or_error(tools, "attach_script", &args).await,
         "godot_connect_signal" => editor_or_error(tools, "connect_signal", &args).await,
@@ -94,6 +102,61 @@ pub async fn call(tools: &ToolManager, name: &str, args: Value) -> ToolResult {
         "godot_set_project_setting" => set_setting(tools, &args).await,
         "godot_get_project_settings" => get_settings(tools, &args).await,
         _ => ToolResult::error(format!("Tool '{name}' has no handler"), &[]),
+    }
+}
+
+/// Bootstrap is host-side because there is no project for an editor to open yet.
+fn create_project(args: &Value) -> ToolResult {
+    let recovery = &[
+        "Pass an absolute project_path without .. and a non-empty string name; existing projects are never replaced",
+    ];
+    let (Some(raw_path), Some(name)) = (str_arg(args, "project_path"), str_arg(args, "name"))
+    else {
+        return ToolResult::error("Missing or invalid project_path or name", recovery);
+    };
+    let normalized = raw_path.replace('\\', "/");
+    let directory = Path::new(&normalized);
+    if !directory.is_absolute()
+        || directory
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+        || name.trim().is_empty()
+        || name.contains('\0')
+    {
+        return ToolResult::error("Invalid project_path or name", recovery);
+    }
+    if let Err(error) = std::fs::create_dir_all(directory) {
+        return ToolResult::error(
+            format!("Cannot create project directory: {error}"),
+            recovery,
+        );
+    }
+    let directory = match directory.canonicalize() {
+        Ok(path) => path,
+        Err(error) => {
+            return ToolResult::error(
+                format!("Cannot resolve project directory: {error}"),
+                recovery,
+            );
+        }
+    };
+    let target = match resolve_in_project(&directory, "res://project.godot") {
+        Ok(path) => path,
+        Err(error) => return ToolResult::error(error, recovery),
+    };
+    let body = format!(
+        "config_version=5\n\n[application]\nconfig/name={}\n\n[rendering]\nrenderer/rendering_method=\"gl_compatibility\"\nrenderer/rendering_method.mobile=\"gl_compatibility\"\n",
+        godot_string(name)
+    );
+    match create_new_file(&target, &body) {
+        Ok(()) => ToolResult::text(
+            json!({"project_path": directory, "created": "res://project.godot", "name": name})
+                .to_string(),
+        ),
+        Err(error) => ToolResult::error(
+            format!("Cannot create project.godot (existing projects are never replaced): {error}"),
+            recovery,
+        ),
     }
 }
 

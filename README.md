@@ -259,6 +259,17 @@ Steps are **exact** only for a game started with `godot_run_project` `{"mode": "
 
 Closing the game's window ends a hold. The server stopping the run does too. A server that disappears without stopping the run leaves its game held, with a window that can still be closed.
 
+## Playing a scenario
+
+`godot_game_scenario` is one call that presses Input Map actions and pointers, advances physics ticks, and reads the result. It does not run GDScript from the caller. Start the game with `godot_run_project` `{"mode": "process", "held": true}` when the tick count must be exact. The call leaves the game held; `godot_game_physics` `{"action": "resume"}` lets it run, and `godot_stop_project` stops it. The arguments, what is and is not deterministic, and a worked example are in [docs/game-checks.md](docs/game-checks.md).
+
+```json
+{"steps": [
+  {"frames": 20, "actions": [{"action": "move_right", "strength": 1}, {"action": "jump", "phase": "tap"}]},
+  {"frames": 40}
+], "bodies": ["Player"], "nodes": [{"path": "Player", "properties": ["jump_count"]}]}
+```
+
 ## How it works
 
 ```
@@ -288,3 +299,21 @@ GODOT_PATH=/path/to/godot cargo test --test runtime_e2e_test -- --ignored --test
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Checking voxel model exports
+
+`godot_check_voxel_model` exports one `.vox`, or a batch of up to 16 models,
+through Froxel MCP and imports the resulting GLBs into the selected Godot project.
+Set `FROXEL_BIN` to a Froxel executable supporting `export_models` (or put it on
+PATH). Pass `vox` and `dest`, or `models: [{vox, dest}]`; source paths are absolute
+and destinations are project-local `res://` GLB paths. Optional `preview: true`
+path-traces a PNG beside each successfully exported model. This is a Froxel
+preview, not a Godot viewport capture.
+
+All output paths are validated before writing. Output names must be unique,
+including previews, links and case-only aliases. Each Froxel process has a
+60-second deadline covering initialization, tool replies and process exit.
+The report preserves per-model export failures even when no model can be
+imported; a mixed batch imports and previews only successful exports. The Godot
+check verifies import sidecars; it does not yet verify the instantiated model's
+meshes or animation behavior.

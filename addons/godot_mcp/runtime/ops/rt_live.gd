@@ -42,6 +42,8 @@ static func methods() -> Dictionary:
         "game.signals": {"fn": signals_of},
         "game.observe": {"fn": observe},
         "game.snapshot": {"fn": snapshot},
+        "game.body": {"fn": read_bodies},
+        "game.pause": {"fn": set_pause},
         "game.physics": {"fn": physics},
     }
 
@@ -387,6 +389,66 @@ static func snapshot(rt: Node, _params: Dictionary) -> Dictionary:
     }
     body.merge(rt.scene_context(), true)
     return R.ok(body)
+
+
+## Sets SceneTree.paused. The runtime keeps answering: its node ignores pause, and a hold
+## serves requests from the physics tick, which the tree still emits while paused.
+static func set_pause(rt: Node, params: Dictionary) -> Dictionary:
+    if not params.has("paused") or not params["paused"] is bool:
+        return R.err(R.BAD_PARAMS, "game.pause: paused must be a boolean.")
+    rt.get_tree().paused = bool(params["paused"])
+    return R.ok({"paused": rt.get_tree().paused, "scene": rt.scene_context()})
+
+
+## Fixed reads of a CharacterBody2D or CharacterBody3D. A missing node or any other class
+## is an entry in errors; the other paths are still returned.
+static func read_bodies(rt: Node, params: Dictionary) -> Dictionary:
+    var paths: Variant = params.get("paths", [])
+    if not paths is Array or (paths as Array).is_empty():
+        return R.err(R.BAD_PARAMS, "game.body: paths must be a non-empty array of node paths.")
+    var bodies: Array = []
+    var errors: Array = []
+    for entry: Variant in paths:
+        var path := str(entry).strip_edges()
+        var node: Node = rt.find_node(path)
+        if node == null:
+            errors.append({"path": path, "message": "Node not found at '%s'." % path})
+            continue
+        if not (node is CharacterBody2D or node is CharacterBody3D):
+            errors.append({
+                "path": rt.path_of(node),
+                "message": "Node at '%s' is a %s. game.body reads CharacterBody2D and CharacterBody3D only." % [rt.path_of(node), node.get_class()],
+            })
+            continue
+        bodies.append(_body_snapshot(rt, node))
+    return R.ok({"bodies": bodies, "errors": errors, "scene": rt.scene_context()})
+
+
+static func _body_snapshot(rt: Node, node: Node) -> Dictionary:
+    var count := int(node.call("get_slide_collision_count"))
+    var collisions: Array = []
+    for index in mini(count, 8):
+        var collision: Object = node.call("get_slide_collision", index)
+        var collider: Variant = collision.call("get_collider")
+        var collider_path := ""
+        if collider is Node:
+            collider_path = rt.path_of(collider)
+        collisions.append({
+            "normal": rt.encode(collision.call("get_normal")),
+            "position": rt.encode(collision.call("get_position")),
+            "collider": collider_path,
+        })
+    return {
+        "path": rt.path_of(node),
+        "class": node.get_class(),
+        "position": rt.encode(node.get("global_position")),
+        "velocity": rt.encode(node.get("velocity")),
+        "is_on_floor": bool(node.call("is_on_floor")),
+        "is_on_wall": bool(node.call("is_on_wall")),
+        "is_on_ceiling": bool(node.call("is_on_ceiling")),
+        "slide_count": count,
+        "collisions": collisions,
+    }
 
 
 const MAX_PHYSICS_TICKS := 120

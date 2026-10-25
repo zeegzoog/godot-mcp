@@ -2625,3 +2625,86 @@ async fn project_creation_validates_before_creating_directories() {
     assert!(!result.is_error, "{}", text(&result));
     assert!(target.join("project.godot").is_file());
 }
+
+#[tokio::test]
+async fn a_scenario_is_refused_before_a_game_exists() {
+    let no_game = call("godot_game_scenario", json!({"steps": [{"frames": 1}]})).await;
+    assert!(
+        no_game.is_error && text(&no_game).contains("managed process"),
+        "{}",
+        text(&no_game)
+    );
+    let editor = call(
+        "godot_game_scenario",
+        json!({"run_id": "editor", "steps": [{"frames": 1}]}),
+    )
+    .await;
+    assert!(
+        editor.is_error && text(&editor).contains("mode process"),
+        "{}",
+        text(&editor)
+    );
+    let empty = call("godot_game_scenario", json!({})).await;
+    assert!(text(&empty).contains("steps"), "{}", text(&empty));
+    let wide = call("godot_game_scenario", json!({"steps": [{"frames": 601}]})).await;
+    assert!(text(&wide).contains("600"), "{}", text(&wide));
+    let strength = call(
+        "godot_game_scenario",
+        json!({"steps": [{"frames": 1, "actions": [{"action": "jump", "strength": 2}]}]}),
+    )
+    .await;
+    assert!(text(&strength).contains("strength"), "{}", text(&strength));
+    let tools = ToolManager::list_tools();
+    let scenario = tools
+        .iter()
+        .find(|tool| tool.name == "godot_game_scenario")
+        .expect("scenario tool");
+    let description = scenario.description.to_lowercase();
+    for word in [
+        "deterministic",
+        "physics",
+        "pause",
+        "characterbody",
+        "screenshot",
+        "released",
+    ] {
+        assert!(description.contains(word), "{word} missing: {description}");
+    }
+}
+
+#[tokio::test]
+async fn a_voxel_model_check_is_refused_before_froxel_starts() {
+    let project = project_dir();
+    let tools = manager_in(
+        project.path(),
+        PathBuf::from("godot-binary-that-does-not-exist"),
+    );
+    let missing = Arc::clone(&tools)
+        .call_tool(
+            "godot_check_voxel_model",
+            json!({
+                "project_path": project.path(),
+                "vox": "/no/such/model.vox",
+                "dest": "res://art/model.glb"
+            }),
+        )
+        .await;
+    assert!(text(&missing).contains("not found"), "{}", text(&missing));
+    let bad_dest = Arc::clone(&tools)
+        .call_tool(
+            "godot_check_voxel_model",
+            json!({
+                "project_path": project.path(),
+                "vox": "/no/such/model.vox",
+                "dest": "res://art/model.txt"
+            }),
+        )
+        .await;
+    assert!(text(&bad_dest).contains(".glb"), "{}", text(&bad_dest));
+    let described = ToolManager::list_tools()
+        .into_iter()
+        .find(|tool| tool.name == "godot_check_voxel_model")
+        .expect("voxel model tool");
+    assert!(described.description.contains("structure"));
+    assert!(described.description.contains("import"));
+}

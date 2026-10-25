@@ -432,6 +432,37 @@ impl Run {
         restore_override(&self.override_state);
     }
 
+    /// The next log sequence number. Lines written after this call have `seq >=` the result.
+    pub fn log_cursor(&self) -> u64 {
+        lock(&self.logs).seq
+    }
+
+    /// Warnings and errors recorded at or after `since`. Info lines are left out, and
+    /// lines from before `since` are not included.
+    pub fn logs_from(&self, since: u64) -> Value {
+        let logs = lock(&self.logs);
+        let lines: Vec<Value> = logs
+            .lines
+            .iter()
+            .filter(|line| line.seq >= since && line.level != "info")
+            .map(|line| {
+                json!({
+                    "seq": line.seq,
+                    "level": line.level,
+                    "text": line.text,
+                    "stack": line.stack,
+                })
+            })
+            .collect();
+        let errors: Vec<Value> = logs
+            .errors
+            .iter()
+            .filter(|line| line.get("seq").and_then(Value::as_u64).unwrap_or(0) >= since)
+            .cloned()
+            .collect();
+        json!({"lines": lines, "errors": errors})
+    }
+
     pub fn page_logs(&self, since: u64, level: &str) -> Value {
         let logs = lock(&self.logs);
         let lines: Vec<Value> = logs

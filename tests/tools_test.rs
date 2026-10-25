@@ -2585,6 +2585,13 @@ async fn creates_project_without_engine_and_preserves_existing_work() {
     let body = std::fs::read_to_string(dir.path().join("project.godot")).expect("project");
     assert!(body.contains("config_version=5"));
     assert!(body.contains("gl_compatibility"));
+    // The quote and the line break of the name stay inside one quoted value, so the name cannot
+    // start a new entry or section of project.godot.
+    assert!(
+        body.contains(r#"config/name="Frog \"World\"\nPond""#),
+        "{body}"
+    );
+    assert_eq!(body.lines().filter(|line| line.starts_with('[')).count(), 2);
     assert_eq!(
         std::fs::read_to_string(dir.path().join("AGENTS.md")).expect("docs"),
         "keep"

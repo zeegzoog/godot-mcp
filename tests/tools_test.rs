@@ -2675,6 +2675,8 @@ async fn a_scenario_is_refused_before_a_game_exists() {
 #[tokio::test]
 async fn a_voxel_model_check_is_refused_before_froxel_starts() {
     let project = project_dir();
+    // A leading slash is absolute on Unix and relative on Windows.
+    let missing_vox = project.path().join("missing.vox");
     let tools = manager_in(
         project.path(),
         PathBuf::from("godot-binary-that-does-not-exist"),
@@ -2684,7 +2686,7 @@ async fn a_voxel_model_check_is_refused_before_froxel_starts() {
             "godot_check_voxel_model",
             json!({
                 "project_path": project.path(),
-                "vox": "/no/such/model.vox",
+                "vox": missing_vox,
                 "dest": "res://art/model.glb"
             }),
         )
@@ -2695,7 +2697,7 @@ async fn a_voxel_model_check_is_refused_before_froxel_starts() {
             "godot_check_voxel_model",
             json!({
                 "project_path": project.path(),
-                "vox": "/no/such/model.vox",
+                "vox": missing_vox,
                 "dest": "res://art/model.txt"
             }),
         )

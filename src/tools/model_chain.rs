@@ -16,16 +16,17 @@ use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{ChildStdout, Command};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command;
 use tokio::time::Instant;
 
 const EXPORT_WAIT: Duration = Duration::from_secs(60);
 /// The longest line Froxel may send. A reply to 16 models is a few kilobytes.
-const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_LINE_BYTES: usize = 1024 * 1024;
 /// How much of Froxel's text an error message repeats.
 const MAX_ECHO_CHARS: usize = 2000;
 const MAX_MODELS: usize = 16;
@@ -80,7 +81,12 @@ async fn call_with(tools: &ToolManager, args: &Value, bin: &OsStr) -> ToolResult
             );
         }
     };
-    let jobs = match jobs_of(args, &project) {
+    // The checks look at the disk (links, existing files), so they run off the async workers.
+    let checked = {
+        let (args, project) = (args.clone(), project.clone());
+        tokio::task::spawn_blocking(move || jobs_of(&args, &project)).await
+    };
+    let jobs = match checked.unwrap_or_else(|_| Err("The path checks did not finish.".into())) {
         Ok(jobs) => jobs,
         Err(message) => {
             return ToolResult::error(
@@ -146,13 +152,19 @@ async fn call_with(tools: &ToolManager, args: &Value, bin: &OsStr) -> ToolResult
     let mut stale = Vec::new();
     for (index, job) in &successful {
         let dest = res_display(&project, &job.dest);
-        match import_current(&project, &job.dest) {
+        let current = {
+            let (project, dest) = (project.clone(), job.dest.clone());
+            tokio::task::spawn_blocking(move || import_current(&project, &dest))
+                .await
+                .unwrap_or(None)
+        };
+        match current {
             None => missing.push(format!("{dest}.import")),
             Some(false) if content_hash(&job.dest).await != previous[*index] => stale.push(dest),
             Some(_) => {}
         }
     }
-    let structure_ok = exported.get("ok").and_then(Value::as_bool) == Some(true);
+    let structure_ok = structure_passed(&exported, &flags);
     let previews_ok = previews
         .iter()
         .all(|preview| preview.get("ok").and_then(Value::as_bool) != Some(false));
@@ -199,7 +211,7 @@ async fn export(bin: &OsStr, jobs: &[Job]) -> Result<(Value, Vec<bool>), ToolRes
     }
     let exported = froxel_export(bin, &models)
         .await
-        .map_err(|message| ToolResult::error(message.clone(), export_hints(&message)))?;
+        .map_err(|error| ToolResult::error(error.to_string(), export_hints(&error)))?;
     let flags = export_results(&exported, jobs.len()).map_err(|message| {
         ToolResult::error(
             message,
@@ -212,24 +224,57 @@ async fn export(bin: &OsStr, jobs: &[Job]) -> Result<(Value, Vec<bool>), ToolRes
     Ok((exported, flags))
 }
 
+/// What went wrong while talking to Froxel; the kind picks the recovery steps.
+#[derive(Debug)]
+enum FroxelError {
+    /// The program could not be started.
+    Start(String),
+    /// The exchange, including the exit, did not finish in time.
+    Deadline(String),
+    /// Anything else: a bad reply, an error from Froxel, a non-zero exit.
+    Failed(String),
+}
+
+impl fmt::Display for FroxelError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (Self::Start(text) | Self::Deadline(text) | Self::Failed(text)) = self;
+        formatter.write_str(text)
+    }
+}
+
+impl From<String> for FroxelError {
+    fn from(text: String) -> Self {
+        Self::Failed(text)
+    }
+}
+
+impl From<&str> for FroxelError {
+    fn from(text: &str) -> Self {
+        Self::Failed(text.to_string())
+    }
+}
+
 /// The recovery steps that fit what went wrong with Froxel.
-fn export_hints(message: &str) -> &'static [&'static str] {
-    if message.contains("Could not start") {
-        &[
+fn export_hints(error: &FroxelError) -> &'static [&'static str] {
+    match error {
+        FroxelError::Start(_) => &[
             "Set FROXEL_BIN to the Froxel executable, or put `froxel` on PATH",
             "Froxel needs a build that supports the export_models tool",
-        ]
-    } else if message.contains("deadline") {
-        &[
+        ],
+        FroxelError::Deadline(_) => &[
             "Export fewer models in one call",
             "Run `froxel mcp` by hand to see whether it answers",
-        ]
-    } else {
-        &[
+        ],
+        FroxelError::Failed(_) => &[
             "Run `froxel mcp` by hand and call export_models to see its reply",
             "Check that the .vox files are valid and that Froxel supports export_models",
-        ]
+        ],
     }
+}
+
+/// Froxel called the export a success and every model in it.
+fn structure_passed(exported: &Value, flags: &[bool]) -> bool {
+    exported.get("ok").and_then(Value::as_bool) == Some(true) && flags.iter().all(|ok| *ok)
 }
 
 /// One boolean per requested model, from Froxel's `models` list.
@@ -365,10 +410,40 @@ fn destination_key(path: &Path) -> Result<String, String> {
     Ok(resolved.to_string_lossy().replace('\\', "/").to_lowercase())
 }
 
-/// A network share (`\\host\share`, `//host/share`) or a device path (`\\?\`): looking at it
-/// would reach out to another machine or bypass the path rules.
+/// Whether `path` runs through `.godot`, Godot's own cache. Windows and macOS ignore the case of
+/// a name, and Windows ignores trailing dots and spaces.
+fn inside_godot_cache(project: &Path, path: &Path) -> bool {
+    let relative = path.strip_prefix(project).unwrap_or(path);
+    relative.components().any(|part| {
+        part.as_os_str()
+            .to_string_lossy()
+            .trim_end_matches(['.', ' '])
+            .eq_ignore_ascii_case(".godot")
+    })
+}
+
+/// A network share or a device path that is not a drive: looking at it would reach out to
+/// another machine or bypass the path rules. Only Windows has such paths, in several spellings
+/// (two leading separators in any mix, or a prefix that is not a drive); `//usr/x.vox` is an
+/// ordinary path elsewhere.
+#[cfg(windows)]
 fn is_remote_or_device_path(path: &str) -> bool {
-    path.starts_with("\\\\") || path.starts_with("//")
+    use std::path::{Component, Prefix};
+    let mut leading = path.chars();
+    let separator = |c: Option<char>| matches!(c, Some('/') | Some('\\'));
+    if separator(leading.next()) && separator(leading.next()) {
+        return true;
+    }
+    matches!(
+        Path::new(path).components().next(),
+        Some(Component::Prefix(prefix))
+            if !matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
+    )
+}
+
+#[cfg(not(windows))]
+fn is_remote_or_device_path(_path: &str) -> bool {
+    false
 }
 
 fn one_job(
@@ -408,10 +483,7 @@ fn one_job(
     }
     let dest_path = resolve_in_project(project, dest)
         .map_err(|error| format!("models[{index}].dest: {error}"))?;
-    if res_display(project, &dest_path)
-        .split('/')
-        .any(|part| part == ".godot")
-    {
+    if inside_godot_cache(project, &dest_path) {
         return Err(format!(
             "models[{index}].dest is inside .godot, which is Godot's own cache."
         ));
@@ -433,13 +505,13 @@ fn one_job(
     })
 }
 
-async fn froxel_export(bin: &OsStr, models: &[Value]) -> Result<Value, String> {
+async fn froxel_export(bin: &OsStr, models: &[Value]) -> Result<Value, FroxelError> {
     let reply = froxel_call(bin, "export_models", json!({"models": models}), EXPORT_WAIT).await?;
     serde_json::from_str(&reply).map_err(|error| {
-        format!(
+        FroxelError::Failed(format!(
             "Froxel export was not JSON: {error}: {}",
             clip(&reply, MAX_ECHO_CHARS)
-        )
+        ))
     })
 }
 
@@ -468,8 +540,12 @@ async fn froxel_render(bin: &OsStr, vox: &Path, png: &Path, wait: Duration) -> R
         ],
         wait,
     )
-    .await?;
-    if png.is_file() {
+    .await
+    .map_err(|error| error.to_string())?;
+    if tokio::fs::metadata(png)
+        .await
+        .is_ok_and(|meta| meta.is_file())
+    {
         Ok(())
     } else {
         Err(format!("Froxel did not write {}", png.display()))
@@ -481,7 +557,7 @@ async fn froxel_call(
     name: &str,
     arguments: Value,
     wait: Duration,
-) -> Result<String, String> {
+) -> Result<String, FroxelError> {
     froxel_script_with(bin, &[(name, arguments)], wait)
         .await
         .map(|replies| replies.into_iter().next().unwrap_or_default())
@@ -506,11 +582,14 @@ async fn froxel_script_with(
     bin: &OsStr,
     calls: &[(&str, Value)],
     wait: Duration,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, FroxelError> {
     let operation = async {
-        let mut child = froxel_command(bin)
-            .spawn()
-            .map_err(|error| format!("Could not start {} mcp: {error}", bin.to_string_lossy()))?;
+        let mut child = froxel_command(bin).spawn().map_err(|error| {
+            FroxelError::Start(format!(
+                "Could not start {} mcp: {error}",
+                bin.to_string_lossy()
+            ))
+        })?;
         let mut stdin = child.stdin.take().ok_or("froxel mcp stdin was closed")?;
         let stdout = child.stdout.take().ok_or("froxel mcp stdout was closed")?;
         let mut lines = BufReader::new(stdout);
@@ -542,7 +621,7 @@ async fn froxel_script_with(
                 })
                 .ok_or("Froxel returned no text content")?;
             if result.get("isError").and_then(Value::as_bool) == Some(true) {
-                return Err(clip(text, MAX_ECHO_CHARS));
+                return Err(FroxelError::Failed(clip(text, MAX_ECHO_CHARS)));
             }
             replies.push(text.to_string());
         }
@@ -550,17 +629,17 @@ async fn froxel_script_with(
         let status = child
             .wait()
             .await
-            .map_err(|error| format!("Waiting for Froxel: {error}"))?;
+            .map_err(|error| FroxelError::Failed(format!("Waiting for Froxel: {error}")))?;
         if !status.success() {
-            return Err(format!("Froxel exited with {status}"));
+            return Err(FroxelError::Failed(format!("Froxel exited with {status}")));
         }
         Ok(replies)
     };
     tokio::time::timeout(wait, operation).await.map_err(|_| {
-        format!(
+        FroxelError::Deadline(format!(
             "Froxel MCP exceeded its {:.3}-second deadline, including process exit.",
             wait.as_secs_f64()
-        )
+        ))
     })?
 }
 
@@ -576,7 +655,7 @@ fn clip(text: &str, limit: usize) -> String {
 
 /// One line of Froxel's output, at most `MAX_LINE_BYTES`: a program that never ends its line
 /// must not fill the server's memory until the deadline.
-async fn read_line(reader: &mut BufReader<ChildStdout>) -> Result<Option<String>, String> {
+async fn read_line<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Option<String>, String> {
     let mut line = Vec::new();
     loop {
         let available = reader
@@ -617,10 +696,12 @@ async fn read_line(reader: &mut BufReader<ChildStdout>) -> Result<Option<String>
         .map_err(|_| "Froxel sent output that is not UTF-8.".to_string())
 }
 
-async fn read_reply(reader: &mut BufReader<ChildStdout>, id: u64) -> Result<Value, String> {
+async fn read_reply<R: AsyncBufRead + Unpin>(reader: &mut R, id: u64) -> Result<Value, String> {
     while let Some(line) = read_line(reader).await? {
-        let reply: Value = serde_json::from_str(&line)
-            .map_err(|error| format!("Invalid Froxel JSON-RPC: {error}"))?;
+        // Anything that is not a JSON message (an empty line, a stray log line) is skipped.
+        let Ok(reply) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
         if reply.get("id").and_then(Value::as_u64) != Some(id) {
             continue;
         }
@@ -715,13 +796,6 @@ mod tests {
         let dir = project();
         let source = dir.path().join("source.vox");
         let refused = |args: Value| jobs_of(&args, dir.path()).err().expect("refused");
-        assert!(
-            refused(json!({"vox":"\\\\host\\share\\a.vox","dest":"res://a.glb"}))
-                .contains("network")
-        );
-        assert!(
-            refused(json!({"vox":"//host/share/a.vox","dest":"res://a.glb"})).contains("network")
-        );
         assert!(refused(json!({"vox":"relative.vox","dest":"res://a.glb"})).contains("absolute"));
         assert!(
             refused(json!({"vox":dir.path().join("a.txt"),"dest":"res://a.glb"})).contains(".vox")
@@ -751,9 +825,88 @@ mod tests {
     }
     #[test]
     fn the_recovery_steps_fit_the_failure() {
-        assert!(export_hints("Could not start froxel mcp: not found")[0].contains("FROXEL_BIN"));
-        assert!(export_hints("Froxel MCP exceeded its deadline")[0].contains("fewer"));
-        assert!(export_hints("Froxel exited with 1")[0].contains("by hand"));
+        let start = FroxelError::Start("Could not start froxel mcp: not found".into());
+        assert!(export_hints(&start)[0].contains("FROXEL_BIN"));
+        let late = FroxelError::Deadline("Froxel MCP exceeded its deadline".into());
+        assert!(export_hints(&late)[0].contains("fewer"));
+        // Froxel's own words must not pick the steps.
+        let failed = FroxelError::Failed("Could not start the deadline".into());
+        assert!(export_hints(&failed)[0].contains("by hand"));
+    }
+    #[test]
+    fn one_failed_model_fails_the_check() {
+        let reply = json!({"ok":true,"models":[{"ok":true},{"ok":false}]});
+        let flags = export_results(&reply, 2).unwrap();
+        assert!(!structure_passed(&reply, &flags));
+        let all = json!({"ok":true,"models":[{"ok":true},{"ok":true}]});
+        assert!(structure_passed(&all, &export_results(&all, 2).unwrap()));
+        let refused = json!({"ok":false,"models":[{"ok":true}]});
+        assert!(!structure_passed(&refused, &[true]));
+    }
+    #[test]
+    fn the_godot_cache_is_refused_whatever_the_spelling() {
+        let dir = project();
+        let source = dir.path().join("source.vox");
+        for dest in [
+            "res://.godot/a.glb",
+            "res://.GODOT/imported/a.glb",
+            "res://.Godot./a.glb",
+            "res://art/../.godot/a.glb",
+        ] {
+            let result = jobs_of(&json!({"vox":source,"dest":dest}), dir.path());
+            assert!(result.is_err(), "{dest} was accepted");
+        }
+        assert!(
+            jobs_of(
+                &json!({"vox":source,"dest":"res://godot/a.glb"}),
+                dir.path()
+            )
+            .is_ok()
+        );
+    }
+    #[cfg(windows)]
+    #[test]
+    fn network_and_device_paths_are_refused_as_a_source() {
+        for vox in [
+            "\\\\host\\share\\a.vox",
+            "//host/share/a.vox",
+            "/\\host\\share\\a.vox",
+            "\\/host/share/a.vox",
+            "\\\\?\\UNC\\host\\share\\a.vox",
+            "\\\\.\\C:\\a.vox",
+        ] {
+            assert!(is_remote_or_device_path(vox), "{vox}");
+        }
+        assert!(!is_remote_or_device_path("C:\\models\\a.vox"));
+        assert!(is_remote_or_device_path("\\\\?\\C:\\models\\a.vox"));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_path_with_two_leading_slashes_is_an_ordinary_path_on_unix() {
+        assert!(!is_remote_or_device_path("//usr/share/a.vox"));
+    }
+    #[tokio::test]
+    async fn a_line_is_read_up_to_the_limit_and_no_further() {
+        let mut exact = vec![b'a'; MAX_LINE_BYTES];
+        exact.push(b'\n');
+        let mut reader = BufReader::new(&exact[..]);
+        let line = read_line(&mut reader).await.unwrap().unwrap();
+        assert_eq!(line.len(), MAX_LINE_BYTES);
+        let long = vec![b'a'; MAX_LINE_BYTES + 1];
+        let mut reader = BufReader::new(&long[..]);
+        let error = read_line(&mut reader).await.unwrap_err();
+        assert!(error.contains("longer than"), "{error}");
+        let mut reader = BufReader::new(&b"last words"[..]);
+        let line = read_line(&mut reader).await.unwrap().unwrap();
+        assert_eq!(line, "last words");
+        assert_eq!(read_line(&mut reader).await.unwrap(), None);
+    }
+    #[tokio::test]
+    async fn lines_that_are_not_json_are_skipped_while_waiting_for_a_reply() {
+        let input = b"\nnot json\n{\"jsonrpc\":\"2.0\",\"id\":9,\"result\":{}}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"v\":1}}\n";
+        let mut reader = BufReader::new(&input[..]);
+        let reply = read_reply(&mut reader, 2).await.unwrap();
+        assert_eq!(reply["v"], 1);
     }
     #[test]
     fn froxel_does_not_inherit_the_bridge_token() {
@@ -807,9 +960,14 @@ mod tests {
     }
     #[cfg(unix)]
     fn stub(dir: &Path, name: &str, body: &str) -> PathBuf {
+        use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
         let bin = dir.join(name);
-        std::fs::write(&bin, body).unwrap();
+        // Closed before it runs: executing a file that is still open for writing fails (ETXTBSY).
+        let mut file = std::fs::File::create(&bin).unwrap();
+        file.write_all(body.as_bytes()).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         bin
     }
@@ -871,6 +1029,7 @@ exec sleep 3
         )
         .await
         .unwrap_err();
+        assert!(matches!(missing, FroxelError::Start(_)), "{missing}");
         assert!(
             export_hints(&missing)[0].contains("FROXEL_BIN"),
             "{missing}"
@@ -884,6 +1043,8 @@ exec sleep 3
         )
         .await
         .unwrap_err();
+        assert!(matches!(failed, FroxelError::Failed(_)), "{failed}");
+        assert!(failed.to_string().starts_with("Froxel exited"), "{failed}");
         assert!(!export_hints(&failed)[0].contains("FROXEL_BIN"), "{failed}");
     }
 }

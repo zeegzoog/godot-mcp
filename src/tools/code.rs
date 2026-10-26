@@ -8,6 +8,7 @@ use crate::error::McpError;
 use crate::paths::resolve_in_project;
 use crate::protocol::{Tool, ToolResult};
 use serde_json::{Value, json};
+use std::path::Path;
 
 pub fn handles(name: &str) -> bool {
     matches!(
@@ -24,7 +25,7 @@ pub fn catalog() -> Vec<Tool> {
     vec![
         tool(
             "godot_code_diagnostics",
-            "GDScript errors and warnings from Godot's language server (1-based lines), including analyzer warnings such as SHADOWED_GLOBAL_IDENTIFIER. Uses an editor already listening on GODOT_MCP_LSP_PORT (default 6005) or starts a private headless one. Does not report a clean file if the server never answers. godot_validate_script reports the same diagnostics when this server is already running, and otherwise only a headless parse check.",
+            "GDScript errors and warnings from Godot's language server (1-based lines), including analyzer warnings such as SHADOWED_GLOBAL_IDENTIFIER. Godot leaves scripts under res://addons/ out of analyzer warnings unless the project sets debug/gdscript/warnings/exclude_addons=false; for such a script the answer carries warnings_hidden saying so. Uses an editor already listening on GODOT_MCP_LSP_PORT (default 6005) or starts a private headless one. Does not report a clean file if the server never answers. godot_validate_script reports the same diagnostics when this server is already running, and otherwise only a headless parse check.",
             json!({"script_path": s("res:// path of a .gd file."), "project_path": s("")}),
             &["script_path"],
         ),
@@ -90,7 +91,14 @@ async fn code_diagnostics(tools: &ToolManager, args: &Value) -> ToolResult {
         Err(result) => return result,
     };
     match tools.lsp.diagnostics(&project, external_ok, &file).await {
-        Ok(value) => ToolResult::text(serde_json::to_string_pretty(&value).unwrap_or_default()),
+        Ok(mut value) => {
+            if addon_warnings_hidden(&project, &file)
+                && let Some(map) = value.as_object_mut()
+            {
+                map.insert("warnings_hidden".into(), json!(ADDON_WARNINGS_HIDDEN));
+            }
+            ToolResult::text(serde_json::to_string_pretty(&value).unwrap_or_default())
+        }
         Err(error) => ToolResult::error(
             error.to_string(),
             &[
@@ -208,6 +216,53 @@ fn runtime_error(error: &McpError) -> ToolResult {
     }
 }
 
+/// Why a clean answer for a script under `res://addons/` may still hide warnings.
+pub(super) const ADDON_WARNINGS_HIDDEN: &str = "This script is under res://addons/, and this project leaves addons out of analyzer warnings (debug/gdscript/warnings/exclude_addons is on, Godot's default), so only errors are reported for it. Set debug/gdscript/warnings/exclude_addons=false in project.godot to see its warnings.";
+
+/// True when `file` lies under the project's `addons/` and the project keeps Godot's default
+/// `debug/gdscript/warnings/exclude_addons=true`: the analyzer then reports no warnings for it.
+pub(super) fn addon_warnings_hidden(project: &Path, file: &Path) -> bool {
+    // One side may be canonical and the other not (/var and /private/var on macOS).
+    let project_real = project
+        .canonicalize()
+        .unwrap_or_else(|_| project.to_path_buf());
+    let file_real = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
+    let Ok(relative) = file_real
+        .strip_prefix(&project_real)
+        .or_else(|_| file.strip_prefix(project))
+    else {
+        return false;
+    };
+    if relative
+        .components()
+        .next()
+        .and_then(|part| part.as_os_str().to_str())
+        != Some("addons")
+    {
+        return false;
+    }
+    let Ok(settings) = std::fs::read_to_string(project.join("project.godot")) else {
+        return true;
+    };
+    let mut section = "";
+    for line in settings.lines() {
+        let line = line.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            section = line;
+            continue;
+        }
+        if section != "[debug]" {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=')
+            && key.trim() == "gdscript/warnings/exclude_addons"
+        {
+            return value.trim() != "false";
+        }
+    }
+    true
+}
+
 /// A line or column parameter: an integer of at least 1, as in the editor.
 fn position(description: &str) -> Value {
     json!({"type": "integer", "minimum": 1, "description": description})
@@ -298,6 +353,30 @@ fn position_arg(args: &Value, key: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn addon_warnings_are_hidden_unless_the_project_turns_exclude_addons_off() {
+        let dir = tempfile::tempdir().expect("project");
+        let root = dir.path();
+        let addon = root.join("addons/tool/main.gd");
+        let own = root.join("scripts/main.gd");
+        std::fs::write(root.join("project.godot"), "config_version=5\n").unwrap();
+        assert!(addon_warnings_hidden(root, &addon));
+        assert!(!addon_warnings_hidden(root, &own));
+        std::fs::write(
+            root.join("project.godot"),
+            "config_version=5\n\n[debug]\n\ngdscript/warnings/exclude_addons=false\n",
+        )
+        .unwrap();
+        assert!(!addon_warnings_hidden(root, &addon));
+        // The same key in another section is not the setting.
+        std::fs::write(
+            root.join("project.godot"),
+            "[editor]\ngdscript/warnings/exclude_addons=false\n",
+        )
+        .unwrap();
+        assert!(addon_warnings_hidden(root, &addon));
+    }
 
     #[test]
     fn a_position_beyond_32_bits_does_not_wrap_to_a_small_one() {

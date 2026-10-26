@@ -2,10 +2,12 @@ extends RefCounted
 ## Input injection for a running game.
 ##
 ## Events go through Input.parse_input_event and Input.flush_buffered_events, which is the
-## same path a real device uses (including the headless display server). Positions passed
-## to this server are pixels of the root viewport's visible rectangle, the space the game
-## reads in _input. parse_input_event treats a position as a window pixel and the engine
-## then applies the inverse content-scale transform, so each position is multiplied by
+## same path a real device uses (including the headless display server). By default positions
+## passed to this server are pixels of the root viewport's visible rectangle, the space the game
+## reads in _input (coordinate_space "viewport"). coordinate_space "window" takes window pixels
+## instead and maps them into that space once, when the steps are parsed, so everything after
+## the parse works in viewport space. parse_input_event treats a position as a window pixel and
+## the engine then applies the inverse content-scale transform, so each position is multiplied by
 ## the root viewport's final transform before it is parsed. Mouse events do
 ## not move the OS cursor unless the call passes warp_mouse. Presses are
 ## remembered so input.release_all can clear them. A tap is delivered at the start of a
@@ -20,6 +22,8 @@ const R := preload("rt_result.gd")
 
 ## The most frames one path or circle step may take; the same bound as a wait step.
 const MAX_PATH_FRAMES := 600
+## The spaces a caller may give pointer positions in. viewport is the default.
+const COORDINATE_SPACES: Array[String] = ["viewport", "window"]
 
 const MOUSE_BUTTONS := {
     "left": MOUSE_BUTTON_LEFT,
@@ -48,6 +52,7 @@ static var _touches: Dictionary = {}
 static var _actions: Dictionary = {}
 static var _mouse_pos := Vector2.ZERO
 static var _warp_mouse := false
+static var _space := "viewport"
 static var _saved_time_scale := -1.0
 static var _scheduled: Array = []
 
@@ -76,9 +81,17 @@ static func parse_steps(params: Dictionary) -> Dictionary:
         return R.err(R.BAD_PARAMS, "input.run: warp_mouse must be a boolean.")
     if params.has("emulate_mouse") and not params["emulate_mouse"] is bool:
         return R.err(R.BAD_PARAMS, "input.run: emulate_mouse must be a boolean.")
+    var space: Variant = params.get("coordinate_space", "viewport")
+    if not space is String or not COORDINATE_SPACES.has(space):
+        return R.err(R.BAD_PARAMS, "input.run: coordinate_space must be viewport or window.")
     _warp_mouse = bool(params.get("warp_mouse", false))
+    _space = str(space)
     if not raw is Array or (raw as Array).is_empty():
         return R.err(R.BAD_PARAMS, "input.run: 'steps' must be a non-empty array.")
+    # Window pixels are mapped into the viewport space once, here, with the transform of now.
+    var to_viewport := Transform2D.IDENTITY
+    if _space == "window":
+        to_viewport = _final_transform().affine_inverse()
     var steps: Array = []
     var index := 0
     for entry: Variant in raw:
@@ -87,7 +100,7 @@ static func parse_steps(params: Dictionary) -> Dictionary:
         var parsed := _parse(entry, index)
         if R.is_err(parsed):
             return parsed
-        steps.append(parsed["step"])
+        steps.append(_into_viewport(parsed["step"], to_viewport))
         index += 1
     return {
         "steps": steps,
@@ -164,7 +177,54 @@ static func warp_enabled() -> bool:
     return _warp_mouse
 
 
-static func release_all(rt: Node, _params: Dictionary) -> Dictionary:
+## The space this call's pointer positions were given in, and how it maps onto the other one.
+static func space_summary() -> Dictionary:
+    var tree := Engine.get_main_loop() as SceneTree
+    var xform := _final_transform()
+    var visible := Vector2.ZERO
+    var window := Vector2.ZERO
+    if tree != null and tree.root != null:
+        visible = tree.root.get_visible_rect().size
+        window = Vector2(tree.root.size)
+    return {
+        "coordinate_space": _space,
+        "space": {
+            "viewport_size": [visible.x, visible.y],
+            "window_size": [window.x, window.y],
+            "window_per_viewport_pixel": [xform.x.x, xform.y.y],
+            "window_offset": [xform.origin.x, xform.origin.y],
+            "note": "viewport is the root viewport's visible rectangle after content scale, the space _input sees; window is pixels of the game window. window = viewport * window_per_viewport_pixel + window_offset.",
+        },
+    }
+
+
+## A step's positions, given in this call's coordinate space, in viewport space.
+static func _into_viewport(step: Dictionary, to_viewport: Transform2D) -> Dictionary:
+    if to_viewport == Transform2D.IDENTITY:
+        return step
+    if step.has("x") and step.has("y"):
+        var at: Vector2 = to_viewport * Vector2(float(step["x"]), float(step["y"]))
+        step["x"] = at.x
+        step["y"] = at.y
+    if step.has("to_x") and step.has("to_y"):
+        var to: Vector2 = to_viewport * Vector2(float(step["to_x"]), float(step["to_y"]))
+        step["to_x"] = to.x
+        step["to_y"] = to.y
+    if step.has("points"):
+        var mapped: Array = []
+        for point: Vector2 in step["points"]:
+            mapped.append(to_viewport * point)
+        step["points"] = mapped
+    return step
+
+
+## Where a viewport position is reported in this call's coordinate space.
+static func _reported(point: Vector2) -> Array:
+    var at := _window_point(point) if _space == "window" else point
+    return [at.x, at.y]
+
+
+static func release_all(_rt: Node, _params: Dictionary) -> Dictionary:
     var released := _release_everything()
     Input.flush_buffered_events()
     return R.ok({"released": released, "held": _held_summary()})
@@ -187,7 +247,7 @@ static func wait_frames(rt: Node, params: Dictionary) -> Dictionary:
         return R.err(R.BAD_PARAMS, "input.wait: a signal needs a node path.")
     if not node_path.is_empty() or not sig.is_empty():
         var timeout := clampi(int(params.get("timeout", params.get("frames", 180))), 1, 600)
-        var state := {
+        var until_state := {
             "until": _until_state(node_path, sig, timeout),
             "note": note,
             "results": [],
@@ -195,7 +255,7 @@ static func wait_frames(rt: Node, params: Dictionary) -> Dictionary:
             "mode": "until",
             "tool_wait": true,
         }
-        return {"_pending": true, "_tick": func() -> bool: return _tick_until(rt, state)}
+        return {"_pending": true, "_tick": func() -> bool: return _tick_until(rt, until_state)}
     var frames := clampi(int(params.get("frames", 1)), 0, 600)
     var state := {"left": frames, "start": Engine.get_process_frames(), "note": note}
     return {"_pending": true, "_tick": func() -> bool:
@@ -247,7 +307,9 @@ static func _tick_steps(rt: Node, state: Dictionary) -> bool:
         return _tick_text(rt, state)
     if index >= steps.size():
         _restore_emulation(state)
-        rt.finish_job(R.ok({"steps": state["results"], "held": _held_summary(), "warp_mouse": _warp_mouse}))
+        var body := {"steps": state["results"], "held": _held_summary(), "warp_mouse": _warp_mouse}
+        body.merge(space_summary())
+        rt.finish_job(R.ok(body))
         return false
     var step: Dictionary = steps[index]
     var kind := str(step["type"])
@@ -331,7 +393,7 @@ static func _tick_steps(rt: Node, state: Dictionary) -> bool:
     return true
 
 
-static func _tick_text(rt: Node, state: Dictionary) -> bool:
+static func _tick_text(_rt: Node, state: Dictionary) -> bool:
     var chars: Array = state["chars"]
     var char_i := int(state["char_i"])
     if bool(state["char_down"]):
@@ -956,6 +1018,8 @@ static func _viewport_point(node: Node) -> Variant:
 
 ## The step's result with a warning when a pointer lands outside the root viewport (RO-11).
 static func _done(step: Dictionary, result: Dictionary) -> Dictionary:
+    if str(step.get("label", "")) == "click_node":
+        result["at"] = _reported(Vector2(float(step["x"]), float(step["y"])))
     var note := _pointer_note(step)
     if not note.is_empty():
         result["warning"] = note
@@ -1029,7 +1093,8 @@ static func _tick_path(state: Dictionary) -> bool:
         return true
     if i < total:
         var along := i
-        var segment := mini(int((along - 1) / per), segments - 1)
+        @warning_ignore("integer_division")
+        var segment := mini((along - 1) / per, segments - 1)
         var within := (along - 1) - segment * per
         var from: Vector2 = points[segment]
         var to: Vector2 = points[segment + 1]
@@ -1290,7 +1355,7 @@ static func _key(rt: Node, code: int, phase: String) -> void:
 
 static func _key_event(code: int, pressed: bool) -> void:
     var event := InputEventKey.new()
-    event.keycode = code & KEY_CODE_MASK
+    event.keycode = (code & KEY_CODE_MASK) as Key
     event.physical_keycode = event.keycode
     event.pressed = pressed
     event.echo = false
@@ -1300,7 +1365,7 @@ static func _key_event(code: int, pressed: bool) -> void:
 static func _unicode(code: int, pressed: bool) -> void:
     var event := InputEventKey.new()
     event.unicode = code
-    event.keycode = code
+    event.keycode = code as Key
     event.pressed = pressed
     Input.parse_input_event(event)
 
@@ -1322,10 +1387,15 @@ static func _mouse_motion(x: float, y: float) -> void:
 ## A caller position is in the root viewport's visible rectangle. parse_input_event expects a
 ## window pixel; the engine then applies the inverse of this transform, so the game sees `point`.
 static func _window_point(point: Vector2) -> Vector2:
+    return _final_transform() * point
+
+
+## The root viewport's transform from its visible rectangle to window pixels.
+static func _final_transform() -> Transform2D:
     var tree := Engine.get_main_loop() as SceneTree
     if tree == null or tree.root == null:
-        return point
-    return tree.root.get_final_transform() * point
+        return Transform2D.IDENTITY
+    return tree.root.get_final_transform()
 
 
 static func _mouse_button(rt: Node, button: String, phase: String, x: float, y: float) -> void:
@@ -1348,7 +1418,7 @@ static func _mouse_button(rt: Node, button: String, phase: String, x: float, y: 
 
 static func _mouse_event(index: int, pressed: bool, x: float, y: float) -> void:
     var event := InputEventMouseButton.new()
-    event.button_index = index
+    event.button_index = index as MouseButton
     event.pressed = pressed
     var at := _window_point(Vector2(x, y))
     event.position = at
@@ -1443,7 +1513,7 @@ static func _joy_button(rt: Node, button: String, phase: String, device: int) ->
 static func _joy_button_event(device: int, button: int, pressed: bool) -> void:
     var event := InputEventJoypadButton.new()
     event.device = device
-    event.button_index = button
+    event.button_index = button as JoyButton
     event.pressed = pressed
     Input.parse_input_event(event)
 
@@ -1451,7 +1521,7 @@ static func _joy_button_event(device: int, button: int, pressed: bool) -> void:
 static func _joy_axis(axis: String, value: float, device: int) -> void:
     var event := InputEventJoypadMotion.new()
     event.device = device
-    event.axis = int(JOY_AXES[axis])
+    event.axis = int(JOY_AXES[axis]) as JoyAxis
     event.axis_value = value
     Input.parse_input_event(event)
     var key := "%d:%s" % [device, axis]

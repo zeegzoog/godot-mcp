@@ -28,7 +28,7 @@ The call leaves the game held. Nothing in the game advances until `godot_game_ph
 
 The default is the same as `godot_game_input`. Pointers use the same phases and default, plus `move`.
 
-`pointers` is mouse or touch. `x` and `y` are pixels of the root viewport's visible rectangle, the same space `_input` sees. Several touches are separate `index` values and may be down together. `phase` `move` drags a touch that is already down (or moves the mouse). A touch also emits the engine's emulated mouse event when that project setting is on.
+`pointers` is mouse or touch. `x` and `y` are in the call's `coordinate_space`: `viewport` (default) is pixels of the root viewport's visible rectangle, the same space `_input` sees; `window` is pixels of the game window. In a 1920 x 1080 project shown in a 1280 x 720 window, window (640, 360) is viewport (960, 540). The answer repeats `coordinate_space`. Several touches are separate `index` values and may be down together. `phase` `move` drags a touch that is already down (or moves the mouse). A touch also emits the engine's emulated mouse event when that project setting is on.
 
 `pause` sets `SceneTree.paused` before the ticks. Pausable nodes skip `_physics_process`. The runtime still answers: its node ignores pause, and a hold serves requests from the physics tick, which the tree still emits while paused. The game's own pause does not release the hold.
 

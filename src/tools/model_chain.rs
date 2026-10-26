@@ -1087,7 +1087,7 @@ exec sleep 3
         .await
         .unwrap_err();
         assert!(matches!(failed, FroxelError::Failed(_)), "{failed}");
-        assert!(failed.to_string().starts_with("Froxel exited"), "{failed}");
+        assert!(failed.to_string().starts_with("Froxel closed"), "{failed}");
         assert!(!export_hints(&failed)[0].contains("FROXEL_BIN"), "{failed}");
     }
 }

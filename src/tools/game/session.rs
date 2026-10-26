@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use std::time::Duration;
 
 impl ToolManager {
-    pub(super) async fn runtime_call(
+    pub(crate) async fn runtime_call(
         &self,
         run_id: Option<&str>,
         method: &str,

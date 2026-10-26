@@ -22,6 +22,7 @@ mod game;
 mod headless;
 mod project;
 mod run;
+mod scenario;
 mod scripts;
 
 use project::EditorChoice;

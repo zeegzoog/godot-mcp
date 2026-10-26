@@ -709,15 +709,32 @@ mod tests {
         assert!(guard.is_none(), "successful cleanup must disarm the retry");
     }
 
-    #[tokio::test]
+    // Windows shares one ~15ms timer tick, so two 20ms sleeps can finish inside a
+    // 30ms deadline. Paused time checks the shared deadline without that race.
+    #[tokio::test(start_paused = true)]
     async fn the_deadline_covers_all_awaits_instead_of_restarting_per_operation() {
         let deadline = Instant::now() + Duration::from_millis(30);
-        let result = within_deadline(deadline, async {
+        let operation = within_deadline(deadline, async {
             tokio::time::sleep(Duration::from_millis(20)).await;
             tokio::time::sleep(Duration::from_millis(20)).await;
             Ok(())
-        })
-        .await;
-        assert!(result.is_err(), "each await got a fresh budget");
+        });
+        tokio::pin!(operation);
+
+        let waker = std::task::Waker::noop();
+        let mut context = std::task::Context::from_waker(waker);
+        assert!(
+            operation.as_mut().poll(&mut context).is_pending(),
+            "finished before the deadline"
+        );
+
+        tokio::time::advance(Duration::from_millis(30)).await;
+
+        match operation.as_mut().poll(&mut context) {
+            std::task::Poll::Ready(result) => {
+                assert!(result.is_err(), "each await got a fresh budget");
+            }
+            std::task::Poll::Pending => panic!("the shared deadline did not fire"),
+        }
     }
 }

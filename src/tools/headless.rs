@@ -191,7 +191,10 @@ impl ToolManager {
                 .await
             {
                 Ok(Some(value)) => {
-                    let report = code::report_diagnostics(script_path, &value);
+                    let mut report = code::report_diagnostics(script_path, &value);
+                    if code::addon_warnings_hidden(dir, &file) {
+                        report.text = format!("{}\n{}", report.text, code::ADDON_WARNINGS_HIDDEN);
+                    }
                     return if report.failed {
                         ToolResult::error(
                             report.text,

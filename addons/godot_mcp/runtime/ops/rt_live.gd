@@ -165,12 +165,12 @@ static func get_node(rt: Node, params: Dictionary) -> Dictionary:
     if bool(params.get("signals", false)):
         result["signals"] = _signal_list(node)
     if bool(params.get("methods", false)):
-        var methods: Array = []
+        var method_names: Array = []
         for info: Dictionary in node.get_method_list():
             var name := str(info.get("name", ""))
             if not name.begins_with("_") and not name in DENY:
-                methods.append(name)
-        result["methods"] = methods
+                method_names.append(name)
+        result["methods"] = method_names
     return R.ok(result)
 
 
@@ -322,7 +322,7 @@ static func call_method(rt: Node, params: Dictionary) -> Dictionary:
     var args: Array = []
     var index := 0
     for item: Variant in raw:
-        var expected := TYPE_NIL
+        var expected: int = TYPE_NIL
         if index < arg_types.size():
             expected = int(arg_types[index])
         var coerced: Variant = _coerce(item, expected)
@@ -512,6 +512,7 @@ static func physics(rt: Node, params: Dictionary) -> Dictionary:
     _arm_physics(rt)
     # Ticks come at the game's own rate, at most one per frame, so the wait is measured in time:
     # generously more than the ticks need, and less than the server waits for an answer.
+    @warning_ignore("integer_division")
     var wait_ms := mini(15000, 2000 + int(ticks) * 4000 / maxi(Engine.physics_ticks_per_second, 1))
     var state := {
         "ticks": int(ticks),
@@ -619,7 +620,7 @@ static func _signal_list(node: Node) -> Array:
         for connection: Dictionary in node.get_signal_connection_list(name):
             var callable: Callable = connection.get("callable", Callable())
             connections.append({
-                "method": callable.get_method() if callable.is_valid() else "",
+                "method": str(callable.get_method()) if callable.is_valid() else "",
                 "flags": connection.get("flags", 0),
             })
         out.append({"name": name, "connections": connections})
@@ -643,7 +644,9 @@ static func _type_compatible(value: Variant, expected: int) -> bool:
 
 static func _coerce(value: Variant, expected: int) -> Variant:
     if (expected == TYPE_INT or expected == TYPE_FLOAT) and (value is float or value is int):
-        return int(value) if expected == TYPE_INT else float(value)
+        if expected == TYPE_INT:
+            return int(value)
+        return float(value)
     if value is Array:
         var items: Array = value
         if expected == TYPE_VECTOR2 and items.size() >= 2:

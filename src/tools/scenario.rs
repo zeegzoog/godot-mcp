@@ -82,7 +82,7 @@ impl Drop for ReleaseInput {
 pub fn definition() -> Tool {
     tool(
         "godot_game_scenario",
-        "Plays one input scenario in a running game and returns that run's steps, snapshots, warnings and errors. Each step applies Input Map actions and pointer events, then advances `frames` physics ticks (0 to 600; the whole scenario at most 3600). phase is tap by default, as in godot_game_input: tap stays down for the step's frames and is released before the next step, so a step with a tap needs frames of at least 1. press stays down after the step until a later release, and release lets go at the start of the step. strength is the analog value, 0 to 1. pointers are mouse or touch; several touches may be down together, and touch phase move drags an index that is already down. pause sets SceneTree.paused for the following ticks; the runtime still answers, because a hold is not the tree's pause and pausable nodes simply skip their physics callback. bodies reads CharacterBody2D and CharacterBody3D (position, velocity, is_on_floor, is_on_wall, is_on_ceiling, up to 8 slide collisions). nodes reads public properties with game.get. A missing node or an unsupported body is an error that names the path. The game is held for the whole call (started with godot_run_project held true when the ticks must be exact) and left held, so nothing moves after the last snapshot; resume with godot_game_physics action resume. deterministic is true only for a game started held at a fixed frame rate equal to its tick rate. A press is flushed before the ticks, so _input sees it immediately and _process sees it on the following frame. Threads, loading and the physics solver are not made deterministic. screenshot true adds one capture of the last drawn frame (a headless game records a warning and no image). Every synthetic button, action and touch is released when the call finishes, when a step fails, and if the call is cancelled. output.lines and output.errors are only the warnings and errors recorded during this call. The call has a total 60-second budget, including 3 seconds reserved for input cleanup. It targets one managed process selected at the start; starting another process does not redirect it. A timed-out physics step may finish before the game holds again.",
+        "Plays one input scenario in a running game and returns that run's steps, snapshots, warnings and errors. Each step applies Input Map actions and pointer events, then advances `frames` physics ticks (0 to 600; the whole scenario at most 3600). phase is tap by default, as in godot_game_input: tap stays down for the step's frames and is released before the next step, so a step with a tap needs frames of at least 1. press stays down after the step until a later release, and release lets go at the start of the step. strength is the analog value, 0 to 1. pointers are mouse or touch at x, y in coordinate_space (viewport by default: the root viewport's visible rectangle after content scale; window: game window pixels), and the answer names that space; several touches may be down together, and touch phase move drags an index that is already down. pause sets SceneTree.paused for the following ticks; the runtime still answers, because a hold is not the tree's pause and pausable nodes simply skip their physics callback. bodies reads CharacterBody2D and CharacterBody3D (position, velocity, is_on_floor, is_on_wall, is_on_ceiling, up to 8 slide collisions). nodes reads public properties with game.get. A missing node or an unsupported body is an error that names the path. The game is held for the whole call (started with godot_run_project held true when the ticks must be exact) and left held, so nothing moves after the last snapshot; resume with godot_game_physics action resume. deterministic is true only for a game started held at a fixed frame rate equal to its tick rate. A press is flushed before the ticks, so _input sees it immediately and _process sees it on the following frame. Threads, loading and the physics solver are not made deterministic. screenshot true adds one capture of the last drawn frame (a headless game records a warning and no image). Every synthetic button, action and touch is released when the call finishes, when a step fails, and if the call is cancelled. output.lines and output.errors are only the warnings and errors recorded during this call. The call has a total 60-second budget, including 3 seconds reserved for input cleanup. It targets one managed process selected at the start; starting another process does not redirect it. A timed-out physics step may finish before the game holds again.",
         json!({
             "run_id": {"type": "string", "description": "Optional managed run id. Default: newest process run, pinned for the entire scenario."},
             "steps": {
@@ -141,7 +141,8 @@ pub fn definition() -> Tool {
                     "required": ["path", "properties"]
                 }
             },
-            "screenshot": {"type": "boolean", "description": "Capture one frame at the end. Default false."}
+            "screenshot": {"type": "boolean", "description": "Capture one frame at the end. Default false."},
+            "coordinate_space": {"type": "string", "enum": ["viewport", "window"], "description": "The space of pointer x and y. viewport (default): pixels of the root viewport's visible rectangle after content scale, the space _input sees and Control global positions use. window: pixels of the game window, mapped into viewport space when the step is applied."}
         }),
         &["steps"],
     )
@@ -156,6 +157,7 @@ struct Step {
 
 struct Spec {
     steps: Vec<Step>,
+    coordinate_space: &'static str,
     bodies: Vec<String>,
     nodes: Vec<Value>,
     screenshot: bool,
@@ -217,6 +219,7 @@ pub async fn call(tools: &ToolManager, args: &Value) -> ToolResult {
         "deterministic_reason": "not_stepped",
         "paused": false,
         "ticks_run": 0,
+        "coordinate_space": spec.coordinate_space,
         "steps": [],
         "warnings": [],
         "errors": [],
@@ -263,7 +266,16 @@ pub async fn call(tools: &ToolManager, args: &Value) -> ToolResult {
                 }
             }
             let mut applied = Vec::new();
-            if let Err(error) = apply_input(tools, run_id, step, false, &mut applied).await {
+            if let Err(error) = apply_input(
+                tools,
+                run_id,
+                step,
+                spec.coordinate_space,
+                false,
+                &mut applied,
+            )
+            .await
+            {
                 push_error(&mut report, &error.to_string());
                 break;
             }
@@ -302,7 +314,16 @@ pub async fn call(tools: &ToolManager, args: &Value) -> ToolResult {
                     }
                 }
             }
-            if let Err(error) = apply_input(tools, run_id, step, true, &mut applied).await {
+            if let Err(error) = apply_input(
+                tools,
+                run_id,
+                step,
+                spec.coordinate_space,
+                true,
+                &mut applied,
+            )
+            .await
+            {
                 push_error(&mut report, &error.to_string());
                 break;
             }
@@ -428,6 +449,7 @@ async fn apply_input(
     tools: &ToolManager,
     run_id: Option<&str>,
     step: &Step,
+    coordinate_space: &str,
     taps_only: bool,
     applied: &mut Vec<Value>,
 ) -> Result<(), McpError> {
@@ -484,7 +506,11 @@ async fn apply_input(
         return Ok(());
     }
     let result = tools
-        .runtime_call(run_id, "input.run", json!({"steps": input}))
+        .runtime_call(
+            run_id,
+            "input.run",
+            json!({"steps": input, "coordinate_space": coordinate_space}),
+        )
         .await?;
     applied.push(result);
     Ok(())
@@ -667,8 +693,15 @@ fn parse(args: &Value) -> Result<Spec, String> {
         Some(Value::Bool(value)) => *value,
         Some(_) => return Err("screenshot must be a boolean.".into()),
     };
+    let coordinate_space = match args.get("coordinate_space") {
+        None => "viewport",
+        Some(Value::String(space)) if space == "viewport" => "viewport",
+        Some(Value::String(space)) if space == "window" => "window",
+        Some(_) => return Err("coordinate_space must be viewport or window.".into()),
+    };
     Ok(Spec {
         steps,
+        coordinate_space,
         bodies,
         nodes,
         screenshot,
@@ -872,6 +905,35 @@ mod tests {
             step(json!({"pointers": [{"pointer": "touch", "x": 1, "y": 1, "index": 10}]}));
         assert!(refused(bad_index).contains("index"));
         assert!(refused(step(json!({"pause": "yes"}))).contains("pause"));
+    }
+
+    #[test]
+    fn coordinate_space_defaults_to_viewport_and_accepts_window() {
+        let spec = |extra: Value| {
+            let mut args = json!({"steps": [{"frames": 1}]});
+            for (key, value) in extra.as_object().into_iter().flatten() {
+                args[key] = value.clone();
+            }
+            parse(&args)
+        };
+        assert_eq!(
+            spec(json!({})).map(|spec| spec.coordinate_space).ok(),
+            Some("viewport")
+        );
+        assert_eq!(
+            spec(json!({"coordinate_space": "window"}))
+                .map(|spec| spec.coordinate_space)
+                .ok(),
+            Some("window")
+        );
+        assert!(
+            refused(json!({"steps": [{"frames": 1}], "coordinate_space": "screen"}))
+                .contains("coordinate_space")
+        );
+        assert!(
+            refused(json!({"steps": [{"frames": 1}], "coordinate_space": 1}))
+                .contains("coordinate_space")
+        );
     }
 
     #[test]

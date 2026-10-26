@@ -397,6 +397,8 @@ static func set_pause(rt: Node, params: Dictionary) -> Dictionary:
     if not params.has("paused") or not params["paused"] is bool:
         return R.err(R.BAD_PARAMS, "game.pause: paused must be a boolean.")
     rt.get_tree().paused = bool(params["paused"])
+    # A resume gives back the pause this call set, but not a pause the game made itself.
+    _paused_by_step = rt.get_tree().paused
     return R.ok({"paused": rt.get_tree().paused, "scene": rt.scene_context()})
 
 
@@ -478,6 +480,9 @@ static func physics(rt: Node, params: Dictionary) -> Dictionary:
     if Hold.is_armed():
         if action == "resume":
             Hold.release(rt)
+            if _paused_by_step:
+                rt.get_tree().paused = false
+                _paused_by_step = false
             var released := _physics_status(rt)
             released["action"] = "resume"
             return R.ok(released)

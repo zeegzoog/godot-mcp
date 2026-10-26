@@ -8,7 +8,7 @@ use crate::godot::Run;
 use crate::protocol::{Tool, ToolContent, ToolResult};
 use serde_json::{Value, json};
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -17,9 +17,45 @@ const MAX_FRAMES: i64 = 600;
 const MAX_TOTAL_FRAMES: i64 = 3600;
 const SCENARIO_WAIT: Duration = Duration::from_secs(60);
 const CLEANUP_WAIT: Duration = Duration::from_secs(3);
+/// Per step and per call, so one call cannot ask for an unbounded number of round trips.
+const MAX_INPUTS: usize = 32;
+const MAX_READS: usize = 16;
+const MAX_PROPERTIES: usize = 32;
+const MAX_NAME_CHARS: usize = 256;
+/// Touch indexes a game can tell apart in practice.
+const MAX_TOUCH_INDEX: i64 = 9;
+
+/// The runs a scenario is playing in. Two scenarios in one run would release each other's input
+/// and fight over the physics step.
+static ACTIVE: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+struct RunLock(String);
+
+impl RunLock {
+    fn take(run_id: &str) -> Option<Self> {
+        let mut active = ACTIVE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if active.iter().any(|id| id == run_id) {
+            return None;
+        }
+        active.push(run_id.to_string());
+        Some(Self(run_id.to_string()))
+    }
+}
+
+impl Drop for RunLock {
+    fn drop(&mut self) {
+        let mut active = ACTIVE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        active.retain(|id| *id != self.0);
+    }
+}
 
 struct ReleaseInput {
     run: Option<Arc<Run>>,
+    lock: Option<RunLock>,
 }
 
 impl Drop for ReleaseInput {
@@ -27,10 +63,18 @@ impl Drop for ReleaseInput {
         let Some(run) = self.run.take() else {
             return;
         };
-        tokio::spawn(async move {
+        // The retry keeps the run locked until it is done, so it cannot wipe the input of the
+        // next scenario. Outside a runtime there is nothing to retry on; the game releases its
+        // input when it exits.
+        let lock = self.lock.take();
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        runtime.spawn(async move {
             let _ = run
                 .runtime("input.release_all", json!({}), CLEANUP_WAIT)
                 .await;
+            drop(lock);
         });
     }
 }
@@ -145,9 +189,19 @@ pub async fn call(tools: &ToolManager, args: &Value) -> ToolResult {
         }
     };
     let run_id = Some(run.id());
+    let Some(lock) = RunLock::take(run.id()) else {
+        return ToolResult::error(
+            "A scenario is already playing in this run.",
+            &[
+                "Wait for the other godot_game_scenario call to finish, then retry",
+                "Or start another process with godot_run_project and pass its run_id",
+            ],
+        );
+    };
     let cursor = run.log_cursor();
     let mut guard = ReleaseInput {
         run: Some(Arc::clone(&run)),
+        lock: Some(lock),
     };
     let deadline = Instant::now() + SCENARIO_WAIT;
     // Reserve cleanup time inside the total budget, rather than adding it afterwards.
@@ -326,6 +380,13 @@ pub async fn call(tools: &ToolManager, args: &Value) -> ToolResult {
         }
     }
     report["output"] = run.logs_from(cursor);
+    if report["ok"] != true {
+        report["recovery"] = json!([
+            "godot_game_physics with action status shows whether the game is held and where it stopped",
+            "godot_run_output shows the game's warnings and errors",
+            "Lower frames or split the scenario into shorter calls; godot_game_input_release lets go of any input still down",
+        ]);
+    }
     let text = serde_json::to_string_pretty(&report).unwrap_or_else(|_| report.to_string());
     let failed = report["ok"] != true;
     let mut content = vec![ToolContent::Text { text }];
@@ -516,6 +577,11 @@ fn parse(args: &Value) -> Result<Spec, String> {
             None => Vec::new(),
             Some(value) => parse_pointers(index, value)?,
         };
+        if actions.len() + pointers.len() > MAX_INPUTS {
+            return Err(format!(
+                "steps[{index}] has more than {MAX_INPUTS} actions and pointers."
+            ));
+        }
         // A tap is let go after the step's ticks; with none, no tick would see it down.
         if frames == 0
             && actions
@@ -540,6 +606,9 @@ fn parse(args: &Value) -> Result<Spec, String> {
         });
     }
     let bodies = string_array(args.get("bodies"), "bodies")?;
+    if bodies.len() > MAX_READS {
+        return Err(format!("bodies may name at most {MAX_READS} nodes."));
+    }
     let nodes = match args.get("nodes") {
         None => Vec::new(),
         Some(Value::Array(items)) => {
@@ -549,8 +618,12 @@ fn parse(args: &Value) -> Result<Spec, String> {
                     .get("path")
                     .and_then(Value::as_str)
                     .map(str::trim)
-                    .filter(|path| !path.is_empty())
-                    .ok_or_else(|| format!("nodes[{index}].path must be a node path."))?;
+                    .filter(|path| !path.is_empty() && path.chars().count() <= MAX_NAME_CHARS)
+                    .ok_or_else(|| {
+                        format!(
+                            "nodes[{index}].path must be a node path of at most {MAX_NAME_CHARS} characters."
+                        )
+                    })?;
                 let properties = item
                     .get("properties")
                     .and_then(Value::as_array)
@@ -562,12 +635,30 @@ fn parse(args: &Value) -> Result<Spec, String> {
                         "nodes[{index}].properties must be a non-empty array of strings."
                     ));
                 }
+                if properties.len() > MAX_PROPERTIES {
+                    return Err(format!(
+                        "nodes[{index}].properties may name at most {MAX_PROPERTIES} properties."
+                    ));
+                }
+                if let Some(name) = properties
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .find(|name| !is_public_property(name))
+                {
+                    return Err(format!(
+                        "nodes[{index}].properties: '{}' is not a public property name.",
+                        name.chars().take(64).collect::<String>()
+                    ));
+                }
                 nodes.push(json!({"path": path, "properties": properties}));
             }
             nodes
         }
         Some(_) => return Err("nodes must be an array.".into()),
     };
+    if nodes.len() > MAX_READS {
+        return Err(format!("nodes may name at most {MAX_READS} nodes."));
+    }
     let screenshot = match args.get("screenshot") {
         None => false,
         Some(Value::Bool(value)) => *value,
@@ -638,11 +729,6 @@ fn parse_pointers(index: usize, value: &Value) -> Result<Vec<Value>, String> {
                 "steps[{index}].pointers[{pointer_index}].phase must be press, release, move, or tap."
             ));
         }
-        if phase == "move" && kind != "touch" && kind != "mouse" {
-            return Err(format!(
-                "steps[{index}].pointers[{pointer_index}] cannot move."
-            ));
-        }
         let x = item.get("x").and_then(Value::as_f64).ok_or_else(|| {
             format!("steps[{index}].pointers[{pointer_index}] needs a numeric x and y.")
         })?;
@@ -651,17 +737,35 @@ fn parse_pointers(index: usize, value: &Value) -> Result<Vec<Value>, String> {
         })?;
         let mut event = json!({"pointer": kind, "phase": phase, "x": x, "y": y});
         if let Some(touch_index) = item.get("index") {
-            let touch_index = whole(Some(touch_index)).ok_or_else(|| {
-                format!("steps[{index}].pointers[{pointer_index}].index must be an integer.")
-            })?;
+            let touch_index = whole(Some(touch_index))
+                .filter(|touch| (0..=MAX_TOUCH_INDEX).contains(touch))
+                .ok_or_else(|| {
+                    format!(
+                        "steps[{index}].pointers[{pointer_index}].index must be an integer from 0 to {MAX_TOUCH_INDEX}."
+                    )
+                })?;
             event["index"] = json!(touch_index);
         }
         if let Some(button) = item.get("button").and_then(Value::as_str) {
+            if button.chars().count() > MAX_NAME_CHARS {
+                return Err(format!(
+                    "steps[{index}].pointers[{pointer_index}].button is too long."
+                ));
+            }
             event["button"] = json!(button);
         }
         pointers.push(event);
     }
     Ok(pointers)
+}
+
+/// A property name the snapshot may read: no segment of a `/` or `:` path starts with `_`.
+fn is_public_property(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().count() <= MAX_NAME_CHARS
+        && name
+            .split(['/', ':'])
+            .all(|segment| !segment.starts_with('_'))
 }
 
 fn string_array(value: Option<&Value>, name: &str) -> Result<Vec<String>, String> {
@@ -672,7 +776,7 @@ fn string_array(value: Option<&Value>, name: &str) -> Result<Vec<String>, String
             .map(|item| {
                 item.as_str()
                     .map(str::trim)
-                    .filter(|item| !item.is_empty())
+                    .filter(|item| !item.is_empty() && item.chars().count() <= MAX_NAME_CHARS)
                     .map(str::to_string)
                     .ok_or_else(|| format!("{name} must be an array of node paths."))
             })
@@ -694,6 +798,86 @@ fn whole(value: Option<&Value>) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn refused(args: Value) -> String {
+        match parse(&args) {
+            Ok(_) => panic!("accepted: {args}"),
+            Err(message) => message,
+        }
+    }
+
+    #[test]
+    fn limits_are_refused_before_a_game_is_touched() {
+        let many = |count: usize| vec![json!({"action": "jump", "phase": "press"}); count];
+        let too_many_steps = json!({"steps": vec![json!({"frames": 1}); MAX_STEPS + 1]});
+        assert!(refused(too_many_steps).contains("steps"));
+        let too_long = json!({"steps": vec![json!({"frames": 600}); 7]});
+        assert!(refused(too_long).contains("3600"));
+        let too_many_inputs = json!({"steps": [{"frames": 1, "actions": many(MAX_INPUTS + 1)}]});
+        assert!(refused(too_many_inputs).contains("more than"));
+        let nodes = vec![json!({"path": "Player", "properties": ["hp"]}); MAX_READS + 1];
+        assert!(refused(json!({"steps": [{"frames": 1}], "nodes": nodes})).contains("nodes"));
+        let bodies = vec![json!("Player"); MAX_READS + 1];
+        assert!(refused(json!({"steps": [{"frames": 1}], "bodies": bodies})).contains("bodies"));
+        let properties = vec![json!("hp"); MAX_PROPERTIES + 1];
+        let many_properties = json!({"steps": [{"frames": 1}],
+            "nodes": [{"path": "Player", "properties": properties}]});
+        assert!(refused(many_properties).contains("properties"));
+        let long = "x".repeat(MAX_NAME_CHARS + 1);
+        let long_path = json!({"steps": [{"frames": 1}],
+            "nodes": [{"path": long, "properties": ["hp"]}]});
+        assert!(refused(long_path).contains("path"));
+    }
+
+    #[test]
+    fn input_arguments_are_validated() {
+        let step = |extra: Value| {
+            let mut step = json!({"frames": 1});
+            for (key, value) in extra.as_object().into_iter().flatten() {
+                step[key] = value.clone();
+            }
+            json!({"steps": [step]})
+        };
+        let bad_phase = step(json!({"actions": [{"action": "jump", "phase": "hold"}]}));
+        assert!(refused(bad_phase).contains("phase"));
+        assert!(refused(step(json!({"actions": [{"action": ""}]}))).contains("action"));
+        let bad_pointer = step(json!({"pointers": [{"pointer": "pen", "x": 1, "y": 1}]}));
+        assert!(refused(bad_pointer).contains("mouse or touch"));
+        let no_y = step(json!({"pointers": [{"pointer": "touch", "x": 1}]}));
+        assert!(refused(no_y).contains("numeric"));
+        let bad_index =
+            step(json!({"pointers": [{"pointer": "touch", "x": 1, "y": 1, "index": 10}]}));
+        assert!(refused(bad_index).contains("index"));
+        assert!(refused(step(json!({"pause": "yes"}))).contains("pause"));
+    }
+
+    #[test]
+    fn private_properties_are_refused_whatever_the_spelling() {
+        for name in ["_secret", "child/_secret", "material:_secret", "a/b:_c", ""] {
+            assert!(!is_public_property(name), "{name}");
+            let message = refused(json!({"steps": [{"frames": 1}],
+                "nodes": [{"path": "Player", "properties": [name]}]}));
+            assert!(message.contains("public property"), "{name}: {message}");
+        }
+        for name in ["jump_count", "position/x", "material:shader_parameter/a"] {
+            assert!(is_public_property(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_run_is_locked_for_one_scenario_at_a_time() {
+        let first = RunLock::take("lock-test-run").expect("free run");
+        assert!(
+            RunLock::take("lock-test-run").is_none(),
+            "second lock on one run"
+        );
+        assert!(RunLock::take("another-run").is_some());
+        drop(first);
+        assert!(
+            RunLock::take("lock-test-run").is_some(),
+            "lock not released"
+        );
+    }
 
     #[tokio::test]
     async fn cancellation_during_release_keeps_the_guard_armed() {

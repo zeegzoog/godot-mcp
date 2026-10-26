@@ -455,3 +455,81 @@ async fn zero_tick_scenarios_preserve_initial_runtime_status() {
         assert_eq!(body["ticks_run"], 0, "{body}");
     }
 }
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.8 executable"]
+async fn resuming_a_held_game_gives_back_the_pause_a_scenario_set() {
+    let project = probe_project();
+    let tools = manager(project.path());
+    let started = call(
+        &tools,
+        "godot_run_project",
+        json!({"project_path":project.path(),"mode":"process","held":true,"headless":true}),
+    )
+    .await;
+    assert!(!started.is_error, "{}", text_of(&started));
+    let run_id = run_id_of(&started);
+    let paused = call(
+        &tools,
+        "godot_game_scenario",
+        json!({"run_id":run_id,"steps":[{"frames":1,"pause":true}]}),
+    )
+    .await;
+    assert_eq!(json_of(&paused)["paused"], true, "{}", text_of(&paused));
+    let resumed = call(
+        &tools,
+        "godot_game_physics",
+        json!({"run_id":run_id,"action":"resume"}),
+    )
+    .await;
+    let status = call(
+        &tools,
+        "godot_game_physics",
+        json!({"run_id":run_id,"action":"status"}),
+    )
+    .await;
+    let _ = call(&tools, "godot_stop_project", json!({"run_id":run_id})).await;
+    assert!(!resumed.is_error, "{}", text_of(&resumed));
+    let body = json_of(&status);
+    assert_eq!(
+        body["paused"], false,
+        "the scenario's pause stayed on: {body}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.8 executable"]
+async fn a_second_scenario_in_one_run_is_refused_while_the_first_plays() {
+    let project = probe_project();
+    let tools = manager(project.path());
+    let started = call(
+        &tools,
+        "godot_run_project",
+        json!({"project_path":project.path(),"mode":"process","held":true,"headless":true}),
+    )
+    .await;
+    assert!(!started.is_error, "{}", text_of(&started));
+    let run_id = run_id_of(&started);
+    let long = json!({"run_id":run_id,"steps":vec![json!({"frames":600});5]});
+    let first = tokio::spawn({
+        let tools = Arc::clone(&tools);
+        async move { call(&tools, "godot_game_scenario", long).await }
+    });
+    let mut refused = None;
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let second = call(
+            &tools,
+            "godot_game_scenario",
+            json!({"run_id":run_id,"steps":[{"frames":1}]}),
+        )
+        .await;
+        if second.is_error && text_of(&second).contains("already playing") {
+            refused = Some(text_of(&second));
+            break;
+        }
+    }
+    let _ = first.await;
+    let _ = call(&tools, "godot_stop_project", json!({"run_id":run_id})).await;
+    assert!(refused.is_some(), "a second scenario was never refused");
+}

@@ -2663,7 +2663,9 @@ async fn a_voxel_model_check_is_refused_before_froxel_starts() {
         .expect("voxel model tool");
     assert!(described.description.contains("structure"));
     assert!(described.description.contains("import"));
+}
 
+#[tokio::test]
 async fn a_scenario_is_refused_before_a_game_exists() {
     let no_game = call("godot_game_scenario", json!({"steps": [{"frames": 1}]})).await;
     assert!(

@@ -265,19 +265,27 @@ Closing the game's window ends a hold. The server stopping the run does too. A s
 `godot_check_voxel_model` exports one `.vox`, or a batch of up to 16 models,
 through Froxel MCP and imports the resulting GLBs into the selected Godot project.
 Set `FROXEL_BIN` to a Froxel executable supporting `export_models` (or put it on
-PATH). Pass `vox` and `dest`, or `models: [{vox, dest}]`; source paths are absolute
-and destinations are project-local `res://` GLB paths. Optional `preview: true`
-path-traces a PNG beside each successfully exported model. This is a Froxel
-preview, not a Godot viewport capture.
+PATH). Both are trusted programs, like `GODOT_PATH`: the server starts `<bin> mcp`
+without the bridge token in its environment. Pass `vox` and `dest`, or
+`models: [{vox, dest}]`; source paths are absolute paths on this machine (a network
+share is refused, and the source is not confined to the project), and destinations are
+project-local `res://` GLB paths outside `.godot/`. Optional `preview: true`
+path-traces `<model>.preview.png` beside each successfully exported model, so a
+texture with the model's name is never overwritten. This is a Froxel preview, not a
+Godot viewport capture.
 
 All output paths are validated before writing. Output names must be unique,
 including previews, links and case-only aliases. Each Froxel process has a
 60-second deadline covering initialization, tool replies and process exit.
-The report preserves per-model export failures even when no model can be
-imported; a mixed batch imports and previews only successful exports. The import
+A Froxel reply that leaves a model out, or that reports a model as exported without
+leaving its `.glb`, makes the check fail (`missing_exports`). The report preserves
+per-model export failures even when no model can be imported; a mixed batch imports
+and previews only successful exports. The import
 goes through the connected editor when it has the project open, and is headless
 otherwise. The Godot check verifies import sidecars and reports a changed `.glb`
-whose cache is older than the file under `stale_imports`; it does not yet verify
+whose cache is older than the file under `stale_imports` (an export that left the
+bytes unchanged is not re-imported, so a cache that is older for another reason is
+not reported); it does not yet verify
 the instantiated model's meshes or animation behavior.
 
 ```json

@@ -77,7 +77,10 @@ async fn a_voxel_model_is_exported_imported_and_described() {
         project.path().join("art/model.glb.import").is_file(),
         "{body}"
     );
-    assert!(project.path().join("art/model.png").is_file(), "{body}");
+    assert!(
+        project.path().join("art/model.preview.png").is_file(),
+        "{body}"
+    );
 }
 
 #[tokio::test]

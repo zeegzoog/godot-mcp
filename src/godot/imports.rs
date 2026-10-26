@@ -72,13 +72,20 @@ fn stale_source(project: &Path, import_file: &Path) -> Option<String> {
         return None;
     }
     let res = res_path(project, &source)?;
-    let text = read_sidecar(import_file)?;
-    let cache = cache_path(project, &text);
-    let stale = match &cache {
-        Some(cache) => newer_than(&source, cache),
-        None => newer_than(&source, import_file),
+    (!import_current(project, &source)?).then_some(res)
+}
+
+/// Whether the cache of an imported `source` is at least as new as the source: `false` when the
+/// cache is older or missing, `None` when the source has no readable `.import` sidecar.
+pub fn import_current(project: &Path, source: &Path) -> Option<bool> {
+    let name = source.file_name()?.to_str()?;
+    let import_file = source.with_file_name(format!("{name}.import"));
+    let text = read_sidecar(&import_file)?;
+    let stale = match cache_path(project, &text) {
+        Some(cache) => newer_than(source, &cache),
+        None => newer_than(source, &import_file),
     };
-    stale.then_some(res)
+    Some(!stale)
 }
 
 /// Fingerprint of each `.import` sidecar: the `res://` source and a hash of the sidecar text.
@@ -315,6 +322,19 @@ mod tests {
     fn a_cache_newer_than_its_source_is_left_alone() {
         let project = project_with(false);
         assert!(stale_imports(project.path()).is_empty());
+    }
+
+    #[test]
+    fn import_current_reads_one_source() {
+        let stale = project_with(true);
+        let source = stale.path().join("shaders/flow.glsl");
+        assert_eq!(import_current(stale.path(), &source), Some(false));
+        let fresh = project_with(false);
+        let source = fresh.path().join("shaders/flow.glsl");
+        assert_eq!(import_current(fresh.path(), &source), Some(true));
+        let unimported = fresh.path().join("shaders/other.glsl");
+        fs::write(&unimported, "void main() {}\n").unwrap();
+        assert_eq!(import_current(fresh.path(), &unimported), None);
     }
 
     #[test]

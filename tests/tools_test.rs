@@ -2627,6 +2627,45 @@ async fn project_creation_validates_before_creating_directories() {
 }
 
 #[tokio::test]
+async fn a_voxel_model_check_is_refused_before_froxel_starts() {
+    let project = project_dir();
+    // A leading slash is absolute on Unix and relative on Windows.
+    let missing_vox = project.path().join("missing.vox");
+    let tools = manager_in(
+        project.path(),
+        PathBuf::from("godot-binary-that-does-not-exist"),
+    );
+    let missing = Arc::clone(&tools)
+        .call_tool(
+            "godot_check_voxel_model",
+            json!({
+                "project_path": project.path(),
+                "vox": missing_vox,
+                "dest": "res://art/model.glb"
+            }),
+        )
+        .await;
+    assert!(text(&missing).contains("not found"), "{}", text(&missing));
+    let bad_dest = Arc::clone(&tools)
+        .call_tool(
+            "godot_check_voxel_model",
+            json!({
+                "project_path": project.path(),
+                "vox": missing_vox,
+                "dest": "res://art/model.txt"
+            }),
+        )
+        .await;
+    assert!(text(&bad_dest).contains(".glb"), "{}", text(&bad_dest));
+    let described = ToolManager::list_tools()
+        .into_iter()
+        .find(|tool| tool.name == "godot_check_voxel_model")
+        .expect("voxel model tool");
+    assert!(described.description.contains("structure"));
+    assert!(described.description.contains("import"));
+}
+
+#[tokio::test]
 async fn a_scenario_is_refused_before_a_game_exists() {
     let no_game = call("godot_game_scenario", json!({"steps": [{"frames": 1}]})).await;
     assert!(

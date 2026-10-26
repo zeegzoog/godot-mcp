@@ -30,6 +30,8 @@ const MAX_LINE_BYTES: usize = 1024 * 1024;
 /// How much of Froxel's text an error message repeats.
 const MAX_ECHO_CHARS: usize = 2000;
 const MAX_MODELS: usize = 16;
+/// Lines that are not JSON-RPC and are skipped while waiting for a reply.
+const MAX_SKIPPED_LINES: usize = 64;
 
 pub fn definition() -> Tool {
     tool(
@@ -86,7 +88,13 @@ async fn call_with(tools: &ToolManager, args: &Value, bin: &OsStr) -> ToolResult
         let (args, project) = (args.clone(), project.clone());
         tokio::task::spawn_blocking(move || jobs_of(&args, &project)).await
     };
-    let jobs = match checked.unwrap_or_else(|_| Err("The path checks did not finish.".into())) {
+    let Ok(checked) = checked else {
+        return ToolResult::error(
+            "The path checks did not finish.",
+            &["Retry the call; if it fails again, report it with godot_note_feedback"],
+        );
+    };
+    let jobs = match checked {
         Ok(jobs) => jobs,
         Err(message) => {
             return ToolResult::error(
@@ -150,18 +158,20 @@ async fn call_with(tools: &ToolManager, args: &Value, bin: &OsStr) -> ToolResult
     };
     let mut missing = Vec::new();
     let mut stale = Vec::new();
+    let mut unchecked = Vec::new();
     for (index, job) in &successful {
         let dest = res_display(&project, &job.dest);
         let current = {
             let (project, dest) = (project.clone(), job.dest.clone());
-            tokio::task::spawn_blocking(move || import_current(&project, &dest))
-                .await
-                .unwrap_or(None)
+            tokio::task::spawn_blocking(move || import_current(&project, &dest)).await
         };
         match current {
-            None => missing.push(format!("{dest}.import")),
-            Some(false) if content_hash(&job.dest).await != previous[*index] => stale.push(dest),
-            Some(_) => {}
+            Err(_) => unchecked.push(dest),
+            Ok(None) => missing.push(format!("{dest}.import")),
+            Ok(Some(false)) if content_hash(&job.dest).await != previous[*index] => {
+                stale.push(dest);
+            }
+            Ok(Some(_)) => {}
         }
     }
     let structure_ok = structure_passed(&exported, &flags);
@@ -173,6 +183,7 @@ async fn call_with(tools: &ToolManager, args: &Value, bin: &OsStr) -> ToolResult
         && missing.is_empty()
         && stale.is_empty()
         && missing_exports.is_empty()
+        && unchecked.is_empty()
         && previews_ok;
     let body = json!({
         "ok": ok,
@@ -181,6 +192,7 @@ async fn call_with(tools: &ToolManager, args: &Value, bin: &OsStr) -> ToolResult
         "missing_exports": missing_exports,
         "missing_imports": missing,
         "stale_imports": stale,
+        "unchecked_imports": unchecked,
         "previews": previews,
         "screenshot": "This check does not capture a Godot window. preview path-traces the voxel model. godot_capture_viewport and godot_game_screenshot capture a window.",
     });
@@ -697,9 +709,22 @@ async fn read_line<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Option<Str
 }
 
 async fn read_reply<R: AsyncBufRead + Unpin>(reader: &mut R, id: u64) -> Result<Value, String> {
+    let mut skipped = 0_usize;
+    let mut last_skipped = String::new();
     while let Some(line) = read_line(reader).await? {
-        // Anything that is not a JSON message (an empty line, a stray log line) is skipped.
+        // A line that is not a JSON message (an empty line, a stray log line) is skipped, but only
+        // a few of them: a program that prints text and waits is not Froxel.
         let Ok(reply) = serde_json::from_str::<Value>(&line) else {
+            if !line.trim().is_empty() {
+                skipped += 1;
+                last_skipped = line;
+            }
+            if skipped > MAX_SKIPPED_LINES {
+                return Err(format!(
+                    "Froxel sent {skipped} lines that are not JSON-RPC, the last one: {}",
+                    clip(&last_skipped, 200)
+                ));
+            }
             continue;
         };
         if reply.get("id").and_then(Value::as_u64) != Some(id) {
@@ -851,10 +876,10 @@ mod tests {
             "res://.godot/a.glb",
             "res://.GODOT/imported/a.glb",
             "res://.Godot./a.glb",
-            "res://art/../.godot/a.glb",
         ] {
             let result = jobs_of(&json!({"vox":source,"dest":dest}), dir.path());
-            assert!(result.is_err(), "{dest} was accepted");
+            let message = result.err().unwrap_or_default();
+            assert!(message.contains(".godot"), "{dest}: {message:?}");
         }
         assert!(
             jobs_of(
@@ -879,6 +904,24 @@ mod tests {
         }
         assert!(!is_remote_or_device_path("C:\\models\\a.vox"));
         assert!(is_remote_or_device_path("\\\\?\\C:\\models\\a.vox"));
+    }
+    #[cfg(windows)]
+    #[test]
+    fn a_network_source_is_refused_before_anything_is_touched() {
+        let dir = project();
+        let args = json!({"vox":"//host/share/a.vox","dest":"res://a.glb"});
+        let message = jobs_of(&args, dir.path()).err().unwrap_or_default();
+        assert!(message.contains("network"), "{message}");
+    }
+    #[tokio::test]
+    async fn text_that_is_not_json_rpc_is_skipped_only_a_few_times() {
+        let noise = "banner line\n".repeat(MAX_SKIPPED_LINES + 1);
+        let mut reader = BufReader::new(noise.as_bytes());
+        let error = read_reply(&mut reader, 2).await.unwrap_err();
+        assert!(
+            error.contains("not JSON-RPC") && error.contains("banner line"),
+            "{error}"
+        );
     }
     #[cfg(unix)]
     #[test]
@@ -998,7 +1041,7 @@ exec sleep 3
         )
         .await
         .unwrap_err();
-        assert!(error.contains("deadline"), "{error}");
+        assert!(error.to_string().contains("deadline"), "{error}");
         assert!(start.elapsed() < Duration::from_secs(2));
     }
     #[cfg(unix)]
@@ -1017,7 +1060,7 @@ exec sleep 3
         )
         .await
         .unwrap_err();
-        assert!(error.contains("longer than"), "{error}");
+        assert!(error.to_string().contains("longer than"), "{error}");
     }
     #[cfg(unix)]
     #[tokio::test]

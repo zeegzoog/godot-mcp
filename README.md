@@ -286,8 +286,8 @@ goes through the connected editor when it has the project open, and is headless
 otherwise. The Godot check verifies import sidecars and reports a changed `.glb`
 whose cache is older than the file under `stale_imports` (an export that left the
 bytes unchanged is not re-imported, so a cache that is older for another reason is
-not reported); it does not yet verify
-the instantiated model's meshes or animation behavior.
+not reported); it does not yet verify the instantiated model's meshes or animation
+behavior.
 
 ```json
 {"vox": "/path/lily_pad.vox", "dest": "res://art/lily_pad.glb", "project_path": "/path/frog-world"}
@@ -298,6 +298,7 @@ The end-to-end test needs a Froxel build and the Godot build named in `.github/g
 ```bash
 FROXEL_BIN=/path/to/froxel GODOT_PATH=/path/to/godot \
   cargo test --test model_chain_e2e_test -- --ignored --test-threads=1
+```
 
 ## Playing a scenario
 

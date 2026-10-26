@@ -63,6 +63,7 @@ pub fn handles(name: &str) -> bool {
             | "godot_game_input_release"
             | "godot_game_wait"
             | "godot_game_physics"
+            | "godot_game_scenario"
             | "godot_game_screenshot"
             | "godot_game_record"
             | "godot_debug_breakpoints"
@@ -85,6 +86,7 @@ pub async fn call(tools: &ToolManager, name: &str, args: Value) -> ToolResult {
         "godot_game_input_release" => runtime(tools, &args, "input.release_all").await,
         "godot_game_wait" => runtime(tools, &args, "input.wait").await,
         "godot_game_physics" => runtime(tools, &args, "game.physics").await,
+        "godot_game_scenario" => crate::tools::scenario::call(tools, &args).await,
         "godot_game_screenshot" => screenshot(tools, &args).await,
         "godot_game_record" => record(tools, &args).await,
         "godot_debug_breakpoints" => breakpoints(tools, &args).await,

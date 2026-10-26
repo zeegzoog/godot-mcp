@@ -30,7 +30,7 @@ const TIMED_STEPS: Array[String] = ["wait", "text", "swipe", "path"]
 ## The runtime methods that answer at once and are therefore safe to serve while held.
 const SERVED: Array[String] = [
     "game.tree", "game.get", "game.set", "game.call", "game.signals", "game.snapshot",
-    "game.physics", "rt.output", "input.release_all",
+    "game.body", "game.pause", "game.physics", "rt.output", "input.release_all",
 ]
 
 static var _armed := false

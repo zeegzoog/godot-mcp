@@ -11,6 +11,12 @@ config_version=5
 config/name="Godot MCP (addon dev project)"
 config/features=PackedStringArray("4.8")
 
+[debug]
+
+; Godot leaves addons/ out of analyzer warnings by default. This project exists to develop the
+; addon, so its warnings are reported (tests/runtime_e2e_test.rs audits them).
+gdscript/warnings/exclude_addons=false
+
 [editor_plugins]
 
 enabled=PackedStringArray("res://addons/godot_mcp/plugin.cfg")

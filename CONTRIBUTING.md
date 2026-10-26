@@ -123,6 +123,12 @@ When the running-game tools, the debugger client, or the GDScript language-serve
 GODOT_PATH=/path/to/godot cargo test --test runtime_e2e_test -- --ignored --test-threads=1
 ```
 
+`--check-only` reports parse errors only, never analyzer warnings. When you changed an addon script, run the warning audit too (it is part of the runtime suite above): it asks the language server about every addon script, which the dev `project.godot` lets report warnings under `addons/`.
+
+```bash
+GODOT_PATH=/path/to/godot cargo test --test runtime_e2e_test addon_scripts_have_no_analyzer_warnings -- --ignored --test-threads=1
+```
+
 ## Commits and Pull Requests
 
 - Write commit messages as Conventional Commits with a scope: `fix(bridge): reject a token that is not a string`. Common types: `feat`, `fix`, `docs`, `test`, `refactor`, `ci`, `build`, `chore`.

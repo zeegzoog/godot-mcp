@@ -4002,3 +4002,278 @@ fn project_dir_with_scripts() -> tempfile::TempDir {
     .unwrap();
     dir
 }
+
+/// A result screen that pauses the tree, as a victory or pause menu does: the root ignores
+/// input while paused and the menu's button is the only thing that still reacts.
+fn paused_menu_project() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("paused menu project");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("scripts")).unwrap();
+    std::fs::write(
+        root.join("project.godot"),
+        "config_version=5\n\n[application]\n\nconfig/name=\"PausedMenu\"\nrun/main_scene=\"res://scripts/menu.tscn\"\nconfig/features=PackedStringArray(\"4.5\")\n\n[display]\n\nwindow/size/viewport_width=200\nwindow/size/viewport_height=150\nwindow/size/window_width_override=400\nwindow/size/window_height_override=300\nwindow/stretch/mode=\"canvas_items\"\nwindow/stretch/aspect=\"expand\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("scripts/menu.gd"),
+        r#"extends Node2D
+var again_presses := 0
+var again_downs := 0
+var far_presses := 0
+var physics_ticks := 0
+
+func _ready() -> void:
+    get_tree().paused = true
+
+func _physics_process(_delta: float) -> void:
+    physics_ticks += 1
+
+func _on_again_pressed() -> void:
+    again_presses += 1
+
+func _on_again_down() -> void:
+    again_downs += 1
+
+func _on_far_pressed() -> void:
+    far_presses += 1
+
+func counters() -> Dictionary:
+    return {"again_presses": again_presses, "again_downs": again_downs, "far_presses": far_presses, "paused": get_tree().paused, "physics_ticks": physics_ticks}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("scripts/menu.tscn"),
+        "[gd_scene load_steps=2 format=3]\n\n[ext_resource type=\"Script\" path=\"res://scripts/menu.gd\" id=\"1\"]\n\n[node name=\"Menu\" type=\"Node2D\"]\nscript = ExtResource(\"1\")\n\n[node name=\"Layer\" type=\"CanvasLayer\" parent=\".\"]\nprocess_mode = 2\n\n[node name=\"Again\" type=\"Button\" parent=\"Layer\"]\noffset_left = 4.0\noffset_top = 4.0\noffset_right = 44.0\noffset_bottom = 44.0\n\n[node name=\"Far\" type=\"Button\" parent=\"Layer\"]\noffset_left = 130.0\noffset_top = 90.0\noffset_right = 180.0\noffset_bottom = 130.0\n\n[connection signal=\"pressed\" from=\"Layer/Far\" to=\".\" method=\"_on_far_pressed\"]\n[connection signal=\"pressed\" from=\"Layer/Again\" to=\".\" method=\"_on_again_pressed\"]\n[connection signal=\"button_down\" from=\"Layer/Again\" to=\".\" method=\"_on_again_down\"]\n",
+    )
+    .unwrap();
+    dir
+}
+
+async fn menu_counters(tools: &Arc<ToolManager>, run_id: &str) -> Value {
+    let reply = call(
+        tools,
+        "godot_game_call",
+        json!({"run_id": run_id, "path": ".", "method": "counters", "permit": ["counters"]}),
+    )
+    .await;
+    assert!(!reply.is_error, "{}", text_of(&reply));
+    call_value(&json_of(&reply))
+}
+
+/// click_node, click and a mouse or touch tap complete a click on a button that works while the
+/// game has paused its own tree, in a free-running game and in a held one.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn click_node_completes_a_click_while_the_tree_is_paused() {
+    let _ = IGNORE;
+    paused_menu_clicks(true).await;
+    if windowed_game_can_open() {
+        paused_menu_clicks(false).await;
+    }
+}
+
+async fn paused_menu_clicks(headless: bool) {
+    let project = paused_menu_project();
+    let tools = manager(project.path());
+    let started = call(
+        &tools,
+        "godot_run_project",
+        json!({"project_path": project.path(), "mode": "process", "headless": headless}),
+    )
+    .await;
+    assert!(!started.is_error, "{}", text_of(&started));
+    let run_id = run_id_of(&started);
+
+    let mut expected = 0;
+    for step in [
+        json!({"type": "click_node", "node": "Layer/Again"}),
+        json!({"type": "click_node", "node": "Layer/Again", "pointer": "touch"}),
+        json!({"type": "click", "x": 20, "y": 20}),
+        json!({"type": "mouse_button", "button": "left", "x": 20, "y": 20}),
+    ] {
+        let answered = call(
+            &tools,
+            "godot_game_input",
+            json!({"run_id": run_id, "steps": [step.clone(), {"type": "wait", "frames": 2}]}),
+        )
+        .await;
+        assert!(!answered.is_error, "{step}: {}", text_of(&answered));
+        expected += 1;
+        let seen = menu_counters(&tools, &run_id).await;
+        assert_eq!(seen["paused"], true, "{step}: {seen}");
+        assert_eq!(
+            seen["again_presses"], expected,
+            "{step} did not click (headless {headless}): {seen}"
+        );
+    }
+
+    // The answer names the space; click_node says where it clicked, in that space.
+    let named = call(
+        &tools,
+        "godot_game_input",
+        json!({"run_id": run_id, "steps": [
+            {"type": "click_node", "node": "Layer/Again"}, {"type": "wait", "frames": 2}]}),
+    )
+    .await;
+    assert!(!named.is_error, "{}", text_of(&named));
+    let named = json_of(&named);
+    expected += 1;
+    assert_eq!(named["coordinate_space"], "viewport", "{named}");
+    let scale = json_number(&named["space"]["window_per_viewport_pixel"][0]);
+    let offset = json_number(&named["space"]["window_offset"][0]);
+    assert!(
+        scale > 0.0 && (scale - 1.0).abs() > 0.01,
+        "not stretched: {named}"
+    );
+    let at = &named["steps"][0]["at"];
+    assert!((json_number(&at[0]) - 24.0).abs() < 1.0, "{named}");
+    assert!((json_number(&at[1]) - 24.0).abs() < 1.0, "{named}");
+
+    // The same button in window pixels: viewport (20, 20) is window 20 * scale + offset.
+    let window_xy = 20.0 * scale + offset;
+    let window_y = 20.0 * json_number(&named["space"]["window_per_viewport_pixel"][1])
+        + json_number(&named["space"]["window_offset"][1]);
+    let in_window = call(
+        &tools,
+        "godot_game_input",
+        json!({"run_id": run_id, "coordinate_space": "window", "steps": [
+            {"type": "click", "x": window_xy, "y": window_y}, {"type": "wait", "frames": 2},
+            {"type": "click_node", "node": "Layer/Again"}, {"type": "wait", "frames": 2}]}),
+    )
+    .await;
+    assert!(!in_window.is_error, "{}", text_of(&in_window));
+    let in_window = json_of(&in_window);
+    expected += 2;
+    assert_eq!(in_window["coordinate_space"], "window", "{in_window}");
+    let at = &in_window["steps"][2]["at"];
+    assert!(
+        (json_number(&at[0]) - (24.0 * scale + offset)).abs() < 1.0,
+        "click_node at is not in window pixels: {in_window}"
+    );
+    let seen = menu_counters(&tools, &run_id).await;
+    assert_eq!(
+        seen["again_presses"], expected,
+        "window-space clicks: {seen} {in_window}"
+    );
+
+    let refused = call(
+        &tools,
+        "godot_game_input",
+        json!({"run_id": run_id, "coordinate_space": "screen", "steps": [
+            {"type": "click", "x": 1, "y": 1}]}),
+    )
+    .await;
+    assert!(refused.is_error, "{}", text_of(&refused));
+    assert!(
+        text_of(&refused).contains("coordinate_space"),
+        "{}",
+        text_of(&refused)
+    );
+
+    // In a stretched window the button far from the origin is clicked where it is drawn.
+    if !headless {
+        let far = call(
+            &tools,
+            "godot_game_input",
+            json!({"run_id": run_id, "steps": [
+                {"type": "click_node", "node": "Layer/Far"}, {"type": "wait", "frames": 2},
+                {"type": "click", "x": 155, "y": 110}, {"type": "wait", "frames": 2}]}),
+        )
+        .await;
+        assert!(!far.is_error, "{}", text_of(&far));
+        let seen = menu_counters(&tools, &run_id).await;
+        assert_eq!(
+            seen["far_presses"],
+            2,
+            "stretched click missed Far: {seen} {}",
+            text_of(&far)
+        );
+    }
+
+    // The same click in a held game: applied at once, released after hold_ticks ticks.
+    hold_now(&tools, &run_id).await;
+    let held = call(
+        &tools,
+        "godot_game_input",
+        json!({"run_id": run_id, "steps": [{"type": "click_node", "node": "Layer/Again"}]}),
+    )
+    .await;
+    assert!(!held.is_error, "{}", text_of(&held));
+    let stepped = held_step(&tools, &run_id, json!({"ticks": 3})).await;
+    assert!(!stepped.is_error, "{}", text_of(&stepped));
+    let seen = menu_counters(&tools, &run_id).await;
+    assert_eq!(
+        seen["again_presses"],
+        expected + 1,
+        "held click_node did not click (headless {headless}): {seen}"
+    );
+
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+}
+
+/// The addon's own scripts as res:// paths, read from this checkout.
+fn addon_scripts(root: &Path) -> Vec<String> {
+    fn walk(dir: &Path, root: &Path, found: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, root, found);
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some("gd") {
+                let relative = path.strip_prefix(root).unwrap_or(&path);
+                found.push(format!(
+                    "res://{}",
+                    relative.to_string_lossy().replace('\\', "/")
+                ));
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(&root.join("addons/godot_mcp"), root, &mut found);
+    found.sort();
+    found
+}
+
+/// The shipped addon has no GDScript analyzer warnings. `--check-only` prints none at all, so
+/// this asks the language server, which runs the full analyzer, about every addon script.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn addon_scripts_have_no_analyzer_warnings() {
+    let _ = IGNORE;
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let scripts = addon_scripts(&root);
+    assert!(scripts.len() > 10, "found only {scripts:?}");
+    let tools = manager(&root);
+    let mut found = Vec::new();
+    for script in &scripts {
+        let result = call(
+            &tools,
+            "godot_code_diagnostics",
+            json!({"project_path": root, "script_path": script}),
+        )
+        .await;
+        assert!(!result.is_error, "{script}: {}", text_of(&result));
+        let body = json_of(&result);
+        let diagnostics = body["diagnostics"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{script}: {body}"));
+        // LSP severity 1 is an error and 2 a warning; 3 and 4 are information and hints.
+        for item in diagnostics {
+            let severity = &item["severity"];
+            let reported = matches!(severity.as_i64(), Some(1 | 2))
+                || matches!(severity.as_str(), Some("error" | "warning"));
+            if reported {
+                found.push(format!("{script}: {item}"));
+            }
+        }
+    }
+    assert!(
+        found.is_empty(),
+        "analyzer diagnostics in the addon:\n{}",
+        found.join("\n")
+    );
+}

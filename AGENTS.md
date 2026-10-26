@@ -82,7 +82,7 @@ Before submitting or committing changes, agents must execute and pass the comple
 
 4. **GDScript Syntax Check**:
 
-   The repo root has its own minimal `project.godot` (it also makes the addon loadable as a plugin for manual testing). The addon declares no `class_name` on purpose: a global class would be listed in every exported game's class list while its script is left out of the export, so keep addon scripts free of `class_name` and load them by path.
+   The repo root has its own minimal `project.godot` (it also makes the addon loadable as a plugin for manual testing). It sets `debug/gdscript/warnings/exclude_addons=false`, so the language server reports the addon's analyzer warnings; `--check-only` reports parse errors only, and `addon_scripts_have_no_analyzer_warnings` in `tests/runtime_e2e_test.rs` is the warning audit. The addon declares no `class_name` on purpose: a global class would be listed in every exported game's class list while its script is left out of the export, so keep addon scripts free of `class_name` and load them by path.
 
    ```bash
    godot --headless --path . --import   # first run only, or after script changes
@@ -115,6 +115,12 @@ Before submitting or committing changes, agents must execute and pass the comple
 
    ```bash
    GODOT_PATH=/path/to/godot cargo test --test runtime_e2e_test -- --ignored --test-threads=1
+   ```
+
+   When an addon script changed, run the analyzer warning audit (part of that suite): `--check-only` never reports warnings.
+
+   ```bash
+   GODOT_PATH=/path/to/godot cargo test --test runtime_e2e_test addon_scripts_have_no_analyzer_warnings -- --ignored --test-threads=1
    ```
 
 ## Tool Invocation Protocols for AI Agents

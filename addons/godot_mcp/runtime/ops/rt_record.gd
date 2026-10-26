@@ -126,6 +126,7 @@ static func _keep_frame(state: Dictionary, image: Image, captured_at: int) -> Va
     var frame_bytes := image.get_width() * image.get_height() * 4
     var pixels := int(state["kept_bytes"]) + (int(state["want"]) - index + 1) * frame_bytes
     if pixels > MAX_PIXEL_BYTES:
+        @warning_ignore("integer_division")
         var megabytes := pixels / (1024 * 1024)
         return R.err(R.BAD_PARAMS, "This recording would keep %d MB of pixels in memory (frames × width × height × 4), above the 512 MB limit. Lower frames or max_dimension." % megabytes)
     var copy := image.duplicate() as Image

@@ -8,6 +8,19 @@ Each Godot version has its own release line and branch (`godot-v4.5`, `godot-v4.
 
 ## [Unreleased]
 
+### Added
+
+- `godot_game_input` and `godot_game_scenario` take `coordinate_space`: `viewport` (the default, unchanged) or `window`. `viewport` is the root viewport's visible rectangle after content scale, the space `_input` sees and Control global positions use; `window` is pixels of the game window, mapped into viewport space when the call is parsed. Every input answer names the space (`coordinate_space`) and the mapping between the two (`space`: both sizes, `window_per_viewport_pixel`, `window_offset`), and a `click_node` step returns `at`, the point it clicked, in that space. Before 0.8.0 pointer positions were window pixels, while `click_node` aimed at viewport coordinates; a test written for one space can now say which it means instead of being converted by hand.
+- `godot_code_diagnostics` adds `warnings_hidden`, and `godot_validate_script` a line, for a script under `res://addons/` in a project that keeps Godot's default `debug/gdscript/warnings/exclude_addons=true`: the analyzer reports no warnings for such a script, so a clean answer did not mean the script was clean.
+
+### Fixed
+
+- The addon's own scripts have no GDScript analyzer warnings (unused parameters, shadowed names, integer division, an int used as an enum, an incompatible ternary). They were never reported because Godot leaves `addons/` out of warnings by default and `--check-only` prints none. The addon development project now sets `debug/gdscript/warnings/exclude_addons=false`, and `addon_scripts_have_no_analyzer_warnings` in `tests/runtime_e2e_test.rs` asks the language server about every addon script.
+
+### Tests
+
+- `click_node_completes_a_click_while_the_tree_is_paused` clicks a button that works while the game has paused its tree, with `click_node`, a touch `click_node`, `click` and a mouse tap, in a headless and a stretched windowed game and in a held one, and in both coordinate spaces. A paused tree was not the cause of the missed clicks reported from a game with a 1920 x 1080 viewport in a 1280 x 720 window: before 0.8.0, `click_node` aimed at viewport coordinates and the event treated them as window pixels. The test fails if the content-scale mapping is removed.
+
 ## [0.8.0] - 2026-10-25
 
 The AI can now run a GDScript headless and get its errors back, write to a deep property path of a running game and be told when a write did not take, see analyzer warnings in `godot_validate_script`, and refresh imported resources even when the editor is closed. The release holds the files for Godot 4.5, 4.6 and 4.7 as before: download the files whose names end in `-godotM.N` for your Godot version, and update the server and the addon together. Everything below works on all three versions.

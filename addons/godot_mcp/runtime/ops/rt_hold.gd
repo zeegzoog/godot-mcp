@@ -100,21 +100,23 @@ static func run_input(rt: Node, params: Dictionary) -> Dictionary:
         return parsed
     var restore_emulation: Variant = Inputs.suppress_emulation(parsed)
     var results: Array = []
-    for step: Dictionary in parsed["steps"]:
-        var applied := Inputs.apply_held_step(rt, step, _total_ticks + int(hold_ticks))
+    for input_step: Dictionary in parsed["steps"]:
+        var applied := Inputs.apply_held_step(rt, input_step, _total_ticks + int(hold_ticks))
         if R.is_err(applied):
             Inputs.release_everything()
             Inputs.restore_emulation(restore_emulation)
             return applied
         results.append(applied["result"])
     Inputs.restore_emulation(restore_emulation)
-    return R.ok({
+    var body := {
         "steps": results,
         "held": Inputs.held_summary(),
         "warp_mouse": Inputs.warp_enabled(),
         "hold_ticks": int(hold_ticks),
         "total_ticks": _total_ticks,
-    })
+    }
+    body.merge(Inputs.space_summary())
+    return R.ok(body)
 
 
 static func _refused(what: String, instead: String) -> String:
@@ -183,7 +185,7 @@ static func exactness() -> Dictionary:
 
 ## Runs exactly the asked ticks, or until a condition holds, then holds again. The answer is sent
 ## from the hold point that ends the step.
-static func step(rt: Node, params: Dictionary) -> Dictionary:
+static func step(_rt: Node, params: Dictionary) -> Dictionary:
     if not is_held():
         return R.err(R.BAD_PARAMS, "The game is not held. Hold it first with action \"hold\".")
     if _step_active:

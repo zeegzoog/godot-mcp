@@ -2625,3 +2625,62 @@ async fn project_creation_validates_before_creating_directories() {
     assert!(!result.is_error, "{}", text(&result));
     assert!(target.join("project.godot").is_file());
 }
+
+#[tokio::test]
+async fn a_scenario_is_refused_before_a_game_exists() {
+    let no_game = call("godot_game_scenario", json!({"steps": [{"frames": 1}]})).await;
+    assert!(
+        no_game.is_error && text(&no_game).contains("managed process"),
+        "{}",
+        text(&no_game)
+    );
+    let editor = call(
+        "godot_game_scenario",
+        json!({"run_id": "editor", "steps": [{"frames": 1}]}),
+    )
+    .await;
+    assert!(
+        editor.is_error && text(&editor).contains("mode process"),
+        "{}",
+        text(&editor)
+    );
+    let empty = call("godot_game_scenario", json!({})).await;
+    assert!(text(&empty).contains("steps"), "{}", text(&empty));
+    let wide = call("godot_game_scenario", json!({"steps": [{"frames": 601}]})).await;
+    assert!(text(&wide).contains("600"), "{}", text(&wide));
+    for input in [
+        json!({"actions": [{"action": "jump"}]}),
+        json!({"pointers": [{"pointer": "mouse", "phase": "tap", "x": 1, "y": 1}]}),
+    ] {
+        let mut step = input;
+        step["frames"] = json!(0);
+        let instant = call("godot_game_scenario", json!({"steps": [step]})).await;
+        assert!(
+            instant.is_error && text(&instant).contains("frames 0"),
+            "{}",
+            text(&instant)
+        );
+    }
+    let strength = call(
+        "godot_game_scenario",
+        json!({"steps": [{"frames": 1, "actions": [{"action": "jump", "strength": 2}]}]}),
+    )
+    .await;
+    assert!(text(&strength).contains("strength"), "{}", text(&strength));
+    let tools = ToolManager::list_tools();
+    let scenario = tools
+        .iter()
+        .find(|tool| tool.name == "godot_game_scenario")
+        .expect("scenario tool");
+    let description = scenario.description.to_lowercase();
+    for word in [
+        "deterministic",
+        "physics",
+        "pause",
+        "characterbody",
+        "screenshot",
+        "released",
+    ] {
+        assert!(description.contains(word), "{word} missing: {description}");
+    }
+}

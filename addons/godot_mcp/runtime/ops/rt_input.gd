@@ -45,6 +45,7 @@ static var _mouse: Dictionary = {}
 static var _joy_buttons: Dictionary = {}
 static var _joy_axes: Dictionary = {}
 static var _touches: Dictionary = {}
+static var _actions: Dictionary = {}
 static var _mouse_pos := Vector2.ZERO
 static var _warp_mouse := false
 static var _saved_time_scale := -1.0
@@ -112,7 +113,14 @@ static func apply_held_step(rt: Node, step: Dictionary, release_at: int) -> Dict
             "time_scale": note["time_scale"],
             "previous_time_scale": note["previous_time_scale"],
         }}
-    if kind == "key" or kind == "mouse_button" or kind == "touch" or kind == "joy_button":
+    if kind == "touch" and str(step["phase"]) == "move":
+        var touch_index := int(step["index"])
+        if not _touches.has(touch_index):
+            return R.err(R.BAD_PARAMS, "touch index %d is not down. Press it before moving it." % touch_index)
+        _touch_drag(touch_index, float(step["x"]), float(step["y"]))
+        Input.flush_buffered_events()
+        return {"result": _done(step, {"type": "touch", "ok": true})}
+    if kind == "action" or kind == "key" or kind == "mouse_button" or kind == "touch" or kind == "joy_button":
         var phase := str(step["phase"])
         if phase == "tap":
             _apply_phase(step, "press")
@@ -292,7 +300,16 @@ static func _tick_steps(rt: Node, state: Dictionary) -> bool:
         state["char_down"] = false
         state["mode"] = "text"
         return _tick_text(rt, state)
-    if kind == "key" or kind == "mouse_button" or kind == "touch" or kind == "joy_button":
+    if kind == "touch" and str(step["phase"]) == "move":
+        var touch_index := int(step["index"])
+        if not _touches.has(touch_index):
+            return _fail(rt, state, R.err(R.BAD_PARAMS, "touch index %d is not down. Press it before moving it." % touch_index))
+        _touch_drag(touch_index, float(step["x"]), float(step["y"]))
+        Input.flush_buffered_events()
+        (state["results"] as Array).append({"type": "touch", "ok": true})
+        state["index"] = index + 1
+        return true
+    if kind == "action" or kind == "key" or kind == "mouse_button" or kind == "touch" or kind == "joy_button":
         var phase := str(step["phase"])
         if phase == "tap":
             _apply_phase(step, "press")
@@ -358,12 +375,25 @@ static func _apply_phase(step: Dictionary, phase: String) -> void:
         Input.flush_buffered_events()
     elif kind == "touch":
         var touch_index := int(step["index"])
-        if phase == "release":
+        if phase == "move":
+            if _touches.has(touch_index):
+                _touch_drag(touch_index, float(step["x"]), float(step["y"]))
+        elif phase == "release":
             _touch_event(touch_index, false, float(step["x"]), float(step["y"]))
             _touches.erase(touch_index)
         else:
             _touch_event(touch_index, true, float(step["x"]), float(step["y"]))
             _touches[touch_index] = Vector2(float(step["x"]), float(step["y"]))
+        Input.flush_buffered_events()
+    elif kind == "action":
+        var action_name := str(step["action"])
+        if phase == "release":
+            _action_event(action_name, false, 0.0)
+            _actions.erase(action_name)
+        else:
+            var strength := float(step.get("strength", 1.0))
+            _action_event(action_name, true, strength)
+            _actions[action_name] = strength
         Input.flush_buffered_events()
     elif kind == "joy_button":
         var button_name := str(step["button"])
@@ -1065,9 +1095,28 @@ static func _release_tap(step: Dictionary) -> void:
 static func _parse(step: Dictionary, index: int) -> Dictionary:
     var kind := str(step.get("type", ""))
     var phase := str(step.get("phase", "tap"))
-    if not phase in ["tap", "press", "release"]:
-        return R.err(R.BAD_PARAMS, "steps[%d]: phase must be tap, press, or release." % index)
+    if phase == "move" and kind != "touch":
+        return R.err(R.BAD_PARAMS, "steps[%d]: phase move is only for a touch." % index)
+    if not phase in ["tap", "press", "release", "move"]:
+        return R.err(R.BAD_PARAMS, "steps[%d]: phase must be tap, press, release, or move." % index)
     match kind:
+        "action":
+            var action_name := str(step.get("action", "")).strip_edges()
+            if action_name.is_empty() or action_name.length() > 64:
+                return R.err(R.BAD_PARAMS, "steps[%d]: action needs a name of 1 to 64 characters." % index)
+            if not InputMap.has_action(action_name):
+                return R.err(R.BAD_PARAMS, "steps[%d]: unknown action '%s'. Add it to the project's Input Map." % [index, action_name])
+            var strength := 1.0
+            if step.has("strength"):
+                var raw: Variant = step["strength"]
+                if not (raw is float or raw is int):
+                    return R.err(R.BAD_PARAMS, "steps[%d]: strength must be a number from 0 to 1." % index)
+                strength = float(raw)
+                if strength < 0.0 or strength > 1.0:
+                    return R.err(R.BAD_PARAMS, "steps[%d]: strength must be a number from 0 to 1." % index)
+            if phase == "release":
+                strength = 0.0
+            return {"step": {"type": kind, "phase": phase, "action": action_name, "strength": strength}}
         "key":
             var key := str(step.get("key", ""))
             var code := OS.find_keycode_from_string(key)
@@ -1208,6 +1257,8 @@ static func _run(rt: Node, step: Dictionary) -> Dictionary:
             Input.flush_buffered_events()
         "mouse_button":
             await _mouse_button(rt, str(step["button"]), str(step["phase"]), float(step["x"]), float(step["y"]))
+        "action":
+            await _action(rt, str(step["action"]), str(step["phase"]), float(step["strength"]))
         "touch":
             await _touch(rt, int(step["index"]), str(step["phase"]), float(step["x"]), float(step["y"]))
         "joy_button":
@@ -1306,6 +1357,12 @@ static func _mouse_event(index: int, pressed: bool, x: float, y: float) -> void:
 
 
 static func _touch(rt: Node, index: int, phase: String, x: float, y: float) -> void:
+    if phase == "move":
+        if not _touches.has(index):
+            return
+        _touch_drag(index, x, y)
+        Input.flush_buffered_events()
+        return
     if phase == "release":
         _touch_event(index, false, x, y)
         _touches.erase(index)
@@ -1319,6 +1376,42 @@ static func _touch(rt: Node, index: int, phase: String, x: float, y: float) -> v
         _touch_event(index, false, x, y)
         _touches.erase(index)
         Input.flush_buffered_events()
+
+
+static func _touch_drag(index: int, x: float, y: float) -> void:
+    var previous: Vector2 = _touches[index]
+    var event := InputEventScreenDrag.new()
+    event.index = index
+    event.position = _window_point(Vector2(x, y))
+    event.relative = event.position - _window_point(previous)
+    _touches[index] = Vector2(x, y)
+    Input.parse_input_event(event)
+
+
+static func _action(rt: Node, action: String, phase: String, strength: float) -> void:
+    if phase == "release":
+        _action_event(action, false, 0.0)
+        _actions.erase(action)
+        Input.flush_buffered_events()
+        return
+    _action_event(action, true, strength)
+    _actions[action] = strength
+    Input.flush_buffered_events()
+    if phase == "tap":
+        await rt.get_tree().process_frame
+        _action_event(action, false, 0.0)
+        _actions.erase(action)
+        Input.flush_buffered_events()
+
+
+static func _action_event(action: String, pressed: bool, strength: float) -> void:
+    var event := InputEventAction.new()
+    event.action = action
+    event.pressed = pressed
+    event.strength = strength
+    Input.parse_input_event(event)
+    if not pressed:
+        Input.action_release(action)
 
 
 static func _touch_event(index: int, pressed: bool, x: float, y: float) -> void:
@@ -1388,12 +1481,16 @@ static func _release_everything() -> Dictionary:
         var parts := str(key).split(":")
         _joy_axis(parts[1], 0.0, int(parts[0]))
     _joy_axes.clear()
+    var actions: Array = _actions.keys()
+    for name: Variant in actions:
+        _action_event(str(name), false, 0.0)
+    _actions.clear()
     var touches: Array = _touches.keys()
     for index: Variant in touches:
         var at: Vector2 = _touches[index]
         _touch_event(int(index), false, at.x, at.y)
     _touches.clear()
-    return {"keys": keys.size(), "mouse": buttons.size(), "joy_buttons": joy.size(), "joy_axes": axes.size(), "touches": touches.size()}
+    return {"keys": keys.size(), "mouse": buttons.size(), "joy_buttons": joy.size(), "joy_axes": axes.size(), "actions": actions.size(), "touches": touches.size()}
 
 
 static func _held_summary() -> Dictionary:
@@ -1402,5 +1499,6 @@ static func _held_summary() -> Dictionary:
         "mouse": _mouse.size(),
         "joy_buttons": _joy_buttons.size(),
         "joy_axes": _joy_axes.size(),
+        "actions": _actions.size(),
         "touches": _touches.size(),
     }

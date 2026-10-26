@@ -65,7 +65,7 @@ Tool names are the MCP names. Solo and Vollkorn do not use a `godot_` prefix.
 
 | Area | Files |
 | --- | --- |
-| Tool catalog and handlers | `src/tools.rs`, `src/tools/game.rs`, `src/tools/code.rs`, `src/tools/authoring.rs`, `src/tools/scripts.rs` |
+| Tool catalog and handlers | `src/tools.rs`, `src/tools/game.rs`, `src/tools/code.rs`, `src/tools/authoring.rs`, `src/tools/scripts.rs`, `src/tools/run.rs`, `src/tools/headless.rs`, `src/tools/project.rs` |
 | Remote debugger session, variant codec | `src/godot/debug_session.rs`, `src/godot/variant.rs` |
 | Breakpoints, pause, step, stack | `src/godot/debug_ctl.rs` |
 | Process runs, `override.cfg` autoload, logs | `src/godot/runs.rs` |

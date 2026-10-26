@@ -1,14 +1,18 @@
 //! Export a `.vox` through Froxel, import the `.glb` into a Godot project, and
-//! report whether Godot wrote an `.import` sidecar. The picture, when asked
+//! report whether Godot wrote an `.import` sidecar whose cache matches the new
+//! file. The picture, when asked
 //! for, is Froxel's path-traced PNG. A Godot window capture stays on
 //! `godot_capture_viewport` or `godot_game_screenshot`.
 
 use super::{ToolManager, tool};
+use crate::godot::import_current;
 use crate::paths::{res_display, resolve_in_project};
 use crate::protocol::{Tool, ToolResult};
 use serde_json::{Value, json};
 use std::collections::HashSet;
+use std::collections::hash_map::DefaultHasher;
 use std::ffi::OsStr;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -19,7 +23,7 @@ const EXPORT_WAIT: Duration = Duration::from_secs(60);
 pub fn definition() -> Tool {
     tool(
         "godot_check_voxel_model",
-        "Exports a .vox through `froxel mcp` (FROXEL_BIN, or `froxel` on PATH), writes the .glb inside the Godot project, imports it, and checks the result. The Froxel reply's structure lists nodes, meshes, skins, animations, and warnings (an empty mesh, a skin with no joints, a missing or repeated node name, an animation with no channels). The Godot check is the .import sidecar: without it the model would not load. preview true also asks Froxel to path-trace a PNG next to the .glb (128², 4 samples). This does not open a Godot scene and does not take a Godot screenshot; use godot_capture_viewport or godot_game_screenshot for that. The .vox is read only. 1 to 16 models can be passed instead of one vox, each with its own dest.",
+        "Exports a .vox through `froxel mcp` (FROXEL_BIN, or `froxel` on PATH), writes the .glb inside the Godot project, imports it, and checks the result. The Froxel reply's structure lists nodes, meshes, skins, animations, and warnings (an empty mesh, a skin with no joints, a missing or repeated node name, an animation with no channels). The import goes through the connected editor when it has this project open, and is a headless import otherwise. The Godot check is the .import sidecar: without it the model would not load (missing_imports), and a changed .glb whose cache is older than the file was not imported again (stale_imports). A failed export is reported under export and is not imported. preview true also asks Froxel to path-trace a PNG next to the .glb (128², 4 samples). This does not open a Godot scene and does not take a Godot screenshot; use godot_capture_viewport or godot_game_screenshot for that. The .vox is read only. 1 to 16 models can be passed instead of one vox, each with its own dest.",
         json!({
             "project_path": {"type": "string", "description": "Directory containing project.godot. Optional when the server was started in the project."},
             "vox": {"type": "string", "description": "Absolute path of one .vox file. Use models instead to export several."},
@@ -71,6 +75,9 @@ pub async fn call(tools: &ToolManager, args: &Value) -> ToolResult {
             );
         }
     };
+    // An identical re-export is not imported again (Godot compares the source hash), so its
+    // older cache still matches; a changed .glb must get a cache newer than itself.
+    let previous: Vec<Option<u64>> = jobs.iter().map(|job| content_hash(&job.dest)).collect();
     let mut models = Vec::new();
     for job in &jobs {
         if let Some(parent) = job.dest.parent() {
@@ -98,37 +105,40 @@ pub async fn call(tools: &ToolManager, args: &Value) -> ToolResult {
             );
         }
     };
-    let destinations: Vec<String> = jobs
-        .iter()
-        .map(|job| res_display(&project, &job.dest))
-        .collect();
     let exported_models = exported.get("models").and_then(Value::as_array);
-    let successful: Vec<&Job> = jobs
+    let successful: Vec<(usize, &Job)> = jobs
         .iter()
         .enumerate()
-        .filter_map(|(index, job)| {
-            let result = exported_models.and_then(|models| models.get(index));
-            (result
+        .filter(|(index, _)| {
+            let result = exported_models.and_then(|models| models.get(*index));
+            result
                 .and_then(|model| model.get("ok"))
                 .and_then(Value::as_bool)
-                == Some(true))
-            .then_some(job)
+                == Some(true)
         })
         .collect();
     let mut import_ok = true;
     let import_body = if successful.is_empty() {
         json!({"skipped": true, "reason": "No models were exported successfully."})
     } else {
-        let imported = tools.import_headless(&json!({
-            "project_path": project,
-            "paths": successful.iter().map(|job| res_display(&project, &job.dest)).collect::<Vec<_>>()
-        })).await;
+        // The resave path imports through a connected editor of this project, and runs a
+        // headless import only when no such editor answers.
+        let imported = tools
+            .handle_resave_resources(json!({
+                "project_path": project,
+                "paths": successful
+                    .iter()
+                    .map(|(_, job)| res_display(&project, &job.dest))
+                    .collect::<Vec<_>>(),
+                "wait": true,
+            }))
+            .await;
         import_ok = !imported.is_error;
         text_json(&imported)
     };
     let mut previews = Vec::new();
     if preview {
-        for job in &successful {
+        for (_, job) in &successful {
             if let Some(png) = &job.preview {
                 match froxel_render(&job.vox, png).await {
                     Ok(()) => previews.push(json!({"vox": job.vox, "png": png, "ok": true})),
@@ -139,23 +149,26 @@ pub async fn call(tools: &ToolManager, args: &Value) -> ToolResult {
         }
     }
     let mut missing = Vec::new();
-    for dest in &destinations {
-        let sidecar = format!("{dest}.import");
-        match resolve_in_project(&project, &sidecar) {
-            Ok(path) if path.is_file() => {}
-            _ => missing.push(sidecar),
+    let mut stale = Vec::new();
+    for (index, job) in &successful {
+        let dest = res_display(&project, &job.dest);
+        match import_current(&project, &job.dest) {
+            None => missing.push(format!("{dest}.import")),
+            Some(false) if content_hash(&job.dest) != previous[*index] => stale.push(dest),
+            Some(_) => {}
         }
     }
     let structure_ok = exported.get("ok").and_then(Value::as_bool) == Some(true);
     let previews_ok = previews
         .iter()
         .all(|preview| preview.get("ok").and_then(Value::as_bool) != Some(false));
-    let ok = structure_ok && import_ok && missing.is_empty() && previews_ok;
+    let ok = structure_ok && import_ok && missing.is_empty() && stale.is_empty() && previews_ok;
     let body = json!({
         "ok": ok,
         "export": exported,
         "import": import_body,
         "missing_imports": missing,
+        "stale_imports": stale,
         "previews": previews,
         "screenshot": "This check does not capture a Godot window. preview path-traces the voxel model. godot_capture_viewport and godot_game_screenshot capture a window.",
     });
@@ -164,6 +177,13 @@ pub async fn call(tools: &ToolManager, args: &Value) -> ToolResult {
         content: vec![crate::protocol::ToolContent::Text { text }],
         is_error: !ok,
     }
+}
+
+fn content_hash(path: &Path) -> Option<u64> {
+    let bytes = std::fs::read(path).ok()?;
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    Some(hasher.finish())
 }
 
 struct Job {

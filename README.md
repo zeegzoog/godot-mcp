@@ -314,6 +314,9 @@ All output paths are validated before writing. Output names must be unique,
 including previews, links and case-only aliases. Each Froxel process has a
 60-second deadline covering initialization, tool replies and process exit.
 The report preserves per-model export failures even when no model can be
-imported; a mixed batch imports and previews only successful exports. The Godot
-check verifies import sidecars; it does not yet verify the instantiated model's
+imported; a mixed batch imports and previews only successful exports. The import
+goes through the connected editor when it has the project open, and is headless
+otherwise. The Godot check verifies import sidecars and reports a changed `.glb`
+whose cache is older than the file under `stale_imports`; it does not yet verify
+the instantiated model's
 meshes or animation behavior.

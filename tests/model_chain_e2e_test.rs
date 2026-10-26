@@ -82,6 +82,22 @@ async fn a_voxel_model_is_exported_imported_and_described() {
 
 #[tokio::test]
 #[ignore = "needs FROXEL_BIN and GODOT_PATH"]
+async fn a_repeated_check_of_an_imported_model_is_not_stale() {
+    let (project, tools, vox) = fixture();
+    let args = json!({"project_path":project.path(),"vox":vox,"dest":"res://again.glb"});
+    for _ in 0..2 {
+        let result = check(Arc::clone(&tools), args.clone()).await;
+        let body = json_of(&result);
+        assert!(!result.is_error, "{body}");
+        assert!(
+            body["stale_imports"].as_array().unwrap().is_empty(),
+            "{body}"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs FROXEL_BIN and GODOT_PATH"]
 async fn all_failed_exports_keep_the_original_error_and_skip_import() {
     let (project, tools, vox) = fixture();
     std::fs::write(&vox, b"malformed fixture").unwrap();

@@ -510,14 +510,14 @@ async fn a_second_scenario_in_one_run_is_refused_while_the_first_plays() {
     .await;
     assert!(!started.is_error, "{}", text_of(&started));
     let run_id = run_id_of(&started);
-    let long = json!({"run_id":run_id,"steps":vec![json!({"frames":600});5]});
+    let long = json!({"run_id":run_id,"steps":vec![json!({"frames":600});6]});
     let first = tokio::spawn({
         let tools = Arc::clone(&tools);
         async move { call(&tools, "godot_game_scenario", long).await }
     });
     let mut refused = None;
-    for _ in 0..50 {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    for _ in 0..200 {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let second = call(
             &tools,
             "godot_game_scenario",

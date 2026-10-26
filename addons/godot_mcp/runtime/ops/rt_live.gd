@@ -396,9 +396,12 @@ static func snapshot(rt: Node, _params: Dictionary) -> Dictionary:
 static func set_pause(rt: Node, params: Dictionary) -> Dictionary:
     if not params.has("paused") or not params["paused"] is bool:
         return R.err(R.BAD_PARAMS, "game.pause: paused must be a boolean.")
+    var was_paused := rt.get_tree().paused
     rt.get_tree().paused = bool(params["paused"])
-    # A resume gives back the pause this call set, but not a pause the game made itself.
-    _paused_by_step = rt.get_tree().paused
+    # A resume gives back the pause this call set, but not a pause the game made itself: the
+    # flag follows a change, and a pause that was already on stays the game's.
+    if rt.get_tree().paused != was_paused:
+        _paused_by_step = rt.get_tree().paused
     return R.ok({"paused": rt.get_tree().paused, "scene": rt.scene_context()})
 
 
@@ -471,7 +474,8 @@ static func physics(rt: Node, params: Dictionary) -> Dictionary:
     var action := str(params.get("action", "step")).strip_edges()
     if action == "hold":
         # Held ticks must reach pausable nodes, so a pause the pause-based step left is cleared.
-        if _paused_by_step:
+        # A game that is already held keeps the pause a scenario set on purpose.
+        if _paused_by_step and not Hold.is_armed():
             rt.get_tree().paused = false
             _paused_by_step = false
         return Hold.begin(rt)

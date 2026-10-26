@@ -64,8 +64,8 @@ impl Drop for ReleaseInput {
             return;
         };
         // The retry keeps the run locked until it is done, so it cannot wipe the input of the
-        // next scenario. Outside a runtime there is nothing to retry on; the game releases its
-        // input when it exits.
+        // next scenario. Outside a runtime there is nothing to retry on: the lock is freed, and
+        // input still down stays down until the next release, which every scenario ends with.
         let lock = self.lock.take();
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
@@ -95,10 +95,11 @@ pub fn definition() -> Tool {
                         "frames": {"type": "integer", "minimum": 0, "maximum": MAX_FRAMES, "description": "Physics ticks. 0 applies the input and takes the snapshot without stepping, and refuses a tap."},
                         "actions": {
                             "type": "array",
+                            "maxItems": MAX_INPUTS,
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "action": {"type": "string"},
+                                    "action": {"type": "string", "maxLength": 64},
                                     "phase": {"type": "string", "enum": ["press", "release", "tap"], "description": "Default tap, which needs frames of at least 1."},
                                     "strength": {"type": "number", "minimum": 0, "maximum": 1}
                                 },
@@ -107,6 +108,7 @@ pub fn definition() -> Tool {
                         },
                         "pointers": {
                             "type": "array",
+                            "maxItems": MAX_INPUTS,
                             "items": {
                                 "type": "object",
                                 "properties": {
@@ -114,8 +116,8 @@ pub fn definition() -> Tool {
                                     "phase": {"type": "string", "enum": ["press", "release", "move", "tap"], "description": "Default tap, which needs frames of at least 1."},
                                     "x": {"type": "number"},
                                     "y": {"type": "number"},
-                                    "index": {"type": "integer", "description": "Touch index. Several indexes can be down at once."},
-                                    "button": {"type": "string", "description": "Mouse button. Default left."}
+                                    "index": {"type": "integer", "minimum": 0, "maximum": MAX_TOUCH_INDEX, "description": "Touch index. Several indexes can be down at once."},
+                                    "button": {"type": "string", "maxLength": MAX_NAME_CHARS, "description": "Mouse button. Default left."}
                                 },
                                 "required": ["pointer", "x", "y"]
                             }
@@ -125,15 +127,16 @@ pub fn definition() -> Tool {
                     "required": ["frames"]
                 }
             },
-            "bodies": {"type": "array", "items": {"type": "string"}, "description": "CharacterBody paths read after every step."},
+            "bodies": {"type": "array", "maxItems": MAX_READS, "items": {"type": "string", "maxLength": MAX_NAME_CHARS}, "description": "CharacterBody paths read after every step."},
             "nodes": {
                 "type": "array",
-                "description": "Public properties read after every step.",
+                "maxItems": MAX_READS,
+                "description": "Public properties read after every step. Names starting with _ are refused.",
                 "items": {
                     "type": "object",
                     "properties": {
-                        "path": {"type": "string"},
-                        "properties": {"type": "array", "items": {"type": "string"}}
+                        "path": {"type": "string", "maxLength": MAX_NAME_CHARS},
+                        "properties": {"type": "array", "maxItems": MAX_PROPERTIES, "items": {"type": "string", "maxLength": MAX_NAME_CHARS}}
                     },
                     "required": ["path", "properties"]
                 }
@@ -676,6 +679,11 @@ fn parse_actions(index: usize, value: &Value) -> Result<Vec<Value>, String> {
     let items = value
         .as_array()
         .ok_or_else(|| format!("steps[{index}].actions must be an array."))?;
+    if items.len() > MAX_INPUTS {
+        return Err(format!(
+            "steps[{index}] has more than {MAX_INPUTS} actions and pointers."
+        ));
+    }
     let mut actions = Vec::new();
     for (action_index, item) in items.iter().enumerate() {
         let action = item
@@ -715,6 +723,11 @@ fn parse_pointers(index: usize, value: &Value) -> Result<Vec<Value>, String> {
     let items = value
         .as_array()
         .ok_or_else(|| format!("steps[{index}].pointers must be an array."))?;
+    if items.len() > MAX_INPUTS {
+        return Err(format!(
+            "steps[{index}] has more than {MAX_INPUTS} actions and pointers."
+        ));
+    }
     let mut pointers = Vec::new();
     for (pointer_index, item) in items.iter().enumerate() {
         let kind = item.get("pointer").and_then(Value::as_str).unwrap_or("");
@@ -816,9 +829,19 @@ mod tests {
         let too_many_inputs = json!({"steps": [{"frames": 1, "actions": many(MAX_INPUTS + 1)}]});
         assert!(refused(too_many_inputs).contains("more than"));
         let nodes = vec![json!({"path": "Player", "properties": ["hp"]}); MAX_READS + 1];
-        assert!(refused(json!({"steps": [{"frames": 1}], "nodes": nodes})).contains("nodes"));
+        let message = refused(json!({"steps": [{"frames": 1}], "nodes": nodes}));
+        assert!(message.contains("at most 16 nodes"), "{message}");
         let bodies = vec![json!("Player"); MAX_READS + 1];
-        assert!(refused(json!({"steps": [{"frames": 1}], "bodies": bodies})).contains("bodies"));
+        let message = refused(json!({"steps": [{"frames": 1}], "bodies": bodies}));
+        assert!(message.contains("at most 16 nodes"), "{message}");
+        let long_body =
+            json!({"steps": [{"frames": 1}], "bodies": ["x".repeat(MAX_NAME_CHARS + 1)]});
+        assert!(refused(long_body).contains("array of node paths"));
+        let long_button = json!({"steps": [{"frames": 1, "pointers": [
+            {"pointer": "mouse", "x": 1, "y": 1, "button": "x".repeat(MAX_NAME_CHARS + 1)}]}]});
+        assert!(refused(long_button).contains("button is too long"));
+        let negative = json!({"steps": [{"frames": 1, "pointers": [{"pointer": "touch", "x": 1, "y": 1, "index": -1}]}]});
+        assert!(refused(negative).contains("from 0 to 9"));
         let properties = vec![json!("hp"); MAX_PROPERTIES + 1];
         let many_properties = json!({"steps": [{"frames": 1}],
             "nodes": [{"path": "Player", "properties": properties}]});

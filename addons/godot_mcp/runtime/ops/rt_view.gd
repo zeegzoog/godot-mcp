@@ -12,6 +12,10 @@ const MAX_BASELINES := 8
 const MAX_BASELINE_PIXELS := 512 * 512
 ## Frames a capture waits for a window that has not drawn anything yet before it gives up.
 const EMPTY_RETRIES := 60
+## Process frames a capture waits for the window to draw a new frame. A window the system stops
+## drawing (covered on macOS, minimized) keeps its last frame in the viewport texture, so a
+## capture taken then is reported as stale instead of being passed off as current.
+const DRAW_WAIT := 30
 
 static var _previous = null
 static var _baselines: Dictionary = {}
@@ -62,6 +66,9 @@ static func screenshot(rt: Node, params: Dictionary) -> Dictionary:
         "previous_2d": bool(picked.get("previous_2d", false)),
         "label": picked.get("label", "viewport"),
         "baseline": request,
+        "drawn_mark": Engine.get_frames_drawn(),
+        "stale": 0,
+        "waited": 0,
     }
     if Hold.is_held():
         return _capture_now(state)
@@ -76,6 +83,7 @@ static func _capture_now(state: Dictionary) -> Dictionary:
     if grabbed is Dictionary:
         return grabbed
     state["got"] = [grabbed]
+    state["held"] = true
     return _compose(state)
 
 
@@ -89,6 +97,10 @@ static func _tick_shot(rt: Node, state: Dictionary) -> bool:
         if int(state["pause"]) > 0:
             return true
         state["phase"] = "capture"
+    if not _drew_since_mark(state):
+        state["draw_wait"] = int(state.get("draw_wait", 0)) + 1
+        if int(state["draw_wait"]) <= DRAW_WAIT:
+            return true
     var grabbed = _grab(state)
     if grabbed == null:
         # A window that has not drawn its first frame has no image yet, which a slow start
@@ -103,6 +115,11 @@ static func _tick_shot(rt: Node, state: Dictionary) -> bool:
         _restore_cameras(state)
         rt.finish_job(grabbed)
         return false
+    if not _drew_since_mark(state):
+        state["stale"] = int(state["stale"]) + 1
+        state["waited"] = DRAW_WAIT
+    state["draw_wait"] = 0
+    state["drawn_mark"] = Engine.get_frames_drawn()
     (state["got"] as Array).append(grabbed)
     if (state["got"] as Array).size() < int(state["want"]):
         state["pause"] = int(state["every"])
@@ -111,6 +128,14 @@ static func _tick_shot(rt: Node, state: Dictionary) -> bool:
     _restore_cameras(state)
     rt.finish_job(_compose(state))
     return false
+
+
+## Whether the engine drew a frame since the last mark. Low processor mode draws only when
+## something changed, so a frame not drawn there is still the current picture.
+static func _drew_since_mark(state: Dictionary) -> bool:
+    if OS.low_processor_usage_mode:
+        return true
+    return Engine.get_frames_drawn() > int(state["drawn_mark"])
 
 
 static func _grab(state: Dictionary) -> Variant:
@@ -178,6 +203,14 @@ static func _compose(state: Dictionary) -> Dictionary:
         "captured_width": space["captured_width"],
         "captured_height": space["captured_height"],
         "diff": diff,
+        "render": {
+            "frames_drawn": Engine.get_frames_drawn(),
+            "process_frame": Engine.get_process_frames(),
+            "stale_frames": 0 if bool(state.get("held", false)) else int(state.get("stale", 0)),
+            "waited_frames": int(state.get("waited", 0)),
+            "window_can_draw": DisplayServer.window_can_draw(),
+            "held": bool(state.get("held", false)),
+        },
     }
     var report: Dictionary = applied.get("report", {})
     if not report.is_empty():

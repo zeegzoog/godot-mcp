@@ -184,6 +184,10 @@ func _on_tiny_pressed() -> void:
 func poke(value: int) -> int:
     pinged.emit(value)
     return value + 1
+
+func stop_drawing(stopped: bool) -> bool:
+    RenderingServer.render_loop_enabled = not stopped
+    return stopped
 "#,
     )
     .unwrap();
@@ -1800,6 +1804,93 @@ async fn windowed_screenshot_returns_a_sheet_and_a_diff() {
 
     let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
     assert!(!stopped.is_error, "{}", text_of(&stopped));
+}
+
+/// A window that stops drawing (covered on macOS, minimized) keeps the last drawn frame in its
+/// viewport texture. The capture must say so instead of returning that frame as current.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn windowed_screenshot_flags_a_window_that_stopped_drawing() {
+    let _ = IGNORE;
+    if !windowed_game_can_open() {
+        eprintln!("skipped: a windowed screenshot needs a display server");
+        return;
+    }
+    let project = project();
+    let tools = manager(project.path());
+    let started = call(
+        &tools,
+        "godot_run_project",
+        json!({
+            "project_path": project.path(),
+            "scene": "res://scenes/main.tscn",
+            "mode": "process",
+            "headless": false
+        }),
+    )
+    .await;
+    assert!(!started.is_error, "{}", text_of(&started));
+    let run_id = run_id_of(&started);
+
+    let fresh = call(
+        &tools,
+        "godot_game_screenshot",
+        json!({"run_id": run_id, "max_dimension": 64}),
+    )
+    .await;
+    assert!(!fresh.is_error, "{}", text_of(&fresh));
+    let note = text_of(&fresh);
+    if covered_window(&tools, &run_id, &note).await {
+        return;
+    }
+    assert!(
+        note.contains("frames drawn") && !note.contains("STALE"),
+        "{note}"
+    );
+
+    let stop = |stopped: bool| json!({"run_id": run_id, "path": ".", "method": "stop_drawing", "permit": ["stop_drawing"], "args": [stopped]});
+    let stopped = call(&tools, "godot_game_call", stop(true)).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+    let stale = call(
+        &tools,
+        "godot_game_screenshot",
+        json!({"run_id": run_id, "max_dimension": 64}),
+    )
+    .await;
+    assert!(!stale.is_error, "{}", text_of(&stale));
+    let note = text_of(&stale);
+    assert!(
+        note.contains("STALE") && note.contains("Bring the game window to the front"),
+        "{note}"
+    );
+
+    let resumed = call(&tools, "godot_game_call", stop(false)).await;
+    assert!(!resumed.is_error, "{}", text_of(&resumed));
+    let again = call(
+        &tools,
+        "godot_game_screenshot",
+        json!({"run_id": run_id, "max_dimension": 64}),
+    )
+    .await;
+    assert!(!again.is_error, "{}", text_of(&again));
+    if covered_window(&tools, &run_id, &text_of(&again)).await {
+        return;
+    }
+    assert!(!text_of(&again).contains("STALE"), "{}", text_of(&again));
+
+    let ended = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!ended.is_error, "{}", text_of(&ended));
+}
+
+/// The system reports the game window cannot draw (covered or minimized by something outside
+/// the test), so a fresh frame cannot be expected. Stops the run and skips the rest.
+async fn covered_window(tools: &Arc<ToolManager>, run_id: &str, note: &str) -> bool {
+    if !note.contains("The window reports that it cannot draw") {
+        return false;
+    }
+    eprintln!("skipped: the game window cannot draw on this desktop: {note}");
+    let _ = call(tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    true
 }
 
 /// A window larger than the viewport, so content scale is not 1. Touch positions must arrive

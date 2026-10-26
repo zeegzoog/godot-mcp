@@ -205,7 +205,7 @@ async fn a_scenario_moves_jumps_pauses_and_releases_input() {
                 "nodes": [{"path": "Player", "properties": ["jump_count", "touch_presses"]}],
                 "steps": [
                     {"frames": 20},
-                    {"frames": 20, "actions": [{"action": "move_right", "strength": 1}]}
+                    {"frames": 20, "actions": [{"action": "move_right", "phase": "press", "strength": 1}]}
                 ]
             }),
         )
@@ -278,7 +278,7 @@ async fn a_scenario_moves_jumps_pauses_and_releases_input() {
                 "nodes": [{"path": "Player", "properties": ["jump_count", "touch_presses"]}],
                 "steps": [
                     {"frames": 5, "pause": true},
-                    {"frames": 20, "actions": [{"action": "move_right", "strength": 1}]}
+                    {"frames": 20, "actions": [{"action": "move_right", "phase": "press", "strength": 1}]}
                 ]
             }),
         )
@@ -400,7 +400,7 @@ async fn frog_world_moves_jumps_and_uses_the_touch_controls() {
             &tools,
             &run_id,
             json!({"steps": [
-                {"frames": 40, "actions": [{"action": "move_right", "strength": 1}]},
+                {"frames": 40, "actions": [{"action": "move_right", "phase": "press", "strength": 1}]},
                 {"frames": 5, "actions": [{"action": "move_right", "phase": "release"}]}
             ]}),
         )
@@ -446,7 +446,7 @@ async fn frog_world_moves_jumps_and_uses_the_touch_controls() {
             &run_id,
             json!({"steps": [
                 {"frames": 5, "pause": true},
-                {"frames": 30, "actions": [{"action": "move_right", "strength": 1}]}
+                {"frames": 30, "actions": [{"action": "move_right", "phase": "press", "strength": 1}]}
             ]}),
         )
         .await,
@@ -621,7 +621,7 @@ async fn a_default_scenario_stays_on_its_original_run() {
                 json!({
                     "bodies": ["Player"],
                     "steps": [
-                        {"frames": 120, "actions": [{"action": "move_right"}]},
+                        {"frames": 120, "actions": [{"action": "move_right", "phase": "press"}]},
                         {"frames": 5}
                     ]
                 }),

@@ -2648,6 +2648,19 @@ async fn a_scenario_is_refused_before_a_game_exists() {
     assert!(text(&empty).contains("steps"), "{}", text(&empty));
     let wide = call("godot_game_scenario", json!({"steps": [{"frames": 601}]})).await;
     assert!(text(&wide).contains("600"), "{}", text(&wide));
+    for input in [
+        json!({"actions": [{"action": "jump"}]}),
+        json!({"pointers": [{"pointer": "mouse", "phase": "tap", "x": 1, "y": 1}]}),
+    ] {
+        let mut step = input;
+        step["frames"] = json!(0);
+        let instant = call("godot_game_scenario", json!({"steps": [step]})).await;
+        assert!(
+            instant.is_error && text(&instant).contains("frames 0"),
+            "{}",
+            text(&instant)
+        );
+    }
     let strength = call(
         "godot_game_scenario",
         json!({"steps": [{"frames": 1, "actions": [{"action": "jump", "strength": 2}]}]}),

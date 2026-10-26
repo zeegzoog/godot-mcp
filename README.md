@@ -265,7 +265,7 @@ Closing the game's window ends a hold. The server stopping the run does too. A s
 
 ```json
 {"steps": [
-  {"frames": 20, "actions": [{"action": "move_right", "strength": 1}, {"action": "jump", "phase": "tap"}]},
+  {"frames": 20, "actions": [{"action": "move_right", "phase": "press", "strength": 1}, {"action": "jump", "phase": "tap"}]},
   {"frames": 40}
 ], "bodies": ["Player"], "nodes": [{"path": "Player", "properties": ["jump_count"]}]}
 ```

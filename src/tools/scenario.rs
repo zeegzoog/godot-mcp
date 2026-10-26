@@ -38,7 +38,7 @@ impl Drop for ReleaseInput {
 pub fn definition() -> Tool {
     tool(
         "godot_game_scenario",
-        "Plays one input scenario in a running game and returns that run's steps, snapshots, warnings and errors. Each step applies Input Map actions and pointer events, then advances `frames` physics ticks (0 to 600; the whole scenario at most 3600). phase press stays down after the step, release lets go at the start of the step, tap stays down for the step's frames and is released before the next step. strength is the analog value, 0 to 1. pointers are mouse or touch; several touches may be down together, and touch phase move drags an index that is already down. pause sets SceneTree.paused for the following ticks; the runtime still answers, because a hold is not the tree's pause and pausable nodes simply skip their physics callback. bodies reads CharacterBody2D and CharacterBody3D (position, velocity, is_on_floor, is_on_wall, is_on_ceiling, up to 8 slide collisions). nodes reads public properties with game.get. A missing node or an unsupported body is an error that names the path. The game is held for the whole call (started with godot_run_project held true when the ticks must be exact) and left held, so nothing moves after the last snapshot; resume with godot_game_physics action resume. deterministic is true only for a game started held at a fixed frame rate equal to its tick rate. A press is flushed before the ticks, so _input sees it immediately and _process sees it on the following frame. Threads, loading and the physics solver are not made deterministic. screenshot true adds one capture of the last drawn frame (a headless game records a warning and no image). Every synthetic button, action and touch is released when the call finishes, when a step fails, and if the call is cancelled. output.lines and output.errors are only the warnings and errors recorded during this call. The call has a total 60-second budget, including 3 seconds reserved for input cleanup. It targets one managed process selected at the start; starting another process does not redirect it. A timed-out physics step may finish before the game holds again.",
+        "Plays one input scenario in a running game and returns that run's steps, snapshots, warnings and errors. Each step applies Input Map actions and pointer events, then advances `frames` physics ticks (0 to 600; the whole scenario at most 3600). phase is tap by default, as in godot_game_input: tap stays down for the step's frames and is released before the next step, so a step with a tap needs frames of at least 1. press stays down after the step until a later release, and release lets go at the start of the step. strength is the analog value, 0 to 1. pointers are mouse or touch; several touches may be down together, and touch phase move drags an index that is already down. pause sets SceneTree.paused for the following ticks; the runtime still answers, because a hold is not the tree's pause and pausable nodes simply skip their physics callback. bodies reads CharacterBody2D and CharacterBody3D (position, velocity, is_on_floor, is_on_wall, is_on_ceiling, up to 8 slide collisions). nodes reads public properties with game.get. A missing node or an unsupported body is an error that names the path. The game is held for the whole call (started with godot_run_project held true when the ticks must be exact) and left held, so nothing moves after the last snapshot; resume with godot_game_physics action resume. deterministic is true only for a game started held at a fixed frame rate equal to its tick rate. A press is flushed before the ticks, so _input sees it immediately and _process sees it on the following frame. Threads, loading and the physics solver are not made deterministic. screenshot true adds one capture of the last drawn frame (a headless game records a warning and no image). Every synthetic button, action and touch is released when the call finishes, when a step fails, and if the call is cancelled. output.lines and output.errors are only the warnings and errors recorded during this call. The call has a total 60-second budget, including 3 seconds reserved for input cleanup. It targets one managed process selected at the start; starting another process does not redirect it. A timed-out physics step may finish before the game holds again.",
         json!({
             "run_id": {"type": "string", "description": "Optional managed run id. Default: newest process run, pinned for the entire scenario."},
             "steps": {
@@ -48,14 +48,14 @@ pub fn definition() -> Tool {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "frames": {"type": "integer", "minimum": 0, "maximum": MAX_FRAMES, "description": "Physics ticks. 0 applies the input and takes the snapshot without stepping."},
+                        "frames": {"type": "integer", "minimum": 0, "maximum": MAX_FRAMES, "description": "Physics ticks. 0 applies the input and takes the snapshot without stepping, and refuses a tap."},
                         "actions": {
                             "type": "array",
                             "items": {
                                 "type": "object",
                                 "properties": {
                                     "action": {"type": "string"},
-                                    "phase": {"type": "string", "enum": ["press", "release", "tap"]},
+                                    "phase": {"type": "string", "enum": ["press", "release", "tap"], "description": "Default tap, which needs frames of at least 1."},
                                     "strength": {"type": "number", "minimum": 0, "maximum": 1}
                                 },
                                 "required": ["action"]
@@ -67,7 +67,7 @@ pub fn definition() -> Tool {
                                 "type": "object",
                                 "properties": {
                                     "pointer": {"type": "string", "enum": ["mouse", "touch"]},
-                                    "phase": {"type": "string", "enum": ["press", "release", "move", "tap"]},
+                                    "phase": {"type": "string", "enum": ["press", "release", "move", "tap"], "description": "Default tap, which needs frames of at least 1."},
                                     "x": {"type": "number"},
                                     "y": {"type": "number"},
                                     "index": {"type": "integer", "description": "Touch index. Several indexes can be down at once."},
@@ -369,10 +369,7 @@ async fn apply_input(
 ) -> Result<(), McpError> {
     let mut input = Vec::new();
     for action in &step.actions {
-        let phase = action
-            .get("phase")
-            .and_then(Value::as_str)
-            .unwrap_or("press");
+        let phase = action.get("phase").and_then(Value::as_str).unwrap_or("tap");
         let is_tap = phase == "tap";
         if taps_only && !is_tap {
             continue;
@@ -391,7 +388,7 @@ async fn apply_input(
         let phase = pointer
             .get("phase")
             .and_then(Value::as_str)
-            .unwrap_or("press");
+            .unwrap_or("tap");
         let is_tap = phase == "tap";
         if taps_only && !is_tap {
             continue;
@@ -519,6 +516,17 @@ fn parse(args: &Value) -> Result<Spec, String> {
             None => Vec::new(),
             Some(value) => parse_pointers(index, value)?,
         };
+        // A tap is let go after the step's ticks; with none, no tick would see it down.
+        if frames == 0
+            && actions
+                .iter()
+                .chain(&pointers)
+                .any(|input| input["phase"] == "tap")
+        {
+            return Err(format!(
+                "steps[{index}] has frames 0, so a tap (the default phase) would be released before any tick sees it. Give the step frames of at least 1, or use phase press and a later release."
+            ));
+        }
         let pause = match step.get("pause") {
             None => None,
             Some(Value::Bool(value)) => Some(*value),
@@ -587,7 +595,7 @@ fn parse_actions(index: usize, value: &Value) -> Result<Vec<Value>, String> {
             .ok_or_else(|| {
                 format!("steps[{index}].actions[{action_index}].action must be a name of 1 to 64 characters.")
             })?;
-        let phase = item.get("phase").and_then(Value::as_str).unwrap_or("press");
+        let phase = item.get("phase").and_then(Value::as_str).unwrap_or("tap");
         if !matches!(phase, "press" | "release" | "tap") {
             return Err(format!(
                 "steps[{index}].actions[{action_index}].phase must be press, release, or tap."
@@ -624,7 +632,7 @@ fn parse_pointers(index: usize, value: &Value) -> Result<Vec<Value>, String> {
                 "steps[{index}].pointers[{pointer_index}].pointer must be mouse or touch."
             ));
         }
-        let phase = item.get("phase").and_then(Value::as_str).unwrap_or("press");
+        let phase = item.get("phase").and_then(Value::as_str).unwrap_or("tap");
         if !matches!(phase, "press" | "release" | "move" | "tap") {
             return Err(format!(
                 "steps[{index}].pointers[{pointer_index}].phase must be press, release, move, or tap."

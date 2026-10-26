@@ -16,15 +16,17 @@ The call leaves the game held. Nothing in the game advances until `godot_game_ph
 
 ## One step
 
-`frames` is how many physics ticks run after the step's input is applied. `0` applies the input and reads state without stepping. Each step is at most 600 ticks, and the whole call at most 3600.
+`frames` is how many physics ticks run after the step's input is applied. `0` applies the input and reads state without stepping; a tap is refused there, because no tick would see it down. Each step is at most 600 ticks, and the whole call at most 3600.
 
 `actions` names an Input Map action:
 
 | `phase` | What the game sees |
 | --- | --- |
-| `press` (default) | Down for this step and still down afterwards, at `strength` (0 to 1, default 1). |
+| `tap` (default) | Down for this step's ticks, at `strength` (0 to 1, default 1), then released before the next step. Needs `frames` of at least 1. |
+| `press` | Down for this step and still down afterwards, until a later `release`. |
 | `release` | Let go at the start of the step. |
-| `tap` | Down for this step's ticks, then released before the next step. |
+
+The default is the same as `godot_game_input`. Pointers use the same phases and default, plus `move`.
 
 `pointers` is mouse or touch. `x` and `y` are pixels of the root viewport's visible rectangle, the same space `_input` sees. Several touches are separate `index` values and may be down together. `phase` `move` drags a touch that is already down (or moves the mouse). A touch also emits the engine's emulated mouse event when that project setting is on.
 
@@ -55,7 +57,7 @@ Not exact: threads, file loading, GPU work, and the physics solver's contact det
   "steps": [
     {"frames": 10},
     {"frames": 20, "actions": [
-      {"action": "move_right", "strength": 1},
+      {"action": "move_right", "phase": "press", "strength": 1},
       {"action": "jump", "phase": "tap"}
     ]},
     {"frames": 45}

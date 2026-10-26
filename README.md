@@ -159,6 +159,7 @@ To report a vulnerability, follow [SECURITY.md](SECURITY.md). Never open a publi
 | `godot_validate_script` | — | Checks a `.gd` file. When a language server is already running, lists its errors and warnings (`file:line:col`, code, message); a warning does not fail the check. Without one, `godot --headless --check-only` sees parse errors only and the answer says analyzer warnings were not checked. |
 | `godot_run_script` | Godot binary | Runs an `extends SceneTree` script headless (`--path` project, `-s` script, `user_args` after `--`). Returns the exit code, stdout, stderr, and each `SCRIPT ERROR` with its file and line. `timeout_seconds` defaults to 120 (max 600); on timeout the process tree is killed and the last output lines are included. A `SCRIPT ERROR` that leaves the main loop idle (the process stays up, as an error in `_init` does) stops the run then, and the answer says so, instead of waiting out the timeout. Paths outside the project are refused. |
 | `godot_resave_resources` | — | Refreshes the given `res://` files after external edits. With the editor, assets it already knows are re-imported synchronously and other files are re-scanned. A path it has never scanned is scanned first and listed under `reimported` only once a `.import` file exists; otherwise it is `not_scanned`. Without paths, rescans the whole project in the background. `wait: true` returns only after scanning and importing finish (up to 60s) and reports how many files were imported. Without the editor, runs `godot --headless --path <project> --import` and reports the sources whose `.import` sidecar appeared or changed. |
+| `godot_check_voxel_model` | Froxel | Exports one `.vox`, or up to 16 `models`, through `froxel mcp`, writes each `.glb` into the project, imports it and checks the `.import` sidecar. `preview: true` adds a Froxel path-traced PNG. See [Checking voxel model exports](#checking-voxel-model-exports). |
 | `godot_run_output` | Running game | Logs, warnings and errors, with stack traces, from a managed process run or the editor's running game (`since`, `level`). |
 | `godot_game_tree` | Running game | Live nodes of the running game: path, class, position, visible text. Filter by `name`, `class`, `group` or `text`. |
 | `godot_game_get` | Running game | A live node's properties, groups and, optionally, signals and methods. `/` reads a Dictionary key or an Object property (get only; private names are refused). A missing segment is that property's entry in `property_errors` and names the segment; other properties are still returned. `null` is a value that really is null. `:` steps through a Resource (`material:shader_parameter/caustics`), including a name that starts with `_`. A requested `script` is omitted. A non-resource `:` step names the `/` form. |
@@ -259,6 +260,44 @@ A held game refuses what needs time to pass, and says to step instead: `godot_ga
 Steps are **exact** only for a game started with `godot_run_project` `{"mode": "process", "held": true}`. That start fixes the engine's frame rate to the project's tick rate (`physics/common/physics_ticks_per_second`, 60 when unset), so every tick is paired with one frame, and the answers say `"deterministic": true`. A hold entered later, or on the editor's Play, still stands still but is reported as `"deterministic": false` with a `deterministic_reason`: `not_started_held`, `fixed_rate_differs` (the game changed its tick rate) or `frames_did_not_follow_ticks` (a step saw frames fail to follow its ticks, which ends the claim for the rest of the run). A step runs its ticks as fast as the game can, so `max` bounds ticks, not seconds. Work on other threads and file loading takes real time, so after starting a game repeat short `until` steps instead of guessing a tick count. A held step that takes longer than 60 seconds is not cancelled: the call returns an error saying the game finishes it and holds again, and `status` shows where it is.
 
 Closing the game's window ends a hold. The server stopping the run does too. A server that disappears without stopping the run leaves its game held, with a window that can still be closed.
+
+## Checking voxel model exports
+
+`godot_check_voxel_model` exports one `.vox`, or a batch of up to 16 models,
+through Froxel MCP and imports the resulting GLBs into the selected Godot project.
+Set `FROXEL_BIN` to a Froxel executable supporting `export_models` (or put it on
+PATH). Both are trusted programs, like `GODOT_PATH`: the server starts `<bin> mcp`
+without the bridge token in its environment. Pass `vox` and `dest`, or
+`models: [{vox, dest}]`; source paths are absolute paths on this machine (a network
+share is refused, and the source is not confined to the project), and destinations are
+project-local `res://` GLB paths outside `.godot/`. Optional `preview: true`
+path-traces `<model>.preview.png` beside each successfully exported model, so a
+texture with the model's name is never overwritten. This is a Froxel preview, not a
+Godot viewport capture.
+
+All output paths are validated before writing. Output names must be unique,
+including previews, links and case-only aliases. Each Froxel process has a
+60-second deadline covering initialization, tool replies and process exit.
+A Froxel reply that leaves a model out, or that reports a model as exported without
+leaving its `.glb`, makes the check fail (`missing_exports`). The report preserves
+per-model export failures even when no model can be imported; a mixed batch imports
+and previews only successful exports. The import
+goes through the connected editor when it has the project open, and is headless
+otherwise. The Godot check verifies import sidecars and reports a changed `.glb`
+whose cache is older than the file under `stale_imports` (an export that left the
+bytes unchanged is not re-imported, so a cache that is older for another reason is
+not reported); it does not yet verify
+the instantiated model's meshes or animation behavior.
+
+```json
+{"vox": "/path/lily_pad.vox", "dest": "res://art/lily_pad.glb", "project_path": "/path/frog-world"}
+```
+
+The end-to-end test needs a Froxel build and the Godot build named in `.github/godot-version`:
+
+```bash
+FROXEL_BIN=/path/to/froxel GODOT_PATH=/path/to/godot \
+  cargo test --test model_chain_e2e_test -- --ignored --test-threads=1
 
 ## Playing a scenario
 

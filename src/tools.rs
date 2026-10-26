@@ -20,6 +20,7 @@ mod code;
 mod feedback;
 mod game;
 mod headless;
+mod model_chain;
 mod project;
 mod run;
 mod scenario;
@@ -125,6 +126,7 @@ impl ToolManager {
             "godot_validate_script" => self.handle_validate_script(args).await,
             "godot_run_script" => self.handle_run_script(args).await,
             "godot_resave_resources" => self.handle_resave_resources(args).await,
+            "godot_check_voxel_model" => model_chain::call(&self, &args).await,
             name if authoring::handles(name) => authoring::call(&self, name, args).await,
             name if scripts::handles(name) => scripts::call(&self, name, args).await,
             name if game::handles(name) => game::call(&self, name, args).await,
@@ -833,6 +835,7 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
             }),
             &["script"],
         ),
+        model_chain::definition(),
         tool(
             "godot_resave_resources",
             "Refreshes assets and resources after they were changed externally. With the editor connected, importable files the editor already knows are re-imported synchronously and other files are re-scanned. A path the editor has never scanned is updated and, if needed, scanned first; it is listed under reimported only after a .import file exists, and otherwise under not_scanned (load() would fail with no loader). Without paths, rescans the whole project in the background. wait true holds the reply until scanning and importing finish (up to 60s) and reports how many files were imported; timed_out means they may not be loadable yet. Without the editor, runs `godot --headless --path <project> --import` and reports the sources whose .import sidecar appeared or changed.",

@@ -34,11 +34,15 @@ The default is the same as `godot_game_input`. Pointers use the same phases and 
 
 `bodies` lists CharacterBody2D or CharacterBody3D paths. Each snapshot has `position`, `velocity`, `is_on_floor`, `is_on_wall`, `is_on_ceiling`, `slide_count` and up to 8 `collisions` (`normal`, `position`, `collider` path). Another class, or a missing node, is an error that names the path. `nodes` reads public properties through `game.get` (no method calls, no private names).
 
+Limits: at most 32 steps, 32 actions and pointers in one step, 16 `bodies`, 16 `nodes` with at most 32 properties each, names of at most 256 characters, and touch `index` 0 to 9. A property name whose `/` or `:` path has a segment starting with `_` is refused. Only one scenario plays in a run at a time; a second call is refused until the first has released its input.
+
 `screenshot` true captures one frame of what the game last drew. A headless game has no image; that is a warning on the scenario, not a fake picture. The image is the same PNG `godot_game_screenshot` returns.
 
 ## Answer
 
 `steps` is one object per step that ran, with `ticks_run` and `snapshot`. `ticks_run` at the top is the sum. `deterministic` and `deterministic_reason` come from the held stepper (`not_started_held`, `fixed_rate_differs`, `frames_did_not_follow_ticks`). `output.lines` and `output.errors` are warnings and errors whose sequence number is at least the cursor taken at the start of this call. Older lines from the same process are not included, and another run has its own log.
+
+`ok` is false when a step fails, when a body or node cannot be read, or when cleanup fails. A game error that only shows up in `output.errors` does not change `ok`; read it there.
 
 `released` is the `input.release_all` answer. `held` inside it is what is still down afterwards, which is empty unless the release itself failed. A failed step, a timeout and a cancelled call release the same way. Stopping the game releases input from the runtime's exit.
 

@@ -23,6 +23,7 @@ mod headless;
 mod model_chain;
 mod project;
 mod run;
+mod scenario;
 mod scripts;
 
 use project::EditorChoice;

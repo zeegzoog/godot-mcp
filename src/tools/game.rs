@@ -48,6 +48,7 @@ pub fn handles(name: &str) -> bool {
             | "godot_game_input_release"
             | "godot_game_wait"
             | "godot_game_physics"
+            | "godot_game_scenario"
             | "godot_game_screenshot"
             | "godot_game_record"
             | "godot_debug_breakpoints"
@@ -108,13 +109,13 @@ pub fn catalog() -> Vec<Tool> {
         ),
         tool(
             "godot_game_input",
-            "Injects input into the running game. Steps: key, text, mouse_move, mouse_button, touch, joy_button, joy_axis, wait, click, click_node, swipe, path, circle, time_scale. phase is tap (default), press, or release. click is a mouse tap at x, y. click_node taps the center of a Control, Node2D, or Node3D. swipe presses at x, y and releases at to_x, to_y across frames (default 8, pointer mouse or touch). path presses once at the first of points ([[x, y], ...], 2 to 256), moves through them, and releases at the last; frames_per_point is the frames spent on each step between points (default 1); a path takes at most 600 frames in all (points - 1 times frames_per_point). circle is that same drag around center [x, y]: radius, turns (default 1, max 8) and points_per_turn (default 16, 4 to 64). pointer is mouse or touch, and touch may set index. Every pointer position (mouse_move, mouse_button, touch, click, swipe, path, circle) is a pixel of the root viewport's visible rectangle, the same space _input and _unhandled_input see after content scale. It is not an OS screen pixel and not a world coordinate. A touch step, and a swipe, path or circle with pointer touch, also emits the engine's emulated mouse event when Input.emulate_mouse_from_touch is on (project setting input_devices/pointing/emulate_mouse_from_touch, on by default). The engine delivers that InputEventMouseButton or InputEventMouseMotion first, with device InputEvent.DEVICE_ID_EMULATION, then the touch, both at the same viewport position. emulate_mouse false turns that emulation off for this call and restores the previous value afterwards, including when a step fails. Mouse steps do not move the OS cursor unless warp_mouse is true. time_scale sets Engine.time_scale (0 through 8) until another call changes it. A failed step releases every button and touch this server is still holding. More than 20 steps return ok_count and failed instead of one object per step, unless verbose is true. In a held game the steps are applied at once: key, mouse_button, touch and joy_button taps stay down for hold_ticks ticks (default 2) and are released at the start of the tick they fall due on, so how the ticks are split into steps does not change what the game sees; wait, text, swipe, path and circle steps are refused while held. Leaving the hold releases everything still held.",
+            "Injects input into the running game. Steps: action, key, text, mouse_move, mouse_button, touch, joy_button, joy_axis, wait, click, click_node, swipe, path, circle, time_scale. action presses an Input Map action (phase tap, press, or release; strength 0 to 1). touch phase move drags a touch that is already down. phase is tap (default), press, or release. click is a mouse tap at x, y. click_node taps the center of a Control, Node2D, or Node3D. swipe presses at x, y and releases at to_x, to_y across frames (default 8, pointer mouse or touch). path presses once at the first of points ([[x, y], ...], 2 to 256), moves through them, and releases at the last; frames_per_point is the frames spent on each step between points (default 1); a path takes at most 600 frames in all (points - 1 times frames_per_point). circle is that same drag around center [x, y]: radius, turns (default 1, max 8) and points_per_turn (default 16, 4 to 64). pointer is mouse or touch, and touch may set index. Every pointer position (mouse_move, mouse_button, touch, click, swipe, path, circle) is a pixel of the root viewport's visible rectangle, the same space _input and _unhandled_input see after content scale. It is not an OS screen pixel and not a world coordinate. A touch step, and a swipe, path or circle with pointer touch, also emits the engine's emulated mouse event when Input.emulate_mouse_from_touch is on (project setting input_devices/pointing/emulate_mouse_from_touch, on by default). The engine delivers that InputEventMouseButton or InputEventMouseMotion first, with device InputEvent.DEVICE_ID_EMULATION, then the touch, both at the same viewport position. emulate_mouse false turns that emulation off for this call and restores the previous value afterwards, including when a step fails. Mouse steps do not move the OS cursor unless warp_mouse is true. time_scale sets Engine.time_scale (0 through 8) until another call changes it. A failed step releases every button and touch this server is still holding. More than 20 steps return ok_count and failed instead of one object per step, unless verbose is true. In a held game the steps are applied at once: key, mouse_button, touch and joy_button taps stay down for hold_ticks ticks (default 2) and are released at the start of the tick they fall due on, so how the ticks are split into steps does not change what the game sees; wait, text, swipe, path and circle steps are refused while held. Leaving the hold releases everything still held.",
             json!({"run_id": s(""), "steps": {"type": "array", "items": step_schema()}, "warp_mouse": {"type": "boolean", "description": "Move the real OS cursor to each mouse event. Default false."}, "emulate_mouse": {"type": "boolean", "description": "When false, touch steps do not also emit the engine's emulated mouse events. The previous value is restored when the call finishes. Default: leave the project setting (on unless the project turned it off)."}, "verbose": {"type": "boolean", "description": "Return every step when there are more than 20. Default false, which answers with ok_count and failed."}, "hold_ticks": ir("Held game only: how many ticks a tap stays down before it is released. 1 to 600, default 2.", 1, Some(600))}),
             &["steps"],
         ),
         tool(
             "godot_game_input_release",
-            "Releases every key, mouse button, joypad button, axis and touch this server is still holding.",
+            "Releases every key, mouse button, joypad button, axis, Input Map action and touch this server is still holding.",
             json!({"run_id": s("")}),
             &[],
         ),
@@ -130,6 +131,7 @@ pub fn catalog() -> Vec<Tool> {
             json!({"run_id": s(""), "action": s("step (default), hold, resume, or status. hold stops the game at the start of a physics tick until it is stepped or resumed."), "ticks": ir("Physics iterations for step: 1 to 120, or 1 to 600 while the game is held.", 1, None), "until": until_schema(), "max": ir("With until: the most ticks to run. 1 to 3600, default 600.", 1, Some(3600))}),
             &[],
         ),
+        super::scenario::definition(),
         tool(
             "godot_game_screenshot",
             "Captures the running game window, a viewport, or a Camera2D/Camera3D as one PNG. frames (1 to 8) stitches shots taken every process frames into a single sheet. For a longer series saved as PNG files, use godot_game_record. The text names the godot_game_input coordinate space (the root viewport's visible width and height, after content scale) and the scale from returned image pixels to that space: multiply an image pixel by the scale. A sheet uses that scale per frame, after subtracting the cell origin. When a baseline is compared, roi is the comparison region in returned-image pixels (roi_space returned_image) and the same scale applies inside a frame; roi does not crop the image and is refused without a baseline. A camera capture uses the camera's viewport; when that viewport is not the root, the text also names the captured viewport and the scale to it. The text says how many pixels changed since the previous capture of this run, and where (a sheet compares its last frame, and only against a capture of the same size). save_baseline stores the returned image under a name (at most 8, each at most 512×512 pixels). baseline compares the returned image with a saved one. roi is the comparison region (x, y, w, h in pixels of that returned image, including a sheet) and requires baseline; it does not crop the returned image. tolerance (0 to 255, only with baseline) is the allowed per-channel difference; a larger difference counts as changed. The text reports changed, sampled, ratio, bounds, tolerance, the baseline name, and whether the pixel count is exact or sampled. Fails instead of returning an empty image. Headless games have nothing to capture. While the game is held a single capture shows the last frame it drew (a sheet with frames above 1, or a camera switch, is refused: take one capture, step, take the next). A missing baseline, a bad name, or an roi outside the image is an error and does not replace a saved image.",
@@ -197,8 +199,10 @@ fn step_schema() -> Value {
         "type": "object",
         "description": "One input step. type is required; the other fields depend on it (key: key, phase; text: text; mouse_move, mouse_button, touch: x, y, button, index, phase; click: x, y, button; click_node: node, pointer, button; swipe: x, y, to_x, to_y, frames, pointer, button; path: points, frames_per_point, pointer, button, index; circle: center, radius, turns, points_per_turn, frames_per_point, pointer, button, index; joy_button: button, device, phase; joy_axis: axis, value, device; wait: frames, node, signal, timeout; time_scale: scale).",
         "properties": {
-            "type": {"type": "string", "enum": ["key", "text", "mouse_move", "mouse_button", "touch", "click", "click_node", "swipe", "path", "circle", "joy_button", "joy_axis", "wait", "time_scale"]},
-            "phase": {"type": "string", "enum": ["tap", "press", "release"], "description": "Default tap."},
+            "type": {"type": "string", "enum": ["action", "key", "text", "mouse_move", "mouse_button", "touch", "click", "click_node", "swipe", "path", "circle", "joy_button", "joy_axis", "wait", "time_scale"]},
+            "phase": {"type": "string", "enum": ["tap", "press", "release", "move"], "description": "Default tap. move is a touch drag and needs that index to be down."},
+            "action": {"type": "string", "description": "Input Map action name, such as move_right or jump."},
+            "strength": {"type": "number", "description": "action: analog strength from 0 to 1. Default 1."},
             "key": {"type": "string", "description": "An engine key name such as Right, Space or A."},
             "text": {"type": "string"},
             "x": {"type": "number"}, "y": {"type": "number"},
@@ -281,6 +285,7 @@ pub async fn call(tools: &ToolManager, name: &str, args: Value) -> ToolResult {
         "godot_game_input_release" => runtime(tools, &args, "input.release_all").await,
         "godot_game_wait" => runtime(tools, &args, "input.wait").await,
         "godot_game_physics" => runtime(tools, &args, "game.physics").await,
+        "godot_game_scenario" => crate::tools::scenario::call(tools, &args).await,
         "godot_game_screenshot" => screenshot(tools, &args).await,
         "godot_game_record" => record(tools, &args).await,
         "godot_debug_breakpoints" => breakpoints(tools, &args).await,
@@ -991,7 +996,7 @@ fn runtime_error(error: &McpError) -> ToolResult {
 }
 
 impl ToolManager {
-    pub(super) async fn runtime_call(
+    pub(crate) async fn runtime_call(
         &self,
         run_id: Option<&str>,
         method: &str,

@@ -65,7 +65,7 @@ Tool names are the MCP names. Solo and Vollkorn do not use a `godot_` prefix.
 
 | Area | Files |
 | --- | --- |
-| Tool catalog and handlers | `src/tools.rs`, `src/tools/game.rs`, `src/tools/code.rs`, `src/tools/authoring.rs`, `src/tools/scripts.rs`, `src/tools/run.rs`, `src/tools/headless.rs`, `src/tools/project.rs`, `src/tools/scenario.rs`, `src/tools/model_chain.rs` |
+| Tool catalog and handlers | `src/tools.rs`, `src/tools/game.rs`, `src/tools/game/*.rs`, `src/tools/code.rs`, `src/tools/authoring.rs`, `src/tools/scripts.rs`, `src/tools/run.rs`, `src/tools/headless.rs`, `src/tools/project.rs`, `src/tools/scenario.rs`, `src/tools/model_chain.rs` |
 | Remote debugger session, variant codec | `src/godot/debug_session.rs`, `src/godot/variant.rs` |
 | Breakpoints, pause, step, stack | `src/godot/debug_ctl.rs` |
 | Process runs, `override.cfg` autoload, logs | `src/godot/runs.rs` |
@@ -73,7 +73,7 @@ Tool names are the MCP names. Solo and Vollkorn do not use a `godot_` prefix.
 | Editor bridge commands, stale-scene reload | `addons/godot_mcp/bridge_server.gd` |
 | In-game runtime | `addons/godot_mcp/runtime/mcp_runtime.gd`, `addons/godot_mcp/runtime/ops/rt_*.gd` |
 | Editor Play relay | `addons/godot_mcp/editor/game_relay.gd`, `addons/godot_mcp/core/runtime_override.gd` |
-| Behavior tests | `src/godot/variant.rs`, `src/godot/debug_session.rs`, `src/lsp/framing.rs`, `src/tools/game.rs`, `src/tools/authoring.rs`, `tests/tools_test.rs`, `tests/runtime_e2e_test.rs`, `tests/editor_e2e_test.rs`, `tests/addon_export_test.rs` |
+| Behavior tests | `src/godot/variant.rs`, `src/godot/debug_session.rs`, `src/lsp/framing.rs`, `src/tools/game.rs`, `src/tools/game/*.rs`, `src/tools/authoring.rs`, `tests/tools_test.rs`, `tests/runtime_e2e_test.rs`, `tests/editor_e2e_test.rs`, `tests/addon_export_test.rs` |
 
 ## Errors and limits
 

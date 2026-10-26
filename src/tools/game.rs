@@ -19,7 +19,7 @@ mod session;
 use crate::error::McpError;
 use crate::protocol::ToolResult;
 pub use catalog::catalog;
-pub use debug::check_breakpoint;
+pub(in crate::tools) use debug::check_breakpoint;
 use debug::{breakpoints, debug_control, debug_state};
 use input::game_input;
 use record::record;
@@ -218,12 +218,6 @@ fn since_of(args: &Value) -> u64 {
 
 fn level_of(args: &Value) -> &str {
     str_arg(args, "level").unwrap_or("all")
-}
-
-fn json_number(value: Option<&Value>) -> String {
-    value
-        .map(|item| serde_json::to_string(item).unwrap_or_else(|_| "0".into()))
-        .unwrap_or_else(|| "0".into())
 }
 
 fn text_result(result: Result<Value, McpError>) -> ToolResult {

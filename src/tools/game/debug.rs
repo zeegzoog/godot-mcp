@@ -60,7 +60,7 @@ pub(super) async fn breakpoints(tools: &ToolManager, args: &Value) -> ToolResult
 
 /// A breakpoint location is `res://path/to/script.gd:LINE`: a project file, no parent segments,
 /// a line from 1 (TL-5).
-pub fn check_breakpoint(spec: &str) -> Result<(), ToolResult> {
+pub(in crate::tools) fn check_breakpoint(spec: &str) -> Result<(), ToolResult> {
     let refused = |problem: String| {
         Err(ToolResult::error(
             problem,

@@ -1,6 +1,6 @@
 //! Screenshots: the capture call and the text that tells the caller how to read the picture.
 
-use super::{json_number, params_without_run, runtime_error};
+use super::{params_without_run, runtime_error};
 use crate::protocol::ToolResult;
 use crate::tools::{ToolManager, str_arg};
 use serde_json::Value;
@@ -271,6 +271,12 @@ fn base64_decode(text: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+fn json_number(value: Option<&Value>) -> String {
+    value
+        .map(|item| serde_json::to_string(item).unwrap_or_else(|_| "0".into()))
+        .unwrap_or_else(|| "0".into())
 }
 
 #[cfg(test)]

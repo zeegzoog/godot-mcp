@@ -141,6 +141,7 @@ When interacting with a Godot project, agents must adhere to the following workf
    - Pass game flags with `godot_run_project` `user_args` and `mode: "process"`. They go after `--`. Do not put Godot engine options there.
    - `godot_game_call` runs only a method named in `permit`, and never one that quits, evaluates, calls another method by name, sets a property by name or frees or replaces a node.
    - To act, advance a known amount and look, hold the game with `godot_game_physics` (`hold`, then `step`, `resume`), starting it with `godot_run_project` `held: true` when the steps must be exact. Check `deterministic` in the answers. A held game refuses waits, signal watches, screenshot sheets, recordings and timed input; step instead. Resume or stop the run when done: a held game does not advance on its own.
+   - For a repeatable play-through, use `godot_game_scenario` instead of writing a GDScript test. It presses Input Map actions and pointers, advances a known number of physics ticks, and returns that call's snapshots, warnings and errors. The schema, the determinism limits and an example are in [docs/game-checks.md](docs/game-checks.md).
 
 5. **Feedback to the Maintainers**:
    - When godot-mcp itself blocks or misleads you (a tool fails for a reason its message does not explain, a needed capability has no tool, a description or schema is wrong), record it with `godot_note_feedback` in English: what you tried, what came back, what you expected, one problem per note. Do not note your own mistakes or problems in the user's project.

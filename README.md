@@ -171,6 +171,7 @@ To report a vulnerability, follow [SECURITY.md](SECURITY.md). Never open a publi
 | `godot_game_input_release` | Running game | Releases every key, button, axis and touch this server still holds down. |
 | `godot_game_wait` | Running game | Waits for process frames, for a node to exist (`node`), for a signal (`node` and `signal`), for a public property (`property`, `op`, `value`), or for a newer `scene_generation`. A missing `/` segment is an error that names it, not a timeout; `null` means the value is null. `timeout` is in frames. `time_scale` (0 to 8) sets `Engine.time_scale`; the runtime restores the previous value when the game exits. |
 | `godot_game_physics` | Running game | Controls game time. `hold` stops the game at the start of a physics tick; while held, `step` runs an exact number of ticks (or until a condition holds), input is applied by tick, and `resume` lets the game run. Without a hold, `step` advances N engine physics iterations and leaves the tree paused. See [Holding a game](#holding-a-game). |
+| `godot_game_scenario` | Running game | Plays one input sequence in a held managed game: Input Map actions and pointers, a known number of physics ticks per step, then `CharacterBody` and property snapshots, warnings, errors and an optional screenshot. Releases all input when it ends. See [Playing a scenario](#playing-a-scenario). |
 | `godot_game_screenshot` | Running game with a window | PNG of the game window, a viewport or a camera; `frames` (up to 8) stitches shots taken every `every` frames into one sheet. The text names the `godot_game_input` coordinate space (root viewport width and height) and the scale from image pixels to that space, including a sheet (per frame) and a camera. Compares with the previous capture, and can save or compare a named baseline (`save_baseline`, `baseline`, `tolerance`). `roi` is the comparison region and requires `baseline`; it does not crop the image. An error, never an empty image; a headless game has nothing to capture. |
 | `godot_game_record` | Running game with a window | Saves up to 240 PNG frames of the game window to a directory below the system temporary directory (`frames`, `every`, `max_dimension`, `directory`). The reply lists paths, sizes and timings and does not embed the images. `format` `gif` or `mp4` also builds a movie when `ffmpeg` is on `PATH`; without it the PNG files are the result. |
 | `godot_debug_breakpoints` | Process run | Lists, adds, removes or clears breakpoints (`res://script.gd:LINE`). Editor Play uses the editor's own debugger. |
@@ -258,6 +259,17 @@ A held game refuses what needs time to pass, and says to step instead: `godot_ga
 Steps are **exact** only for a game started with `godot_run_project` `{"mode": "process", "held": true}`. That start fixes the engine's frame rate to the project's tick rate (`physics/common/physics_ticks_per_second`, 60 when unset), so every tick is paired with one frame, and the answers say `"deterministic": true`. A hold entered later, or on the editor's Play, still stands still but is reported as `"deterministic": false` with a `deterministic_reason`: `not_started_held`, `fixed_rate_differs` (the game changed its tick rate) or `frames_did_not_follow_ticks` (a step saw frames fail to follow its ticks, which ends the claim for the rest of the run). A step runs its ticks as fast as the game can, so `max` bounds ticks, not seconds. Work on other threads and file loading takes real time, so after starting a game repeat short `until` steps instead of guessing a tick count. A held step that takes longer than 60 seconds is not cancelled: the call returns an error saying the game finishes it and holds again, and `status` shows where it is.
 
 Closing the game's window ends a hold. The server stopping the run does too. A server that disappears without stopping the run leaves its game held, with a window that can still be closed.
+
+## Playing a scenario
+
+`godot_game_scenario` is one call that presses Input Map actions and pointers, advances physics ticks, and reads the result. It does not run GDScript from the caller. Start the game with `godot_run_project` `{"mode": "process", "held": true}` when the tick count must be exact. The call leaves the game held; `godot_game_physics` `{"action": "resume"}` lets it run, and `godot_stop_project` stops it. The arguments, what is and is not deterministic, and a worked example are in [docs/game-checks.md](docs/game-checks.md).
+
+```json
+{"steps": [
+  {"frames": 20, "actions": [{"action": "move_right", "phase": "press", "strength": 1}, {"action": "jump", "phase": "tap"}]},
+  {"frames": 40}
+], "bodies": ["Player"], "nodes": [{"path": "Player", "properties": ["jump_count"]}]}
+```
 
 ## How it works
 

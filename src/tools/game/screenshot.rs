@@ -95,7 +95,44 @@ fn screenshot_note(value: &Value, width: u32, height: u32, source: &str) -> Stri
         None => {}
     }
     append_baseline(&mut note, value);
+    append_render(&mut note, value, frames);
     note
+}
+
+/// Which drawn frame the image is, and a warning when the window drew nothing new before the
+/// capture: the viewport texture then still holds an older frame than the game state.
+fn append_render(note: &mut String, value: &Value, frames: u64) {
+    let Some(render) = value.get("render").filter(|item| item.is_object()) else {
+        return;
+    };
+    let drawn = json_number(render.get("frames_drawn"));
+    let process = json_number(render.get("process_frame"));
+    note.push_str(&format!(
+        ", frames drawn {drawn} at process frame {process}"
+    ));
+    let stale = render
+        .get("stale_frames")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if stale == 0 {
+        return;
+    }
+    let waited = json_number(render.get("waited_frames"));
+    if frames > 1 {
+        note.push_str(&format!(
+            ". STALE: {stale} of {frames} frames were taken while the window drew no new frame (each waited up to {waited} process frames), so they show older frames than the game state."
+        ));
+    } else {
+        note.push_str(&format!(
+            ". STALE: the window drew no new frame in the {waited} process frames before the capture, so the image shows an older frame than the game state."
+        ));
+    }
+    if render.get("window_can_draw").and_then(Value::as_bool) == Some(false) {
+        note.push_str(" The window reports that it cannot draw (minimized or hidden).");
+    }
+    note.push_str(
+        " Bring the game window to the front and keep it uncovered (macOS stops drawing a covered or minimized window), then capture again; read state with godot_game_get instead of trusting this image.",
+    );
 }
 
 /// How returned image pixels map onto the coordinate space `godot_game_input` uses.
@@ -435,6 +472,80 @@ mod tests {
         assert!(
             sampled.contains("sampled") && !sampled.contains("exact"),
             "{sampled}"
+        );
+    }
+
+    #[test]
+    fn screenshot_note_names_the_drawn_frame() {
+        let note = screenshot_note(
+            &json!({
+                "frames": 1,
+                "diff": {"compared": false},
+                "render": {"frames_drawn": 120, "process_frame": 124, "stale_frames": 0, "window_can_draw": true}
+            }),
+            8,
+            8,
+            "main window",
+        );
+        assert_eq!(
+            note,
+            "Game screenshot 8x8 (main window), no earlier capture to compare, frames drawn 120 at process frame 124"
+        );
+    }
+
+    #[test]
+    fn screenshot_note_warns_when_the_window_drew_nothing_new() {
+        let note = screenshot_note(
+            &json!({
+                "frames": 1,
+                "diff": {"compared": false},
+                "render": {
+                    "frames_drawn": 3,
+                    "process_frame": 190,
+                    "stale_frames": 1,
+                    "waited_frames": 30,
+                    "window_can_draw": true
+                }
+            }),
+            8,
+            8,
+            "main window",
+        );
+        assert!(
+            note.starts_with(
+                "Game screenshot 8x8 (main window), no earlier capture to compare, frames drawn 3 at process frame 190. STALE: the window drew no new frame in the 30 process frames before the capture, so the image shows an older frame than the game state."
+            ),
+            "{note}"
+        );
+        assert!(
+            note.contains("Bring the game window to the front"),
+            "{note}"
+        );
+        assert!(!note.contains("cannot draw"), "{note}");
+
+        let hidden = screenshot_note(
+            &json!({
+                "frames": 4,
+                "columns": 2,
+                "render": {
+                    "frames_drawn": 3,
+                    "process_frame": 190,
+                    "stale_frames": 2,
+                    "waited_frames": 30,
+                    "window_can_draw": false
+                }
+            }),
+            16,
+            16,
+            "main window",
+        );
+        assert!(
+            hidden.contains("STALE: 2 of 4 frames were taken while the window drew no new frame"),
+            "{hidden}"
+        );
+        assert!(
+            hidden.contains("The window reports that it cannot draw (minimized or hidden)"),
+            "{hidden}"
         );
     }
 

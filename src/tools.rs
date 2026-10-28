@@ -20,6 +20,7 @@ mod code;
 mod feedback;
 mod game;
 mod headless;
+mod input_map;
 mod model_chain;
 mod project;
 mod run;
@@ -128,6 +129,7 @@ impl ToolManager {
             "godot_resave_resources" => self.handle_resave_resources(args).await,
             "godot_check_voxel_model" => model_chain::call(&self, &args).await,
             name if authoring::handles(name) => authoring::call(&self, name, args).await,
+            name if input_map::handles(name) => input_map::call(&self, name, args).await,
             name if scripts::handles(name) => scripts::call(&self, name, args).await,
             name if game::handles(name) => game::call(&self, name, args).await,
             name if code::handles(name) => code::call(&self, name, args).await,
@@ -933,6 +935,7 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
         ),
     ];
     tools.extend(authoring::catalog());
+    tools.extend(input_map::catalog());
     tools.extend(scripts::catalog());
     tools.extend(game::catalog());
     tools.extend(code::catalog());

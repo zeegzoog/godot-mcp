@@ -72,7 +72,7 @@ pub fn catalog() -> Vec<Tool> {
         ),
         tool(
             "godot_set_project_setting",
-            "Sets one project setting and saves it. Uses the live editor when connected. The value must be a string, number or boolean, and of the type the setting already has.",
+            "Sets one project setting and saves it. Uses the live editor when connected. The value must be a string, number or boolean, and of the type the setting already has. InputMap actions (input/...) are changed with godot_edit_input_action.",
             json!({"key": s("For example application/config/name."), "value": {"description": "String, number, or boolean."}, "project_path": s("")}),
             &["key", "value"],
         ),
@@ -385,6 +385,14 @@ async fn editor_or_error(tools: &ToolManager, command: &str, args: &Value) -> To
 }
 
 async fn set_setting(tools: &ToolManager, args: &Value) -> ToolResult {
+    if str_arg(args, "key").is_some_and(|key| key.starts_with("input/")) {
+        return ToolResult::error(
+            "An input/ setting is an InputMap action (a deadzone and a list of InputEvents), not a string, number or boolean",
+            &[
+                "Read the actions with godot_get_input_map and change one with godot_edit_input_action",
+            ],
+        );
+    }
     let choice = match tools.editor_choice(args, true).await {
         Ok(choice) => choice,
         Err(result) => return result,

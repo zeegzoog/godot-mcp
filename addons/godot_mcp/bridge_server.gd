@@ -54,6 +54,8 @@ const PARAM_TYPES: Dictionary = {
     "create_resource": {"resource_path": TYPE_STRING, "class_name": TYPE_STRING},
     "set_project_setting": {"key": TYPE_STRING},
     "get_project_settings": {"prefix": TYPE_STRING},
+    "get_input_map": {"action": TYPE_STRING, "include_builtin": TYPE_BOOL},
+    "edit_input_action": {"action": TYPE_STRING, "add_events": TYPE_ARRAY, "remove_events": TYPE_ARRAY, "deadzone": TYPE_FLOAT, "create": TYPE_BOOL, "delete": TYPE_BOOL},
     "game_send": {"command": TYPE_STRING},
 }
 
@@ -310,6 +312,10 @@ func dispatch_command(peer: WebSocketPeer, cmd_id: String, cmd_type: String, par
             set_project_setting(peer, cmd_id, params)
         "get_project_settings":
             get_project_settings(peer, cmd_id, params)
+        "get_input_map":
+            get_input_map(peer, cmd_id, params)
+        "edit_input_action":
+            edit_input_action(peer, cmd_id, params)
         "game_send":
             game_send(peer, cmd_id, params)
         "game_status":
@@ -1579,6 +1585,301 @@ func get_project_settings(peer: WebSocketPeer, cmd_id: String, params: Dictionar
         if count >= 200:
             break
     send_success(peer, cmd_id, {"settings": values, "truncated": count >= 200})
+
+# --- Input map -------------------------------------------------------------------------
+
+const INPUT_PREFIX: String = "input/"
+## What the editor's Input Map panel gives a new action.
+const DEFAULT_DEADZONE: float = 0.2
+## Characters the editor's Input Map panel refuses in an action name.
+const ACTION_NAME_FORBIDDEN: String = "/:=\\\""
+const MAX_ACTION_NAME: int = 128
+const MOUSE_BUTTON_NAMES: Dictionary = {
+    "left": MOUSE_BUTTON_LEFT,
+    "right": MOUSE_BUTTON_RIGHT,
+    "middle": MOUSE_BUTTON_MIDDLE,
+    "wheel_up": MOUSE_BUTTON_WHEEL_UP,
+    "wheel_down": MOUSE_BUTTON_WHEEL_DOWN,
+    "wheel_left": MOUSE_BUTTON_WHEEL_LEFT,
+    "wheel_right": MOUSE_BUTTON_WHEEL_RIGHT,
+    "xbutton1": MOUSE_BUTTON_XBUTTON1,
+    "xbutton2": MOUSE_BUTTON_XBUTTON2,
+}
+
+func _is_action_name(action: String) -> bool:
+    if action.strip_edges().is_empty() or action.length() > MAX_ACTION_NAME:
+        return false
+    for character: String in action:
+        var code: int = character.unicode_at(0)
+        if ACTION_NAME_FORBIDDEN.contains(character) or code < 32 or code == 127:
+            return false
+    return true
+
+## The action stored under input/<name> ({"deadzone", "events"}), or {} when there is none.
+func _stored_action(action: String) -> Dictionary:
+    var key: String = INPUT_PREFIX + action
+    if not ProjectSettings.has_setting(key):
+        return {}
+    var stored: Variant = ProjectSettings.get_setting(key)
+    if not stored is Dictionary:
+        return {}
+    return stored
+
+func _is_number(value: Variant) -> bool:
+    return (value is int or value is float) and not value is bool
+
+func _spec_flag(spec: Dictionary, key: String, default_value: bool) -> bool:
+    var value: Variant = spec.get(key, default_value)
+    return value if value is bool else default_value
+
+## An event as the tools report it. Two events are the same when their descriptions without
+## "text" are equal.
+func _describe_event(event: InputEvent) -> Dictionary:
+    if event is InputEventKey:
+        var key_event: InputEventKey = event
+        var physical: bool = key_event.physical_keycode != KEY_NONE
+        var code: Key = key_event.physical_keycode if physical else key_event.keycode
+        return {
+            "type": "key",
+            "key": OS.get_keycode_string(code),
+            "physical": physical,
+            "shift": key_event.shift_pressed,
+            "ctrl": key_event.ctrl_pressed,
+            "alt": key_event.alt_pressed,
+            "meta": key_event.meta_pressed,
+            "text": key_event.as_text(),
+        }
+    if event is InputEventMouseButton:
+        var mouse_event: InputEventMouseButton = event
+        var button: Variant = int(mouse_event.button_index)
+        for button_name: String in MOUSE_BUTTON_NAMES:
+            if int(MOUSE_BUTTON_NAMES[button_name]) == int(mouse_event.button_index):
+                button = button_name
+        return {"type": "mouse_button", "button": button, "text": mouse_event.as_text()}
+    if event is InputEventJoypadButton:
+        var pad_button: InputEventJoypadButton = event
+        return {"type": "joypad_button", "button": int(pad_button.button_index), "device": pad_button.device, "text": pad_button.as_text()}
+    if event is InputEventJoypadMotion:
+        var pad_motion: InputEventJoypadMotion = event
+        return {"type": "joypad_motion", "axis": int(pad_motion.axis), "axis_value": signf(pad_motion.axis_value), "device": pad_motion.device, "text": pad_motion.as_text()}
+    return {"type": event.get_class(), "text": event.as_text()}
+
+func _event_identity(event: InputEvent) -> Dictionary:
+    var described: Dictionary = _describe_event(event)
+    described.erase("text")
+    return described
+
+## The InputEvent a spec asks for as {"event"}, or {"error"}. Events apply to all devices
+## (device -1) unless a joypad spec names one, as the editor's Input Map panel makes them.
+func _event_from_spec(spec: Variant) -> Dictionary:
+    if not spec is Dictionary:
+        return {"error": "each event must be an object with a type"}
+    var data: Dictionary = spec
+    var kind: String = str(data.get("type", ""))
+    var device: int = -1
+    var raw_device: Variant = data.get("device", -1)
+    if _is_number(raw_device):
+        device = int(raw_device)
+    match kind:
+        "key":
+            var key_name: String = str(data.get("key", "")).strip_edges()
+            var code: Key = OS.find_keycode_from_string(key_name) if not key_name.is_empty() else KEY_NONE
+            if code == KEY_NONE or (code & KEY_MODIFIER_MASK) != 0:
+                return {"error": "Unknown key '%s': use one key name such as E, Space, Up, Escape or F1, and pass modifiers as shift, ctrl, alt or meta" % key_name}
+            var key_event := InputEventKey.new()
+            key_event.device = -1
+            if _spec_flag(data, "physical", true):
+                key_event.physical_keycode = code
+            else:
+                key_event.keycode = code
+            key_event.shift_pressed = _spec_flag(data, "shift", false)
+            key_event.ctrl_pressed = _spec_flag(data, "ctrl", false)
+            key_event.alt_pressed = _spec_flag(data, "alt", false)
+            key_event.meta_pressed = _spec_flag(data, "meta", false)
+            return {"event": key_event}
+        "mouse_button":
+            var raw_button: Variant = data.get("button", "")
+            var index: int = 0
+            if raw_button is String and MOUSE_BUTTON_NAMES.has(raw_button):
+                index = int(MOUSE_BUTTON_NAMES[raw_button])
+            elif _is_number(raw_button) and int(raw_button) >= 1 and int(raw_button) <= 9:
+                index = int(raw_button)
+            if index == 0:
+                return {"error": "Unknown mouse button '%s': use %s, or a number from 1 to 9" % [str(raw_button), ", ".join(PackedStringArray(MOUSE_BUTTON_NAMES.keys()))]}
+            var mouse_event := InputEventMouseButton.new()
+            mouse_event.device = -1
+            mouse_event.button_index = index as MouseButton
+            return {"event": mouse_event}
+        "joypad_button":
+            var raw_pad: Variant = data.get("button", -1)
+            if not _is_number(raw_pad) or int(raw_pad) < 0 or int(raw_pad) > 127:
+                return {"error": "A joypad_button event needs button, a number from 0 to 127"}
+            var pad_button := InputEventJoypadButton.new()
+            pad_button.device = device
+            pad_button.button_index = int(raw_pad) as JoyButton
+            return {"event": pad_button}
+        "joypad_motion":
+            var raw_axis: Variant = data.get("axis", -1)
+            var raw_value: Variant = data.get("axis_value", 0)
+            if not _is_number(raw_axis) or int(raw_axis) < 0 or int(raw_axis) > 9:
+                return {"error": "A joypad_motion event needs axis, a number from 0 to 9"}
+            if not _is_number(raw_value) or is_zero_approx(float(raw_value)):
+                return {"error": "A joypad_motion event needs axis_value, a non-zero number whose sign picks the direction"}
+            var pad_motion := InputEventJoypadMotion.new()
+            pad_motion.device = device
+            pad_motion.axis = int(raw_axis) as JoyAxis
+            pad_motion.axis_value = signf(float(raw_value))
+            return {"event": pad_motion}
+    return {"error": "Unknown event type '%s': use key, mouse_button, joypad_button or joypad_motion" % kind}
+
+func _describe_action(action: String, stored: Dictionary) -> Dictionary:
+    var events: Array = []
+    var stored_events: Variant = stored.get("events", [])
+    if stored_events is Array:
+        for item: Variant in stored_events:
+            if item is InputEvent:
+                events.append(_describe_event(item))
+    var deadzone: Variant = stored.get("deadzone", DEFAULT_DEADZONE)
+    return {"name": action, "deadzone": float(deadzone) if _is_number(deadzone) else DEFAULT_DEADZONE, "events": events}
+
+func get_input_map(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
+    var only: String = str(params.get("action", ""))
+    var include_builtin: bool = params.get("include_builtin", false) == true
+    var actions: Array = []
+    var hidden: int = 0
+    for info: Dictionary in ProjectSettings.get_property_list():
+        var key: String = str(info.get("name", ""))
+        if not key.begins_with(INPUT_PREFIX):
+            continue
+        var action: String = key.trim_prefix(INPUT_PREFIX)
+        if not only.is_empty() and action != only:
+            continue
+        var stored: Dictionary = _stored_action(action)
+        if stored.is_empty():
+            continue
+        if only.is_empty() and not include_builtin and action.begins_with("ui_"):
+            hidden += 1
+            continue
+        actions.append(_describe_action(action, stored))
+    if not only.is_empty() and actions.is_empty():
+        send_error(peer, cmd_id, "Action '%s' does not exist. Call godot_get_input_map without action to list the actions, or create it with godot_edit_input_action create: true." % only)
+        return
+    send_success(peer, cmd_id, {"actions": actions, "builtin_hidden": hidden})
+
+## Adds and removes events of one action, sets its deadzone, creates or deletes it. Every event
+## is checked before anything changes; the change is saved and recorded as one undoable step.
+func edit_input_action(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
+    var action: String = str(params.get("action", ""))
+    if not _is_action_name(action):
+        send_error(peer, cmd_id, "action '%s' is not a valid name: use 1 to %d characters without / : = \\ \" or control characters" % [action, MAX_ACTION_NAME])
+        return
+    var exists: bool = not _stored_action(action).is_empty()
+    var create: bool = params.get("create", false) == true
+    var delete: bool = params.get("delete", false) == true
+    var raw_add: Variant = params.get("add_events", [])
+    var raw_remove: Variant = params.get("remove_events", [])
+    var to_add: Array = raw_add if raw_add is Array else []
+    var to_remove: Array = raw_remove if raw_remove is Array else []
+    if delete:
+        if not to_add.is_empty() or not to_remove.is_empty() or params.has("deadzone") or create:
+            send_error(peer, cmd_id, "delete cannot be combined with add_events, remove_events, deadzone or create")
+            return
+        if action.begins_with("ui_"):
+            send_error(peer, cmd_id, "'%s' is a built-in action: it can be edited but not deleted" % action)
+            return
+        if not exists:
+            send_error(peer, cmd_id, "Action '%s' does not exist, so there is nothing to delete. List the actions with godot_get_input_map." % action)
+            return
+        _commit_input_action(peer, cmd_id, action, null, {"deleted": true})
+        return
+    if not exists and not create:
+        send_error(peer, cmd_id, "Action '%s' does not exist. Pass create: true to make it, or list the actions with godot_get_input_map." % action)
+        return
+
+    var current: Dictionary = _stored_action(action)
+    var deadzone: float = float(_describe_action(action, current)["deadzone"])
+    if params.has("deadzone"):
+        var raw_deadzone: Variant = params["deadzone"]
+        if not _is_number(raw_deadzone) or float(raw_deadzone) < 0.0 or float(raw_deadzone) > 1.0:
+            send_error(peer, cmd_id, "deadzone must be a number from 0 to 1")
+            return
+        deadzone = float(raw_deadzone)
+    var events: Array = []
+    var stored_events: Variant = current.get("events", [])
+    if stored_events is Array:
+        for item: Variant in stored_events:
+            if item is InputEvent:
+                events.append(item)
+
+    var removed: int = 0
+    for spec: Variant in to_remove:
+        var built: Dictionary = _event_from_spec(spec)
+        if built.has("error"):
+            send_error(peer, cmd_id, "remove_events: %s. Nothing was changed." % built["error"])
+            return
+        var wanted: Dictionary = _event_identity(built["event"])
+        var found: int = -1
+        for index: int in events.size():
+            if _event_identity(events[index]) == wanted:
+                found = index
+                break
+        if found < 0:
+            send_error(peer, cmd_id, "Action '%s' does not have the event %s. Nothing was changed; read its events with godot_get_input_map." % [action, (built["event"] as InputEvent).as_text()])
+            return
+        events.remove_at(found)
+        removed += 1
+
+    var added: int = 0
+    var already: Array = []
+    for spec: Variant in to_add:
+        var built: Dictionary = _event_from_spec(spec)
+        if built.has("error"):
+            send_error(peer, cmd_id, "add_events: %s. Nothing was changed." % built["error"])
+            return
+        var event: InputEvent = built["event"]
+        var identity: Dictionary = _event_identity(event)
+        var present: bool = false
+        for existing: Variant in events:
+            if _event_identity(existing) == identity:
+                present = true
+                break
+        if present:
+            already.append(_describe_event(event))
+            continue
+        events.append(event)
+        added += 1
+
+    var value: Dictionary = {"deadzone": deadzone, "events": events}
+    _commit_input_action(peer, cmd_id, action, value, {"created": not exists, "added": added, "removed": removed, "already_present": already})
+
+## Stores and saves the action (null deletes it), restoring the old value if the save fails, then
+## records the change in the editor's global undo history without applying it a second time.
+func _commit_input_action(peer: WebSocketPeer, cmd_id: String, action: String, value: Variant, report: Dictionary) -> void:
+    var key: String = INPUT_PREFIX + action
+    var previous: Variant = ProjectSettings.get_setting(key) if ProjectSettings.has_setting(key) else null
+    ProjectSettings.set_setting(key, value)
+    var err: Error = ProjectSettings.save()
+    if err != OK:
+        ProjectSettings.set_setting(key, previous)
+        send_error(peer, cmd_id, "Failed to save project settings: %s. Nothing was changed; check that project.godot is writable." % error_string(err))
+        return
+    if undo_redo != null:
+        undo_redo.create_action("Edit Input Action " + action, UndoRedo.MERGE_DISABLE, ProjectSettings)
+        undo_redo.add_do_method(ProjectSettings, "set_setting", key, value)
+        undo_redo.add_do_method(ProjectSettings, "save")
+        undo_redo.add_undo_method(ProjectSettings, "set_setting", key, previous)
+        undo_redo.add_undo_method(ProjectSettings, "save")
+        undo_redo.commit_action(false)
+    var answer: Dictionary = report.duplicate()
+    answer["action"] = action
+    answer["saved"] = true
+    answer["undoable"] = undo_redo != null
+    answer["deleted"] = value == null
+    if value is Dictionary:
+        var described: Dictionary = _describe_action(action, value)
+        answer["deadzone"] = described["deadzone"]
+        answer["events"] = described["events"]
+    send_success(peer, cmd_id, answer)
 
 # --- Running game ---------------------------------------------------------------------
 

@@ -2321,3 +2321,124 @@ enabled=PackedStringArray(\"res://addons/godot_mcp/plugin.cfg\")
         .await
         .expect("the first editor still answers");
 }
+
+/// Turns on the script editor's rewrites on save, the way a person's editor settings may have
+/// them, so a test does not depend on the settings of the machine it runs on.
+const SAVE_REWRITE_HOOK: &str = r#"        "__test_rewrites_on_save":
+            var settings: EditorSettings = EditorInterface.get_editor_settings()
+            for name: String in ["text_editor/behavior/files/convert_indent_on_save", "text_editor/behavior/files/trim_trailing_whitespace_on_save", "text_editor/behavior/files/trim_final_newlines_on_save"]:
+                if settings.has_setting(name):
+                    settings.set_setting(name, true)
+            settings.set_setting("text_editor/behavior/indent/type", 0)
+            send_success(peer, cmd_id, {"on": true})
+        "__test_convert_indent_on_save":
+            send_success(peer, cmd_id, {"on": EditorInterface.get_editor_settings().get_setting("text_editor/behavior/files/convert_indent_on_save")})
+"#;
+
+/// Saving a scene saves the script editor's tabs as well, and the editor's convert-indent and
+/// trim settings rewrote every open script on the way, even one with no unsaved changes. The
+/// save leaves such a script alone and names any script the editor did write.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn save_scene_leaves_open_scripts_alone_and_names_the_ones_it_saved() {
+    let spaces = "extends Node\n\nfunc f() -> void:\n    if true:\n        pass \n\n\n";
+    let typed = "extends Node\n";
+    let hook = format!("{SAVE_REWRITE_HOOK}{SCRIPT_PROBE_HOOK}");
+    let editor = start_editor_with(
+        Some(&hook),
+        SCRIPT_PROBE_HELPERS,
+        &[("spaces.gd", spaces), ("typed.gd", typed)],
+        "",
+    )
+    .await;
+    editor
+        .bridge
+        .send_command("__test_rewrites_on_save", json!({}))
+        .await
+        .expect("turn on rewrites");
+    for path in ["res://spaces.gd", "res://typed.gd"] {
+        editor
+            .bridge
+            .send_command("__probe_open", json!({"path": path}))
+            .await
+            .expect("open script");
+    }
+    sleep(Duration::from_millis(500)).await;
+    editor
+        .bridge
+        .send_command("open_scene", json!({"scene_path": "res://main.tscn"}))
+        .await
+        .expect("open scene");
+    editor
+        .bridge
+        .send_command(
+            "set_node_properties",
+            json!({"node_path": "Player", "properties": {"position": "Vector2(9, 9)"}}),
+        )
+        .await
+        .expect("change scene");
+
+    let saved = editor
+        .bridge
+        .send_command("save_scene", json!({}))
+        .await
+        .expect("save");
+    assert_eq!(saved["saved"], true);
+    assert_eq!(saved["scene_path"], "res://main.tscn");
+    assert_eq!(saved["scripts_saved"], json!([]), "{saved}");
+    assert!(
+        std::fs::read_to_string(editor.project.join("main.tscn"))
+            .expect("scene")
+            .contains("Vector2(9, 9)"),
+        "the scene itself was not saved"
+    );
+    assert_eq!(
+        std::fs::read_to_string(editor.project.join("spaces.gd")).expect("spaces.gd"),
+        spaces,
+        "a clean open script was rewritten by the scene save"
+    );
+
+    // Unsaved typing in a script tab is saved with the scene, as the editor's own save does,
+    // and the answer says so.
+    editor
+        .bridge
+        .send_command(
+            "__probe_type",
+            json!({"path": "res://typed.gd", "text": "# typed\n"}),
+        )
+        .await
+        .expect("type");
+    let saved = editor
+        .bridge
+        .send_command("save_scene", json!({}))
+        .await
+        .expect("save again");
+    assert_eq!(saved["scripts_saved"], json!(["res://typed.gd"]), "{saved}");
+    assert_eq!(
+        std::fs::read_to_string(editor.project.join("typed.gd")).expect("typed.gd"),
+        format!("# typed\n{typed}")
+    );
+    assert_eq!(
+        std::fs::read_to_string(editor.project.join("spaces.gd")).expect("spaces.gd"),
+        spaces,
+        "the second save rewrote the clean script"
+    );
+    assert_eq!(
+        editor
+            .bridge
+            .send_command("__probe_state", json!({"path": "res://spaces.gd"}))
+            .await
+            .expect("state")["text"],
+        spaces,
+        "the editor's text no longer matches the file"
+    );
+    assert_eq!(
+        editor
+            .bridge
+            .send_command("__test_convert_indent_on_save", json!({}))
+            .await
+            .expect("setting")["on"],
+        true,
+        "the person's editor setting was not restored"
+    );
+}

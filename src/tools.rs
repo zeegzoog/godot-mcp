@@ -834,7 +834,7 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
         ),
         tool(
             "godot_save_scene",
-            "Saves changes to the current open scene in Godot Editor.",
+            "Saves the current open scene in Godot Editor. The editor saves its open script tabs with it: a script with unsaved typing is written and listed in scripts_saved, while the editor's convert-indent and trim-on-save settings are held off so a clean script is not rewritten. Returns scene_path.",
             json!({}),
             &[],
         ),

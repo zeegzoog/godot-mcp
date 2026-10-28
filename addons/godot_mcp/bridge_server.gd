@@ -502,15 +502,71 @@ func open_scene(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void
     remember_scene_sync(scene_path)
     send_success(peer, cmd_id, {"opened": true, "reloaded": bool(decision.get("reload", false)), "scene_path": scene_path})
 
+## Saving a scene also saves the script editor's tabs, and on the way the editor applies its
+## convert-indent and trim settings to every open script, so a clean script indented with spaces
+## came back with tabs. Those settings are off for the length of the save; a script with unsaved
+## typing is still saved, as the editor's own save does, and the answer names it.
 func save_scene(peer: WebSocketPeer, cmd_id: String) -> void:
+    var before: Dictionary = _open_script_digests()
+    var restore: Dictionary = _suspend_script_rewrites()
     var err: Error = EditorInterface.save_scene()
-    if err == OK:
-        var root: Node = EditorInterface.get_edited_scene_root()
-        if root != null and not String(root.scene_file_path).is_empty():
-            remember_scene_sync(String(root.scene_file_path))
-        send_success(peer, cmd_id, {"saved": true})
-    else:
-        send_error(peer, cmd_id, "Failed to save scene: " + error_string(err))
+    _restore_editor_settings(restore)
+    if err != OK:
+        send_error(peer, cmd_id, "Failed to save scene: " + error_string(err) + ". Give the scene a file with godot_create_scene or save it once in the editor, then save again.")
+        return
+    var scene_path: String = ""
+    var root: Node = EditorInterface.get_edited_scene_root()
+    if root != null and not String(root.scene_file_path).is_empty():
+        scene_path = String(root.scene_file_path)
+        remember_scene_sync(scene_path)
+    var scripts_saved: Array = []
+    for path: String in before:
+        if FileAccess.get_md5(path) != str(before[path]):
+            scripts_saved.append(path)
+    send_success(peer, cmd_id, {"saved": true, "scene_path": scene_path, "scripts_saved": scripts_saved})
+
+const SCRIPT_REWRITE_SETTINGS: PackedStringArray = [
+    "text_editor/behavior/files/convert_indent_on_save",
+    "text_editor/behavior/files/trim_trailing_whitespace_on_save",
+    "text_editor/behavior/files/trim_final_newlines_on_save",
+]
+
+## Turns off the script editor's rewrites on save and returns the values to restore.
+func _suspend_script_rewrites() -> Dictionary:
+    var settings: EditorSettings = EditorInterface.get_editor_settings()
+    var restore: Dictionary = {}
+    for setting: String in SCRIPT_REWRITE_SETTINGS:
+        if settings.has_setting(setting) and bool(settings.get_setting(setting)):
+            restore[setting] = true
+            settings.set_setting(setting, false)
+    _tell_script_editor_settings_changed(restore)
+    return restore
+
+func _restore_editor_settings(restore: Dictionary) -> void:
+    var settings: EditorSettings = EditorInterface.get_editor_settings()
+    for setting: String in restore:
+        settings.set_setting(setting, restore[setting])
+    _tell_script_editor_settings_changed(restore)
+
+## The script editor keeps its own copy of these settings and refreshes it only on the editor
+## settings notification, which EditorSettings does not let a script send. Send it to the script
+## editor alone, so the change applies now and nothing else in the editor reacts.
+func _tell_script_editor_settings_changed(changed: Dictionary) -> void:
+    var script_editor: ScriptEditor = EditorInterface.get_script_editor()
+    if script_editor != null and not changed.is_empty():
+        script_editor.propagate_notification(EditorSettings.NOTIFICATION_EDITOR_SETTINGS_CHANGED)
+
+## MD5 of every script file open in the script editor, by res:// path.
+func _open_script_digests() -> Dictionary:
+    var digests: Dictionary = {}
+    var script_editor: ScriptEditor = EditorInterface.get_script_editor()
+    if script_editor == null:
+        return digests
+    for script: Script in script_editor.get_open_scripts():
+        var path: String = script.resource_path
+        if path.begins_with("res://") and not path.contains("::") and FileAccess.file_exists(path):
+            digests[path] = FileAccess.get_md5(path)
+    return digests
 
 # --- Nodes -----------------------------------------------------------------------------
 

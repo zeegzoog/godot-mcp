@@ -2322,6 +2322,89 @@ enabled=PackedStringArray(\"res://addons/godot_mcp/plugin.cfg\")
         .expect("the first editor still answers");
 }
 
+/// A scene whose own node `A` is added under an instance that already has a child `A`. Godot
+/// renames the incoming node while loading and reports it only in its "Load Errors" dialog.
+const CLASH_SUB: &str = "[gd_scene format=3]\n\n[node name=\"Sub\" type=\"Node2D\"]\n\n[node name=\"A\" type=\"Node\" parent=\".\"]\n";
+const CLASH_SCENE: &str = "[gd_scene load_steps=2 format=3]\n\n[ext_resource type=\"PackedScene\" path=\"res://sub.tscn\" id=\"1\"]\n\n[node name=\"Clash\" type=\"Node2D\"]\n\n[node name=\"Sub\" parent=\".\" instance=ExtResource(\"1\")]\n\n[node name=\"A\" type=\"Node\" parent=\"Sub\"]\n";
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn open_scene_returns_what_the_load_errors_dialog_shows() {
+    let editor = start_editor_with(
+        None,
+        "",
+        &[("sub.tscn", CLASH_SUB), ("clash.tscn", CLASH_SCENE)],
+        "",
+    )
+    .await;
+    let bridge = &editor.bridge;
+
+    let clean = bridge
+        .send_command("open_scene", json!({"scene_path": "res://main.tscn"}))
+        .await
+        .expect("open main");
+    assert_eq!(clean["load_errors"], json!([]), "{clean}");
+    assert_eq!(clean["unsaved"], false, "{clean}");
+    assert!(clean.get("dialog").is_none(), "{clean}");
+    assert!(clean.get("warning").is_none(), "{clean}");
+
+    let clash = bridge
+        .send_command("open_scene", json!({"scene_path": "res://clash.tscn"}))
+        .await
+        .expect("open clash");
+    assert_eq!(clash["opened"], true, "{clash}");
+    let errors = clash["load_errors"].as_array().expect("load_errors");
+    assert_eq!(errors.len(), 1, "{clash}");
+    let message = errors[0].as_str().expect("message");
+    assert!(
+        message.starts_with("An incoming node's name clashes with Sub/A"),
+        "{clash}"
+    );
+    assert!(
+        message.ends_with("Please fix and re-save the scene."),
+        "{clash}"
+    );
+    assert_eq!(clash["dialog"], "Load Errors", "{clash}");
+    assert_eq!(clash["unsaved"], true, "{clash}");
+    assert!(
+        clash["warning"]
+            .as_str()
+            .is_some_and(|w| w.contains("reload")),
+        "{clash}"
+    );
+    let tree = bridge
+        .send_command("get_scene_tree", json!({}))
+        .await
+        .expect("clash tree");
+    let sub = find(&tree["tree"], "Sub").expect("Sub");
+    assert_eq!(child_names(sub), ["A", "A2"], "{tree}");
+
+    // The dialog stays open until the person closes it. What it already showed is not
+    // reported again for a scene that loads cleanly.
+    let again = bridge
+        .send_command("open_scene", json!({"scene_path": "res://main.tscn"}))
+        .await
+        .expect("back to main");
+    assert_eq!(again["load_errors"], json!([]), "{again}");
+    assert!(again.get("dialog").is_none(), "{again}");
+
+    // A reload adds its messages to the open dialog; only the new ones are returned.
+    let reloaded = bridge
+        .send_command(
+            "open_scene",
+            json!({"scene_path": "res://clash.tscn", "reload": true}),
+        )
+        .await
+        .expect("reload clash");
+    assert_eq!(reloaded["reloaded"], true, "{reloaded}");
+    assert_eq!(
+        reloaded["load_errors"].as_array().map(Vec::len),
+        Some(1),
+        "{reloaded}"
+    );
+    assert_eq!(reloaded["dialog"], "Load Errors", "{reloaded}");
+}
+
 /// Turns on the script editor's rewrites on save, the way a person's editor settings may have
 /// them, so a test does not depend on the settings of the machine it runs on.
 const SAVE_REWRITE_HOOK: &str = r#"        "__test_rewrites_on_save":

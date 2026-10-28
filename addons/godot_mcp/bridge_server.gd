@@ -495,12 +495,78 @@ func open_scene(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void
     if decision.has("error"):
         send_error(peer, cmd_id, decision["error"])
         return
+    var dialogs_before: Dictionary = _visible_dialog_texts()
     if bool(decision.get("reload", false)):
         EditorInterface.reload_scene_from_path(scene_path)
     else:
         EditorInterface.open_scene_from_path(scene_path)
     remember_scene_sync(scene_path)
-    send_success(peer, cmd_id, {"opened": true, "reloaded": bool(decision.get("reload", false)), "scene_path": scene_path})
+    var payload: Dictionary = {"opened": true, "reloaded": bool(decision.get("reload", false)), "scene_path": scene_path}
+    payload.merge(await _load_report(scene_path, dialogs_before))
+    send_success(peer, cmd_id, payload)
+
+const MAX_LOAD_ERRORS: int = 50
+
+## Godot reports what it had to fix while loading a scene, such as a node renamed because its
+## name clashed with a child of an instanced scene, only in its Load Errors dialog: those
+## messages reach neither the log nor a Logger. The dialog is in the tree only while it is
+## shown and keeps its text until it is closed, so the messages of this load are the text the
+## dialogs gained during it.
+func _load_report(scene_path: String, dialogs_before: Dictionary) -> Dictionary:
+    var messages: Array[String] = []
+    var dialog_title: String = ""
+    var dialogs_after: Dictionary = _visible_dialog_texts()
+    for dialog: Variant in dialogs_after:
+        var text: String = str(dialogs_after[dialog])
+        var seen: String = str(dialogs_before.get(dialog, ""))
+        var added: String = text.substr(seen.length()) if text.begins_with(seen) else text
+        if added.strip_edges().is_empty():
+            continue
+        if dialog_title.is_empty():
+            dialog_title = (dialog as AcceptDialog).title
+        messages.append_array(_dialog_messages(added))
+    if not messages.is_empty():
+        # The editor marks a scene it changed while loading as unsaved a frame later.
+        await get_tree().process_frame
+    var unsaved: bool = EditorInterface.get_unsaved_scenes().has(scene_path)
+    var report: Dictionary = {"load_errors": messages.slice(0, MAX_LOAD_ERRORS), "unsaved": unsaved}
+    if messages.size() > MAX_LOAD_ERRORS:
+        report["load_errors_total"] = messages.size()
+    if not dialog_title.is_empty():
+        report["dialog"] = dialog_title
+        var warning: String = "Godot reported %d problem(s) while loading the scene and showed them in its '%s' dialog, which stays open until the person closes it." % [messages.size(), dialog_title]
+        if unsaved:
+            warning += " The editor changed the scene while loading it, so it now has unsaved changes."
+        warning += " Fix the scene file as load_errors describe and open it again with reload: true, or save the scene to keep the editor's changes."
+        report["warning"] = warning
+    return report
+
+## Text of every visible dialog, by dialog: its own text and that of its rich text labels.
+func _visible_dialog_texts() -> Dictionary:
+    var texts: Dictionary = {}
+    for node: Node in get_tree().root.find_children("*", "AcceptDialog", true, false):
+        var dialog: AcceptDialog = node as AcceptDialog
+        if not dialog.visible:
+            continue
+        var text: String = dialog.dialog_text
+        for label: Node in dialog.find_children("*", "RichTextLabel", true, false):
+            text += (label as RichTextLabel).get_parsed_text()
+        texts[dialog] = text
+    return texts
+
+## The Load Errors dialog writes each message after an icon, which reads as one space, and
+## ends it with a newline. A message may span lines, so a line without the icon continues the
+## message before it.
+func _dialog_messages(text: String) -> Array[String]:
+    var messages: Array[String] = []
+    for line: String in text.split("\n"):
+        if line.strip_edges().is_empty():
+            continue
+        if messages.is_empty() or line.begins_with(" "):
+            messages.append(line.strip_edges())
+        else:
+            messages[-1] += "\n" + line.strip_edges()
+    return messages
 
 ## Saving a scene also saves the script editor's tabs, and on the way the editor applies its
 ## convert-indent and trim settings to every open script, so a clean script indented with spaces

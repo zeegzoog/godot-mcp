@@ -8,6 +8,7 @@ const MAX_BYTES: int = 1048576
 ## 64-bit FNV-1a offset basis (0xcbf29ce484222325) written as the signed value GDScript holds.
 const FNV_OFFSET: int = -3750763034362895579
 const FNV_PRIME: int = 0x100000001b3
+const STALE_TAB: String = "The script tab of %s shows older text than the file on disk and has no unsaved changes. Call godot_resave_resources with paths [\"%s\"] to reload the tab, then read the script again and repeat the edit."
 
 ## Version label of a text: FNV-1a over its UTF-8 bytes with "\r\n" read as "\n", as 16 hex digits.
 func label(text: String) -> String:
@@ -27,11 +28,58 @@ func read(res_path: String) -> Dictionary:
         answer["text"] = _buffer(pair["editor"]).text
         answer["source"] = "editor"
         answer["dirty"] = true
+    elif str(pair["state"]) == "found" and _buffer(pair["editor"]).text != file_text:
+        answer["stale_tab"] = true
+        answer["hint"] = "The open script tab shows older text than the file. Call godot_resave_resources with this path to reload the tab before editing."
     elif str(pair["state"]) == "unknown":
         answer["editor_state"] = "unknown"
         answer["reason"] = str(pair["reason"])
     answer["version"] = label(str(answer["text"]))
     return answer
+
+## The state of the script tab for res_path: {"path", "open", "dirty", "stale", "reloaded"}, plus
+## "editor_state" and "reason" when the tab cannot be matched. "stale" means the tab's text differs
+## from the file. With reload, a stale tab without unsaved changes is given the file's text.
+func tab_state(res_path: String, reload: bool) -> Dictionary:
+    var loaded: Dictionary = _file_text(res_path)
+    if loaded.has("error"):
+        return loaded
+    var file_text: String = str(loaded["text"])
+    var answer: Dictionary = {"path": res_path, "open": false, "dirty": false, "stale": false, "reloaded": false}
+    var pair: Dictionary = _pair_editor(res_path)
+    match str(pair["state"]):
+        "none":
+            return answer
+        "unknown":
+            answer["editor_state"] = "unknown"
+            answer["reason"] = str(pair["reason"])
+            return answer
+    var editor: Object = pair["editor"]
+    var base: CodeEdit = _buffer(editor)
+    answer["open"] = true
+    answer["dirty"] = _is_dirty(editor)
+    answer["stale"] = base.text != file_text
+    if reload and bool(answer["stale"]) and not bool(answer["dirty"]):
+        _reload_tab(res_path, base, file_text)
+        answer["stale"] = base.text != file_text
+        answer["reloaded"] = not bool(answer["stale"])
+    return answer
+
+## Gives an unmodified tab the file's text and marks it saved, keeps the caret and scroll where they
+## were, and gives the loaded script the same source so the running code matches the tab.
+func _reload_tab(res_path: String, base: CodeEdit, file_text: String) -> void:
+    var caret_line: int = base.get_caret_line()
+    var caret_column: int = base.get_caret_column()
+    var scroll: float = base.scroll_vertical
+    base.text = file_text
+    base.tag_saved_version()
+    base.set_caret_line(mini(caret_line, base.get_line_count() - 1))
+    base.set_caret_column(caret_column)
+    base.scroll_vertical = scroll
+    var script: Script = load(res_path) as Script
+    if script != null and script.source_code != file_text:
+        script.source_code = file_text
+        script.reload(true)
 
 func edit(res_path: String, old_text: String, new_text: String, version: String) -> Dictionary:
     if old_text.is_empty():
@@ -65,7 +113,7 @@ func edit(res_path: String, old_text: String, new_text: String, version: String)
             return {"error": "The script editor did not open %s. Open it in the editor and repeat the edit." % res_path}
     var base: CodeEdit = _buffer(pair["editor"])
     if base.text != file_lf:
-        return {"error": "The editor's text of %s differs from the file. Save or reload it in the editor, then repeat the edit." % res_path}
+        return {"error": STALE_TAB % [res_path, res_path]}
 
     var index: int = file_lf.find(old_lf)
     var before: String = file_lf.substr(0, index)
@@ -106,7 +154,7 @@ func _editor_problem(res_path: String, file_lf: String, pair: Dictionary) -> Str
             if _is_dirty(editor):
                 return "%s has unsaved changes in the script editor. Save it in the editor, or discard the changes, then read it again and repeat the edit." % res_path
             if _buffer(editor).text != file_lf:
-                return "The editor's text of %s differs from the file on disk. Save or reload it in the editor, then repeat the edit." % res_path
+                return STALE_TAB % [res_path, res_path]
     return ""
 
 ## {"state": "none"} when the script is not open, {"state": "found", "editor": ScriptEditorBase}

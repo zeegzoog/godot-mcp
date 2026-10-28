@@ -2715,3 +2715,184 @@ async fn save_scene_leaves_open_scripts_alone_and_names_the_ones_it_saved() {
         "the person's editor setting was not restored"
     );
 }
+
+/// Test-only command that opens a script tab and reports what the editor's file system and tabs
+/// hold for a path.
+const DELETE_PROBE_HOOK: &str = r#"        "__test_delete_probe":
+            var path: String = str(params.get("path", ""))
+            if bool(params.get("open_script", false)):
+                EditorInterface.edit_script(load(path))
+            var scripts: Array = EditorInterface.get_script_editor().get_open_scripts().map(func(s: Script) -> String: return s.resource_path)
+            send_success(peer, cmd_id, {"in_filesystem": _filesystem_has(EditorInterface.get_resource_filesystem(), path), "script_tabs": scripts, "open_scenes": EditorInterface.get_open_scenes()})
+"#;
+
+/// godot_delete_file through the editor: a referenced script and a scene with unsaved changes are
+/// refused; a script with its .uid, an imported image with its .import and imported data, and an
+/// open scene are deleted, their tabs closed and the FileSystem dock updated.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn files_are_deleted_through_the_editor_with_companions_and_tabs() {
+    use godot_mcp::cli_runner::CliRunner;
+    use godot_mcp::tools::ToolManager;
+    use std::sync::Arc;
+
+    let simple_scene = "[gd_scene format=3]\n\n[node name=\"Root\" type=\"Node2D\"]\n";
+    let hook = format!("{DELETE_PROBE_HOOK}{UNDO_HOOK}");
+    let editor = start_editor_with(
+        Some(&hook),
+        "",
+        &[
+            ("used.gd", "extends Node\n"),
+            (
+                "uses.tscn",
+                "[gd_scene format=3]\n\n[ext_resource type=\"Script\" path=\"res://used.gd\" id=\"1\"]\n\n[node name=\"Uses\" type=\"Node\"]\nscript = ExtResource(\"1\")\n",
+            ),
+            ("old.gd", "extends Node\n"),
+            ("old_scene.tscn", simple_scene),
+            ("dirty.tscn", simple_scene),
+            (
+                "icon.svg",
+                "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"16\"><rect width=\"16\" height=\"16\" fill=\"#3a3\"/></svg>\n",
+            ),
+        ],
+        "",
+    )
+    .await;
+    let project = editor.project.clone();
+    let (godot, _) = godot_binaries();
+    let tools = Arc::new(
+        ToolManager::new(BridgeClient::new(editor.port), CliRunner::new(godot))
+            .with_working_dir(project.clone()),
+    );
+    let delete = |args: Value| {
+        let tools = Arc::clone(&tools);
+        async move { tools.call_tool("godot_delete_file", args).await }
+    };
+    let probe = |path: &str, open_script: bool| {
+        let bridge = editor.bridge.clone();
+        let params = json!({"path": path, "open_script": open_script});
+        async move {
+            bridge
+                .send_command("__test_delete_probe", params)
+                .await
+                .expect("probe")
+        }
+    };
+
+    assert!(
+        project.join("old.gd.uid").is_file(),
+        "the import gives scripts a .uid"
+    );
+    let import = std::fs::read_to_string(project.join("icon.svg.import")).expect("icon.svg.import");
+    let imported: Vec<PathBuf> = import
+        .split('"')
+        .filter_map(|part| part.strip_prefix("res://"))
+        .filter(|part| part.starts_with(".godot/imported/"))
+        .map(|part| project.join(part))
+        .collect();
+    assert!(
+        !imported.is_empty() && imported.iter().all(|path| path.is_file()),
+        "{import}"
+    );
+
+    // A script a scene still uses is refused, and nothing changes.
+    let refused = delete(json!({"paths": ["res://used.gd"], "trash": false})).await;
+    assert!(refused.is_error, "{}", tool_text(&refused));
+    assert!(
+        tool_text(&refused).contains("res://uses.tscn"),
+        "{}",
+        tool_text(&refused)
+    );
+    assert!(project.join("used.gd").is_file());
+
+    // A scene with unsaved changes is refused.
+    editor
+        .bridge
+        .send_command("open_scene", json!({"scene_path": "res://dirty.tscn"}))
+        .await
+        .expect("open dirty.tscn");
+    editor
+        .bridge
+        .send_command("__test_hand_edit", json!({}))
+        .await
+        .expect("hand edit");
+    let unsaved = delete(json!({"paths": ["res://dirty.tscn"], "trash": false})).await;
+    assert!(unsaved.is_error, "{}", tool_text(&unsaved));
+    assert!(
+        tool_text(&unsaved).contains("unsaved changes"),
+        "{}",
+        tool_text(&unsaved)
+    );
+    assert!(project.join("dirty.tscn").is_file());
+
+    editor
+        .bridge
+        .send_command("open_scene", json!({"scene_path": "res://old_scene.tscn"}))
+        .await
+        .expect("open old_scene.tscn");
+    let before = probe("res://old.gd", true).await;
+    assert!(
+        before["script_tabs"].to_string().contains("res://old.gd"),
+        "{before}"
+    );
+    assert!(before["in_filesystem"] == true, "{before}");
+
+    let deleted = delete(json!({
+        "paths": ["res://old.gd", "res://icon.svg", "res://old_scene.tscn"],
+        "trash": false
+    }))
+    .await;
+    assert!(!deleted.is_error, "{}", tool_text(&deleted));
+    let report: Value = serde_json::from_str(&tool_text(&deleted)).expect("JSON report");
+    assert_eq!(report["source"], "editor", "{report}");
+    assert_eq!(
+        report["deleted"].as_array().map(Vec::len),
+        Some(3),
+        "{report}"
+    );
+    assert_eq!(
+        report["deleted"][0]["companions"],
+        json!(["res://old.gd.uid"]),
+        "{report}"
+    );
+    let icon_companions = report["deleted"][1]["companions"].to_string();
+    assert!(
+        icon_companions.contains("res://icon.svg.import"),
+        "{report}"
+    );
+    assert!(
+        icon_companions.contains("res://.godot/imported/"),
+        "{report}"
+    );
+    let closed = report["closed_tabs"].to_string();
+    assert!(closed.contains("res://old_scene.tscn"), "{report}");
+    assert!(closed.contains("res://old.gd"), "{report}");
+    for gone in [
+        "old.gd",
+        "old.gd.uid",
+        "icon.svg",
+        "icon.svg.import",
+        "old_scene.tscn",
+    ] {
+        assert!(
+            !project.join(gone).exists(),
+            "{gone} still exists: {report}"
+        );
+    }
+    for path in &imported {
+        assert!(!path.exists(), "{} still exists", path.display());
+    }
+    for path in ["res://old.gd", "res://icon.svg", "res://old_scene.tscn"] {
+        let after = probe(path, false).await;
+        assert!(after["in_filesystem"] == false, "{path}: {after}");
+        assert!(
+            !after["open_scenes"].to_string().contains(path),
+            "{path}: {after}"
+        );
+        assert!(
+            !after["script_tabs"].to_string().contains(path),
+            "{path}: {after}"
+        );
+    }
+    assert!(project.join("used.gd").is_file() && project.join("dirty.tscn").is_file());
+}

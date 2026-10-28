@@ -2933,3 +2933,153 @@ async fn input_action_edits_are_checked_first_and_never_write_project_godot() {
     }
     assert!(tools.iter().any(|tool| tool.name == "godot_get_input_map"));
 }
+
+/// Without an editor, godot_delete_file deletes on disk: a script with its .uid, an imported
+/// image with its .import and imported data. A file a scene still names is refused (nothing is
+/// deleted while anything is refused) unless force is set, and protected paths never go.
+#[tokio::test]
+async fn files_are_deleted_on_disk_with_their_companions_unless_still_referenced() {
+    let project = project_dir();
+    let root = project.path();
+    let write = |name: &str, text: &str| {
+        let path = root.join(name);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("folder");
+        std::fs::write(path, text).expect("fixture file");
+    };
+    write("old.gd", "extends Node\n");
+    write("old.gd.uid", "uid://oldscript\n");
+    write("used.gd", "extends Node\n");
+    write("used.gd.uid", "uid://usedscript\n");
+    write(
+        "main.tscn",
+        "[gd_scene format=3 uid=\"uid://mainscene\"]\n\n[ext_resource type=\"Script\" uid=\"uid://usedscript\" path=\"res://used.gd\" id=\"1\"]\n\n[node name=\"Main\" type=\"Node\"]\nscript = ExtResource(\"1\")\n",
+    );
+    write("used.gdshader", "shader_type canvas_item;\n");
+    write("art/icon.png", "png bytes");
+    write(
+        "art/icon.png.import",
+        "[remap]\n\nimporter=\"texture\"\ntype=\"CompressedTexture2D\"\nuid=\"uid://iconpng\"\npath=\"res://.godot/imported/icon.png-0123.ctex\"\n\n[deps]\n\nsource_file=\"res://art/icon.png\"\ndest_files=[\"res://.godot/imported/icon.png-0123.ctex\"]\n",
+    );
+    write(".godot/imported/icon.png-0123.ctex", "texture");
+    write(".godot/imported/icon.png-0123.md5", "md5");
+    write("empty/.keep_out_of_git", "");
+    std::fs::create_dir_all(root.join("hollow")).expect("empty folder");
+    let delete = |args: Value| async move {
+        let mut args = args;
+        args["project_path"] = json!(root);
+        call("godot_delete_file", args).await
+    };
+
+    // A referenced file is refused, and the unreferenced file in the same call stays too.
+    let refused = delete(json!({"paths": ["res://used.gd", "res://old.gd"]})).await;
+    assert!(refused.is_error, "{}", text(&refused));
+    let message = text(&refused);
+    assert!(message.contains("Nothing was deleted"), "{message}");
+    assert!(message.contains("res://main.tscn"), "{message}");
+    assert!(message.contains("force"), "{message}");
+    assert!(
+        message.contains("\"uid\""),
+        "matched by path and uid: {message}"
+    );
+    assert!(
+        !message.contains("used.gdshader"),
+        "a longer name is not a mention: {message}"
+    );
+    assert!(root.join("used.gd").exists() && root.join("old.gd").exists());
+
+    // A dry run reports and keeps everything.
+    let dry = delete(json!({"paths": ["res://art/icon.png"], "dry_run": true})).await;
+    assert!(!dry.is_error, "{}", text(&dry));
+    assert!(
+        text(&dry).contains("res://.godot/imported/icon.png-0123.ctex"),
+        "{}",
+        text(&dry)
+    );
+    assert!(root.join("art/icon.png").exists());
+
+    let deleted = delete(json!({"paths": ["res://old.gd", "res://art/icon.png"]})).await;
+    assert!(!deleted.is_error, "{}", text(&deleted));
+    let report: Value = serde_json::from_str(&text(&deleted)).expect("JSON report");
+    assert_eq!(report["source"], "disk", "{report}");
+    assert_eq!(report["rescan_needed"], true, "{report}");
+    let companions = report["deleted"][1]["companions"].to_string();
+    for gone in [
+        "old.gd",
+        "old.gd.uid",
+        "art/icon.png",
+        "art/icon.png.import",
+        ".godot/imported/icon.png-0123.ctex",
+        ".godot/imported/icon.png-0123.md5",
+    ] {
+        assert!(!root.join(gone).exists(), "{gone} still exists: {report}");
+    }
+    assert!(companions.contains("res://art/icon.png.import"), "{report}");
+    assert_eq!(
+        report["deleted"][0]["companions"],
+        json!(["res://old.gd.uid"])
+    );
+
+    // force deletes a referenced file and still lists who referenced it.
+    let forced = delete(json!({"paths": ["res://used.gd"], "force": true})).await;
+    assert!(!forced.is_error, "{}", text(&forced));
+    assert!(
+        text(&forced).contains("res://main.tscn"),
+        "{}",
+        text(&forced)
+    );
+    assert!(!root.join("used.gd").exists() && !root.join("used.gd.uid").exists());
+
+    for (path, needle) in [
+        ("res://project.godot", "project file"),
+        ("res://Project.godot", "project file"),
+        ("res://project.godot.", "another file"),
+        ("res://.godot/imported", ".godot"),
+        ("res://addons/godot_mcp/plugin.cfg", "addon"),
+        ("res://main.tscn.uid", "belongs to main.tscn"),
+        ("res://hollow", "allow_empty_dir"),
+        ("res://empty", "allow_empty_dir"),
+        ("res://../outside.gd", ".."),
+        ("res://missing.gd", "does not exist"),
+    ] {
+        let refused = delete(json!({"paths": [path]})).await;
+        assert!(refused.is_error, "{path}: {}", text(&refused));
+        assert!(
+            text(&refused).contains(needle),
+            "{path}: {}",
+            text(&refused)
+        );
+    }
+    std::fs::write(root.join("keep.gd"), "extends Node\n").expect("keep.gd");
+    std::fs::write(root.join("keep.gd.uid"), "uid://keep\n").expect("keep.gd.uid");
+    let sidecar = delete(json!({"paths": ["res://keep.gd.uid"]})).await;
+    assert!(
+        text(&sidecar).contains("delete keep.gd instead"),
+        "{}",
+        text(&sidecar)
+    );
+    assert!(root.join("keep.gd.uid").exists());
+    assert!(root.join("project.godot").exists());
+
+    let not_empty = delete(json!({"paths": ["res://empty"], "allow_empty_dir": true})).await;
+    assert!(
+        text(&not_empty).contains("not empty"),
+        "{}",
+        text(&not_empty)
+    );
+    let hollow = delete(json!({"paths": ["res://hollow"], "allow_empty_dir": true})).await;
+    assert!(!hollow.is_error, "{}", text(&hollow));
+    assert!(!root.join("hollow").exists());
+
+    let tools = ToolManager::list_tools();
+    let tool = tools
+        .iter()
+        .find(|tool| tool.name == "godot_delete_file")
+        .expect("delete tool listed");
+    for word in ["force", ".uid", ".import", "trash", "rescan", "dry_run"] {
+        assert!(
+            tool.description.contains(word),
+            "{word} missing: {}",
+            tool.description
+        );
+    }
+}

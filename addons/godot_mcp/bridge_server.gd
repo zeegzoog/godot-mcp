@@ -23,6 +23,7 @@ const MAX_VALUE_CHARS: int = 2000
 ## the call for at most this long. The MCP client waits slightly longer than this.
 const RESAVE_WAIT_MSEC: int = 60000
 const SCRIPT_OPS_PATH: String = "res://addons/godot_mcp/editor/script_ops.gd"
+const FILE_OPS_PATH: String = "res://addons/godot_mcp/editor/file_ops.gd"
 const MAX_CAPTURE_DIMENSION: int = 1568
 const MIN_CAPTURE_SIZE: int = 16
 
@@ -56,6 +57,7 @@ const PARAM_TYPES: Dictionary = {
     "get_project_settings": {"prefix": TYPE_STRING},
     "get_input_map": {"action": TYPE_STRING, "include_builtin": TYPE_BOOL},
     "edit_input_action": {"action": TYPE_STRING, "add_events": TYPE_ARRAY, "remove_events": TYPE_ARRAY, "deadzone": TYPE_FLOAT, "create": TYPE_BOOL, "delete": TYPE_BOOL},
+    "delete_files": {"paths": TYPE_ARRAY, "force": TYPE_BOOL, "allow_empty_dir": TYPE_BOOL, "dry_run": TYPE_BOOL, "trash": TYPE_BOOL},
     "game_send": {"command": TYPE_STRING},
 }
 
@@ -78,6 +80,7 @@ var game_relay: EditorDebuggerPlugin = null
 var port: int = DEFAULT_PORT
 var verbose: bool = false
 var _script_ops_instance: RefCounted = null
+var _file_ops_instance: RefCounted = null
 ## scene res:// path -> hash of the file bytes last loaded or saved by this bridge.
 ## Compared by content, not mtime, so an edit in the same second is still detected.
 var _scene_sync_hash: Dictionary = {}
@@ -316,6 +319,8 @@ func dispatch_command(peer: WebSocketPeer, cmd_id: String, cmd_type: String, par
             get_input_map(peer, cmd_id, params)
         "edit_input_action":
             edit_input_action(peer, cmd_id, params)
+        "delete_files":
+            delete_files(peer, cmd_id, params)
         "game_send":
             game_send(peer, cmd_id, params)
         "game_status":
@@ -1419,6 +1424,16 @@ func _script_ops() -> RefCounted:
     if _script_ops_instance == null:
         _script_ops_instance = (load(SCRIPT_OPS_PATH) as GDScript).new() as RefCounted
     return _script_ops_instance
+
+## Deletes project files with their companions, closing their tabs; see editor/file_ops.gd.
+func delete_files(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
+    if _file_ops_instance == null:
+        _file_ops_instance = (load(FILE_OPS_PATH) as GDScript).new() as RefCounted
+    var result: Dictionary = _file_ops_instance.call("delete", self, params)
+    if result.has("error"):
+        send_error(peer, cmd_id, str(result["error"]))
+        return
+    send_success(peer, cmd_id, result)
 
 func connect_signal(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
     var root: Node = scene_root_or_error(peer, cmd_id)

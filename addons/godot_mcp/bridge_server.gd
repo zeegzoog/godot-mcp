@@ -534,8 +534,15 @@ func _load_report(scene_path: String, dialogs_before: Dictionary) -> Dictionary:
     if not messages.is_empty():
         # The editor marks a scene it changed while loading as unsaved a frame later.
         await get_tree().process_frame
-    var unsaved: bool = EditorInterface.get_unsaved_scenes().has(scene_path)
-    var report: Dictionary = {"load_errors": messages.slice(0, MAX_LOAD_ERRORS), "unsaved": unsaved}
+    # EditorInterface.get_unsaved_scenes() exists from Godot 4.7: older editors cannot tell.
+    var unsaved_known: bool = EditorInterface.has_method("get_unsaved_scenes")
+    var unsaved: bool = false
+    if unsaved_known:
+        var unsaved_scenes: Variant = EditorInterface.call("get_unsaved_scenes")
+        unsaved = unsaved_scenes is PackedStringArray and (unsaved_scenes as PackedStringArray).has(scene_path)
+    var report: Dictionary = {"load_errors": messages.slice(0, MAX_LOAD_ERRORS)}
+    if unsaved_known:
+        report["unsaved"] = unsaved
     if messages.size() > MAX_LOAD_ERRORS:
         report["load_errors_total"] = messages.size()
     if not dialog_title.is_empty():

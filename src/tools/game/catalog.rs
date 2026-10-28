@@ -32,7 +32,7 @@ pub fn catalog() -> Vec<Tool> {
         ),
         tool(
             "godot_game_call",
-            "Calls one method on a live node. The method must be listed in permit and is refused if it can quit, evaluate code, call another method by name (call, callv, call_group, propagate_call, rpc, emit_signal, notification), set a property by name (set, set_deferred, set_indexed), or free or replace a node (free, queue_free, replace_by). A JSON string is passed as a StringName or NodePath where the method asks for one.",
+            "Calls one method on a live node. The method must be listed in permit and is refused if it can quit, evaluate code, call another method by name (call, callv, call_group, propagate_call, rpc, emit_signal, notification), set a property by name (set, set_deferred, set_indexed), or free or replace a node (free, queue_free, replace_by). A JSON string is passed as a StringName or NodePath where the method asks for one. When the method takes the node out of the tree (it reloads or changes the scene), the answer has left_tree true and the path the node had before the call.",
             json!({"run_id": s(""), "path": s(""), "method": s(""), "args": {"type": "array"}, "permit": {"type": "array", "items": {"type": "string"}, "description": "Methods this call is allowed to invoke. Must include method."}}),
             &["method", "permit"],
         ),

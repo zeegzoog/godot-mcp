@@ -1166,6 +1166,18 @@ async fn headless_game_waits_for_a_value_a_new_scene_and_real_physics_ticks() {
     )
     .await;
     assert!(!reloaded.is_error, "{}", text_of(&reloaded));
+    // The scene root left the tree during the call: the answer says so and names the path it
+    // had, and the runtime logs no engine error of its own while answering.
+    let reloaded_json = json_of(&reloaded);
+    assert_eq!(reloaded_json["path"], ".", "{reloaded_json}");
+    assert_eq!(reloaded_json["left_tree"], true, "{reloaded_json}");
+    assert!(
+        reloaded_json["note"]
+            .as_str()
+            .unwrap_or("")
+            .contains("left the scene tree"),
+        "{reloaded_json}"
+    );
     let waited = call(
         &tools,
         "godot_game_wait",
@@ -1218,6 +1230,16 @@ async fn headless_game_waits_for_a_value_a_new_scene_and_real_physics_ticks() {
     assert_eq!(
         first_ready["scene"]["script_sha256"], loaded_hash,
         "an old error was restamped with the reloaded script: {first_ready}"
+    );
+    let runtime_noise = stale["lines"].as_array().and_then(|lines| {
+        lines.iter().find(|line| {
+            let text = line["text"].as_str().unwrap_or("");
+            text.contains("is_inside_tree") || text.contains("mcp_runtime.gd")
+        })
+    });
+    assert!(
+        runtime_noise.is_none(),
+        "answering a call that reloaded the scene logged an engine error: {runtime_noise:?}"
     );
 
     let scaled = call(

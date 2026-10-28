@@ -139,7 +139,7 @@ To report a vulnerability, follow [SECURITY.md](SECURITY.md). Never open a publi
 | `godot_get_run_status` | — | Whether a scene is playing, and the managed process runs, each with its `user_args`, exit code, `ended_by` (`game` or `server`) and `ended_at` once it has ended. Says that nothing is running when that is so. |
 | `godot_get_open_scenes` | Editor | Open scene tabs and the active one. |
 | `godot_open_scene` | Editor | Opens a scene by `res://` path. If that tab is already open and the file on disk has changed, reloads it and drops its undo history. A reload over unsaved editor changes, typed by hand or made by a tool, is refused unless you pass `discard: true`; `reload: true` reloads an open scene even when the file is unchanged. |
-| `godot_save_scene` | Editor | Saves the active scene. |
+| `godot_save_scene` | Editor | Saves the active scene. Names in `scripts_saved` any open script tab with unsaved typing that the editor saved with it; clean scripts are not reformatted. |
 | `godot_get_scene_tree` | Editor | Node hierarchy of the active scene, or of another open tab via `scene_path`. Paths are relative to the scene root. |
 | `godot_add_node` | Editor | Adds a node of any instantiable `Node` class or global script class (undoable). |
 | `godot_remove_node` | Editor | Removes a node, restoring order and ownership on undo. |

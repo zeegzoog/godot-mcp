@@ -3679,6 +3679,74 @@ async fn game_set_writes_through_an_object_and_refuses_a_missing_leaf() {
     assert!(!stopped.is_error, "{}", text_of(&stopped));
 }
 
+/// A Godot literal string is parsed for a typed property, as the editor tool does. A value of
+/// the wrong type is refused with the property's type, and no script error reaches the game log.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn game_set_parses_a_godot_literal_and_refuses_a_wrong_type_quietly() {
+    let _ = IGNORE;
+    let project = project();
+    let tools = manager(project.path());
+    let started = call(
+        &tools,
+        "godot_run_project",
+        json!({
+            "project_path": project.path(),
+            "scene": "res://scenes/main.tscn",
+            "mode": "process",
+            "headless": true
+        }),
+    )
+    .await;
+    assert!(!started.is_error, "{}", text_of(&started));
+    let run_id = run_id_of(&started);
+
+    let moved = call(
+        &tools,
+        "godot_game_set",
+        json!({
+            "run_id": run_id,
+            "path": "Mark",
+            "properties": {"transform": "Transform2D(1, 0, 0, 1, 5, 6)"}
+        }),
+    )
+    .await;
+    assert!(!moved.is_error, "{}", text_of(&moved));
+    let mark = call(
+        &tools,
+        "godot_game_get",
+        json!({"run_id": run_id, "path": "Mark", "properties": ["position"]}),
+    )
+    .await;
+    let position = &json_of(&mark)["properties"]["position"];
+    assert_eq!(position[0].as_f64(), Some(5.0), "{position}");
+    assert_eq!(position[1].as_f64(), Some(6.0), "{position}");
+
+    let wrong = call(
+        &tools,
+        "godot_game_set",
+        json!({"run_id": run_id, "path": "Mark", "properties": {"transform": "not a transform"}}),
+    )
+    .await;
+    assert!(wrong.is_error, "{}", text_of(&wrong));
+    let wrong_text = text_of(&wrong);
+    assert!(
+        wrong_text.contains("Transform2D") && wrong_text.contains("String"),
+        "{wrong_text}"
+    );
+
+    let mut log = String::new();
+    for _ in 0..10 {
+        log = text_of(&call(&tools, "godot_run_output", json!({"run_id": run_id})).await);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(!log.contains("Invalid operands"), "{log}");
+    assert!(!log.contains("rt_live.gd"), "{log}");
+
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+}
+
 #[tokio::test]
 #[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
 async fn headless_game_sets_a_shader_parameter_on_a_material() {

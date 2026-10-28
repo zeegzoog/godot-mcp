@@ -3031,6 +3031,7 @@ async fn files_are_deleted_on_disk_with_their_companions_unless_still_referenced
 
     for (path, needle) in [
         ("res://project.godot", "project file"),
+        ("res://Project.godot", "project file"),
         ("res://.godot/imported", ".godot"),
         ("res://addons/godot_mcp/plugin.cfg", "addon"),
         ("res://main.tscn.uid", "belongs to main.tscn"),

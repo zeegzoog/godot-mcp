@@ -352,6 +352,9 @@ fn listing(project: &Path, target: &Target) -> Value {
 
 /// Why a path may never be deleted through this tool, or `None`.
 fn protected(res_path: &str) -> Option<String> {
+    // Windows and macOS file systems ignore case, so res://Project.godot is project.godot there.
+    let res_path = res_path.to_lowercase();
+    let res_path = res_path.as_str();
     if res_path == "res://project.godot" {
         return Some("is the project file itself".into());
     }
@@ -576,6 +579,9 @@ mod tests {
             "res://.godot/uid_cache.bin",
             "res://addons/godot_mcp",
             "res://addons/godot_mcp/plugin.cfg",
+            "res://Project.godot",
+            "res://.GODOT/uid_cache.bin",
+            "res://Addons/Godot_MCP/plugin.cfg",
         ] {
             assert!(protected(path).is_some(), "{path}");
         }

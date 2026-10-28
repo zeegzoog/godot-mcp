@@ -179,7 +179,9 @@ func _refuse(report: Dictionary, res_path: String, reason: String) -> void:
     report["refused"].append({"path": res_path, "reason": reason})
 
 ## Why a path may never be deleted through this call, or "".
-func _protected(res_path: String) -> String:
+func _protected(path: String) -> String:
+    # Windows and macOS file systems ignore case, so res://Project.godot is project.godot there.
+    var res_path: String = path.to_lower()
     if res_path == "res://project.godot":
         return "is the project file itself"
     if res_path == "res://.godot" or res_path.begins_with("res://.godot/"):

@@ -2826,3 +2826,110 @@ async fn a_scenario_is_refused_before_a_game_exists() {
         assert!(description.contains(word), "{word} missing: {description}");
     }
 }
+
+/// The input map tools edit through the editor only. A request that could never be applied is
+/// refused before the editor is asked, and project.godot is never written by hand.
+#[tokio::test]
+async fn input_action_edits_are_checked_first_and_never_write_project_godot() {
+    let project = project_dir();
+    let project_file = project.path().join("project.godot");
+    let before = std::fs::read_to_string(&project_file).expect("project.godot");
+    let key_e = json!({"type": "key", "key": "E"});
+    for (args, needle) in [
+        (json!({"action": ""}), "action"),
+        (json!({"action": "a/b", "add_events": [key_e]}), "action"),
+        (
+            json!({"action": "say \"hi\"", "add_events": [key_e]}),
+            "action",
+        ),
+        (json!({"action": "tongue"}), "nothing to change"),
+        (
+            json!({"action": "tongue", "add_events": [{"type": "gesture"}]}),
+            "type",
+        ),
+        (
+            json!({"action": "tongue", "add_events": [{"type": "key"}]}),
+            "key",
+        ),
+        (
+            json!({"action": "tongue", "add_events": [{"type": "mouse_button", "button": "nose"}]}),
+            "button",
+        ),
+        (
+            json!({"action": "tongue", "add_events": [{"type": "joypad_button", "button": 200}]}),
+            "button",
+        ),
+        (
+            json!({"action": "tongue", "add_events": [{"type": "joypad_motion", "axis": 1, "axis_value": 0}]}),
+            "axis_value",
+        ),
+        (json!({"action": "tongue", "deadzone": 2}), "deadzone"),
+        (
+            json!({"action": "tongue", "delete": true, "add_events": [key_e]}),
+            "delete",
+        ),
+        (json!({"action": "ui_accept", "delete": true}), "built-in"),
+    ] {
+        let refused = call("godot_edit_input_action", args.clone()).await;
+        assert!(refused.is_error, "{args}: {}", text(&refused));
+        assert!(
+            text(&refused).contains(needle),
+            "{args}: expected {needle:?} in {}",
+            text(&refused)
+        );
+        assert!(
+            !text(&refused).contains("bridge is not reachable"),
+            "{args} reached the editor: {}",
+            text(&refused)
+        );
+    }
+
+    // A valid request without an editor names the editor and leaves project.godot alone.
+    let unreachable = call(
+        "godot_edit_input_action",
+        json!({"action": "tongue", "add_events": [key_e], "deadzone": 0.5}),
+    )
+    .await;
+    assert!(unreachable.is_error, "{}", text(&unreachable));
+    assert!(
+        text(&unreachable).contains("godot_launch_editor"),
+        "{}",
+        text(&unreachable)
+    );
+    let as_setting = call(
+        "godot_set_project_setting",
+        json!({"key": "input/tongue", "value": "E", "project_path": project.path()}),
+    )
+    .await;
+    assert!(as_setting.is_error, "{}", text(&as_setting));
+    assert!(
+        text(&as_setting).contains("godot_edit_input_action"),
+        "{}",
+        text(&as_setting)
+    );
+    let listed = call("godot_get_input_map", json!({})).await;
+    assert!(listed.is_error, "{}", text(&listed));
+    assert!(
+        text(&listed).contains("godot_launch_editor"),
+        "{}",
+        text(&listed)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&project_file).expect("project.godot again"),
+        before
+    );
+
+    let tools = ToolManager::list_tools();
+    let edit = tools
+        .iter()
+        .find(|tool| tool.name == "godot_edit_input_action")
+        .expect("edit tool listed");
+    for word in ["undo", "physical", "deadzone", "joypad"] {
+        assert!(
+            edit.description.to_lowercase().contains(word),
+            "{word} missing: {}",
+            edit.description
+        );
+    }
+    assert!(tools.iter().any(|tool| tool.name == "godot_get_input_map"));
+}

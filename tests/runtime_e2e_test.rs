@@ -840,6 +840,7 @@ var hp := 1
 var stats := {"hp": 1}
 var samples := [1, 2]
 var mark: Node2D
+var goal: Variant = null
 var physics_ticks := 0
 var physics_time := 0.0
 var slide := 0.0
@@ -1025,6 +1026,49 @@ async fn headless_game_waits_for_a_value_a_new_scene_and_real_physics_ticks() {
     .await;
     assert!(!exists.is_error, "{}", text_of(&exists));
     assert_eq!(json_of(&exists)["exists"], true, "{}", text_of(&exists));
+
+    // null compares with any type: eq null holds only for a null value, ne null for any
+    // other, so a wait can see a Variant property being cleared.
+    let is_null = call(
+        &tools,
+        "godot_game_wait",
+        json!({"run_id": run_id, "node": ".", "property": "goal", "op": "eq", "value": null}),
+    )
+    .await;
+    assert!(!is_null.is_error, "{}", text_of(&is_null));
+    assert!(
+        json_of(&is_null)["observed"].is_null(),
+        "{}",
+        text_of(&is_null)
+    );
+    for property in ["hp", "mark", "stats"] {
+        let not_null = call(
+            &tools,
+            "godot_game_wait",
+            json!({"run_id": run_id, "node": ".", "property": property, "op": "ne", "value": null}),
+        )
+        .await;
+        assert!(!not_null.is_error, "{property}: {}", text_of(&not_null));
+    }
+    let never_null = call(
+        &tools,
+        "godot_game_wait",
+        json!({"run_id": run_id, "node": ".", "property": "hp", "op": "eq", "value": null, "timeout": 2}),
+    )
+    .await;
+    let never_text = text_of(&never_null);
+    assert!(never_null.is_error, "{never_text}");
+    assert!(!never_text.contains("Type mismatch"), "{never_text}");
+    assert!(never_text.contains("\"observed\""), "{never_text}");
+    assert_error(
+        &call(
+            &tools,
+            "godot_game_wait",
+            json!({"run_id": run_id, "node": ".", "property": "goal", "op": "lt", "value": null, "timeout": 1}),
+        )
+        .await,
+        "ordering",
+    );
 
     assert_error(
         &call(

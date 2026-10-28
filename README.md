@@ -201,7 +201,7 @@ To tighten it, set `GODOT_MCP_FEEDBACK=draft` (the AI can write reports but has 
 
 ## Checking a running game
 
-These calls work on a managed process and on editor Play. A property wait reads with `get` only. It does not evaluate an expression or call a method. A name that starts with `_`, the name `script`, and a path that goes through an Array are refused. `eq` and `ne` need the same type. JSON has one number type, so a whole number such as `1` may match an int property; `1.5` against an int is a type error. Strings are not turned into numbers. Float equality is exact.
+These calls work on a managed process and on editor Play. A property wait reads with `get` only. It does not evaluate an expression or call a method. A name that starts with `_`, the name `script`, and a path that goes through an Array are refused. `eq` and `ne` need the same type, except `null`: it compares with any value, so `eq null` waits for a property to be cleared. JSON has one number type, so a whole number such as `1` may match an int property; `1.5` against an int is a type error. Strings are not turned into numbers. Float equality is exact.
 
 ```json
 {"node": ".", "property": "stats/hp", "op": "gte", "value": 1, "timeout": 60}

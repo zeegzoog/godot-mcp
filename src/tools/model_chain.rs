@@ -1014,6 +1014,24 @@ mod tests {
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         bin
     }
+    /// Runs a stub. Closing it first is not enough on Linux: a test forking on another thread
+    /// holds the write handle until its exec, so a busy start is retried.
+    #[cfg(unix)]
+    async fn run_stub(
+        bin: &Path,
+        calls: &[(&str, Value)],
+        wait: Duration,
+    ) -> Result<Vec<String>, FroxelError> {
+        for _ in 0..40 {
+            match froxel_script_with(bin.as_os_str(), calls, wait).await {
+                Err(FroxelError::Start(text)) if text.contains("os error 26") => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                other => return other,
+            }
+        }
+        froxel_script_with(bin.as_os_str(), calls, wait).await
+    }
     #[cfg(unix)]
     #[tokio::test]
     async fn the_deadline_includes_child_exit_after_all_replies() {
@@ -1034,8 +1052,8 @@ exec sleep 3
 "#,
         );
         let start = std::time::Instant::now();
-        let error = froxel_script_with(
-            bin.as_os_str(),
+        let error = run_stub(
+            &bin,
             &[("export_models", json!({}))],
             Duration::from_millis(150),
         )
@@ -1053,8 +1071,8 @@ exec sleep 3
             "noisy-froxel",
             "#!/bin/sh\nhead -c 20000000 /dev/zero | tr '\\0' 'a'\nexec sleep 3\n",
         );
-        let error = froxel_script_with(
-            bin.as_os_str(),
+        let error = run_stub(
+            &bin,
             &[("export_models", json!({}))],
             Duration::from_secs(20),
         )
@@ -1079,8 +1097,8 @@ exec sleep 3
         );
         let dir = tempfile::tempdir().unwrap();
         let bin = stub(dir.path(), "failing-froxel", "#!/bin/sh\nexit 3\n");
-        let failed = froxel_script_with(
-            bin.as_os_str(),
+        let failed = run_stub(
+            &bin,
             &[("export_models", json!({}))],
             Duration::from_secs(5),
         )

@@ -1056,6 +1056,37 @@ fn the_physics_tool_offers_hold_conditions_and_the_input_tool_hold_ticks() {
 }
 
 #[test]
+fn a_wait_value_declares_null_so_a_client_does_not_send_it_as_text() {
+    let tools = ToolManager::list_tools();
+    let schema = |name: &str| {
+        tools
+            .iter()
+            .find(|tool| tool.name == name)
+            .unwrap_or_else(|| panic!("no tool {name}"))
+            .input_schema
+            .clone()
+    };
+    let wait = schema("godot_game_wait");
+    let physics = schema("godot_game_physics");
+    for value in [
+        &wait["properties"]["value"],
+        &physics["properties"]["until"]["properties"]["value"],
+    ] {
+        let types = value["type"].as_array().expect("value lists its types");
+        assert!(types.contains(&json!("null")), "{value}");
+        assert!(types.contains(&json!("string")), "{value}");
+        assert!(types.contains(&json!("number")), "{value}");
+    }
+    assert!(
+        wait["properties"]["value"]["description"]
+            .as_str()
+            .unwrap_or("")
+            .contains("null"),
+        "{wait}"
+    );
+}
+
+#[test]
 fn the_descriptions_tell_an_agent_what_a_hold_does_and_what_it_refuses() {
     let tools = ToolManager::list_tools();
     let description = |name: &str| {

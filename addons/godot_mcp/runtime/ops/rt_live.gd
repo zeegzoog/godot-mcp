@@ -224,6 +224,8 @@ static func _assign_leaf(name: String, looked: Dictionary, raw: Variant) -> Dict
     else:
         return R.err(R.BAD_PARAMS, "Cannot write '%s'." % name)
     if not _same(stored, decoded):
+        if current != null and not _type_compatible(decoded, typeof(current)):
+            return R.err(R.BAD_PARAMS, "Property '%s' is a %s and a %s value was not accepted. Pass a Godot literal such as %s, or the value in the shape godot_game_get returns." % [name, type_string(typeof(current)), type_string(typeof(decoded)), var_to_str(current)])
         return R.err(R.BAD_PARAMS, "Property '%s' is %s after writing %s. The write did not take." % [name, stored, decoded])
     return {"value": stored}
 
@@ -232,7 +234,12 @@ static func _assign_leaf(name: String, looked: Dictionary, raw: Variant) -> Dict
 ## 0.10000000149. Floats and float-based values are compared approximately, the rest exactly.
 static func _same(stored: Variant, written: Variant) -> bool:
     if typeof(stored) != typeof(written):
-        return stored == written
+        # `==` between unrelated types (Transform3D and String) is a script error in the game.
+        if (stored is int or stored is float) and (written is int or written is float):
+            return stored == written
+        if (stored is String or stored is StringName) and (written is String or written is StringName):
+            return str(stored) == str(written)
+        return false
     match typeof(stored):
         TYPE_FLOAT:
             return is_equal_approx(stored, written)
@@ -669,8 +676,10 @@ static func _coerce(value: Variant, expected: int) -> Variant:
         return StringName(value)
     if value is String and expected == TYPE_NODE_PATH:
         return NodePath(value)
-    if value is String and (expected == TYPE_VECTOR2 or expected == TYPE_VECTOR3 or expected == TYPE_COLOR):
+    # Any other typed value may be a Godot literal such as "Transform3D(...)", as in the editor tool.
+    # An Object is never built from text: an Object(...) literal would create one in the game.
+    if value is String and expected != TYPE_NIL and expected != TYPE_STRING and expected != TYPE_OBJECT:
         var parsed: Variant = str_to_var(value)
-        if parsed != null:
+        if typeof(parsed) == expected:
             return parsed
     return value

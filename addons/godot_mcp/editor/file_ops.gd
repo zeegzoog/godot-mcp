@@ -180,8 +180,11 @@ func _refuse(report: Dictionary, res_path: String, reason: String) -> void:
 
 ## Why a path may never be deleted through this call, or "".
 func _protected(path: String) -> String:
-    # Windows and macOS file systems ignore case, so res://Project.godot is project.godot there.
-    var res_path: String = path.to_lower()
+    # Windows and macOS file systems ignore case, and every file system reads "./" and "//" as
+    # nothing, so res://Addons//godot_mcp is the addon there.
+    var res_path: String = path.simplify_path().to_lower()
+    if _is_alias(res_path):
+        return "is spelled in a way a file system may read as another file (a trailing dot or space, ':' or '~1'); use the plain name"
     if res_path == "res://project.godot":
         return "is the project file itself"
     if res_path == "res://.godot" or res_path.begins_with("res://.godot/"):
@@ -189,6 +192,20 @@ func _protected(path: String) -> String:
     if res_path + "/" == BRIDGE_ADDON or res_path.begins_with(BRIDGE_ADDON):
         return "belongs to the Godot MCP Bridge addon this call runs through; disable the plugin and remove it by hand"
     return ""
+
+## True when a segment of the path is one some file systems read as another file: a trailing dot
+## or space, a stream (":") or a short name ("~1"). The comparisons in _protected cannot see
+## through those.
+func _is_alias(res_path: String) -> bool:
+    for segment: String in res_path.trim_prefix("res://").split("/"):
+        if segment.ends_with(".") or segment.ends_with(" ") or segment.contains(":"):
+            return true
+        var tilde: int = segment.find("~")
+        while tilde != -1:
+            if tilde + 1 < segment.length() and segment[tilde + 1].is_valid_int():
+                return true
+            tilde = segment.find("~", tilde + 1)
+    return false
 
 ## Refuses a .uid or .import file whose own file still exists: it goes with that file.
 func _companion_owner(res_path: String) -> String:

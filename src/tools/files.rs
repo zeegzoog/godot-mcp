@@ -211,7 +211,10 @@ fn delete_on_disk(project: &Path, requested: &[String], options: Options) -> Val
         if targets.iter().any(|target| target.res_path == res_path) {
             continue;
         }
-        if let Some(reason) = protected(&res_path).or_else(|| companion_owner(&file)) {
+        if let Some(reason) = protected(&res_path)
+            .or_else(|| protected_by_identity(project, &file))
+            .or_else(|| companion_owner(&file))
+        {
             refused.push(json!({"path": res_path, "reason": reason}));
             continue;
         }
@@ -355,6 +358,9 @@ fn protected(res_path: &str) -> Option<String> {
     // Windows and macOS file systems ignore case, so res://Project.godot is project.godot there.
     let res_path = res_path.to_lowercase();
     let res_path = res_path.as_str();
+    if is_alias(res_path) {
+        return Some("is spelled in a way a file system may read as another file (a trailing dot or space, ':' or '~1'); use the plain name".into());
+    }
     if res_path == "res://project.godot" {
         return Some("is the project file itself".into());
     }
@@ -371,6 +377,35 @@ fn protected(res_path: &str) -> Option<String> {
         );
     }
     None
+}
+
+/// Whether a segment of the path is one some file systems read as another file: a trailing dot
+/// or space, a stream (`:`) or a short name (`~1`). The comparisons in `protected` cannot see
+/// through those.
+fn is_alias(res_path: &str) -> bool {
+    res_path
+        .trim_start_matches("res://")
+        .split('/')
+        .any(|segment| {
+            segment.ends_with(['.', ' '])
+                || segment.contains(':')
+                || segment
+                    .as_bytes()
+                    .windows(2)
+                    .any(|pair| pair[0] == b'~' && pair[1].is_ascii_digit())
+        })
+}
+
+/// `protected` for the file a path really names: its canonical place inside the project, which
+/// sees through a short name, a link or a spelling in another case.
+fn protected_by_identity(project: &Path, file: &Path) -> Option<String> {
+    let real = file.canonicalize().ok()?;
+    let root = project.canonicalize().ok()?;
+    let relative = real.strip_prefix(&root).ok()?;
+    protected(&format!(
+        "res://{}",
+        relative.to_string_lossy().replace('\\', "/")
+    ))
 }
 
 /// Refuses a `.uid` or `.import` file whose own file still exists: it goes with that file.
@@ -582,12 +617,30 @@ mod tests {
             "res://Project.godot",
             "res://.GODOT/uid_cache.bin",
             "res://Addons/Godot_MCP/plugin.cfg",
+            "res://project.godot.",
+            "res://project.godot::$DATA",
+            "res://PROJEC~1.GOD",
+            "res://addons/godot_mcp /plugin.cfg",
         ] {
             assert!(protected(path).is_some(), "{path}");
         }
         for path in ["res://player.gd", "res://addons/other/plugin.cfg"] {
             assert!(protected(path).is_none(), "{path}");
         }
+    }
+
+    #[test]
+    fn a_path_is_protected_by_the_file_it_names() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".godot/imported")).expect("cache folder");
+        std::fs::create_dir_all(root.join("sub")).expect("folder");
+        std::fs::write(root.join("project.godot"), "config_version=5\n").expect("project file");
+        std::fs::write(root.join("player.gd"), "extends Node\n").expect("script");
+        assert!(protected_by_identity(root, &root.join("sub/../project.godot")).is_some());
+        assert!(protected_by_identity(root, &root.join("sub/../.godot/imported")).is_some());
+        assert!(protected_by_identity(root, &root.join("sub/../player.gd")).is_none());
+        assert!(protected_by_identity(root, &root.join("missing.gd")).is_none());
     }
 
     #[test]

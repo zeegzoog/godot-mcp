@@ -815,7 +815,7 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
         ),
         tool(
             "godot_open_scene",
-            "Opens a scene file in the Godot Editor by its res:// path. An absolute path inside the project is converted, including both macOS spellings of /var and /private/var. Reloading an already-open scene from disk drops that scene's undo history.",
+            "Opens a scene file in the Godot Editor by its res:// path. An absolute path inside the project is converted, including both macOS spellings of /var and /private/var. Reloading an already-open scene from disk drops that scene's undo history. The answer lists in load_errors what Godot reported while loading (for example a node renamed because its name clashed with a child of an instanced scene), names the editor dialog that shows them, and says in unsaved whether the load left the scene with unsaved changes.",
             json!({
                 "scene_path": {
                     "type": "string",

@@ -2322,6 +2322,196 @@ enabled=PackedStringArray(\"res://addons/godot_mcp/plugin.cfg\")
         .expect("the first editor still answers");
 }
 
+/// Test-only command that undoes the last action of the editor's global history, where project
+/// setting edits are recorded.
+const GLOBAL_UNDO_HOOK: &str = r#"        "__test_undo_global":
+            undo_redo.get_history_undo_redo(EditorUndoRedoManager.GLOBAL_HISTORY).undo()
+            send_success(peer, cmd_id, {"undone": true})
+        "ping":
+"#;
+
+/// An InputMap action gets a key, a mouse button and joypad events, is saved through the editor,
+/// and one undo restores it. A request the editor cannot apply changes nothing.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn input_actions_are_edited_saved_and_undone_through_the_editor() {
+    let editor = start_editor_with(
+        Some(GLOBAL_UNDO_HOOK),
+        "",
+        &[],
+        "\n[input]\n\ntongue={\n\"deadzone\": 0.2,\n\"events\": [Object(InputEventKey,\"resource_local_to_scene\":false,\"resource_name\":\"\",\"device\":-1,\"window_id\":0,\"alt_pressed\":false,\"shift_pressed\":false,\"ctrl_pressed\":false,\"meta_pressed\":false,\"pressed\":false,\"keycode\":0,\"physical_keycode\":32,\"key_label\":0,\"unicode\":0,\"location\":0,\"echo\":false,\"script\":null)\n]\n}\n",
+    )
+    .await;
+    let bridge = &editor.bridge;
+    let call = |command: &'static str, params: Value| async move {
+        bridge.send_command(command, params).await
+    };
+    let project_file =
+        || std::fs::read_to_string(editor.project.join("project.godot")).expect("project.godot");
+
+    let listed = call("get_input_map", json!({}))
+        .await
+        .expect("list actions");
+    let actions = listed["actions"].as_array().expect("actions");
+    let tongue = actions
+        .iter()
+        .find(|action| action["name"] == "tongue")
+        .expect("tongue listed");
+    assert_eq!(
+        tongue["events"].as_array().map(Vec::len),
+        Some(1),
+        "{tongue}"
+    );
+    assert_eq!(tongue["events"][0]["type"], "key", "{tongue}");
+    assert_eq!(tongue["events"][0]["key"], "Space", "{tongue}");
+    assert_eq!(tongue["events"][0]["physical"], true, "{tongue}");
+    assert!(
+        actions
+            .iter()
+            .all(|action| !action["name"].as_str().unwrap_or("").starts_with("ui_")),
+        "built-in actions are listed by default: {listed}"
+    );
+    assert!(
+        listed["builtin_hidden"].as_u64().unwrap_or(0) > 0,
+        "{listed}"
+    );
+    let builtins = call("get_input_map", json!({"include_builtin": true}))
+        .await
+        .expect("list with built-ins");
+    assert!(builtins.to_string().contains("ui_accept"), "{builtins}");
+
+    let edited = call(
+        "edit_input_action",
+        json!({"action": "tongue", "deadzone": 0.5, "add_events": [
+            {"type": "key", "key": "E"},
+            {"type": "mouse_button", "button": "right"},
+            {"type": "joypad_button", "button": 2},
+            {"type": "joypad_motion", "axis": 1, "axis_value": -0.7}
+        ]}),
+    )
+    .await
+    .expect("add events");
+    assert_eq!(edited["saved"], true, "{edited}");
+    assert_eq!(edited["added"], 4, "{edited}");
+    assert!(
+        (edited["deadzone"].as_f64().unwrap_or(0.0) - 0.5).abs() < 1e-6,
+        "{edited}"
+    );
+    let events = edited["events"].as_array().expect("events");
+    assert_eq!(events.len(), 5, "{edited}");
+    assert!(
+        events.iter().any(|event| event["type"] == "key"
+            && event["key"] == "E"
+            && event["physical"] == true),
+        "{edited}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "joypad_motion" && event["axis_value"] == -1.0),
+        "{edited}"
+    );
+    let saved = project_file();
+    assert!(saved.contains("\"deadzone\": 0.5"), "{saved}");
+    assert!(saved.contains("InputEventMouseButton"), "{saved}");
+    assert!(saved.contains("InputEventJoypadMotion"), "{saved}");
+
+    // The same event again is not added twice.
+    let again = call(
+        "edit_input_action",
+        json!({"action": "tongue", "add_events": [{"type": "key", "key": "E"}]}),
+    )
+    .await
+    .expect("add a duplicate");
+    assert_eq!(again["added"], 0, "{again}");
+    assert_eq!(
+        again["already_present"].as_array().map(Vec::len),
+        Some(1),
+        "{again}"
+    );
+
+    // Removing an event the action does not have, a key Godot does not know, or editing a missing
+    // action without create, changes nothing.
+    for (params, needle) in [
+        (
+            json!({"action": "tongue", "remove_events": [{"type": "key", "key": "Q"}]}),
+            "does not have",
+        ),
+        (
+            json!({"action": "tongue", "add_events": [{"type": "key", "key": "NoSuchKey"}]}),
+            "Unknown key",
+        ),
+        (
+            json!({"action": "missing", "add_events": [{"type": "key", "key": "E"}]}),
+            "create",
+        ),
+    ] {
+        expect_error(call("edit_input_action", params).await, needle);
+    }
+    assert_eq!(
+        project_file(),
+        saved,
+        "a refused request changed project.godot"
+    );
+
+    let removed = call(
+        "edit_input_action",
+        json!({"action": "tongue", "remove_events": [{"type": "mouse_button", "button": "right"}]}),
+    )
+    .await
+    .expect("remove an event");
+    assert_eq!(removed["removed"], 1, "{removed}");
+    assert!(
+        !project_file().contains("InputEventMouseButton"),
+        "{}",
+        project_file()
+    );
+
+    // One undo puts the mouse button back, and the file follows.
+    call("__test_undo_global", json!({})).await.expect("undo");
+    let restored = call("get_input_map", json!({"action": "tongue"}))
+        .await
+        .expect("read after undo");
+    assert_eq!(
+        restored["actions"][0]["events"].as_array().map(Vec::len),
+        Some(5),
+        "{restored}"
+    );
+    assert!(
+        project_file().contains("InputEventMouseButton"),
+        "{}",
+        project_file()
+    );
+
+    // A new action is created and deleted again.
+    let created = call(
+        "edit_input_action",
+        json!({"action": "jump", "create": true, "add_events": [{"type": "key", "key": "Space", "physical": false, "shift": true}]}),
+    )
+    .await
+    .expect("create an action");
+    assert_eq!(created["created"], true, "{created}");
+    assert_eq!(created["events"][0]["physical"], false, "{created}");
+    assert_eq!(created["events"][0]["shift"], true, "{created}");
+    assert!(project_file().contains("jump={"), "{}", project_file());
+    let deleted = call(
+        "edit_input_action",
+        json!({"action": "jump", "delete": true}),
+    )
+    .await
+    .expect("delete an action");
+    assert_eq!(deleted["deleted"], true, "{deleted}");
+    assert!(!project_file().contains("jump={"), "{}", project_file());
+    expect_error(
+        call(
+            "edit_input_action",
+            json!({"action": "ui_accept", "delete": true}),
+        )
+        .await,
+        "built-in",
+    );
+}
+
 /// A scene whose own node `A` is added under an instance that already has a child `A`. Godot
 /// renames the incoming node while loading and reports it only in its "Load Errors" dialog.
 const CLASH_SUB: &str = "[gd_scene format=3]\n\n[node name=\"Sub\" type=\"Node2D\"]\n\n[node name=\"A\" type=\"Node\" parent=\".\"]\n";

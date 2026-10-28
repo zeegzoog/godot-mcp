@@ -330,8 +330,15 @@ static func call_method(rt: Node, params: Dictionary) -> Dictionary:
             return R.err(R.BAD_PARAMS, "Argument %d for '%s' is %s; expected %s." % [index, method, type_string(typeof(coerced)), type_string(expected)])
         args.append(coerced)
         index += 1
+    # The path is taken before the call: a method that reloads or changes the scene takes the
+    # node out of the tree, and it has no path afterwards.
+    var path: String = rt.path_of(node)
     var value: Variant = node.callv(method, args)
-    return R.ok({"path": rt.path_of(node), "method": method, "value": rt.encode(value)})
+    var answer: Dictionary = {"path": path, "method": method, "value": rt.encode(value)}
+    if not is_instance_valid(node) or not node.is_inside_tree():
+        answer["left_tree"] = true
+        answer["note"] = "The node left the scene tree during the call (for example the scene was reloaded or changed); path is where it was before the call. Wait for the new scene with godot_game_wait scene_generation before reading it."
+    return R.ok(answer)
 
 
 static func signals_of(rt: Node, params: Dictionary) -> Dictionary:

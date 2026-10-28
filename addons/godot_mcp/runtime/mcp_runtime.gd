@@ -264,9 +264,11 @@ func find_node(path: String) -> Node:
     return root.get_node_or_null(NodePath(cleaned))
 
 
+## "" for a node that is freed or outside the tree: asking such a node for its path is an engine
+## error that would show up in the game's own output.
 func path_of(node: Node) -> String:
     var root := scene_root()
-    if node == null:
+    if node == null or not is_instance_valid(node) or not node.is_inside_tree():
         return ""
     if root != null and (node == root or root.is_ancestor_of(node)):
         return "." if node == root else String(root.get_path_to(node))

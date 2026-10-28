@@ -266,6 +266,24 @@ impl ToolManager {
             }
         };
 
+        let res_path = target
+            .strip_prefix(&project.dir)
+            .ok()
+            .map(|relative| format!("res://{}", relative.to_string_lossy().replace('\\', "/")));
+        let replacing = overwrite && fs::try_exists(&target).await.unwrap_or(false);
+        // A named project may still be the one the editor has open, with the script in a tab.
+        let editor_holds_project = project.from_editor
+            || (replacing
+                && str_arg(&args, "project_path").is_some()
+                && self.editor_may_serve(&project.dir).await);
+        let open_tab = match (&res_path, editor_holds_project && replacing) {
+            (Some(res_path), true) => match self.script_tab(res_path, false).await {
+                Ok(tab) => tab,
+                Err(result) => return result,
+            },
+            _ => None,
+        };
+
         let mut content = format!("extends {extends_class}\n");
         if let Some(name) = class_name {
             content.push_str(&format!("class_name {name}\n"));
@@ -316,24 +334,81 @@ impl ToolManager {
             };
         }
 
-        let res_path = target
-            .strip_prefix(&project.dir)
-            .ok()
-            .map(|relative| format!("res://{}", relative.to_string_lossy().replace('\\', "/")));
-        if project.from_editor {
+        let mut reload_note = String::new();
+        if editor_holds_project {
             if let Some(res_path) = &res_path {
                 // Let the editor pick the file up (and give it a .uid) right away.
                 let _ = self
                     .bridge
                     .send_command("resave_resources", json!({ "paths": [res_path] }))
                     .await;
+                if open_tab.is_some() {
+                    // The refresh above already reloads a clean tab; this call catches an
+                    // older addon or a tab the refresh did not reach.
+                    reload_note = match self.script_tab(res_path, true).await {
+                        Ok(Some(tab))
+                            if tab.get("stale").and_then(Value::as_bool) == Some(true) =>
+                        {
+                            format!(
+                                " Warning: the open script tab still shows the old text; call godot_resave_resources with paths [\"{res_path}\"] to reload it."
+                            )
+                        }
+                        Ok(Some(_)) => {
+                            " The open script tab was reloaded with the new text.".to_string()
+                        }
+                        _ => String::new(),
+                    };
+                }
             }
         }
 
         ToolResult::text(format!(
-            "Created GDScript file {} extending '{extends_class}'.",
+            "Created GDScript file {} extending '{extends_class}'.{reload_note}",
             res_path.unwrap_or_else(|| target.display().to_string()),
         ))
+    }
+
+    /// The editor's script tab for `res_path` when it is open, `None` when it is not or the editor
+    /// cannot say (an editor without the command, or none at all). Refuses, as the error, an
+    /// overwrite the person could lose typing to: a tab with unsaved changes, or one that cannot
+    /// be matched to the file.
+    async fn script_tab(&self, res_path: &str, reload: bool) -> Result<Option<Value>, ToolResult> {
+        let Ok(tab) = self
+            .bridge
+            .send_command(
+                "script_tab",
+                json!({ "script_path": res_path, "reload": reload }),
+            )
+            .await
+        else {
+            return Ok(None);
+        };
+        if reload {
+            return Ok(Some(tab));
+        }
+        if tab.get("dirty").and_then(Value::as_bool) == Some(true) {
+            return Err(ToolResult::error(
+                format!(
+                    "{res_path} has unsaved changes in the Godot script editor, so it was not overwritten"
+                ),
+                &[
+                    "Ask the person to save or discard the changes in the script editor, then call godot_create_script again",
+                    "Or change the script with godot_read_script and godot_edit_script once it is saved",
+                ],
+            ));
+        }
+        if tab.get("editor_state").and_then(Value::as_str) == Some("unknown") {
+            let reason = tab.get("reason").and_then(Value::as_str).unwrap_or("");
+            return Err(ToolResult::error(
+                format!(
+                    "The script editor's tab for {res_path} cannot be matched ({reason}), so it was not overwritten"
+                ),
+                &[
+                    "Close the extra tabs in the script editor, or save the script, then call godot_create_script again",
+                ],
+            ));
+        }
+        Ok((tab.get("open").and_then(Value::as_bool) == Some(true)).then_some(tab))
     }
 }
 
@@ -765,7 +840,7 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
         ),
         tool(
             "godot_create_script",
-            "Creates a new GDScript file with a standard header inside a Godot project. Refuses to overwrite an existing file unless overwrite is true. script_path is the same parameter the other script tools use; file_path is its older name.",
+            "Creates a new GDScript file with a standard header inside a Godot project. Refuses to overwrite an existing file unless overwrite is true. When the editor has the script open in a tab, an overwrite is refused while the tab has unsaved changes, and otherwise reloads the tab with the new text. script_path is the same parameter the other script tools use; file_path is its older name.",
             json!({
                 "script_path": {
                     "type": "string",
@@ -838,7 +913,7 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
         model_chain::definition(),
         tool(
             "godot_resave_resources",
-            "Refreshes assets and resources after they were changed externally. With the editor connected, importable files the editor already knows are re-imported synchronously and other files are re-scanned. A path the editor has never scanned is updated and, if needed, scanned first; it is listed under reimported only after a .import file exists, and otherwise under not_scanned (load() would fail with no loader). Without paths, rescans the whole project in the background. wait true holds the reply until scanning and importing finish (up to 60s) and reports how many files were imported; timed_out means they may not be loadable yet. Without the editor, runs `godot --headless --path <project> --import` and reports the sources whose .import sidecar appeared or changed.",
+            "Refreshes assets and resources after they were changed externally. With the editor connected, importable files the editor already knows are re-imported synchronously and other files are re-scanned. An open script tab without unsaved changes whose text differs from its file is reloaded (listed under reloaded_tabs); one with unsaved changes is kept and listed under unsaved_tabs. A path the editor has never scanned is updated and, if needed, scanned first; it is listed under reimported only after a .import file exists, and otherwise under not_scanned (load() would fail with no loader). Without paths, rescans the whole project in the background. wait true holds the reply until scanning and importing finish (up to 60s) and reports how many files were imported; timed_out means they may not be loadable yet. Without the editor, runs `godot --headless --path <project> --import` and reports the sources whose .import sidecar appeared or changed.",
             json!({
                 "paths": {
                     "type": "array",

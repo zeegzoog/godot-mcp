@@ -47,6 +47,7 @@ const PARAM_TYPES: Dictionary = {
     "create_scene": {"scene_path": TYPE_STRING, "root_type": TYPE_STRING, "root_name": TYPE_STRING},
     "attach_script": {"node_path": TYPE_STRING, "script_path": TYPE_STRING},
     "read_script": {"script_path": TYPE_STRING},
+    "script_tab": {"script_path": TYPE_STRING, "reload": TYPE_BOOL},
     "edit_script": {"script_path": TYPE_STRING, "old_text": TYPE_STRING, "new_text": TYPE_STRING, "version": TYPE_STRING},
     "connect_signal": {"node_path": TYPE_STRING, "signal_name": TYPE_STRING, "method": TYPE_STRING, "target_path": TYPE_STRING},
     "list_signals": {"node_path": TYPE_STRING},
@@ -297,6 +298,8 @@ func dispatch_command(peer: WebSocketPeer, cmd_id: String, cmd_type: String, par
             read_script(peer, cmd_id, params)
         "edit_script":
             edit_script(peer, cmd_id, params)
+        "script_tab":
+            script_tab(peer, cmd_id, params)
         "connect_signal":
             connect_signal(peer, cmd_id, params)
         "list_signals":
@@ -1020,6 +1023,18 @@ func resave_resources(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -
         fs.reimport_files(to_reimport)
     for res_path in to_refresh:
         fs.update_file(res_path)
+    # A script tab without unsaved changes follows its file; one with unsaved changes is kept
+    # and listed, so the caller can ask the person.
+    var reloaded_tabs: PackedStringArray = PackedStringArray()
+    var unsaved_tabs: PackedStringArray = PackedStringArray()
+    for res_path: String in to_refresh:
+        if res_path.get_extension() != "gd":
+            continue
+        var tab: Dictionary = _script_ops().tab_state(res_path, true)
+        if bool(tab.get("reloaded", false)):
+            reloaded_tabs.append(res_path)
+        elif bool(tab.get("dirty", false)):
+            unsaved_tabs.append(res_path)
 
     var reimported: PackedStringArray = PackedStringArray()
     for res_path: String in to_reimport:
@@ -1039,6 +1054,8 @@ func resave_resources(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -
         "mode": mode,
         "reimported": reimported,
         "refreshed": to_refresh,
+        "reloaded_tabs": reloaded_tabs,
+        "unsaved_tabs": unsaved_tabs,
         "not_scanned": not_scanned,
         "skipped_missing": missing_paths,
         "skipped_invalid": invalid_paths,
@@ -1242,6 +1259,17 @@ func edit_script(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> voi
             send_error(peer, cmd_id, "Missing %s. Pass the fragment to replace as old_text and its replacement as new_text." % key)
             return
     var result: Dictionary = _script_ops().edit(res_path, str(params["old_text"]), str(params["new_text"]), str(params.get("version", "")))
+    if result.has("error"):
+        send_error(peer, cmd_id, str(result["error"]))
+        return
+    send_success(peer, cmd_id, result)
+
+## Reports the script tab of a file and, with reload, gives an unmodified stale tab the file's text.
+func script_tab(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
+    var res_path: String = _script_command_path(peer, cmd_id, params)
+    if res_path.is_empty():
+        return
+    var result: Dictionary = _script_ops().tab_state(res_path, bool(params.get("reload", false)))
     if result.has("error"):
         send_error(peer, cmd_id, str(result["error"]))
         return

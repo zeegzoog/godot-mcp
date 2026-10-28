@@ -1970,6 +1970,157 @@ async fn edit_script_replaces_one_fragment_and_never_overwrites_typing() {
     assert_eq!(file("notes.txt"), "hello\n");
 }
 
+/// A script tab that shows older text than the file is reported by a read, reloaded by
+/// godot_resave_resources and by godot_create_script's overwrite, and an overwrite of a script
+/// with unsaved typing is refused.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn an_open_script_tab_follows_the_file_or_says_it_does_not() {
+    use godot_mcp::cli_runner::CliRunner;
+    use godot_mcp::tools::ToolManager;
+    use std::sync::Arc;
+
+    let first = "extends Node\n\nfunc answer() -> int:\n\treturn 1\n";
+    let editor = start_editor_with(
+        Some(SCRIPT_PROBE_HOOK),
+        SCRIPT_PROBE_HELPERS,
+        &[("probe.gd", first)],
+        "",
+    )
+    .await;
+    let bridge = &editor.bridge;
+    let (godot, _) = godot_binaries();
+    let tools = Arc::new(
+        ToolManager::new(BridgeClient::new(editor.port), CliRunner::new(godot))
+            .with_working_dir(editor.project.clone()),
+    );
+    let path = editor.project.join("probe.gd");
+    let file = || std::fs::read_to_string(&path).expect("file");
+    let state = || async {
+        bridge
+            .send_command("__probe_state", json!({"path": "res://probe.gd"}))
+            .await
+            .expect("state")
+    };
+    let read = || async {
+        bridge
+            .send_command("read_script", json!({"script_path": "res://probe.gd"}))
+            .await
+            .expect("read")
+    };
+    bridge
+        .send_command("__probe_open", json!({"path": "res://probe.gd"}))
+        .await
+        .expect("open");
+    sleep(Duration::from_millis(500)).await;
+
+    // The file changes behind the open tab: the read says so, and an edit names the way out.
+    let second = "extends Node\n\nfunc answer() -> int:\n\treturn 2\n";
+    std::fs::write(&path, second).expect("change the file");
+    let stale = read().await;
+    assert_eq!(stale["source"], "file", "{stale}");
+    assert_eq!(stale["text"], second, "{stale}");
+    assert_eq!(stale["dirty"], false, "{stale}");
+    assert_eq!(stale["stale_tab"], true, "{stale}");
+    expect_error(
+        bridge
+            .send_command(
+                "edit_script",
+                json!({"script_path": "res://probe.gd", "old_text": "return 2", "new_text": "return 3"}),
+            )
+            .await,
+        "godot_resave_resources",
+    );
+
+    // godot_resave_resources with the path reloads the tab, which then shows the saved file.
+    let refreshed = Arc::clone(&tools)
+        .call_tool(
+            "godot_resave_resources",
+            json!({"paths": ["res://probe.gd"]}),
+        )
+        .await;
+    assert!(!refreshed.is_error, "{}", tool_text(&refreshed));
+    let refreshed: Value = serde_json::from_str(&tool_text(&refreshed)).expect("resave json");
+    assert_eq!(
+        refreshed["reloaded_tabs"],
+        json!(["res://probe.gd"]),
+        "{refreshed}"
+    );
+    let shown = state().await;
+    assert_eq!(shown["text"], second, "{shown}");
+    assert_eq!(shown["version"], shown["saved_version"], "{shown}");
+    assert!(read().await.get("stale_tab").is_none());
+
+    // An overwrite through godot_create_script reloads the clean tab, so the next edit works.
+    let created = Arc::clone(&tools)
+        .call_tool(
+            "godot_create_script",
+            json!({"script_path": "res://probe.gd", "overwrite": true}),
+        )
+        .await;
+    assert!(!created.is_error, "{}", tool_text(&created));
+    assert!(
+        tool_text(&created).contains("reloaded"),
+        "{}",
+        tool_text(&created)
+    );
+    let fresh = file();
+    assert!(fresh.contains("func _ready() -> void:"), "{fresh}");
+    let shown = state().await;
+    assert_eq!(shown["text"], fresh, "{shown}");
+    assert_eq!(shown["version"], shown["saved_version"], "{shown}");
+    let edited = Arc::clone(&tools)
+        .call_tool(
+            "godot_edit_script",
+            json!({"script_path": "res://probe.gd", "old_text": "\tpass", "new_text": "\tprint(1)"}),
+        )
+        .await;
+    assert!(!edited.is_error, "{}", tool_text(&edited));
+    assert!(file().contains("\tprint(1)"), "{}", file());
+
+    // Unsaved typing in the tab: the overwrite is refused and both texts stay.
+    bridge
+        .send_command(
+            "__probe_type",
+            json!({"path": "res://probe.gd", "text": "# typed\n"}),
+        )
+        .await
+        .expect("type");
+    let before = file();
+    let refused = Arc::clone(&tools)
+        .call_tool(
+            "godot_create_script",
+            json!({"script_path": "res://probe.gd", "overwrite": true}),
+        )
+        .await;
+    assert!(refused.is_error, "{}", tool_text(&refused));
+    assert!(
+        tool_text(&refused).contains("unsaved changes"),
+        "{}",
+        tool_text(&refused)
+    );
+    assert_eq!(file(), before, "the file is untouched");
+    assert!(
+        state().await["text"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("# typed\n"),
+        "the typed text is still in the editor"
+    );
+
+    // A dirty tab is never reloaded by a refresh either.
+    let kept = Arc::clone(&tools)
+        .call_tool(
+            "godot_resave_resources",
+            json!({"paths": ["res://probe.gd"]}),
+        )
+        .await;
+    assert!(!kept.is_error, "{}", tool_text(&kept));
+    let kept: Value = serde_json::from_str(&tool_text(&kept)).expect("resave json");
+    assert_eq!(kept["reloaded_tabs"], json!([]), "{kept}");
+    assert_eq!(kept["unsaved_tabs"], json!(["res://probe.gd"]), "{kept}");
+}
+
 /// What the amended concepts ask of the editor commands: a script with a byte order mark is read
 /// and edited, a new file's folders are created, an unset object property is `null`, a node's
 /// signals list only connections inside the scene, and a setting key has no dot segment.

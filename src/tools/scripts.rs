@@ -24,7 +24,7 @@ pub fn catalog() -> Vec<Tool> {
     vec![
         super::tool(
             "godot_read_script",
-            "Reads an existing .gd script as the editor would save it: the editor's unsaved text when the script is open with unsaved changes (dirty: true, source: editor), otherwise the file. Returns {path, text, source, dirty, version}; the version label identifies the returned text. Without an editor it reads the file.",
+            "Reads an existing .gd script as the editor would save it: the editor's unsaved text when the script is open with unsaved changes (dirty: true, source: editor), otherwise the file. Returns {path, text, source, dirty, version}; the version label identifies the returned text. stale_tab: true means the script is open in a tab without unsaved changes that still shows older text than the file; godot_edit_script refuses until godot_resave_resources with the path reloads the tab. Without an editor it reads the file.",
             json!({
                 "script_path": {"type": "string", "description": "res:// path to a .gd file in the project."},
                 "project_path": {"type": "string"}

@@ -774,6 +774,14 @@ static func _has_public_property(object: Object, part: String) -> bool:
 
 
 static func _compare(op: String, observed: Variant, expected: Variant) -> Dictionary:
+    # null compares with any type, so a wait can see a Variant property being cleared. A
+    # freed object reads as null.
+    var observed_null := _is_null(observed)
+    if observed_null or _is_null(expected):
+        if op != "eq" and op != "ne":
+            return R.err(R.BAD_PARAMS, "Ordering needs both sides to be int or both to be float. null works with eq and ne only.")
+        var both_null := observed_null and _is_null(expected)
+        return {"match": both_null if op == "eq" else not both_null}
     # bool passes `is int` in GDScript. Handle it before the numeric path so true does not
     # become 1 and compare equal to a JSON number.
     if observed is bool or expected is bool:
@@ -798,6 +806,12 @@ static func _compare(op: String, observed: Variant, expected: Variant) -> Dictio
         return R.err(R.BAD_PARAMS, "Type mismatch: observed is %s and the value is %s." % [type_string(typeof(observed)), type_string(typeof(expected))])
     var same_value := bool(observed == expected)
     return {"match": same_value if op == "eq" else not same_value}
+
+
+static func _is_null(value: Variant) -> bool:
+    if typeof(value) == TYPE_NIL:
+        return true
+    return typeof(value) == TYPE_OBJECT and not is_instance_valid(value)
 
 
 static func _compare_numbers(op: String, observed: Variant, expected: Variant) -> Dictionary:

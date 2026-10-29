@@ -935,18 +935,23 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
         ),
         tool(
             "godot_get_node_properties",
-            "Inspects the editor-visible properties of a node. Each property is returned as {type, value}, with the value in Godot's text format (e.g. 'Vector2(5, 7)').",
+            "Inspects the editor-visible properties of a node. Each property is returned as {type, value}, with the value in Godot's text format (e.g. 'Vector2(5, 7)'). With properties, only those names are read, and ':' steps through a resource the way godot_game_get does (material_override:shader_parameter/glow_amount); the last segment is a property of that resource. A name that cannot be read is an entry in property_errors; the others are still returned.",
             json!({
                 "node_path": {
                     "type": "string",
                     "description": "Path to the target node relative to the scene root ('.' or empty for the root)."
+                },
+                "properties": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Property names to read instead of every editor-visible property. A name may step through resources with ':' (material_override:shader_parameter/glow_amount)."
                 }
             }),
             &["node_path"],
         ),
         tool(
             "godot_set_node_properties",
-            "Modifies properties of a node in the active scene with undo/redo support. Values are converted to the property's type: vectors, rects and colors accept arrays ([10, 20]) or objects ({\"x\": 10, \"y\": 20}), colors also accept '#rrggbb' or names, resources accept res:// paths, and any Godot literal string (e.g. 'Vector2(1, 2)') is parsed. 'metadata/<name>' sets node metadata: an existing entry keeps its type, a missing one is created (as the inspector's Add Metadata does) with the JSON value's own type, a whole number as int; the name must be an identifier and the value not null. Unknown properties or unconvertible values reject the whole call without changing anything.",
+            "Modifies properties of a node in the active scene with undo/redo support. Values are converted to the property's type: vectors, rects and colors accept arrays ([10, 20]) or objects ({\"x\": 10, \"y\": 20}), colors also accept '#rrggbb' or names, resources accept res:// paths, and any Godot literal string (e.g. 'Vector2(1, 2)') is parsed. 'metadata/<name>' sets node metadata: an existing entry keeps its type, a missing one is created (as the inspector's Add Metadata does) with the JSON value's own type, a whole number as int; the name must be an identifier and the value not null. ':' steps through a resource the way godot_game_set does (material_override:shader_parameter/glow_amount); the last segment is a property of that resource, converted the same way, and the change is part of the same undo action. Only a resource built into the edited scene (or not saved yet) is changed this way: one saved in a .tres file or built into another scene is shared, so it is refused and the message names the file. Refuses script and a private segment after ':', and a ':' step through a value that is not a resource. Unknown properties or unconvertible values reject the whole call without changing anything.",
             json!({
                 "node_path": {
                     "type": "string",
@@ -954,7 +959,7 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
                 },
                 "properties": {
                     "type": "object",
-                    "description": "Key-value map of property names to new values."
+                    "description": "Key-value map of property names to new values. A name may step through resources with ':' (material_override:shader_parameter/glow_amount)."
                 }
             }),
             &["node_path", "properties"],

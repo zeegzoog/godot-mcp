@@ -181,7 +181,9 @@ static func set_props(rt: Node, params: Dictionary) -> Dictionary:
     var properties: Variant = params.get("properties", {})
     if not properties is Dictionary or (properties as Dictionary).is_empty():
         return R.err(R.BAD_PARAMS, "game.set: 'properties' must be a non-empty object.")
-    var readback := {}
+    # Every value is located and converted before anything is written, so a refused value
+    # never leaves the node half changed.
+    var planned: Array = []
     for key: Variant in properties:
         var name := str(key)
         var located := _locate(node, name, true)
@@ -193,21 +195,59 @@ static func set_props(rt: Node, params: Dictionary) -> Dictionary:
         var looked := Inputs._lookup(target, str(located["leaf"]), true)
         if R.is_err(looked):
             return looked
-        var written := _assign_leaf(name, looked, properties[key])
-        if R.is_err(written):
-            return written
-        readback[name] = rt.encode(written["value"])
+        var prepared := _prepare_leaf(name, looked, properties[key])
+        if R.is_err(prepared):
+            return prepared
+        planned.append(prepared)
+    var readback := {}
+    var written: Array = []
+    for step: Dictionary in planned:
+        written.append(step)
+        var stored := _write_leaf(step)
+        if R.is_err(stored):
+            # A write the engine did not keep: put back everything this call changed.
+            written.reverse()
+            for done: Dictionary in written:
+                _put_leaf(done, done["current"])
+            return stored
+        readback[step["name"]] = rt.encode(stored["value"])
     return R.ok({"path": rt.path_of(node), "properties": readback})
 
 
-## Writes the leaf `_lookup` found and reads it back. A Dictionary is updated in place.
-## A value that is not the one written is an error, never a successful null.
-static func _assign_leaf(name: String, looked: Dictionary, raw: Variant) -> Dictionary:
+## Converts a value for the leaf `_lookup` found, without writing it. A value that cannot be
+## the property's declared type is refused here: Object.set would store a default instead
+## (a String written to a Basis leaves the identity basis).
+static func _prepare_leaf(name: String, looked: Dictionary, raw: Variant) -> Dictionary:
     var current: Variant = looked.get("value", null)
-    var decoded: Variant = _coerce(raw, typeof(current) if current != null else TYPE_NIL)
     var container: Variant = looked.get("container", null)
     var leaf := str(looked.get("leaf", ""))
-    var stored: Variant = null
+    if not (container is Dictionary or (container is Object and container != null)):
+        return R.err(R.BAD_PARAMS, "Cannot write '%s'." % name)
+    var expected: int = typeof(current) if current != null else TYPE_NIL
+    var decoded: Variant = _coerce(raw, expected)
+    var declared := _declared_type(container, leaf)
+    if declared == TYPE_NIL and current != null and not container is Dictionary:
+        declared = expected
+    if declared != TYPE_NIL and declared != TYPE_OBJECT and not _type_compatible(decoded, declared):
+        var example: String = var_to_str(current) if current != null else type_string(declared) + "(...)"
+        return R.err(R.BAD_PARAMS, "Property '%s' is a %s and a %s value was not accepted. Nothing was changed. Pass a Godot literal such as %s%s, or the value in the shape godot_game_get returns." % [name, type_string(declared), type_string(typeof(decoded)), example, _axes_hint(declared)])
+    return {"name": name, "container": container, "leaf": leaf, "current": current, "value": decoded}
+
+
+## Writes a prepared leaf and reads it back. A Dictionary is updated in place.
+## A value that is not the one written is an error, never a successful null.
+static func _write_leaf(step: Dictionary) -> Dictionary:
+    var decoded: Variant = step["value"]
+    var stored: Variant = _put_leaf(step, decoded)
+    if not _same(stored, decoded):
+        return R.err(R.BAD_PARAMS, "Property '%s' is %s after writing %s. The write did not take, and nothing was changed." % [step["name"], stored, decoded])
+    return {"value": stored}
+
+
+## Stores a value in a prepared leaf and returns what the leaf holds afterwards.
+static func _put_leaf(step: Dictionary, value: Variant) -> Variant:
+    var container: Variant = step["container"]
+    var leaf: String = step["leaf"]
     if container is Dictionary:
         var dict := container as Dictionary
         var dict_key: Variant = leaf
@@ -215,19 +255,32 @@ static func _assign_leaf(name: String, looked: Dictionary, raw: Variant) -> Dict
             if str(existing) == leaf:
                 dict_key = existing
                 break
-        dict[dict_key] = decoded
-        stored = dict[dict_key]
-    elif container is Object and container != null:
-        var holder := container as Object
-        holder.set(leaf, decoded)
-        stored = holder.get(leaf)
-    else:
-        return R.err(R.BAD_PARAMS, "Cannot write '%s'." % name)
-    if not _same(stored, decoded):
-        if current != null and not _type_compatible(decoded, typeof(current)):
-            return R.err(R.BAD_PARAMS, "Property '%s' is a %s and a %s value was not accepted. Pass a Godot literal such as %s, or the value in the shape godot_game_get returns." % [name, type_string(typeof(current)), type_string(typeof(decoded)), var_to_str(current)])
-        return R.err(R.BAD_PARAMS, "Property '%s' is %s after writing %s. The write did not take." % [name, stored, decoded])
-    return {"value": stored}
+        dict[dict_key] = value
+        return dict[dict_key]
+    var holder := container as Object
+    holder.set(leaf, value)
+    return holder.get(leaf)
+
+
+## The type an Object property declares, or TYPE_NIL for a Variant property or a Dictionary key.
+static func _declared_type(container: Variant, leaf: String) -> int:
+    if not container is Object or container == null:
+        return TYPE_NIL
+    for info: Dictionary in (container as Object).get_property_list():
+        if str(info.get("name", "")) == leaf:
+            return int(info.get("type", TYPE_NIL))
+    return TYPE_NIL
+
+
+static func _axes_hint(declared: int) -> String:
+    match declared:
+        TYPE_BASIS:
+            return " or Basis(Vector3(x axis), Vector3(y axis), Vector3(z axis))"
+        TYPE_TRANSFORM3D:
+            return " or Transform3D(Vector3(x axis), Vector3(y axis), Vector3(z axis), Vector3(origin))"
+        TYPE_TRANSFORM2D:
+            return " or Transform2D(Vector2(x axis), Vector2(y axis), Vector2(origin))"
+    return ""
 
 
 ## Many engine floats are 32-bit (Node2D.rotation, Camera3D.fov), so 0.1 comes back as
@@ -682,4 +735,58 @@ static func _coerce(value: Variant, expected: int) -> Variant:
         var parsed: Variant = str_to_var(value)
         if typeof(parsed) == expected:
             return parsed
+        var built: Variant = _axes_literal(value, expected)
+        if built != null:
+            return built
     return value
+
+
+## Basis(Vector3, Vector3, Vector3), Transform3D(Vector3 x 4) and Transform2D(Vector2 x 3), as
+## GDScript constructs them: the vectors are the axes (columns) and the origin. str_to_var reads
+## only the all-numbers form, whose numbers are rows, so flattening the vectors into it would
+## transpose the basis. null when the text is not that form.
+static func _axes_literal(text: String, expected: int) -> Variant:
+    var forms := {
+        TYPE_BASIS: ["Basis", "Vector3", TYPE_VECTOR3, 3],
+        TYPE_TRANSFORM3D: ["Transform3D", "Vector3", TYPE_VECTOR3, 4],
+        TYPE_TRANSFORM2D: ["Transform2D", "Vector2", TYPE_VECTOR2, 3],
+    }
+    if not forms.has(expected):
+        return null
+    var form: Array = forms[expected]
+    var body := text.strip_edges()
+    var opening := str(form[0]) + "("
+    if not body.begins_with(opening) or not body.ends_with(")"):
+        return null
+    body = body.substr(opening.length(), body.length() - opening.length() - 1)
+    var parts: Array = []
+    var depth := 0
+    var start := 0
+    for index in body.length():
+        var character := body[index]
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+        elif character == "," and depth == 0:
+            parts.append(body.substr(start, index - start))
+            start = index + 1
+    parts.append(body.substr(start))
+    if parts.size() != int(form[3]):
+        return null
+    var axes: Array = []
+    for part: String in parts:
+        var axis := part.strip_edges()
+        # Only a vector literal reaches str_to_var: an Object(...) literal would create one in the game.
+        if not axis.begins_with(str(form[1]) + "("):
+            return null
+        var vector: Variant = str_to_var(axis)
+        if typeof(vector) != int(form[2]):
+            return null
+        axes.append(vector)
+    match expected:
+        TYPE_BASIS:
+            return Basis(axes[0], axes[1], axes[2])
+        TYPE_TRANSFORM3D:
+            return Transform3D(Basis(axes[0], axes[1], axes[2]), axes[3])
+    return Transform2D(axes[0], axes[1], axes[2])

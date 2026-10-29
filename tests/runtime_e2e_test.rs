@@ -3655,6 +3655,19 @@ async fn game_set_writes_through_an_object_and_refuses_a_missing_leaf() {
     )
     .await;
     assert!(rejected.is_error, "{}", text_of(&rejected));
+    // A write that does not stick puts back the ones the same call made before it.
+    let undone = call(
+        &tools,
+        "godot_game_set",
+        json!({"run_id": run_id, "path": ".", "properties": {"bag/count": 11, "locked": 5}}),
+    )
+    .await;
+    assert!(undone.is_error, "{}", text_of(&undone));
+    assert!(
+        text_of(&undone).contains("nothing was changed"),
+        "{}",
+        text_of(&undone)
+    );
     let still = call(
         &tools,
         "godot_game_get",
@@ -3744,6 +3757,136 @@ async fn game_set_parses_a_godot_literal_and_refuses_a_wrong_type_quietly() {
     }
     assert!(!log.contains("Invalid operands"), "{log}");
     assert!(!log.contains("rt_live.gd"), "{log}");
+
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+}
+
+/// A 3D scene whose sun is turned a quarter around Y, so an identity basis is visible.
+fn sun_project() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("project");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("scenes")).unwrap();
+    std::fs::write(
+        root.join("project.godot"),
+        "config_version=5\n\n[application]\n\nconfig/name=\"SunProbe\"\nrun/main_scene=\"res://scenes/main.tscn\"\nconfig/features=PackedStringArray(\"4.5\")\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("scenes/main.tscn"),
+        "[gd_scene format=3]\n\n[node name=\"Level\" type=\"Node3D\"]\n\n[node name=\"Environment\" type=\"Node3D\" parent=\".\"]\n\n[node name=\"Sun\" type=\"DirectionalLight3D\" parent=\"Environment\"]\ntransform = Transform3D(0, 0, 1, 0, 1, 0, -1, 0, 0, 0, 5, 0)\nlight_energy = 2.0\n",
+    )
+    .unwrap();
+    dir
+}
+
+/// The sun's rotation and energy, as `[rotation.x, rotation.y, rotation.z, energy]`.
+async fn sun_state(tools: &Arc<ToolManager>, run_id: &str) -> Vec<f64> {
+    let read = call(
+        tools,
+        "godot_game_get",
+        json!({"run_id": run_id, "path": "Environment/Sun", "properties": ["rotation", "light_energy"]}),
+    )
+    .await;
+    assert!(!read.is_error, "{}", text_of(&read));
+    let props = &json_of(&read)["properties"];
+    let rotation = &props["rotation"];
+    vec![
+        json_number(&rotation[0]),
+        json_number(&rotation[1]),
+        json_number(&rotation[2]),
+        json_number(&props["light_energy"]),
+    ]
+}
+
+fn assert_sun(state: &[f64], expected: [f64; 4]) {
+    for (got, want) in state.iter().zip(expected) {
+        assert!((got - want).abs() < 1e-4, "{state:?} != {expected:?}");
+    }
+}
+
+/// A refused value leaves the node as it was, also when other properties of the same call
+/// were fine. A Basis or Transform3D written with Vector3 axes, as GDScript constructs it, is
+/// read column by column.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn game_set_refusal_leaves_the_node_untouched_and_reads_vector_axes() {
+    let _ = IGNORE;
+    let project = sun_project();
+    let tools = manager(project.path());
+    let started = call(
+        &tools,
+        "godot_run_project",
+        json!({
+            "project_path": project.path(),
+            "scene": "res://scenes/main.tscn",
+            "mode": "process",
+            "headless": true
+        }),
+    )
+    .await;
+    assert!(!started.is_error, "{}", text_of(&started));
+    let run_id = run_id_of(&started);
+    let quarter = std::f64::consts::FRAC_PI_2;
+    assert_sun(&sun_state(&tools, &run_id).await, [0.0, quarter, 0.0, 2.0]);
+
+    let wrong = call(
+        &tools,
+        "godot_game_set",
+        json!({"run_id": run_id, "path": "Environment/Sun", "properties": {"basis": "not a basis"}}),
+    )
+    .await;
+    assert!(wrong.is_error, "{}", text_of(&wrong));
+    assert!(text_of(&wrong).contains("Basis"), "{}", text_of(&wrong));
+    assert_sun(&sun_state(&tools, &run_id).await, [0.0, quarter, 0.0, 2.0]);
+
+    let mixed = call(
+        &tools,
+        "godot_game_set",
+        json!({
+            "run_id": run_id,
+            "path": "Environment/Sun",
+            "properties": {"light_energy": 0.5, "basis": "Basis(1, 2)"}
+        }),
+    )
+    .await;
+    assert!(mixed.is_error, "{}", text_of(&mixed));
+    assert_sun(&sun_state(&tools, &run_id).await, [0.0, quarter, 0.0, 2.0]);
+
+    // Columns x = (0, 0, 1), y = (0, 1, 0), z = (-1, 0, 0): a quarter turn the other way.
+    let axes = call(
+        &tools,
+        "godot_game_set",
+        json!({
+            "run_id": run_id,
+            "path": "Environment/Sun",
+            "properties": {"basis": "Basis(Vector3(0, 0, 1), Vector3(0, 1, 0), Vector3(-1, 0, 0))"}
+        }),
+    )
+    .await;
+    assert!(!axes.is_error, "{}", text_of(&axes));
+    assert_sun(&sun_state(&tools, &run_id).await, [0.0, -quarter, 0.0, 2.0]);
+
+    let placed = call(
+        &tools,
+        "godot_game_set",
+        json!({
+            "run_id": run_id,
+            "path": "Environment/Sun",
+            "properties": {"transform": "Transform3D(Vector3(0, 0, -1), Vector3(0, 1, 0), Vector3(1, 0, 0), Vector3(1, 2, 3))"}
+        }),
+    )
+    .await;
+    assert!(!placed.is_error, "{}", text_of(&placed));
+    assert_sun(&sun_state(&tools, &run_id).await, [0.0, quarter, 0.0, 2.0]);
+    let position = call(
+        &tools,
+        "godot_game_get",
+        json!({"run_id": run_id, "path": "Environment/Sun", "properties": ["position"]}),
+    )
+    .await;
+    let origin = &json_of(&position)["properties"]["position"];
+    assert_eq!(origin[2].as_f64(), Some(3.0), "{origin}");
 
     let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
     assert!(!stopped.is_error, "{}", text_of(&stopped));

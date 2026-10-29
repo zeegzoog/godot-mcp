@@ -586,6 +586,36 @@ fn take_tail(buf: &Mutex<Vec<u8>>) -> Vec<u8> {
     std::mem::take(&mut *guard)
 }
 
+/// The `ERROR:` line Godot printed when it could not load the `-s` script `script_res`
+/// (`res://...`): a base class other than `SceneTree` or `MainLoop`, a parse error, or a file
+/// it could not open. Godot 4.8 still exits with code 0, so the exit code does not tell.
+pub fn script_load_failure(text: &str, script_res: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let message = line.trim().strip_prefix("ERROR:")?.trim();
+        (message.contains("as it doesn't inherit from SceneTree or MainLoop")
+            || message.starts_with("Can't load script:")
+            || failed_to_load(message, script_res))
+        .then(|| message.to_string())
+    })
+}
+
+/// `Failed to load script "<path>"` for the run script. Godot names it by `res://` path, or by
+/// the absolute path it was given when that path does not start with the project's real path
+/// (`/var/...` for a project in `/private/var/...`); other scripts are always `res://` paths.
+fn failed_to_load(message: &str, script_res: &str) -> bool {
+    let Some(rest) = message.strip_prefix("Failed to load script \"") else {
+        return false;
+    };
+    let Some((path, _)) = rest.split_once('"') else {
+        return false;
+    };
+    if path == script_res {
+        return true;
+    }
+    let relative = script_res.strip_prefix("res://").unwrap_or(script_res);
+    !path.starts_with("res://") && path.replace('\\', "/").ends_with(&format!("/{relative}"))
+}
+
 /// `SCRIPT ERROR` lines and the `at: ... (file:line)` that follows them.
 pub fn script_errors_in(text: &str) -> Vec<ScriptErrorLoc> {
     let lines: Vec<&str> = text.lines().collect();

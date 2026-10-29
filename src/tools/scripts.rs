@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 
 /// Scripts larger than this are not handled by the script tools.
-const MAX_BYTES: u64 = 1_048_576;
+pub(super) const MAX_BYTES: u64 = 1_048_576;
 
 pub fn handles(name: &str) -> bool {
     matches!(name, "godot_read_script" | "godot_edit_script")

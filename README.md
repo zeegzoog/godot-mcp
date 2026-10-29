@@ -145,8 +145,8 @@ Every tool takes only the parameters its schema lists (`additionalProperties: fa
 | `godot_get_scene_tree` | Editor | Node hierarchy of the active scene, or of another open tab via `scene_path`. Paths are relative to the scene root. |
 | `godot_add_node` | Editor | Adds a node of any instantiable `Node` class or global script class (undoable). |
 | `godot_remove_node` | Editor | Removes a node, restoring order and ownership on undo. |
-| `godot_get_node_properties` | Editor | Reads a node's editor-visible properties as `{type, value}` in Godot's text format. |
-| `godot_set_node_properties` | Editor | Sets properties (undoable), converting values to the property's type: `[10, 20]` or `{"x": 10, "y": 20}` for vectors, `"#ff0000"` for colors, `res://` paths for resources. The whole call is rejected if any property is unknown or unconvertible. |
+| `godot_get_node_properties` | Editor | Reads a node's editor-visible properties as `{type, value}` in Godot's text format. `properties` reads only the names given, and `:` steps through a resource (`material_override:shader_parameter/glow_amount`). |
+| `godot_set_node_properties` | Editor | Sets properties (undoable), converting values to the property's type: `[10, 20]` or `{"x": 10, "y": 20}` for vectors, `"#ff0000"` for colors, `res://` paths for resources. `:` steps through a resource built into the scene (`material_override:shader_parameter/glow_amount`) in the same undo action; a `.tres` file or another scene's resource is shared, so it is refused. The whole call is rejected if any property is unknown or unconvertible. |
 | `godot_capture_viewport` | Editor with a window | Screenshot of the 2D or 3D editor viewport as PNG (`view`, `max_dimension` options). Switches the editor to that main screen; doesn't work with `--headless`. |
 | `godot_create_scene` | — | Creates a `.tscn` with one root node (`root_type`, `root_name`) and opens it when the editor is connected. Without the editor it writes the file. Refuses to replace an existing scene. |
 | `godot_attach_script` | Editor | Attaches a script to a node (undoable); an empty `script_path` detaches. The script must exist in the project. |

@@ -635,6 +635,31 @@ fn launch_editor_schema_no_longer_requires_project_path() {
     );
 }
 
+#[test]
+fn node_property_tools_describe_the_resource_step() {
+    let tools = ToolManager::list_tools();
+    let schema = |name: &str| {
+        tools
+            .iter()
+            .find(|tool| tool.name == name)
+            .unwrap_or_else(|| panic!("{name} is listed"))
+    };
+    let get = schema("godot_get_node_properties");
+    assert_eq!(
+        get.input_schema["properties"]["properties"]["items"]["type"], "string",
+        "{}",
+        get.input_schema
+    );
+    for name in ["godot_get_node_properties", "godot_set_node_properties"] {
+        let tool = schema(name);
+        let description = &tool.description;
+        assert!(
+            description.contains("material_override:shader_parameter/"),
+            "{name}: {description}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn create_scene_without_an_editor_writes_a_scene_file() {
     let project = project_dir();

@@ -1,8 +1,9 @@
 //! Tools that run the Godot binary without the editor: script validation, one-off scripts,
 //! resource resaving and the headless import.
 
+use super::main_loop::main_loop_problem;
 use super::{ToolManager, bridge_error_result, code, missing_argument, str_arg, user_args_of};
-use crate::cli_runner::ScriptRun;
+use crate::cli_runner::{ScriptErrorLoc, ScriptRun, script_load_failure};
 use crate::error::McpError;
 use crate::godot::{
     IMPORTED_EXTENSIONS, ResourceDamage, TextResourceSnapshot, changed_imports, import_fingerprints,
@@ -69,6 +70,7 @@ fn damage_report(damage: &[ResourceDamage]) -> (Vec<Value>, Option<String>) {
 
 fn script_run_result(
     report: &ScriptRun,
+    script_res: &str,
     timeout_seconds: u64,
     damage: &[ResourceDamage],
 ) -> ToolResult {
@@ -76,13 +78,20 @@ fn script_run_result(
         .exit_code
         .map(|code| code.to_string())
         .unwrap_or_else(|| "none".into());
+    let load_error = script_load_failure(&report.stderr, script_res)
+        .or_else(|| script_load_failure(&report.stdout, script_res));
+    let mut script_errors = report.script_errors.clone();
+    if let Some(message) = load_error.as_ref().filter(|_| script_errors.is_empty()) {
+        script_errors.push(ScriptErrorLoc {
+            message: message.clone(),
+            file: script_res.to_string(),
+            line: 0,
+        });
+    }
     let summary = if report.stopped_idle {
-        let detail = report
-            .script_errors
-            .first()
-            .map_or_else(String::new, |error| {
-                format!(" at {}:{}: {}", error.file, error.line, error.message)
-            });
+        let detail = script_errors.first().map_or_else(String::new, |error| {
+            format!(" at {}:{}: {}", error.file, error.line, error.message)
+        });
         format!(
             "Stopped after a SCRIPT ERROR while the main loop was idle{detail}. The process was still running, so it was stopped without waiting out the {timeout_seconds}s timeout."
         )
@@ -91,7 +100,16 @@ fn script_run_result(
             "Timed out after {timeout_seconds}s and killed the process tree.\nLast output:\n{}",
             last_output_lines(&report.stdout, &report.stderr, 20)
         )
-    } else if let Some(error) = report.script_errors.first() {
+    } else if let Some(message) = &load_error {
+        let detail = script_errors
+            .first()
+            .filter(|error| error.line > 0)
+            .map_or_else(
+                || message.clone(),
+                |error| format!("{} at {}:{}", error.message, error.file, error.line),
+            );
+        format!("The script did not run: Godot could not load it. {detail} (exit code {exit}).")
+    } else if let Some(error) = script_errors.first() {
         format!(
             "Script error at {}:{}: {} (exit code {exit}).",
             error.file, error.line, error.message
@@ -109,9 +127,10 @@ fn script_run_result(
         "exit_code": report.exit_code,
         "timed_out": report.timed_out,
         "stopped_idle": report.stopped_idle,
+        "load_error": load_error,
         "stdout": report.stdout,
         "stderr": report.stderr,
-        "script_errors": report.script_errors.iter().map(|error| json!({
+        "script_errors": script_errors.iter().map(|error| json!({
             "message": error.message,
             "file": error.file,
             "line": error.line,
@@ -130,7 +149,15 @@ fn script_run_result(
                 "Make the script call quit(), or raise timeout_seconds up to 600",
             ],
         )
-    } else if report.exit_code != Some(0) || !report.script_errors.is_empty() {
+    } else if load_error.is_some() {
+        ToolResult::error(
+            text,
+            &[
+                "The script must parse and extend SceneTree or MainLoop: start it with `extends SceneTree`, do the work in _initialize() and end with quit()",
+                "Check the script with godot_validate_script, then run it again",
+            ],
+        )
+    } else if report.exit_code != Some(0) || !script_errors.is_empty() {
         ToolResult::error(
             text,
             &["script_errors lists each SCRIPT ERROR with its file and line"],
@@ -481,6 +508,16 @@ impl ToolManager {
                 &["Check the path; res:// paths are resolved against the project directory"],
             );
         }
+        let script_res = res_display(&project.dir, &file);
+        if let Some(problem) = main_loop_problem(&project.dir, &file) {
+            return ToolResult::error(
+                problem,
+                &[
+                    "Start the script with `extends SceneTree`, do the work in _initialize() and end with quit()",
+                    "To change a scene or resource with the editor open, use the editor tools instead of a script",
+                ],
+            );
+        }
         let user_args = match user_args_of(&args) {
             Ok(values) => values.unwrap_or_default(),
             Err(result) => return result,
@@ -497,7 +534,7 @@ impl ToolManager {
         {
             Ok(report) => {
                 let damage = snapshot.damage_since(&project.dir);
-                script_run_result(&report, timeout_seconds, &damage)
+                script_run_result(&report, &script_res, timeout_seconds, &damage)
             }
             Err(error) => ToolResult::error(
                 format!("Failed to run the script: {error}"),

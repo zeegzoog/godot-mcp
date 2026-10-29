@@ -4353,6 +4353,78 @@ async fn run_script_returns_an_exit_code_and_kills_a_script_that_never_quits() {
 
 #[tokio::test]
 #[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn run_script_reports_a_script_that_godot_could_not_load() {
+    let _ = IGNORE;
+    let project = project_dir_with_scripts();
+    let root = project.path();
+    std::fs::write(
+        root.join("scripts/broken.gd"),
+        "extends SceneTree\n\nfunc _initialize() -> void:\n\tvar x =\n\tquit(0)\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("scripts/lib.gd"),
+        "extends RefCounted\n\nclass Inner extends Node:\n\tpass\n",
+    )
+    .unwrap();
+    // The base check does not follow an inner class, so Godot itself refuses this one.
+    std::fs::write(
+        root.join("scripts/inner_base.gd"),
+        "extends \"res://scripts/lib.gd\".Inner\n\nfunc _init() -> void:\n\tprint(\"RAN\")\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("scripts/node.gd"),
+        "extends Node\n\nfunc _init() -> void:\n\tprint(\"RAN\")\n",
+    )
+    .unwrap();
+    let tools = manager(root);
+    let run = |script: &'static str| {
+        let tools = Arc::clone(&tools);
+        let root = root.to_path_buf();
+        async move {
+            call(
+                &tools,
+                "godot_run_script",
+                json!({"script": script, "project_path": root, "timeout_seconds": 60}),
+            )
+            .await
+        }
+    };
+
+    let broken = run("res://scripts/broken.gd").await;
+    let broken_text = text_of(&broken);
+    assert!(broken.is_error, "{broken_text}");
+    assert!(
+        broken_text.contains("did not run") && broken_text.contains("scripts/broken.gd:4"),
+        "{broken_text}"
+    );
+
+    let inner = run("res://scripts/inner_base.gd").await;
+    let inner_text = text_of(&inner);
+    assert!(inner.is_error, "{inner_text}");
+    assert!(
+        inner_text.contains("did not run")
+            && inner_text.contains("doesn't inherit from SceneTree or MainLoop"),
+        "{inner_text}"
+    );
+    assert!(
+        !inner_text.contains("\"script_errors\": []"),
+        "{inner_text}"
+    );
+
+    let node = run("res://scripts/node.gd").await;
+    let node_text = text_of(&node);
+    assert!(node.is_error, "{node_text}");
+    assert!(
+        node_text.contains("extends Node, not SceneTree or MainLoop")
+            && !node_text.contains("exit_code"),
+        "the base check did not refuse before Godot started: {node_text}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
 async fn run_script_reports_the_uids_and_shader_parameters_a_headless_save_drops() {
     let _ = IGNORE;
     let project = project_dir_with_scripts();

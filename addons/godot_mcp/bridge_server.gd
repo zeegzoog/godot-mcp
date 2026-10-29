@@ -40,7 +40,7 @@ const IMPORTED_EXTENSIONS: PackedStringArray = [
 ## value produces an error response instead of a script error that leaves the caller waiting.
 const PARAM_TYPES: Dictionary = {
     "get_scene_tree": {"scene_path": TYPE_STRING},
-    "add_node": {"parent_node_path": TYPE_STRING, "node_type": TYPE_STRING, "node_name": TYPE_STRING},
+    "add_node": {"parent_node_path": TYPE_STRING, "node_type": TYPE_STRING, "scene": TYPE_STRING, "node_name": TYPE_STRING, "properties": TYPE_DICTIONARY},
     "remove_node": {"node_path": TYPE_STRING},
     "get_node_properties": {"node_path": TYPE_STRING, "properties": TYPE_ARRAY},
     "set_node_properties": {"node_path": TYPE_STRING, "properties": TYPE_DICTIONARY},
@@ -675,10 +675,49 @@ func instantiate_node(type_name: String) -> Dictionary:
 
     return {"error": "Unknown Godot node type: " + type_name}
 
+## Instances a saved scene for the edited scene the way the editor's Instantiate Child Scene does.
+## Returns {"node": Node, "path": String} or {"error": String}.
+func instantiate_scene(raw_path: String, root: Node) -> Dictionary:
+    var scene_path: String = to_res_path(raw_path)
+    if scene_path.is_empty():
+        return {"error": "Scene path must be inside the project (res://): " + raw_path}
+    if not ResourceLoader.exists(scene_path):
+        return {"error": "Scene file does not exist: " + scene_path}
+    var edited_path: String = root.scene_file_path
+    if scene_path == edited_path:
+        return {"error": "A scene cannot instance itself: %s is the scene being edited" % scene_path}
+    var packed: PackedScene = load(scene_path) as PackedScene
+    if packed == null:
+        return {"error": "%s is not a PackedScene; pass a saved .tscn or .scn scene" % scene_path}
+    var node: Node = packed.instantiate(PackedScene.GEN_EDIT_STATE_INSTANCE)
+    if node == null:
+        return {"error": "Scene %s could not be instantiated; open it in the editor to see why" % scene_path}
+    if not edited_path.is_empty() and instances_scene(node, edited_path):
+        node.free()
+        return {"error": "%s contains the scene being edited (%s), so adding it would make the scene instance itself" % [scene_path, edited_path]}
+    return {"node": node, "path": scene_path}
+
+## True when the node or any node under it is an instance of the scene at scene_path.
+func instances_scene(node: Node, scene_path: String) -> bool:
+    if node.scene_file_path == scene_path:
+        return true
+    for child: Node in node.get_children():
+        if instances_scene(child, scene_path):
+            return true
+    return false
+
 func add_node(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
     var parent_path: String = params.get("parent_node_path", "")
-    var node_type: String = params.get("node_type", "Node")
+    var node_type: String = str(params.get("node_type", "")).strip_edges()
+    var scene_param: String = str(params.get("scene", "")).strip_edges()
     var node_name: String = params.get("node_name", "")
+    var properties: Dictionary = params.get("properties", {})
+
+    if not node_type.is_empty() and not scene_param.is_empty():
+        send_error(peer, cmd_id, "Pass node_type or scene, not both: an instanced scene's root type comes from the scene")
+        return
+    if node_type.is_empty():
+        node_type = "Node"
 
     var root: Node = scene_root_or_error(peer, cmd_id)
     if root == null:
@@ -689,7 +728,7 @@ func add_node(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
         send_error(peer, cmd_id, "Parent node not found at path: " + parent_path)
         return
 
-    var created: Dictionary = instantiate_node(node_type)
+    var created: Dictionary = instantiate_scene(scene_param, root) if not scene_param.is_empty() else instantiate_node(node_type)
     if created.has("error"):
         send_error(peer, cmd_id, created["error"])
         return
@@ -697,8 +736,27 @@ func add_node(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
     if not node_name.is_empty():
         new_node.name = node_name
 
+    # The node is not in the scene yet, so initial values are set directly; undo removes the node.
+    var initial: Dictionary = convert_properties(new_node, properties)
+    var problems: PackedStringArray = initial["problems"]
+    if not problems.is_empty():
+        new_node.free()
+        send_error(peer, cmd_id, "No node was added. " + "; ".join(problems))
+        return
+    var converted: Dictionary = initial["converted"]
+    for prop_name: String in converted:
+        new_node.set(prop_name, converted[prop_name])
+    var new_meta: Dictionary = initial["new_meta"]
+    for prop_name: String in new_meta:
+        new_node.set_meta(StringName(prop_name.substr(META_PREFIX.length())), new_meta[prop_name])
+    var stepped: Dictionary = initial["stepped"]
+    for prop_name: String in stepped:
+        var step: Array = stepped[prop_name]
+        (step[0] as Object).set(step[1], step[2])
+
     if undo_redo != null:
-        undo_redo.create_action("Add Node " + String(new_node.name), UndoRedo.MERGE_DISABLE, root)
+        var action: String = "Instantiate Scene " if created.has("path") else "Add Node "
+        undo_redo.create_action(action + String(new_node.name), UndoRedo.MERGE_DISABLE, root)
         undo_redo.add_do_method(parent_node, "add_child", new_node, true)
         undo_redo.add_do_property(new_node, "owner", root)
         undo_redo.add_do_reference(new_node)
@@ -709,11 +767,14 @@ func add_node(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
         new_node.owner = root
 
     mark_scene_dirty()
-    send_success(peer, cmd_id, {
+    var answer: Dictionary = {
         "name": String(new_node.name),
         "class": new_node.get_class(),
         "path": String(root.get_path_to(new_node))
-    })
+    }
+    if created.has("path"):
+        answer["scene"] = created["path"]
+    send_success(peer, cmd_id, answer)
 
 func collect_owned_nodes(node: Node, root: Node, into: Array[Node]) -> void:
     if node.owner == root:
@@ -972,25 +1033,17 @@ func new_meta_value(meta_name: String, raw: Variant) -> Dictionary:
             return {"value": int(number)}
     return {"value": raw}
 
-func set_node_properties(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
-    var node_path: String = params.get("node_path", "")
-    var properties: Dictionary = params.get("properties", {})
-    var root: Node = scene_root_or_error(peer, cmd_id)
-    if root == null:
-        return
-
-    var target_node: Node = find_scene_node(root, node_path)
-    if target_node == null:
-        send_error(peer, cmd_id, "Node not found at path: " + node_path)
-        return
-
+## Converts requested property values to the node's property types without setting any.
+## Returns {"converted": Dictionary, "new_meta": Dictionary, "stepped": Dictionary,
+## "problems": PackedStringArray}; new_meta holds metadata/<name> entries the node does not have
+## yet, and stepped holds the properties of the node's own resources named with ':' steps
+## (name -> [resource, property, value]).
+func convert_properties(target_node: Node, properties: Dictionary) -> Dictionary:
     var known: Dictionary = {}
     for prop: Dictionary in target_node.get_property_list():
         known[prop["name"]] = prop
 
-    # Validate and convert everything first so a bad value never leaves a half-applied change.
     var converted: Dictionary = {}
-    # metadata/<name> entries the node does not have yet, created as the inspector's Add Metadata does.
     var new_meta: Dictionary = {}
     # Properties of the node's own resources, named with ':' steps: name -> [resource, property, value].
     var stepped: Dictionary = {}
@@ -1023,6 +1076,27 @@ func set_node_properties(peer: WebSocketPeer, cmd_id: String, params: Dictionary
             problems.append("%s: %s" % [prop_name, result["error"]])
         else:
             converted[prop_name] = result["value"]
+    return {"converted": converted, "new_meta": new_meta, "stepped": stepped, "problems": problems}
+
+func set_node_properties(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
+    var node_path: String = params.get("node_path", "")
+    var properties: Dictionary = params.get("properties", {})
+    var root: Node = scene_root_or_error(peer, cmd_id)
+    if root == null:
+        return
+
+    var target_node: Node = find_scene_node(root, node_path)
+    if target_node == null:
+        send_error(peer, cmd_id, "Node not found at path: " + node_path)
+        return
+
+    # Validate and convert everything first so a bad value never leaves a half-applied change.
+    var checked: Dictionary = convert_properties(target_node, properties)
+    var converted: Dictionary = checked["converted"]
+    # metadata/<name> entries the node does not have yet, created as the inspector's Add Metadata does.
+    var new_meta: Dictionary = checked["new_meta"]
+    var stepped: Dictionary = checked["stepped"]
+    var problems: PackedStringArray = checked["problems"]
     if not problems.is_empty():
         send_error(peer, cmd_id, "No properties were changed. " + "; ".join(problems))
         return

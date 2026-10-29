@@ -2975,6 +2975,112 @@ async fn set_node_properties_adds_metadata_the_way_the_inspector_does() {
     assert_eq!(read["position"]["value"], "Vector2(5, 7)", "{read}");
 }
 
+const SNAG_SCENE: &str = r#"[gd_scene format=3 uid="uid://snagfixture"]
+
+[node name="Snag" type="Node2D"]
+
+[node name="Leaf" type="Sprite2D" parent="."]
+"#;
+
+/// A scene that instances main.tscn: adding it to main would make main contain itself.
+const OUTER_SCENE: &str = r#"[gd_scene format=3]
+
+[ext_resource type="PackedScene" path="res://main.tscn" id="1_main"]
+
+[node name="Outer" type="Node2D"]
+
+[node name="Inner" parent="." instance=ExtResource("1_main")]
+"#;
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn add_node_instances_a_saved_scene_the_way_the_editor_does() {
+    let editor = start_editor_with(
+        Some(UNDO_HOOK),
+        "",
+        &[
+            ("snag.tscn", SNAG_SCENE),
+            ("outer.tscn", OUTER_SCENE),
+            (
+                "notes.tres",
+                "[gd_resource type=\"Resource\" format=3]\n\n[resource]\n",
+            ),
+        ],
+        "",
+    )
+    .await;
+    let bridge = &editor.bridge;
+    let call = |command: &'static str, params: Value| async move {
+        bridge.send_command(command, params).await
+    };
+    call("open_scene", json!({"scene_path": "res://main.tscn"}))
+        .await
+        .expect("open main");
+
+    let added = call(
+        "add_node",
+        json!({"parent_node_path": "Player", "scene": "res://snag.tscn", "node_name": "Snag1",
+               "properties": {"position": [3, 4], "rotation_degrees": 90}}),
+    )
+    .await
+    .expect("instance snag");
+    assert_eq!(added["path"], "Player/Snag1", "{added}");
+    assert_eq!(added["scene"], "res://snag.tscn", "{added}");
+    assert_eq!(added["class"], "Node2D", "{added}");
+    let props = call("get_node_properties", json!({"node_path": "Player/Snag1"}))
+        .await
+        .expect("props")["properties"]
+        .clone();
+    assert_eq!(props["position"]["value"], "Vector2(3, 4)", "{props}");
+
+    // Refused without changing the scene: no file, not a scene, the scene itself, a scene that
+    // instances it, both sources at once, and a bad initial property.
+    for (params, needle) in [
+        (json!({"scene": "res://missing.tscn"}), "does not exist"),
+        (json!({"scene": "res://notes.tres"}), "not a PackedScene"),
+        (json!({"scene": "res://main.tscn"}), "itself"),
+        (json!({"scene": "res://outer.tscn"}), "itself"),
+        (json!({"scene": "res://../snag.tscn"}), "inside the project"),
+        (
+            json!({"scene": "res://snag.tscn", "node_type": "Node2D"}),
+            "not both",
+        ),
+        (
+            json!({"scene": "res://snag.tscn", "properties": {"not_a_prop": 1}}),
+            "not_a_prop",
+        ),
+    ] {
+        expect_error(call("add_node", params).await, needle);
+    }
+    let tree = call("get_scene_tree", json!({})).await.expect("tree");
+    let player = find(&tree["tree"], "Player").expect("Player");
+    assert_eq!(child_names(player), ["Body", "Weapon", "Snag1"], "{tree}");
+
+    // Saved as an instance of the scene, by its uid, with the instance's own nodes left inside it.
+    call("save_scene", json!({})).await.expect("save");
+    let saved = std::fs::read_to_string(editor.project.join("main.tscn")).expect("saved scene");
+    assert!(
+        saved.contains(r#"type="PackedScene" uid="uid://snagfixture" path="res://snag.tscn""#),
+        "{saved}"
+    );
+    // Godot 4.6+ writes a unique_id between the parent and the instance.
+    assert!(
+        saved.lines().any(
+            |line| line.starts_with(r#"[node name="Snag1" parent="Player""#)
+                && line.contains("instance=ExtResource(")
+        ),
+        "{saved}"
+    );
+    assert!(saved.contains("position = Vector2(3, 4)"), "{saved}");
+    assert!(!saved.contains(r#"name="Leaf""#), "{saved}");
+
+    // One undo removes the whole instance.
+    call("__test_undo", json!({})).await.expect("undo add");
+    let tree = call("get_scene_tree", json!({})).await.expect("tree");
+    let player = find(&tree["tree"], "Player").expect("Player");
+    assert_eq!(child_names(player), ["Body", "Weapon"], "{tree}");
+}
+
 /// The editor's played game loads the project's adapter like a managed run does, and the same two
 /// tools reach it through the plugin's relay.
 #[tokio::test]

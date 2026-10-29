@@ -4,7 +4,9 @@
 use super::{ToolManager, bridge_error_result, code, missing_argument, str_arg, user_args_of};
 use crate::cli_runner::ScriptRun;
 use crate::error::McpError;
-use crate::godot::{IMPORTED_EXTENSIONS, changed_imports, import_fingerprints};
+use crate::godot::{
+    IMPORTED_EXTENSIONS, ResourceDamage, TextResourceSnapshot, changed_imports, import_fingerprints,
+};
 use crate::paths::{res_display, resolve_in_project};
 use crate::protocol::ToolResult;
 use serde_json::{Value, json};
@@ -35,7 +37,41 @@ fn script_timeout_seconds(args: &Value) -> std::result::Result<u64, ToolResult> 
     Ok(seconds)
 }
 
-fn script_run_result(report: &ScriptRun, timeout_seconds: u64) -> ToolResult {
+/// The `resource_damage` entries of a run's answer and a sentence for its summary.
+fn damage_report(damage: &[ResourceDamage]) -> (Vec<Value>, Option<String>) {
+    let entries = damage
+        .iter()
+        .map(|item| {
+            json!({
+                "path": item.path,
+                "lost_uid": item.lost_uid,
+                "ext_resources_without_uid": item.ext_resources_without_uid.iter().map(|(path, uid)| json!({
+                    "path": path,
+                    "uid": uid,
+                })).collect::<Vec<_>>(),
+                "null_shader_parameters": item.null_shader_parameters,
+            })
+        })
+        .collect::<Vec<_>>();
+    if damage.is_empty() {
+        return (entries, None);
+    }
+    let paths = damage
+        .iter()
+        .map(|item| item.path.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let warning = format!(
+        "WARNING: the script rewrote {paths} without the editor: resource_damage lists the uid:// references the headless saver dropped and the shader parameters it wrote as null (no renderer, so unset uniforms read back as null). Restore the files from version control, or put the listed uid=\"...\" back and delete the null shader_parameter lines; make such edits through the connected editor instead."
+    );
+    (entries, Some(warning))
+}
+
+fn script_run_result(
+    report: &ScriptRun,
+    timeout_seconds: u64,
+    damage: &[ResourceDamage],
+) -> ToolResult {
     let exit = report
         .exit_code
         .map(|code| code.to_string())
@@ -63,6 +99,11 @@ fn script_run_result(report: &ScriptRun, timeout_seconds: u64) -> ToolResult {
     } else {
         format!("Script finished with exit code {exit}.")
     };
+    let (resource_damage, warning) = damage_report(damage);
+    let summary = match &warning {
+        Some(warning) => format!("{summary} {warning}"),
+        None => summary,
+    };
     let body = json!({
         "summary": summary,
         "exit_code": report.exit_code,
@@ -75,8 +116,12 @@ fn script_run_result(report: &ScriptRun, timeout_seconds: u64) -> ToolResult {
             "file": error.file,
             "line": error.line,
         })).collect::<Vec<_>>(),
+        "resource_damage": resource_damage,
     });
-    let text = serde_json::to_string_pretty(&body).unwrap_or(summary);
+    let mut text = serde_json::to_string_pretty(&body).unwrap_or(summary);
+    if let Some(warning) = warning {
+        text = format!("{warning}\n{text}");
+    }
     if report.timed_out {
         ToolResult::error(
             text,
@@ -444,12 +489,16 @@ impl ToolManager {
             Ok(seconds) => seconds,
             Err(result) => return result,
         };
+        let snapshot = TextResourceSnapshot::take(&project.dir);
         match self
             .cli
             .run_script(&project.dir, &file, &user_args, timeout_seconds)
             .await
         {
-            Ok(report) => script_run_result(&report, timeout_seconds),
+            Ok(report) => {
+                let damage = snapshot.damage_since(&project.dir);
+                script_run_result(&report, timeout_seconds, &damage)
+            }
             Err(error) => ToolResult::error(
                 format!("Failed to run the script: {error}"),
                 &["Verify GODOT_PATH points to a working Godot executable"],

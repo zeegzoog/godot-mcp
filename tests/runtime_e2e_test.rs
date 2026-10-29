@@ -4208,6 +4208,59 @@ async fn run_script_returns_an_exit_code_and_kills_a_script_that_never_quits() {
     );
 }
 
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn run_script_reports_the_uids_and_shader_parameters_a_headless_save_drops() {
+    let _ = IGNORE;
+    let project = project_dir_with_scripts();
+    let root = project.path();
+    std::fs::write(
+        root.join("water.gdshader"),
+        "shader_type spatial;\nuniform vec4 tint : source_color = vec4(0.2, 0.5, 0.8, 1.0);\nuniform float speed = 1.5;\nvoid fragment() { ALBEDO = tint.rgb * speed; }\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("water.gdshader.uid"), "uid://dlh0ah0opc20e\n").unwrap();
+    std::fs::write(
+        root.join("pond.tscn"),
+        "[gd_scene load_steps=3 format=3 uid=\"uid://cpond1234abcd\"]\n\n[ext_resource type=\"Shader\" uid=\"uid://dlh0ah0opc20e\" path=\"res://water.gdshader\" id=\"1_abcde\"]\n\n[sub_resource type=\"ShaderMaterial\" id=\"ShaderMaterial_aaaaa\"]\nrender_priority = 0\nshader = ExtResource(\"1_abcde\")\nshader_parameter/speed = 2.0\n\n[sub_resource type=\"BoxMesh\" id=\"BoxMesh_bbbbb\"]\n\n[node name=\"Pond\" type=\"Node3D\"]\n\n[node name=\"Water\" type=\"MeshInstance3D\" parent=\".\"]\nmaterial_override = SubResource(\"ShaderMaterial_aaaaa\")\nmesh = SubResource(\"BoxMesh_bbbbb\")\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("scripts/edit_pond.gd"),
+        "extends SceneTree\n\nfunc _initialize() -> void:\n\tvar scene: PackedScene = load(\"res://pond.tscn\")\n\tvar pond: Node = scene.instantiate(PackedScene.GEN_EDIT_STATE_MAIN)\n\tvar material: ShaderMaterial = pond.get_node(\"Water\").material_override\n\tmaterial.set_shader_parameter(\"speed\", 3.0)\n\tscene.pack(pond)\n\tprint(\"SAVED \", ResourceSaver.save(scene))\n\tpond.free()\n\tquit(0)\n",
+    )
+    .unwrap();
+    let tools = manager(root);
+    let result = call(
+        &tools,
+        "godot_run_script",
+        json!({
+            "script": "res://scripts/edit_pond.gd",
+            "project_path": root,
+            "timeout_seconds": 60
+        }),
+    )
+    .await;
+    let answer = text_of(&result);
+    assert!(answer.contains("SAVED 0"), "{answer}");
+    let saved = std::fs::read_to_string(root.join("pond.tscn")).unwrap();
+    // If a Godot version keeps the uids and leaves the uniforms out, the warning has to go: this
+    // test then fails on purpose, and the tool description needs updating.
+    assert!(
+        !saved.contains("uid://dlh0ah0opc20e") && saved.contains("shader_parameter/tint = null"),
+        "the headless saver no longer drops uids or writes null uniforms:\n{saved}"
+    );
+    assert!(
+        answer.starts_with("WARNING") && answer.contains("\"lost_uid\": \"uid://cpond1234abcd\""),
+        "{answer}"
+    );
+    assert!(
+        answer.contains("\"uid\": \"uid://dlh0ah0opc20e\"")
+            && answer.contains("\"null_shader_parameters\": [\n        \"tint\"\n      ]"),
+        "{answer}"
+    );
+}
+
 fn project_dir_with_scripts() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("script project");
     let root = dir.path();

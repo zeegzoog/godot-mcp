@@ -6,7 +6,7 @@ use crate::godot::GameHub;
 use crate::journal::EvidenceKind;
 use crate::lsp::LspHub;
 use crate::paths::{is_valid_identifier, res_display, resolve_in_project};
-use crate::protocol::{Tool, ToolResult};
+use crate::protocol::{Tool, ToolAnnotations, ToolResult};
 use crate::validation::validate_arguments;
 use serde_json::{Value, json};
 use std::io::ErrorKind;
@@ -643,7 +643,84 @@ fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> 
         name: name.into(),
         description: description.into(),
         input_schema,
+        annotations: annotations(name),
     }
+}
+
+/// Hints for a listed tool. Read-only means it changes nothing in the project,
+/// the editor, a running game or files on disk; scratch state kept by this
+/// server (screenshot baselines) does not count. Destructive means it may
+/// overwrite or remove something there, or run code that can. Idempotent means
+/// repeating the call with the same arguments changes nothing more. Only
+/// godot_submit_feedback reaches outside this machine. A tool missing here is
+/// listed without hints, which hosts read as the most cautious defaults.
+fn annotations(name: &str) -> Option<ToolAnnotations> {
+    let [read_only, destructive, idempotent] = match name {
+        "godot_get_version"
+        | "godot_get_project_info"
+        | "godot_get_run_status"
+        | "godot_get_scene_tree"
+        | "godot_get_open_scenes"
+        | "godot_get_node_properties"
+        | "godot_validate_script"
+        | "godot_list_signals"
+        | "godot_get_project_settings"
+        | "godot_get_input_map"
+        | "godot_read_script"
+        | "godot_run_output"
+        | "godot_game_tree"
+        | "godot_game_get"
+        | "godot_game_signals"
+        | "godot_game_observe"
+        | "godot_game_snapshot"
+        | "godot_game_screenshot"
+        | "godot_debug_state"
+        | "godot_code_diagnostics"
+        | "godot_code_complete"
+        | "godot_code_symbols"
+        | "godot_code_definition"
+        | "godot_code_references" => [true, false, true],
+        "godot_capture_viewport"
+        | "godot_resave_resources"
+        | "godot_create_project"
+        | "godot_create_scene"
+        | "godot_connect_signal"
+        | "godot_create_resource"
+        | "godot_game_input_release"
+        | "godot_game_wait"
+        | "godot_debug_breakpoints" => [false, false, true],
+        "godot_launch_editor"
+        | "godot_run_project"
+        | "godot_add_node"
+        | "godot_game_input"
+        | "godot_game_physics"
+        | "godot_game_scenario"
+        | "godot_game_record"
+        | "godot_debug_control"
+        | "godot_note_feedback"
+        | "godot_draft_feedback"
+        | "godot_submit_feedback" => [false, false, false],
+        "godot_stop_project"
+        | "godot_remove_node"
+        | "godot_set_node_properties"
+        | "godot_open_scene"
+        | "godot_save_scene"
+        | "godot_create_script"
+        | "godot_check_voxel_model"
+        | "godot_attach_script"
+        | "godot_set_project_setting"
+        | "godot_edit_input_action"
+        | "godot_delete_file"
+        | "godot_game_set" => [false, true, true],
+        "godot_run_script" | "godot_edit_script" | "godot_game_call" => [false, true, false],
+        _ => return None,
+    };
+    Some(ToolAnnotations {
+        read_only_hint: read_only,
+        destructive_hint: destructive,
+        idempotent_hint: idempotent,
+        open_world_hint: name == "godot_submit_feedback",
+    })
 }
 
 fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {

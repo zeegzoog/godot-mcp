@@ -3083,3 +3083,53 @@ async fn files_are_deleted_on_disk_with_their_companions_unless_still_referenced
         );
     }
 }
+
+#[test]
+fn every_tool_declares_all_four_hints() {
+    let listed = serde_json::to_value(ToolManager::list_tools()).expect("tools serialize");
+    let tools = listed.as_array().expect("tool array");
+    let hints = |name: &str| {
+        tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("no tool {name}"))["annotations"]
+            .clone()
+    };
+    for tool in tools {
+        let name = &tool["name"];
+        for hint in [
+            "readOnlyHint",
+            "destructiveHint",
+            "idempotentHint",
+            "openWorldHint",
+        ] {
+            assert!(tool["annotations"][hint].is_boolean(), "{name} {hint}");
+        }
+        if tool["annotations"]["readOnlyHint"] == true {
+            assert_eq!(tool["annotations"]["destructiveHint"], false, "{name}");
+            assert_eq!(tool["annotations"]["idempotentHint"], true, "{name}");
+        }
+    }
+    for name in [
+        "godot_get_scene_tree",
+        "godot_read_script",
+        "godot_game_tree",
+        "godot_code_references",
+    ] {
+        assert_eq!(hints(name)["readOnlyHint"], true, "{name}");
+    }
+    for name in [
+        "godot_delete_file",
+        "godot_remove_node",
+        "godot_edit_script",
+        "godot_run_script",
+        "godot_save_scene",
+    ] {
+        assert_eq!(hints(name)["readOnlyHint"], false, "{name}");
+        assert_eq!(hints(name)["destructiveHint"], true, "{name}");
+    }
+    assert_eq!(hints("godot_add_node")["destructiveHint"], false);
+    assert_eq!(hints("godot_edit_script")["idempotentHint"], false);
+    assert_eq!(hints("godot_submit_feedback")["openWorldHint"], true);
+    assert_eq!(hints("godot_get_scene_tree")["openWorldHint"], false);
+}

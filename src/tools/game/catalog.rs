@@ -37,6 +37,18 @@ pub fn catalog() -> Vec<Tool> {
             &["method", "permit"],
         ),
         tool(
+            "godot_game_state",
+            "Reads the states the project registered for its own game, by name: what the project's adapter script (the project setting godot_mcp/adapter) chose to show, such as the run, the level or the balls, without walking the node tree. With no names it reads every state and the answer lists the adapter's commands with their help in adapter.commands. A value is converted as godot_game_get converts a property. A state that fails alone is an entry {error} beside the others, and the errors and warnings the engine logged meanwhile come back in errors. An answer over 262144 bytes is refused with the size of each state: ask for fewer names. Works while the game is held. Without an adapter the call fails and says how to name one; adapter.error in godot_get_run_status says why an adapter did not load.",
+            json!({"run_id": s(""), "names": {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 256}, "maxItems": 64, "description": "State names. Default: every state."}}),
+            &[],
+        ),
+        tool(
+            "godot_game_command",
+            "Runs one command the project registered for its own game, by name, with a dictionary of arguments (numbers arrive as floats). The command does what the project wrote, which may include freeing nodes, changing the scene or writing files: it is not limited by the refusals of godot_game_call, and a script error inside it may leave the game changed. adapter.commands in godot_game_state lists the names with their help. The command's value is converted as godot_game_get converts a property; an entry named error in it is a result, not a failure. A command that refuses its arguments, a name that is not registered, a script error and a value over 262144 bytes are told apart. A command must not await: that is a script error. Whatever it defers (call_deferred, a timer) takes effect when the game next advances, so step a held game before reading the result. Works while the game is held. Needs the project setting godot_mcp/adapter.",
+            json!({"run_id": s(""), "name": {"type": "string", "minLength": 1, "maxLength": 256, "description": "The registered command name."}, "args": {"type": "object", "description": "Arguments for the command."}}),
+            &["name"],
+        ),
+        tool(
             "godot_game_signals",
             "Lists a live node's signals and current connections.",
             json!({"run_id": s(""), "path": s("")}),

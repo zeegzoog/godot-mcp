@@ -6,7 +6,7 @@ use crate::godot::GameHub;
 use crate::journal::EvidenceKind;
 use crate::lsp::LspHub;
 use crate::paths::{is_valid_identifier, res_display, resolve_in_project};
-use crate::protocol::{Tool, ToolAnnotations, ToolResult};
+use crate::protocol::{Tool, ToolAnnotations, ToolContent, ToolResult};
 use crate::validation::validate_arguments;
 use serde_json::{Value, json};
 use std::io::ErrorKind;
@@ -28,6 +28,7 @@ mod run;
 mod scenario;
 mod scripts;
 
+use headless::ScriptCheck;
 use project::EditorChoice;
 
 pub struct ToolManager {
@@ -241,6 +242,29 @@ impl ToolManager {
             );
         }
 
+        let given = str_arg(&args, "content");
+        if given.is_some() {
+            if let Some(header) = ["extends_class", "class_name"]
+                .into_iter()
+                .find(|key| str_arg(&args, key).is_some())
+            {
+                return ToolResult::error(
+                    format!(
+                        "Pass either content or {header}, not both: content is written as given, without the standard header"
+                    ),
+                    &[&format!(
+                        "Put the extends and class_name lines in content and drop {header}"
+                    )],
+                );
+            }
+        }
+        if given.is_some_and(|text| text.len() as u64 > scripts::MAX_BYTES) {
+            return ToolResult::error(
+                "content is larger than 1 MiB, which the script tools do not handle",
+                &["Write a large file with your own file tools"],
+            );
+        }
+
         let extends_class = str_arg(&args, "extends_class").unwrap_or("Node");
         if !is_valid_identifier(extends_class) {
             return invalid_identifier("extends_class", extends_class);
@@ -288,11 +312,17 @@ impl ToolManager {
             _ => None,
         };
 
-        let mut content = format!("extends {extends_class}\n");
-        if let Some(name) = class_name {
-            content.push_str(&format!("class_name {name}\n"));
-        }
-        content.push_str("\nfunc _ready() -> void:\n\tpass\n");
+        let content = match given {
+            Some(text) => text.to_string(),
+            None => {
+                let mut content = format!("extends {extends_class}\n");
+                if let Some(name) = class_name {
+                    content.push_str(&format!("class_name {name}\n"));
+                }
+                content.push_str("\nfunc _ready() -> void:\n\tpass\n");
+                content
+            }
+        };
 
         if let Some(parent) = target.parent() {
             if let Err(err) = fs::create_dir_all(parent).await {
@@ -366,10 +396,34 @@ impl ToolManager {
             }
         }
 
-        ToolResult::text(format!(
-            "Created GDScript file {} extending '{extends_class}'.{reload_note}",
-            res_path.unwrap_or_else(|| target.display().to_string()),
-        ))
+        let shown = res_path.unwrap_or_else(|| target.display().to_string());
+        if given.is_none() {
+            return ToolResult::text(format!(
+                "Created GDScript file {shown} extending '{extends_class}'.{reload_note}"
+            ));
+        }
+        // Given text can be broken, and a success here would send the caller on to run it.
+        let check = json!({ "script_path": shown, "project_path": project.dir });
+        match self.check_script(&check).await {
+            ScriptCheck::Checked(report) if report.is_error => ToolResult::error(
+                format!(
+                    "Created GDScript file {shown} from the given content, but it does not validate:\n{}{reload_note}",
+                    message_of(&report)
+                ),
+                &[
+                    "Fix it with godot_read_script and godot_edit_script, then run godot_validate_script",
+                    "Or call godot_create_script again with overwrite: true and corrected content",
+                ],
+            ),
+            ScriptCheck::Checked(report) => ToolResult::text(format!(
+                "Created GDScript file {shown} from the given content.\n{}{reload_note}",
+                message_of(&report)
+            )),
+            ScriptCheck::NoEngine(report) => ToolResult::text(format!(
+                "Created GDScript file {shown} from the given content. It was not validated: {}\nRun godot_validate_script once GODOT_PATH points to a working Godot.{reload_note}",
+                message_of(&report)
+            )),
+        }
     }
 
     /// The editor's script tab for `res_path` when it is open, `None` when it is not or the editor
@@ -414,6 +468,25 @@ impl ToolManager {
         }
         Ok((tab.get("open").and_then(Value::as_bool) == Some(true)).then_some(tab))
     }
+}
+
+/// A result's text without the `Error: ` prefix and the recovery suggestions, to quote it
+/// inside another message.
+fn message_of(result: &ToolResult) -> String {
+    let text: String = result
+        .content
+        .iter()
+        .filter_map(|content| match content {
+            ToolContent::Text { text } => Some(text.as_str()),
+            ToolContent::Image { .. } => None,
+        })
+        .collect();
+    let text = text.strip_prefix("Error: ").unwrap_or(&text);
+    text.split("\n\nActionable recovery suggestions:")
+        .next()
+        .unwrap_or(text)
+        .trim_end()
+        .to_string()
 }
 
 fn str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
@@ -929,7 +1002,7 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
         ),
         tool(
             "godot_create_script",
-            "Creates a new GDScript file with a standard header inside a Godot project. Refuses to overwrite an existing file unless overwrite is true. When the editor has the script open in a tab, an overwrite is refused while the tab has unsaved changes, and otherwise reloads the tab with the new text. script_path is the same parameter the other script tools use; file_path is its older name.",
+            "Creates a new GDScript file inside a Godot project: the given content, or a standard header (extends_class, class_name and an empty _ready) when content is absent. Content is validated after it is written, and a script that does not validate is reported as an error; the file stays written so it can be fixed with godot_edit_script. Refuses to overwrite an existing file unless overwrite is true. When the editor has the script open in a tab, an overwrite is refused while the tab has unsaved changes, and otherwise reloads the tab with the new text. script_path is the same parameter the other script tools use; file_path is its older name.",
             json!({
                 "script_path": {
                     "type": "string",
@@ -939,13 +1012,17 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
                     "type": "string",
                     "description": "The older name of script_path; both are accepted."
                 },
+                "content": {
+                    "type": "string",
+                    "description": "Full text of the script, written as given (up to 1 MiB). Replaces the standard header, so it cannot be combined with extends_class or class_name."
+                },
                 "extends_class": {
                     "type": "string",
-                    "description": "Base class to extend (e.g. 'Node2D', 'CharacterBody3D'). Defaults to 'Node'."
+                    "description": "Base class of the standard header (e.g. 'Node2D', 'CharacterBody3D'). Defaults to 'Node'. Not used with content."
                 },
                 "class_name": {
                     "type": "string",
-                    "description": "Optional global class_name registration."
+                    "description": "Optional global class_name of the standard header. Not used with content."
                 },
                 "project_path": {
                     "type": "string",

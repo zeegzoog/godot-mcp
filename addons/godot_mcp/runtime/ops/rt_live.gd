@@ -308,6 +308,8 @@ static func _same(stored: Variant, written: Variant) -> bool:
 ## (`shader_parameter/caustics`) stays one name. Writing refuses `script`, a segment that
 ## starts with `_`, and an empty segment. Reading allows a `_` segment. A requested `script`
 ## is skipped, which is what a property list did before paths could step into a resource.
+## The editor bridge resolves its own `:` steps here too; `resources` lists every resource
+## stepped through, outermost first, so it can check where each one is saved.
 static func _locate(root: Object, path: String, writing: bool) -> Dictionary:
     if path.is_empty() or path.begins_with(":") or path.ends_with(":") or path.contains("::"):
         return {"error": _refused_path(path, writing)}
@@ -321,8 +323,12 @@ static func _locate(root: Object, path: String, writing: bool) -> Dictionary:
         if not problem.is_empty():
             return {"error": _refused_path(path, writing)}
     var target: Object = root
+    var resources: Array[Resource] = []
     for index in segments.size() - 1:
         var current: Variant = target.get(segments[index])
+        if current == null:
+            var verb_null := "changed" if writing else "read"
+            return {"error": R.err(R.BAD_PARAMS, "Property '%s' is null (or not a property of %s), not a resource, so '%s' cannot be %s through it. Assign a resource to '%s' first." % [segments[index], target.get_class(), path, verb_null, segments[index]])}
         if not current is Resource:
             var verb := "changed" if writing else "read"
             var slash := "/".join(segments)
@@ -331,7 +337,8 @@ static func _locate(root: Object, path: String, writing: bool) -> Dictionary:
             # A script resource holds code: `source_code` is changed through its own tools, not here.
             return {"error": _refused_path(path, writing)}
         target = current
-    return {"target": target, "leaf": segments[segments.size() - 1]}
+        resources.append(current)
+    return {"target": target, "leaf": segments[segments.size() - 1], "resources": resources}
 
 
 static func _refused_path(path: String, writing: bool) -> Dictionary:

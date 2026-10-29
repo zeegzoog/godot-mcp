@@ -24,6 +24,9 @@ const MAX_VALUE_CHARS: int = 2000
 const RESAVE_WAIT_MSEC: int = 60000
 const SCRIPT_OPS_PATH: String = "res://addons/godot_mcp/editor/script_ops.gd"
 const FILE_OPS_PATH: String = "res://addons/godot_mcp/editor/file_ops.gd"
+## The running game's property ops. The editor reuses their ':' resource-step resolver, so a
+## property path means the same in godot_set_node_properties as in godot_game_set.
+const RtLive: GDScript = preload("res://addons/godot_mcp/runtime/ops/rt_live.gd")
 const MAX_CAPTURE_DIMENSION: int = 1568
 const MIN_CAPTURE_SIZE: int = 16
 
@@ -39,7 +42,7 @@ const PARAM_TYPES: Dictionary = {
     "get_scene_tree": {"scene_path": TYPE_STRING},
     "add_node": {"parent_node_path": TYPE_STRING, "node_type": TYPE_STRING, "node_name": TYPE_STRING},
     "remove_node": {"node_path": TYPE_STRING},
-    "get_node_properties": {"node_path": TYPE_STRING},
+    "get_node_properties": {"node_path": TYPE_STRING, "properties": TYPE_ARRAY},
     "set_node_properties": {"node_path": TYPE_STRING, "properties": TYPE_DICTIONARY},
     "capture_viewport": {"view": TYPE_STRING, "max_dimension": TYPE_FLOAT},
     "open_scene": {"scene_path": TYPE_STRING, "reload": TYPE_BOOL, "discard": TYPE_BOOL},
@@ -764,7 +767,32 @@ func get_node_properties(peer: WebSocketPeer, cmd_id: String, params: Dictionary
         send_error(peer, cmd_id, "Node not found at path: " + node_path)
         return
 
+    var wanted: Array = params.get("properties", [])
+    for prop_path: Variant in wanted:
+        if not prop_path is String:
+            send_error(peer, cmd_id, "Parameter 'properties' must be an array of property names, got %s" % describe_value(prop_path))
+            return
+
     var props: Dictionary = {}
+    if not wanted.is_empty():
+        # Only the named properties, each of which may step through resources with ':'.
+        var errors: Dictionary = {}
+        for prop_path: String in wanted:
+            var resolved: Dictionary = resolve_property(target_node, prop_path, false)
+            if resolved.has("error"):
+                errors[prop_path] = resolved["error"]
+            elif not resolved.has("skip"):
+                var holder: Object = resolved["object"]
+                props[prop_path] = {
+                    "type": property_type_name(resolved["info"]),
+                    "value": describe_value(holder.get(str(resolved["property"]))),
+                }
+        var answer: Dictionary = {"node_path": node_path, "class": target_node.get_class(), "properties": props}
+        if not errors.is_empty():
+            answer["property_errors"] = errors
+        send_success(peer, cmd_id, answer)
+        return
+
     for prop: Dictionary in target_node.get_property_list():
         if not (int(prop["usage"]) & PROPERTY_USAGE_EDITOR):
             continue
@@ -775,6 +803,51 @@ func get_node_properties(peer: WebSocketPeer, cmd_id: String, params: Dictionary
         }
 
     send_success(peer, cmd_id, {"node_path": node_path, "class": target_node.get_class(), "properties": props})
+
+## Finds the object and property a name points to. A plain name is a property of the node. A name
+## with ':' steps through resources the way godot_game_set does (material_override:shader_parameter/x),
+## using the running game's resolver, and the last segment must be a property of the last resource.
+## Writing refuses a resource saved outside the edited scene: a .tres file or another scene's
+## sub-resource is shared, and changing it here would change every scene that uses it.
+## Returns {"object", "property", "info"}, {"skip": true} for a requested script, or {"error": String}.
+func resolve_property(node: Node, prop_path: String, writing: bool) -> Dictionary:
+    var holder: Object = node
+    var leaf: String = prop_path
+    if prop_path.contains(":"):
+        var located: Dictionary = RtLive._locate(node, prop_path, writing)
+        if located.has("error"):
+            var failure: Dictionary = located["error"]["error"]
+            return {"error": str(failure.get("message", "Cannot resolve '%s'" % prop_path))}
+        if bool(located.get("skip", false)):
+            return {"skip": true}
+        if writing:
+            for resource: Resource in located["resources"]:
+                var problem: String = foreign_resource_problem(resource)
+                if not problem.is_empty():
+                    return {"error": "'%s' %s" % [prop_path, problem]}
+        holder = located["target"]
+        leaf = str(located["leaf"])
+    for prop: Dictionary in holder.get_property_list():
+        if prop["name"] == leaf:
+            return {"object": holder, "property": leaf, "info": prop}
+    if holder == node:
+        return {"error": "Unknown property '%s' on %s" % [leaf, node.get_class()]}
+    return {"error": "Unknown property '%s' on %s (in '%s'); read the resource's properties with this tool to see their names" % [leaf, holder.get_class(), prop_path]}
+
+## "" when the resource belongs to the edited scene alone: built into it, or not saved anywhere
+## yet. Otherwise why changing it from this scene is refused and what to do instead.
+func foreign_resource_problem(resource: Resource) -> String:
+    var path: String = resource.resource_path
+    if path.is_empty():
+        return ""
+    var root: Node = EditorInterface.get_edited_scene_root()
+    var scene_path: String = "" if root == null else String(root.scene_file_path)
+    var file: String = path.get_slice("::", 0)
+    if path.contains("::") and file == scene_path and not scene_path.is_empty():
+        return ""
+    if path.contains("::"):
+        return "goes through a %s built into %s, not into this scene, so changing it here would change every scene that uses that file. Open %s and change it there, or give this node its own copy of the resource first." % [resource.get_class(), file, file]
+    return "goes through the resource file %s (%s), which every scene that uses it shares. Change that file instead, or give this node its own copy of the resource first." % [path, resource.get_class()]
 
 ## Builds a vector-like value from a list of numbers; returns null if the count is wrong.
 func build_numeric_value(expected: int, n: Array) -> Variant:
@@ -919,9 +992,22 @@ func set_node_properties(peer: WebSocketPeer, cmd_id: String, params: Dictionary
     var converted: Dictionary = {}
     # metadata/<name> entries the node does not have yet, created as the inspector's Add Metadata does.
     var new_meta: Dictionary = {}
+    # Properties of the node's own resources, named with ':' steps: name -> [resource, property, value].
+    var stepped: Dictionary = {}
     var problems: PackedStringArray = []
     for key: Variant in properties.keys():
         var prop_name: String = str(key)
+        if prop_name.contains(":"):
+            var resolved: Dictionary = resolve_property(target_node, prop_name, true)
+            if resolved.has("error"):
+                problems.append(str(resolved["error"]))
+                continue
+            var stepped_value: Dictionary = convert_property_value(resolved["info"], properties[key])
+            if stepped_value.has("error"):
+                problems.append("%s: %s" % [prop_name, stepped_value["error"]])
+            else:
+                stepped[prop_name] = [resolved["object"], resolved["property"], stepped_value["value"]]
+            continue
         if not known.has(prop_name) and prop_name.begins_with(META_PREFIX):
             var meta_result: Dictionary = new_meta_value(prop_name.substr(META_PREFIX.length()), properties[key])
             if meta_result.has("error"):
@@ -946,6 +1032,11 @@ func set_node_properties(peer: WebSocketPeer, cmd_id: String, params: Dictionary
         for prop_name: String in converted:
             undo_redo.add_do_property(target_node, prop_name, converted[prop_name])
             undo_redo.add_undo_property(target_node, prop_name, target_node.get(prop_name))
+        for prop_name: String in stepped:
+            var step: Array = stepped[prop_name]
+            var resource: Object = step[0]
+            undo_redo.add_do_property(resource, step[1], step[2])
+            undo_redo.add_undo_property(resource, step[1], resource.get(step[1]))
         for prop_name: String in new_meta:
             var meta_name: StringName = StringName(prop_name.substr(META_PREFIX.length()))
             undo_redo.add_do_method(target_node, "set_meta", meta_name, new_meta[prop_name])
@@ -960,11 +1051,17 @@ func set_node_properties(peer: WebSocketPeer, cmd_id: String, params: Dictionary
             target_node.set(prop_name, converted[prop_name])
         for prop_name: String in new_meta:
             target_node.set_meta(StringName(prop_name.substr(META_PREFIX.length())), new_meta[prop_name])
+        for prop_name: String in stepped:
+            var step: Array = stepped[prop_name]
+            (step[0] as Object).set(step[1], step[2])
 
     converted.merge(new_meta)
     var applied: Dictionary = {}
     for prop_name: String in converted:
         applied[prop_name] = describe_value(target_node.get(prop_name))
+    for prop_name: String in stepped:
+        var step: Array = stepped[prop_name]
+        applied[prop_name] = describe_value((step[0] as Object).get(step[1]))
     mark_scene_dirty()
     send_success(peer, cmd_id, {"updated": true, "node_path": node_path, "applied": applied})
 

@@ -3048,3 +3048,212 @@ async fn editor_play_answers_the_project_adapter() {
         .await;
     assert!(!stopped.is_error, "{}", tool_text(&stopped));
 }
+
+const GLOW_SHADER: &str = "shader_type spatial;\n\nuniform float glow_amount = 0.5;\n";
+
+const SHARED_GLOW: &str = r#"[gd_resource type="ShaderMaterial" format=3]
+
+[ext_resource type="Shader" path="res://glow.gdshader" id="1"]
+
+[resource]
+shader = ExtResource("1")
+shader_parameter/glow_amount = 0.5
+"#;
+
+const LAMP_SCENE: &str = r#"[gd_scene format=3]
+
+[ext_resource type="Shader" path="res://glow.gdshader" id="1"]
+
+[sub_resource type="ShaderMaterial" id="ShaderMaterial_lamp"]
+shader = ExtResource("1")
+shader_parameter/glow_amount = 0.75
+
+[node name="Lamp" type="MeshInstance3D"]
+material_override = SubResource("ShaderMaterial_lamp")
+"#;
+
+const POND_SCENE: &str = r#"[gd_scene format=3]
+
+[ext_resource type="Shader" path="res://glow.gdshader" id="1"]
+[ext_resource type="ShaderMaterial" path="res://shared_glow.tres" id="2"]
+[ext_resource type="PackedScene" path="res://lamp.tscn" id="3"]
+
+[sub_resource type="ShaderMaterial" id="ShaderMaterial_water"]
+shader = ExtResource("1")
+shader_parameter/glow_amount = 0.25
+
+[node name="Pond" type="Node3D"]
+
+[node name="Water" type="MeshInstance3D" parent="."]
+material_override = SubResource("ShaderMaterial_water")
+
+[node name="Shared" type="MeshInstance3D" parent="."]
+material_override = ExtResource("2")
+
+[node name="Bare" type="MeshInstance3D" parent="."]
+
+[node name="Lamp" parent="." instance=ExtResource("3")]
+"#;
+
+/// `:` steps through a resource in the editor the way godot_game_set does at run time, so a shader
+/// uniform of a node's own material is changed in one undo action, while a material saved in a
+/// .tres file or in another scene is refused instead of being changed for every scene that uses it.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn node_properties_step_through_the_scenes_own_resources() {
+    let editor = start_editor_with(
+        Some(UNDO_HOOK),
+        "",
+        &[
+            ("glow.gdshader", GLOW_SHADER),
+            ("shared_glow.tres", SHARED_GLOW),
+            ("lamp.tscn", LAMP_SCENE),
+            ("pond.tscn", POND_SCENE),
+        ],
+        "",
+    )
+    .await;
+    let bridge = &editor.bridge;
+    let call = |command: &'static str, params: Value| async move {
+        bridge.send_command(command, params).await
+    };
+    let glow = "material_override:shader_parameter/glow_amount";
+    let read = |node: &'static str| async move {
+        call(
+            "get_node_properties",
+            json!({"node_path": node, "properties": [glow, "visible"]}),
+        )
+        .await
+        .expect("read")
+    };
+    call("open_scene", json!({"scene_path": "res://pond.tscn"}))
+        .await
+        .expect("open pond");
+
+    // A read names only the properties asked for; one that cannot be read is reported beside them.
+    let water = call(
+        "get_node_properties",
+        json!({"node_path": "Water", "properties": [
+            glow,
+            "material_override:shader_parameter/missing",
+            "material_override:script",
+            "visible"
+        ]}),
+    )
+    .await
+    .expect("read water");
+    assert_eq!(
+        water["properties"][glow],
+        json!({"type": "float", "value": "0.25"}),
+        "{water}"
+    );
+    assert_eq!(water["properties"]["visible"]["value"], "true", "{water}");
+    assert!(
+        water["property_errors"]["material_override:shader_parameter/missing"]
+            .as_str()
+            .is_some_and(|message| message.contains("ShaderMaterial")),
+        "{water}"
+    );
+    assert!(
+        water["properties"]
+            .get("material_override:script")
+            .is_none(),
+        "{water}"
+    );
+    assert_eq!(
+        read("Shared").await["properties"][glow]["value"],
+        "0.5",
+        "reading a shared resource is allowed"
+    );
+    expect_error(
+        call(
+            "get_node_properties",
+            json!({"node_path": "Water", "properties": [5]}),
+        )
+        .await,
+        "properties",
+    );
+
+    // The scene's own material is changed with the node in one undo action, and the scene is dirty.
+    let set = call(
+        "set_node_properties",
+        json!({"node_path": "Water", "properties": {glow: 0.9, "visible": false}}),
+    )
+    .await
+    .expect("set glow");
+    assert_eq!(set["applied"][glow], "0.9", "{set}");
+    let after = read("Water").await;
+    assert_eq!(after["properties"][glow]["value"], "0.9", "{after}");
+    assert_eq!(after["properties"]["visible"]["value"], "false", "{after}");
+    expect_error(
+        call(
+            "open_scene",
+            json!({"scene_path": "res://pond.tscn", "reload": true}),
+        )
+        .await,
+        "unsaved",
+    );
+    call("__test_undo", json!({})).await.expect("undo");
+    let undone = read("Water").await;
+    assert_eq!(undone["properties"][glow]["value"], "0.25", "{undone}");
+    assert_eq!(undone["properties"]["visible"]["value"], "true", "{undone}");
+
+    // A shared material, another scene's material, an empty slot and refused segments change nothing.
+    let shared_before =
+        std::fs::read_to_string(editor.project.join("shared_glow.tres")).expect("tres");
+    for (node, key, needle) in [
+        ("Shared", glow, "res://shared_glow.tres"),
+        ("Lamp", glow, "res://lamp.tscn"),
+        ("Bare", glow, "Assign a resource"),
+        ("Water", "material_override:script", "Refusing"),
+        ("Water", "material_override:_private", "Refusing"),
+        ("Water", "visible:x", "not a resource"),
+        (
+            "Water",
+            "material_override:shader_parameter/missing",
+            "Unknown property",
+        ),
+    ] {
+        expect_error(
+            call(
+                "set_node_properties",
+                json!({"node_path": node, "properties": {key: 0.1, "visible": false}}),
+            )
+            .await,
+            needle,
+        );
+        assert_eq!(
+            read(node).await["properties"]["visible"]["value"],
+            "true",
+            "{node} {key}: a rejected batch must not be partially applied"
+        );
+    }
+    assert_eq!(read("Shared").await["properties"][glow]["value"], "0.5");
+    assert_eq!(read("Lamp").await["properties"][glow]["value"], "0.75");
+    expect_error(
+        call(
+            "set_node_properties",
+            json!({"node_path": "Water", "properties": {glow: "bright"}}),
+        )
+        .await,
+        "float",
+    );
+
+    // The change is saved inside the scene, and the shared file is untouched.
+    call(
+        "set_node_properties",
+        json!({"node_path": "Water", "properties": {glow: 0.6}}),
+    )
+    .await
+    .expect("set glow again");
+    call("save_scene", json!({})).await.expect("save");
+    let saved = std::fs::read_to_string(editor.project.join("pond.tscn")).expect("saved scene");
+    assert!(
+        saved.contains("shader_parameter/glow_amount = 0.6"),
+        "{saved}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(editor.project.join("shared_glow.tres")).expect("tres"),
+        shared_before
+    );
+}

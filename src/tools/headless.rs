@@ -4,7 +4,9 @@
 use super::{ToolManager, bridge_error_result, code, missing_argument, str_arg, user_args_of};
 use crate::cli_runner::ScriptRun;
 use crate::error::McpError;
-use crate::godot::{IMPORTED_EXTENSIONS, changed_imports, import_fingerprints};
+use crate::godot::{
+    IMPORTED_EXTENSIONS, ResourceDamage, TextResourceSnapshot, changed_imports, import_fingerprints,
+};
 use crate::paths::{res_display, resolve_in_project};
 use crate::protocol::ToolResult;
 use serde_json::{Value, json};
@@ -35,7 +37,41 @@ fn script_timeout_seconds(args: &Value) -> std::result::Result<u64, ToolResult> 
     Ok(seconds)
 }
 
-fn script_run_result(report: &ScriptRun, timeout_seconds: u64) -> ToolResult {
+/// The `resource_damage` entries of a run's answer and a sentence for its summary.
+fn damage_report(damage: &[ResourceDamage]) -> (Vec<Value>, Option<String>) {
+    let entries = damage
+        .iter()
+        .map(|item| {
+            json!({
+                "path": item.path,
+                "lost_uid": item.lost_uid,
+                "ext_resources_without_uid": item.ext_resources_without_uid.iter().map(|(path, uid)| json!({
+                    "path": path,
+                    "uid": uid,
+                })).collect::<Vec<_>>(),
+                "null_shader_parameters": item.null_shader_parameters,
+            })
+        })
+        .collect::<Vec<_>>();
+    if damage.is_empty() {
+        return (entries, None);
+    }
+    let paths = damage
+        .iter()
+        .map(|item| item.path.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let warning = format!(
+        "WARNING: the script rewrote {paths} without the editor: resource_damage lists the uid:// references the headless saver dropped and the shader parameters it wrote as null (no renderer, so unset uniforms read back as null). Restore the files from version control, or put the listed uid=\"...\" back and delete the null shader_parameter lines; make such edits through the connected editor instead."
+    );
+    (entries, Some(warning))
+}
+
+fn script_run_result(
+    report: &ScriptRun,
+    timeout_seconds: u64,
+    damage: &[ResourceDamage],
+) -> ToolResult {
     let exit = report
         .exit_code
         .map(|code| code.to_string())
@@ -63,6 +99,11 @@ fn script_run_result(report: &ScriptRun, timeout_seconds: u64) -> ToolResult {
     } else {
         format!("Script finished with exit code {exit}.")
     };
+    let (resource_damage, warning) = damage_report(damage);
+    let summary = match &warning {
+        Some(warning) => format!("{summary} {warning}"),
+        None => summary,
+    };
     let body = json!({
         "summary": summary,
         "exit_code": report.exit_code,
@@ -75,8 +116,12 @@ fn script_run_result(report: &ScriptRun, timeout_seconds: u64) -> ToolResult {
             "file": error.file,
             "line": error.line,
         })).collect::<Vec<_>>(),
+        "resource_damage": resource_damage,
     });
-    let text = serde_json::to_string_pretty(&body).unwrap_or(summary);
+    let mut text = serde_json::to_string_pretty(&body).unwrap_or(summary);
+    if let Some(warning) = warning {
+        text = format!("{warning}\n{text}");
+    }
     if report.timed_out {
         ToolResult::error(
             text,
@@ -136,23 +181,46 @@ fn last_output_lines(stdout: &str, stderr: &str, count: usize) -> String {
     }
 }
 
+/// The outcome of godot_validate_script's check.
+pub(super) enum ScriptCheck {
+    /// The script was checked (or refused before a check); an error result means it failed.
+    Checked(ToolResult),
+    /// The engine could not be run, so nothing is known about the script.
+    NoEngine(ToolResult),
+}
+
+impl From<ToolResult> for ScriptCheck {
+    fn from(result: ToolResult) -> Self {
+        Self::Checked(result)
+    }
+}
+
 impl ToolManager {
     pub(super) async fn handle_validate_script(&self, args: Value) -> ToolResult {
-        let Some(script_path) = str_arg(&args, "script_path") else {
-            return missing_argument("script_path");
+        match self.check_script(&args).await {
+            ScriptCheck::Checked(result) | ScriptCheck::NoEngine(result) => result,
+        }
+    }
+
+    /// godot_validate_script's check, telling a script that fails apart from an engine that
+    /// could not be run to check it.
+    pub(super) async fn check_script(&self, args: &Value) -> ScriptCheck {
+        let Some(script_path) = str_arg(args, "script_path") else {
+            return missing_argument("script_path").into();
         };
         if !script_path.ends_with(".gd") {
             return ToolResult::error(
                 format!("Only .gd scripts can be validated: {script_path}"),
                 &["Use a path such as res://scripts/player.gd"],
-            );
+            )
+            .into();
         }
 
         let (project_dir, from_editor) =
-            if str_arg(&args, "project_path").is_some() || script_path.starts_with("res://") {
-                match self.resolve_project(&args).await {
+            if str_arg(args, "project_path").is_some() || script_path.starts_with("res://") {
+                match self.resolve_project(args).await {
                     Ok(project) => (Some(project.dir), project.from_editor),
-                    Err(result) => return result,
+                    Err(result) => return result.into(),
                 }
             } else {
                 (None, false)
@@ -165,7 +233,8 @@ impl ToolManager {
                     return ToolResult::error(
                         problem,
                         &["Use a res:// path or a path inside the project directory"],
-                    );
+                    )
+                    .into();
                 }
             },
             None => PathBuf::from(script_path),
@@ -178,7 +247,8 @@ impl ToolManager {
             return ToolResult::error(
                 format!("Script file not found: {shown}"),
                 &["Check the path; res:// paths are resolved against the project directory"],
-            );
+            )
+            .into();
         }
 
         // Set when a language server was reached but did not answer; the headless check runs instead.
@@ -195,7 +265,7 @@ impl ToolManager {
                     if code::addon_warnings_hidden(dir, &file) {
                         report.text = format!("{}\n{}", report.text, code::ADDON_WARNINGS_HIDDEN);
                     }
-                    return if report.failed {
+                    return ScriptCheck::Checked(if report.failed {
                         ToolResult::error(
                             report.text,
                             &[
@@ -205,7 +275,7 @@ impl ToolManager {
                         )
                     } else {
                         ToolResult::text(report.text)
-                    };
+                    });
                 }
                 Ok(None) => {}
                 Err(error) => lsp_problem = Some(error),
@@ -217,27 +287,27 @@ impl ToolManager {
             .validate_script(project_dir.as_deref(), Path::new(script_path))
             .await
         {
-            Ok(msg) => match lsp_problem {
+            Ok(msg) => ScriptCheck::Checked(match lsp_problem {
                 Some(error) => ToolResult::text(format!(
                     "No parse errors (headless check). Analyzer warnings were not checked: the language server was reached but did not answer ({error}); retry, or use godot_code_diagnostics."
                 )),
                 None => ToolResult::text(msg),
-            },
+            }),
             // The engine could not be run at all: that is a path problem, not a script problem.
-            Err(e @ McpError::Process(_)) => ToolResult::error(
+            Err(e @ McpError::Process(_)) => ScriptCheck::NoEngine(ToolResult::error(
                 format!("Script validation failed: {e}"),
                 &[
                     "Verify GODOT_PATH points to a working Godot executable",
                     "Run the executable with --version to see whether it starts",
                 ],
-            ),
-            Err(e) => ToolResult::error(
+            )),
+            Err(e) => ScriptCheck::Checked(ToolResult::error(
                 format!("Script validation failed: {e}"),
                 &[
                     "Check GDScript syntax line numbers",
                     "Ensure base class and node types exist in the engine",
                 ],
-            ),
+            )),
         }
     }
 
@@ -419,12 +489,16 @@ impl ToolManager {
             Ok(seconds) => seconds,
             Err(result) => return result,
         };
+        let snapshot = TextResourceSnapshot::take(&project.dir);
         match self
             .cli
             .run_script(&project.dir, &file, &user_args, timeout_seconds)
             .await
         {
-            Ok(report) => script_run_result(&report, timeout_seconds),
+            Ok(report) => {
+                let damage = snapshot.damage_since(&project.dir);
+                script_run_result(&report, timeout_seconds, &damage)
+            }
             Err(error) => ToolResult::error(
                 format!("Failed to run the script: {error}"),
                 &["Verify GODOT_PATH points to a working Godot executable"],

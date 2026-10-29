@@ -256,6 +256,133 @@ async fn an_offline_editor_names_the_bridge_port_the_server_is_using() {
     assert!(!message.contains("Verify GODOT_DEBUG_PORT"), "{message}");
 }
 
+/// A manager in an empty working directory with `godot` as the engine and no language server.
+fn checked_manager(cwd: &Path, godot: PathBuf) -> Arc<ToolManager> {
+    Arc::new(
+        ToolManager::new(BridgeClient::new(free_port()), CliRunner::new(godot))
+            .with_working_dir(cwd.to_path_buf())
+            .with_lsp_port(free_port()),
+    )
+}
+
+#[tokio::test]
+async fn creates_a_script_from_the_given_content_and_validates_it() {
+    let project = project_dir();
+    let engine = tempfile::tempdir().expect("engine dir");
+    let cwd = tempfile::tempdir().expect("working dir");
+    let content = "extends SceneTree\n\nfunc _init() -> void:\n\tquit()\n";
+    let result = checked_manager(cwd.path(), quiet_godot(engine.path()))
+        .call_tool(
+            "godot_create_script",
+            json!({"script_path": "res://tools/patch.gd", "content": content,
+                   "project_path": project.path()}),
+        )
+        .await;
+    assert!(!result.is_error, "{}", text(&result));
+    let shown = text(&result);
+    assert!(shown.contains("from the given content"), "{shown}");
+    assert!(shown.contains("No parse errors"), "{shown}");
+    assert!(!shown.contains("extending 'Node'"), "{shown}");
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("tools/patch.gd")).expect("script"),
+        content
+    );
+}
+
+#[tokio::test]
+async fn content_that_does_not_validate_is_reported_as_an_error_and_kept() {
+    let project = project_dir();
+    let engine = tempfile::tempdir().expect("engine dir");
+    let cwd = tempfile::tempdir().expect("working dir");
+    // The stand-in engine writes to stderr, which the headless check reads as a parse error.
+    let result = checked_manager(cwd.path(), fake_godot(engine.path()))
+        .call_tool(
+            "godot_create_script",
+            json!({"script_path": "res://broken.gd", "content": "extends Node\nfunc (\n",
+                   "project_path": project.path()}),
+        )
+        .await;
+    assert!(result.is_error);
+    let shown = text(&result);
+    assert!(shown.contains("does not validate"), "{shown}");
+    assert!(shown.contains("NOISE_ON_STDERR"), "{shown}");
+    assert!(shown.contains("godot_edit_script"), "{shown}");
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("broken.gd")).expect("script"),
+        "extends Node\nfunc (\n"
+    );
+}
+
+#[tokio::test]
+async fn content_is_written_but_says_so_when_no_engine_can_check_it() {
+    let project = project_dir();
+    let cwd = tempfile::tempdir().expect("working dir");
+    let result = checked_manager(
+        cwd.path(),
+        PathBuf::from("godot-binary-that-does-not-exist"),
+    )
+    .call_tool(
+        "godot_create_script",
+        json!({"script_path": "res://unchecked.gd", "content": "extends Node\n",
+               "project_path": project.path()}),
+    )
+    .await;
+    assert!(!result.is_error, "{}", text(&result));
+    let shown = text(&result);
+    assert!(shown.contains("not validated"), "{shown}");
+    assert!(shown.contains("godot_validate_script"), "{shown}");
+    assert!(project.path().join("unchecked.gd").exists());
+}
+
+#[tokio::test]
+async fn content_and_header_parameters_are_not_mixed() {
+    let project = project_dir();
+    for header in [
+        json!({"extends_class": "Node2D"}),
+        json!({"class_name": "Patch"}),
+    ] {
+        let mut args = json!({"script_path": "res://mixed.gd", "content": "extends Node\n",
+                              "project_path": project.path()});
+        args.as_object_mut()
+            .expect("object")
+            .extend(header.as_object().expect("object").clone());
+        let result = call("godot_create_script", args).await;
+        assert!(result.is_error);
+        assert!(
+            text(&result).contains("either content or"),
+            "{}",
+            text(&result)
+        );
+        assert!(!project.path().join("mixed.gd").exists());
+    }
+}
+
+#[tokio::test]
+async fn an_unknown_argument_is_refused_with_its_name_and_the_accepted_ones() {
+    let project = project_dir();
+    let result = call(
+        "godot_create_script",
+        json!({"script_path": "res://patch.gd", "contents": "extends SceneTree\n",
+               "project_path": project.path()}),
+    )
+    .await;
+    assert!(result.is_error);
+    let shown = text(&result);
+    assert!(shown.contains("Unknown parameter 'contents'"), "{shown}");
+    for accepted in [
+        "'script_path'",
+        "'file_path'",
+        "'extends_class'",
+        "'overwrite'",
+    ] {
+        assert!(shown.contains(accepted), "{accepted} missing: {shown}");
+    }
+    assert!(
+        !project.path().join("patch.gd").exists(),
+        "nothing may be written for a call that was refused"
+    );
+}
+
 #[tokio::test]
 async fn needs_a_project_when_the_editor_is_offline() {
     let result = call("godot_create_script", json!({"file_path": "res://a.gd"})).await;
@@ -506,6 +633,31 @@ fn launch_editor_schema_no_longer_requires_project_path() {
         "{}",
         launch.input_schema
     );
+}
+
+#[test]
+fn node_property_tools_describe_the_resource_step() {
+    let tools = ToolManager::list_tools();
+    let schema = |name: &str| {
+        tools
+            .iter()
+            .find(|tool| tool.name == name)
+            .unwrap_or_else(|| panic!("{name} is listed"))
+    };
+    let get = schema("godot_get_node_properties");
+    assert_eq!(
+        get.input_schema["properties"]["properties"]["items"]["type"], "string",
+        "{}",
+        get.input_schema
+    );
+    for name in ["godot_get_node_properties", "godot_set_node_properties"] {
+        let tool = schema(name);
+        let description = &tool.description;
+        assert!(
+            description.contains("material_override:shader_parameter/"),
+            "{name}: {description}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2532,6 +2684,93 @@ async fn run_script_parses_script_errors_and_kills_a_hang() {
         idle_text.contains("\"timed_out\": false") && idle_text.contains("\"stopped_idle\": true"),
         "{idle_text}"
     );
+}
+
+#[tokio::test]
+async fn run_script_names_the_uids_and_null_shader_parameters_a_headless_save_dropped() {
+    let project = project_dir();
+    let root = project.path();
+    std::fs::write(root.join("water.gdshader.uid"), "uid://dshader\n").expect("uid");
+    std::fs::write(
+        root.join("pond.tscn"),
+        "[gd_scene load_steps=2 format=3 uid=\"uid://cpond\"]\n\n[ext_resource type=\"Shader\" uid=\"uid://dshader\" path=\"res://water.gdshader\" id=\"1_a\"]\n\n[sub_resource type=\"ShaderMaterial\" id=\"ShaderMaterial_a\"]\nshader = ExtResource(\"1_a\")\nshader_parameter/speed = 2.0\n\n[node name=\"Pond\" type=\"Node3D\"]\n",
+    )
+    .expect("scene");
+    // What Godot 4.8 writes for the same scene after a headless load, edit and save.
+    std::fs::write(
+        root.join("headless.txt"),
+        "[gd_scene format=3]\n\n[ext_resource type=\"Shader\" path=\"res://water.gdshader\" id=\"1_a\"]\n\n[sub_resource type=\"ShaderMaterial\" id=\"ShaderMaterial_a\"]\nshader = ExtResource(\"1_a\")\nshader_parameter/tint = null\nshader_parameter/speed = 3.0\n\n[node name=\"Pond\" type=\"Node3D\" unique_id=1]\n",
+    )
+    .expect("headless output");
+    write_script(root, "edit.gd", b"extends SceneTree\n");
+    write_script(root, "quiet.gd", b"extends SceneTree\n");
+    let tools = manager_in(root, saving_godot(root));
+
+    let quiet = call_with(&tools, json!({"script": "quiet.gd", "project_path": root})).await;
+    assert!(!quiet.is_error, "{}", text(&quiet));
+    assert!(
+        text(&quiet).contains("\"resource_damage\": []") && !text(&quiet).contains("WARNING"),
+        "{}",
+        text(&quiet)
+    );
+
+    let saved = call_with(&tools, json!({"script": "edit.gd", "project_path": root})).await;
+    let saved_text = text(&saved);
+    assert!(!saved.is_error, "{saved_text}");
+    assert!(
+        saved_text.starts_with("WARNING") && saved_text.contains("res://pond.tscn"),
+        "{saved_text}"
+    );
+    let body: Value = serde_json::from_str(&saved_text[saved_text.find('{').expect("json")..])
+        .expect("answer is JSON after the warning line");
+    assert_eq!(
+        body["resource_damage"],
+        json!([{
+            "path": "res://pond.tscn",
+            "lost_uid": "uid://cpond",
+            "ext_resources_without_uid": [{"path": "res://water.gdshader", "uid": "uid://dshader"}],
+            "null_shader_parameters": ["tint"],
+        }])
+    );
+}
+
+/// A Godot stand-in that, for edit.gd, overwrites pond.tscn with headless.txt.
+fn saving_godot(dir: &Path) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("saving_godot.sh");
+        std::fs::write(
+            &path,
+            r#"#!/bin/sh
+prev=
+proj=
+for arg in "$@"; do
+  if [ "$prev" = "--path" ]; then
+    proj=$arg
+  fi
+  prev=$arg
+done
+case "$*" in
+  *edit.gd*) cp "$proj/headless.txt" "$proj/pond.tscn" ;;
+esac
+exit 0
+"#,
+        )
+        .expect("write saving godot");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        path
+    }
+    #[cfg(windows)]
+    {
+        let path = dir.join("saving_godot.bat");
+        std::fs::write(
+            &path,
+            "@echo off\r\nsetlocal enabledelayedexpansion\r\nset PREV=\r\nset PROJ=\r\nfor %%A in (%*) do (\r\n  if \"!PREV!\"==\"--path\" set PROJ=%%~A\r\n  set PREV=%%A\r\n)\r\necho %* | findstr edit.gd >nul\r\nif %errorlevel%==0 copy /Y \"%PROJ%\\headless.txt\" \"%PROJ%\\pond.tscn\" >nul\r\nexit /b 0\r\n",
+        )
+        .expect("write saving godot");
+        path
+    }
 }
 
 #[tokio::test]

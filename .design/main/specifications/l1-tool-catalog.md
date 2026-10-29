@@ -1,6 +1,6 @@
 # Tool Catalog
 
-**Version:** 1.8.0
+**Version:** 1.9.0
 **Status:** Stable
 **Layer:** concept
 
@@ -67,7 +67,7 @@ Agents call tools without seeing the implementation; a tool's contract has to be
 | `godot_get_node_properties` | editor | no | `{type, value}` per editor-visible property |
 | `godot_set_node_properties` | editor | scene (undoable) | All-or-nothing, read-back |
 | `godot_capture_viewport` | editor (windowed) | editor state | PNG of the 2D/3D viewport with dimensions |
-| `godot_create_script` | host | disk | `.gd` from a fixed template; no overwrite by default |
+| `godot_create_script` | host | disk | `.gd` from the caller's `content`, validated after writing, or from a fixed template; no overwrite by default [MODIFIED] |
 | `godot_validate_script` | host | no | Headless syntax check |
 | `godot_resave_resources` | editor | editor file system | Re-import / refresh after external edits |
 | `godot_check_voxel_model` | host (the import goes through the editor when it has the project open) | disk, editor file system, a helper process | Exports 1 to 16 `.vox` models through an external exporter into `.glb` files inside the project, imports them and checks the result; the exporter is a trusted program [ADDED] |
@@ -114,7 +114,7 @@ graph TD
 ## 7. Drawbacks & Alternatives
 
 - **Headless `--headless` for the fallback game run**: rejected — a visible game window is what a caller of "run project" expects.
-- **Free-form script content in `godot_create_script`**: rejected for now; the fixed template keeps generated code free of caller text. Reading and editing existing scripts is covered by `godot_read_script` and `godot_edit_script` (CA-7 to CA-10 in [l1-content-authoring.md](l1-content-authoring.md)).
+- **Free-form script content in `godot_create_script`**: [MODIFIED] accepted as the optional `content` parameter. It was rejected to keep generated code free of caller text, but `content` is not interpolated into generated code: it is the whole file, written as given, the way `godot_edit_script` already writes caller text. Callers passed it anyway and, before unknown keys were refused, got the template back with a success answer. `content` replaces the template, so it cannot be combined with `extends_class` or `class_name`; it is limited to 1 MiB like the other script tools; after writing, the script goes through the `godot_validate_script` check, and a failing check is an error answer while the file stays written for `godot_edit_script`. An engine that cannot run leaves the script unchecked, which the answer says.
 
 ## Canonical References
 
@@ -139,3 +139,4 @@ graph TD
 | 1.6.0 | 2026-10-21 | Agent (magic.spec) | [MODIFIED] TL-5: node names are data and any name Godot accepts is accepted; the identifier pattern stays for class identifiers. Resolves the open question of 1.5.0. `AGENTS.md` ("Identifier Sanitization") must follow. Stable → RFC → Stable after Post-Update Review. |
 | 1.7.0 | 2026-10-26 | Agent (magic.spec) | [ADDED] `godot_create_project`, `godot_game_scenario` and `godot_check_voxel_model` in the catalog; [MODIFIED] the input row (Input Map actions) and TL-6 (a helper program the server waits for). Stable → RFC → Stable after Post-Update Review. |
 | 1.8.0 | 2026-10-29 | Agent (magic.spec) | [ADDED] `godot_game_state` and `godot_game_command` in the catalog and the link to the project adapter concept. Stable → RFC → Stable after Post-Update Review. |
+| 1.9.0 | 2026-10-29 | Agent (magic.spec) | [MODIFIED] `godot_create_script` takes optional `content`, validated after writing; the drawback that rejected free-form content is reversed with the reason. Stable → RFC → Stable after Post-Update Review. |

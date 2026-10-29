@@ -68,6 +68,19 @@ fn schema_of(name: &str) -> serde_json::Value {
         .input_schema
 }
 
+/// Every tool refuses a key its schema does not declare, and says so in the schema.
+#[test]
+fn every_schema_is_closed_to_undeclared_keys() {
+    for tool in ToolManager::list_tools() {
+        assert_eq!(
+            tool.input_schema.get("additionalProperties"),
+            Some(&serde_json::json!(false)),
+            "{} accepts undeclared keys",
+            tool.name
+        );
+    }
+}
+
 /// TL-1: ranges the tool documents are in its schema, and object parameters describe their fields.
 #[test]
 fn schemas_carry_the_documented_ranges_and_describe_object_fields() {

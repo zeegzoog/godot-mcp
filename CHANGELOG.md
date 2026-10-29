@@ -8,9 +8,28 @@ Each Godot version has its own release line and branch (`godot-v4.5`, `godot-v4.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-29
+
+The AI can read and act in a game through the project's own adapter, delete files and create scripts and node metadata through the editor, and step into a node's resources with `:`. Tools now refuse arguments they do not declare, and several calls that used to look like success say what happened.
+
 ### Added
 
 - `godot_game_state` and `godot_game_command` read and act in a game's own terms. The project names one adapter script in the project setting `godot_mcp/adapter`; its `register(registry)` adds named states and commands, with the registration calls of godot-dev-bridge, so an adapter written for it works unchanged. `godot_game_state` reads states by name (or all of them) and lists the commands; `godot_game_command` runs one with a dictionary of arguments. A state that fails is its own entry, a command that refuses its arguments, an unknown name, a script error inside the project's code and an answer over 262144 bytes are told apart, and `godot_get_run_status` shows each run's adapter, what it registered and why anything was refused. Both work in a managed run, in editor Play and in a held game. A command does what the project wrote and is not limited by the refusals of `godot_game_call`; a command must not `await`.
+- `godot_delete_file` deletes up to 64 `res://` paths together with their `.uid`, `.import` and imported data. It searches the project for each file's path and `uid://` first and refuses a file that is still referenced unless `force` is set; `project.godot`, `.godot/`, the addon and directories are refused, nothing is deleted while any path is refused, and `dry_run` only reports. Thanks to @theromis.
+- Every tool declares `readOnlyHint`, `destructiveHint`, `idempotentHint` and `openWorldHint` in `tools/list`, so a host can tell a scene-tree read from a deletion. Only `godot_submit_feedback` is open-world.
+- `godot_create_script` takes `content`, the whole script written as given (up to 1 MiB). The script is checked after it is written: one that does not validate is an error that quotes the problem, and the file stays so it can be fixed with `godot_edit_script`. `content` cannot be combined with `extends_class` or `class_name`. Thanks to @theromis.
+- `godot_set_node_properties` creates a missing `metadata/<name>` entry the way the inspector's Add Metadata does, in the same undo action. The name must be an identifier and the value not `null`; a whole number becomes an `int`. Thanks to @theromis.
+- `godot_get_node_properties` takes `properties`, a list of names to read, and `godot_set_node_properties` steps through a node's own resources with `:` (`material_override:shader_parameter/glow_amount`), the way `godot_game_set` does. The change joins the same undo action. A resource saved outside the edited scene (a `.tres` file or another scene's sub-resource) is refused with the file named. Thanks to @theromis.
+- `godot_game_set` accepts `Basis(Vector3, Vector3, Vector3)`, `Transform3D(Vector3 x 4)` and `Transform2D(Vector2 x 3)`, the forms GDScript constructs. Thanks to @theromis.
+
+### Changed
+
+- Tools refuse a key their schema does not declare, naming the accepted ones, instead of dropping it and reporting success; every schema in `tools/list` says `additionalProperties: false`. A key set to `null` still counts as absent. Thanks to @theromis.
+- `godot_run_script` reports `resource_damage` when the script rewrote a `.tscn` or `.tres`: headless Godot has no editor file system, so its saver drops every `uid://` (the file's own and each `[ext_resource]`'s), and with no renderer it writes `shader_parameter/<name> = null` for every uniform the script never set. The answer names each file, the uids its references should carry and the null parameters, and the tool description warns about it. The cause is in the engine; the server only finds it. Thanks to @theromis.
+
+### Fixed
+
+- `godot_game_set` checks every value before it writes any: a refused value no longer leaves the node half changed (a text written to a `Basis` used to leave the identity basis behind a refusal), and a write the engine does not keep puts back the properties the call already changed. Thanks to @theromis.
 
 ## [0.9.0] - 2026-10-28
 
@@ -275,7 +294,7 @@ part of every release), and note the behaviour changes below.
   property operations, viewport capture), headless CLI fallback for version, script validation
   and launching the editor.
 
-[Unreleased]: https://github.com/zeegzoog/godot-mcp/compare/v0.9.0...master
+[Unreleased]: https://github.com/zeegzoog/godot-mcp/compare/v0.10.0...master
 [0.4.0]: https://github.com/zeegzoog/godot-mcp/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/zeegzoog/godot-mcp/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/zeegzoog/godot-mcp/compare/v0.1.0...v0.2.0

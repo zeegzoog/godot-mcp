@@ -12,6 +12,10 @@ Each Godot version has its own release line and branch (`godot-v4.5`, `godot-v4.
 
 - `godot_game_state` and `godot_game_command` read and act in a game's own terms. The project names one adapter script in the project setting `godot_mcp/adapter`; its `register(registry)` adds named states and commands, with the registration calls of godot-dev-bridge, so an adapter written for it works unchanged. `godot_game_state` reads states by name (or all of them) and lists the commands; `godot_game_command` runs one with a dictionary of arguments. A state that fails is its own entry, a command that refuses its arguments, an unknown name, a script error inside the project's code and an answer over 262144 bytes are told apart, and `godot_get_run_status` shows each run's adapter, what it registered and why anything was refused. Both work in a managed run, in editor Play and in a held game. A command does what the project wrote and is not limited by the refusals of `godot_game_call`; a command must not `await`.
 
+### Fixed
+
+- `godot_run_script` no longer reports success for a script Godot did not run. Godot 4.8 exits with code 0 when the script does not extend `SceneTree` or `MainLoop`, does not parse or cannot be opened; the answer is now an error with Godot's message in `load_error` and in `script_errors`, and the summary says the script did not run. A script whose `extends` (followed through base scripts and the project's `class_name`s) is not `SceneTree` or `MainLoop` is refused before Godot starts. Thanks to @theromis.
+
 ## [0.9.0] - 2026-10-28
 
 The AI can now create a project, play a repeatable input scenario in a held game, check a voxel model, list and edit InputMap actions, and be told what an overwritten script tab, a saved scene and a loaded scene did to the editor. Several running-game calls stop failing quietly.

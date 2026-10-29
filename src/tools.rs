@@ -22,6 +22,7 @@ mod files;
 mod game;
 mod headless;
 mod input_map;
+mod main_loop;
 mod model_chain;
 mod project;
 mod run;
@@ -970,7 +971,7 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
         ),
         tool(
             "godot_run_script",
-            "Runs a GDScript that extends SceneTree with the configured Godot binary: godot --headless --path <project> -s <script> [-- user_args]. Captures stdout and stderr (they never touch this server's stdout). script_errors lists each SCRIPT ERROR with its file and line. Returns the exit code. timeout_seconds defaults to 120 and cannot exceed 600. On timeout the process tree is killed and the answer says so, with the last output lines. A SCRIPT ERROR that leaves the main loop idle (the process stays up, as a script error in _init does) stops the run as soon as that idle is seen, and the answer says so, instead of waiting out the timeout. Paths outside the project are refused.",
+            "Runs a GDScript that extends SceneTree with the configured Godot binary: godot --headless --path <project> -s <script> [-- user_args]. Captures stdout and stderr (they never touch this server's stdout). script_errors lists each SCRIPT ERROR with its file and line. Returns the exit code. timeout_seconds defaults to 120 and cannot exceed 600. On timeout the process tree is killed and the answer says so, with the last output lines. A SCRIPT ERROR that leaves the main loop idle (the process stays up, as a script error in _init does) stops the run as soon as that idle is seen, and the answer says so, instead of waiting out the timeout. A script that does not extend SceneTree or MainLoop (directly, through a base script, or through a class_name in the global class cache) is refused before Godot starts. When Godot could not load the script anyway (a parse error, a wrong base, a file it could not open; Godot 4.8 exits with code 0 then), the call is an error, load_error holds Godot's message, script_errors lists it and the summary says the script did not run. Paths outside the project are refused.",
             json!({
                 "script": {
                     "type": "string",

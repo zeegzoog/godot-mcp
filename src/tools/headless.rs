@@ -136,23 +136,46 @@ fn last_output_lines(stdout: &str, stderr: &str, count: usize) -> String {
     }
 }
 
+/// The outcome of godot_validate_script's check.
+pub(super) enum ScriptCheck {
+    /// The script was checked (or refused before a check); an error result means it failed.
+    Checked(ToolResult),
+    /// The engine could not be run, so nothing is known about the script.
+    NoEngine(ToolResult),
+}
+
+impl From<ToolResult> for ScriptCheck {
+    fn from(result: ToolResult) -> Self {
+        Self::Checked(result)
+    }
+}
+
 impl ToolManager {
     pub(super) async fn handle_validate_script(&self, args: Value) -> ToolResult {
-        let Some(script_path) = str_arg(&args, "script_path") else {
-            return missing_argument("script_path");
+        match self.check_script(&args).await {
+            ScriptCheck::Checked(result) | ScriptCheck::NoEngine(result) => result,
+        }
+    }
+
+    /// godot_validate_script's check, telling a script that fails apart from an engine that
+    /// could not be run to check it.
+    pub(super) async fn check_script(&self, args: &Value) -> ScriptCheck {
+        let Some(script_path) = str_arg(args, "script_path") else {
+            return missing_argument("script_path").into();
         };
         if !script_path.ends_with(".gd") {
             return ToolResult::error(
                 format!("Only .gd scripts can be validated: {script_path}"),
                 &["Use a path such as res://scripts/player.gd"],
-            );
+            )
+            .into();
         }
 
         let (project_dir, from_editor) =
-            if str_arg(&args, "project_path").is_some() || script_path.starts_with("res://") {
-                match self.resolve_project(&args).await {
+            if str_arg(args, "project_path").is_some() || script_path.starts_with("res://") {
+                match self.resolve_project(args).await {
                     Ok(project) => (Some(project.dir), project.from_editor),
-                    Err(result) => return result,
+                    Err(result) => return result.into(),
                 }
             } else {
                 (None, false)
@@ -165,7 +188,8 @@ impl ToolManager {
                     return ToolResult::error(
                         problem,
                         &["Use a res:// path or a path inside the project directory"],
-                    );
+                    )
+                    .into();
                 }
             },
             None => PathBuf::from(script_path),
@@ -178,7 +202,8 @@ impl ToolManager {
             return ToolResult::error(
                 format!("Script file not found: {shown}"),
                 &["Check the path; res:// paths are resolved against the project directory"],
-            );
+            )
+            .into();
         }
 
         // Set when a language server was reached but did not answer; the headless check runs instead.
@@ -195,7 +220,7 @@ impl ToolManager {
                     if code::addon_warnings_hidden(dir, &file) {
                         report.text = format!("{}\n{}", report.text, code::ADDON_WARNINGS_HIDDEN);
                     }
-                    return if report.failed {
+                    return ScriptCheck::Checked(if report.failed {
                         ToolResult::error(
                             report.text,
                             &[
@@ -205,7 +230,7 @@ impl ToolManager {
                         )
                     } else {
                         ToolResult::text(report.text)
-                    };
+                    });
                 }
                 Ok(None) => {}
                 Err(error) => lsp_problem = Some(error),
@@ -217,27 +242,27 @@ impl ToolManager {
             .validate_script(project_dir.as_deref(), Path::new(script_path))
             .await
         {
-            Ok(msg) => match lsp_problem {
+            Ok(msg) => ScriptCheck::Checked(match lsp_problem {
                 Some(error) => ToolResult::text(format!(
                     "No parse errors (headless check). Analyzer warnings were not checked: the language server was reached but did not answer ({error}); retry, or use godot_code_diagnostics."
                 )),
                 None => ToolResult::text(msg),
-            },
+            }),
             // The engine could not be run at all: that is a path problem, not a script problem.
-            Err(e @ McpError::Process(_)) => ToolResult::error(
+            Err(e @ McpError::Process(_)) => ScriptCheck::NoEngine(ToolResult::error(
                 format!("Script validation failed: {e}"),
                 &[
                     "Verify GODOT_PATH points to a working Godot executable",
                     "Run the executable with --version to see whether it starts",
                 ],
-            ),
-            Err(e) => ToolResult::error(
+            )),
+            Err(e) => ScriptCheck::Checked(ToolResult::error(
                 format!("Script validation failed: {e}"),
                 &[
                     "Check GDScript syntax line numbers",
                     "Ensure base class and node types exist in the engine",
                 ],
-            ),
+            )),
         }
     }
 

@@ -171,6 +171,8 @@ To report a vulnerability, follow [SECURITY.md](SECURITY.md). Never open a publi
 | `godot_game_signals` | Running game | A live node's signals and their connections. |
 | `godot_game_observe` | Running game | Watches signals for a few frames, returns the ones that fired, then disconnects. |
 | `godot_game_snapshot` | Running game | Scene path, monotonic `scene_generation`, `scene_instance_id`, frame, pause flag, children, and the loaded root script path plus its SHA-256. |
+| `godot_game_state` | Running game | Reads the states the project's own adapter script registered for its game (the run, the level, the balls...), by name; with no names it reads all of them and lists the adapter's commands with their help. See [The project adapter](#the-project-adapter). |
+| `godot_game_command` | Running game | Runs one command the project's adapter registered, by name, with a dictionary of arguments. The command does what the project wrote, files included. See [The project adapter](#the-project-adapter). |
 | `godot_game_input` | Running game | Injects key, text, mouse, touch and gamepad input, and waits, as a sequence of steps. Pointer coordinates are in `coordinate_space`: `viewport` (default) is pixels of the root viewport's visible rectangle (what `_input` sees after content scale), `window` is pixels of the game window; neither is a screen or world pixel. The answer names the space and the mapping between the two, and `click_node` returns the point it clicked. A touch step also emits the engine's emulated mouse event first (`device` `DEVICE_ID_EMULATION`, same position) when `emulate_mouse_from_touch` is on; `emulate_mouse: false` turns that off for the call and restores it afterwards. Gestures: `click`, `swipe`, `path` (press, drag through points, release; at most 600 frames), `circle` (that drag around a center) and `click_node` (the center of a Control, Node2D or Node3D). More than 20 steps return `ok_count` and `failed` unless `verbose` is true. `time_scale` sets `Engine.time_scale`. A step that fails releases everything the server still holds. Mouse steps are Godot events and leave the OS cursor in place unless `warp_mouse` is true. |
 | `godot_game_input_release` | Running game | Releases every key, button, axis and touch this server still holds down. |
 | `godot_game_wait` | Running game | Waits for process frames, for a node to exist (`node`), for a signal (`node` and `signal`), for a public property (`property`, `op`, `value`), or for a newer `scene_generation`. A missing `/` segment is an error that names it, not a timeout; `null` means the value is null. `timeout` is in frames. `time_scale` (0 to 8) sets `Engine.time_scale`; the runtime restores the previous value when the game exits. |
@@ -302,6 +304,35 @@ The end-to-end test needs a Froxel build and the Godot build named in `.github/g
 FROXEL_BIN=/path/to/froxel GODOT_PATH=/path/to/godot \
   cargo test --test model_chain_e2e_test -- --ignored --test-threads=1
 ```
+
+## The project adapter
+
+A game has its own vocabulary: the run, the level, the balls still in play. `godot_game_state` and `godot_game_command` let an agent read and act in those terms instead of walking the node tree. The project teaches them through one script it owns, the adapter, named in the project setting `godot_mcp/adapter` (a `res://` path or the `uid://` the file chooser stores). The setting is read once, when the game starts; set it with `godot_set_project_setting` or in Project Settings, then start the game again. The adapter is development code: nothing in the addon names it, and the caller can only ask for what it registered.
+
+```gdscript
+extends RefCounted
+
+var _registry
+
+func register(registry) -> void:
+    _registry = registry
+    registry.add_state("level", _level)
+    registry.add_command("grant", _grant, "Grants an effect: {name}.")
+
+func _level() -> Dictionary:
+    return {"index": 3}
+
+func _grant(args: Dictionary) -> Dictionary:
+    if not args.has("name"):
+        return _registry.refuse("name is required")
+    return {"granted": args["name"]}
+```
+
+- A state provider takes no arguments and returns any value. A command takes one dictionary (the call's arguments, numbers as floats) and returns any value. A command refuses its arguments with `refuse(message)` on the registry it was given in `register`; the caller gets the message as bad arguments. A returned dictionary with an `error` entry is just a result.
+- Reading is `godot_game_state` with `names` (all states when omitted); each state that fails is its own `{error}` entry, and the errors and warnings the engine logged meanwhile come back in `errors`. An answer larger than 262144 bytes is refused with the size of each state.
+- A command is `godot_game_command` with `name` and `args`. It is not limited by the refusals of `godot_game_call`: it may free nodes, change the scene or write files, whatever the project wrote. A script error inside it fails the call and may leave the game changed. A command and a state must not `await`; what a command defers (`call_deferred`, a timer) takes effect when the game next advances, so step a held game before reading the result.
+- Both tools work in a managed run, in editor Play and in a held game. `godot_get_run_status` shows each run's adapter: whether it loaded, what it registered and why a registration or the whole adapter was refused.
+- An adapter written for godot-dev-bridge works unchanged: set `godot_mcp/adapter` to the same script. Values with engine types (vectors, colors) come back as `godot_game_get` shows them.
 
 ## Playing a scenario
 

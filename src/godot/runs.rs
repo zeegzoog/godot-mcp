@@ -59,6 +59,14 @@ const RUNTIME_FILES: &[(&str, &str)] = &[
         "addons/godot_mcp/runtime/ops/rt_record.gd",
         include_str!("../../addons/godot_mcp/runtime/ops/rt_record.gd"),
     ),
+    (
+        "addons/godot_mcp/runtime/ops/rt_registry.gd",
+        include_str!("../../addons/godot_mcp/runtime/ops/rt_registry.gd"),
+    ),
+    (
+        "addons/godot_mcp/runtime/ops/rt_project.gd",
+        include_str!("../../addons/godot_mcp/runtime/ops/rt_project.gd"),
+    ),
 ];
 
 /// Where the game loads the runtime from.
@@ -387,6 +395,10 @@ impl Run {
             "running": self.is_alive(),
             "held": self.is_held(),
             "debugger_connected": self.session.is_connected(),
+            "adapter": lock(&self.hello)
+                .as_ref()
+                .and_then(|hello| hello.get("adapter"))
+                .cloned(),
             "exit_code": lock(&self.exit_code).clone(),
             "ended_by": lock(&self.ended).map(|(who, _)| who),
             "ended_at": lock(&self.ended).map(|(_, at)| at),

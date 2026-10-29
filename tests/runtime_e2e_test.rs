@@ -5,6 +5,8 @@
 //! GODOT_PATH=/path/to/godot cargo test --test runtime_e2e_test -- --ignored --test-threads=1 --nocapture
 //! ```
 
+mod common;
+
 use godot_mcp::bridge::BridgeClient;
 use godot_mcp::cli_runner::CliRunner;
 use godot_mcp::protocol::ToolResult;
@@ -4501,4 +4503,1013 @@ async fn addon_scripts_have_no_analyzer_warnings() {
         "analyzer diagnostics in the addon:\n{}",
         found.join("\n")
     );
+}
+
+/// A game whose scene root keeps handlers of the kind a project hands to the runtime (each takes
+/// one dictionary) and records what the engine's logger is told while they run.
+fn handler_probe_project() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("project");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("scenes")).unwrap();
+    std::fs::create_dir_all(root.join("scripts")).unwrap();
+    std::fs::write(
+        root.join("project.godot"),
+        "config_version=5
+
+[application]
+
+config/name=\"HandlerProbe\"
+run/main_scene=\"res://scenes/handlers.tscn\"
+config/features=PackedStringArray(\"4.5\")
+",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("scripts/handlers.gd"),
+        r#"extends Node
+
+class ProbeLogger extends Logger:
+    var seen: Array = []
+
+    func _log_message(_message: String, _error: bool) -> void:
+        pass
+
+    func _log_error(function: String, _file: String, _line: int, code: String, rationale: String, _editor_notify: bool, error_type: int, _script_backtraces: Array[ScriptBacktrace]) -> void:
+        seen.append({
+            "is_script": error_type == Logger.ERROR_TYPE_SCRIPT,
+            "is_error": error_type == Logger.ERROR_TYPE_ERROR,
+            "is_warning": error_type == Logger.ERROR_TYPE_WARNING,
+            "on_main_thread": OS.get_thread_caller_id() == OS.get_main_thread_id(),
+            "function": function,
+            "code": code,
+            "rationale": rationale,
+        })
+
+var probe: ProbeLogger
+var progress := ""
+var outcome: Variant = null
+var logged_at_return := -1
+
+func _ready() -> void:
+    probe = ProbeLogger.new()
+    OS.add_logger(probe)
+
+func _fails_in_script(_args: Dictionary) -> Variant:
+    var missing: Variant = {}.get("none")
+    return missing.name
+
+func _pushes_an_error(_args: Dictionary) -> Variant:
+    push_error("handler-pushed")
+    return "after-push"
+
+func _awaits_first(_args: Dictionary) -> Variant:
+    await get_tree().process_frame
+    return "after-await"
+
+func entries() -> Array:
+    var copy := probe.seen.duplicate(true)
+    probe.seen.clear()
+    return copy
+
+func plain_script_error() -> Array:
+    var handler := Callable(self, "_fails_in_script")
+    var returned: Variant = handler.call({})
+    logged_at_return = probe.seen.size()
+    outcome = "null" if returned == null else str(returned)
+    return [outcome]
+
+func plain_push_error() -> Array:
+    var handler := Callable(self, "_pushes_an_error")
+    var returned: Variant = handler.call({})
+    logged_at_return = probe.seen.size()
+    outcome = str(returned)
+    return [outcome]
+
+func plain_awaiting() -> Array:
+    progress = "before"
+    var handler := Callable(self, "_awaits_first")
+    var returned: Variant = handler.call({})
+    progress = "after-plain-call"
+    outcome = (returned as Object).get_class() if returned is Object else str(returned)
+    return [outcome]
+
+func awaited_awaiting() -> void:
+    progress = "before"
+    var handler := Callable(self, "_awaits_first")
+    var returned: Variant = await handler.call({})
+    progress = "after-awaited-call"
+    outcome = str(returned)
+
+func awaited_plain() -> void:
+    progress = "before"
+    var handler := Callable(self, "_pushes_an_error")
+    var returned: Variant = await handler.call({})
+    progress = "after-awaited-call"
+    outcome = str(returned)
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("scenes/handlers.tscn"),
+        "[gd_scene load_steps=2 format=3]
+
+[ext_resource type=\"Script\" path=\"res://scripts/handlers.gd\" id=\"1\"]
+
+[node name=\"Handlers\" type=\"Node\"]
+script = ExtResource(\"1\")
+",
+    )
+    .unwrap();
+    dir
+}
+
+/// Calls one probe method on the scene root and returns its reply, then what the probe's logger
+/// recorded during the call, and the probe's `progress` and `outcome` after it.
+async fn probe_handler(
+    tools: &Arc<ToolManager>,
+    run_id: &str,
+    method: &str,
+) -> (ToolResult, Vec<Value>, Value) {
+    let reply = call(
+        tools,
+        "godot_game_call",
+        json!({"run_id": run_id, "path": ".", "method": method, "permit": [method]}),
+    )
+    .await;
+    let entries = game_method(tools, run_id, "entries").await;
+    let state = call(
+        tools,
+        "godot_game_get",
+        json!({"run_id": run_id, "path": ".", "properties": ["progress", "outcome", "logged_at_return"]}),
+    )
+    .await;
+    assert!(!state.is_error, "{}", text_of(&state));
+    (
+        reply,
+        entries.as_array().cloned().unwrap_or_default(),
+        json_of(&state)["properties"].clone(),
+    )
+}
+
+/// A handler the runtime calls can fail in its own script, and nothing can catch that: the
+/// engine's logger is the only witness. These are the facts that reading the logger depends on,
+/// measured on a real engine: the entry exists when `Callable.call` returns, on the main thread,
+/// with the script error type (a pushed error has another); a handler that awaits makes the
+/// engine log a script error against the function that called it and end that function, and
+/// only that one.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn logger_sees_a_script_error_of_a_called_handler_at_once() {
+    let _ = IGNORE;
+    let project = handler_probe_project();
+    let tools = manager(project.path());
+    let started = call(
+        &tools,
+        "godot_run_project",
+        json!({
+            "project_path": project.path(),
+            "scene": "res://scenes/handlers.tscn",
+            "mode": "process",
+            "headless": true
+        }),
+    )
+    .await;
+    assert!(!started.is_error, "{}", text_of(&started));
+    let run_id = run_id_of(&started);
+
+    let (reply, entries, state) = probe_handler(&tools, &run_id, "plain_script_error").await;
+    assert!(!reply.is_error, "{}", text_of(&reply));
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(
+        state["logged_at_return"], 1,
+        "the entry was in the logger when the call returned: {state}"
+    );
+    assert_eq!(entries[0]["is_script"], true, "{entries:?}");
+    assert_eq!(entries[0]["on_main_thread"], true, "{entries:?}");
+    assert_eq!(entries[0]["function"], "_fails_in_script", "{entries:?}");
+    // The text is in the entry's code, with no rationale, and the runtime's line shows it.
+    assert!(
+        entries[0]["code"]
+            .as_str()
+            .is_some_and(|text| text.contains("Invalid access to property or key 'name'")),
+        "{entries:?}"
+    );
+    assert_eq!(
+        state["outcome"], "null",
+        "a handler that fails in its script returns null and the caller goes on: {state}"
+    );
+
+    let (reply, entries, state) = probe_handler(&tools, &run_id, "plain_push_error").await;
+    assert!(!reply.is_error, "{}", text_of(&reply));
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(state["logged_at_return"], 1, "{state}");
+    assert_eq!(entries[0]["is_script"], false, "{entries:?}");
+    assert_eq!(entries[0]["is_error"], true, "{entries:?}");
+    assert_eq!(state["outcome"], "after-push", "{state}");
+
+    // A handler that awaits, called without `await`: the engine logs a script error against the
+    // caller and ends the caller (`progress` never moves), and the runtime's own dispatch above
+    // it goes on and answers.
+    let (reply, entries, state) = probe_handler(&tools, &run_id, "plain_awaiting").await;
+    assert!(
+        !reply.is_error,
+        "the dispatch must survive: {}",
+        text_of(&reply)
+    );
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0]["is_script"], true, "{entries:?}");
+    assert_eq!(entries[0]["function"], "plain_awaiting", "{entries:?}");
+    assert!(
+        entries[0]["code"]
+            .as_str()
+            .is_some_and(|text| text.contains("async function without")),
+        "{entries:?}"
+    );
+    assert_eq!(state["progress"], "before", "the caller was ended: {state}");
+
+    // Called with `await` from a coroutine, the same handler is fine, and so is one that does
+    // not await.
+    let (reply, entries, state) = probe_handler(&tools, &run_id, "awaited_awaiting").await;
+    assert!(!reply.is_error, "{}", text_of(&reply));
+    assert!(entries.is_empty(), "{entries:?}");
+    assert_eq!(state["progress"], "after-awaited-call", "{state}");
+    assert_eq!(state["outcome"], "after-await", "{state}");
+    let (reply, entries, state) = probe_handler(&tools, &run_id, "awaited_plain").await;
+    assert!(!reply.is_error, "{}", text_of(&reply));
+    assert_eq!(entries.len(), 1, "only the handler's own push: {entries:?}");
+    assert_eq!(entries[0]["is_script"], false, "{entries:?}");
+    assert_eq!(state["outcome"], "after-push", "{state}");
+
+    // The logger the runtime installs holds the same errors, with the stack that led to them.
+    let output = call(
+        &tools,
+        "godot_run_output",
+        json!({"run_id": run_id, "level": "error"}),
+    )
+    .await;
+    assert!(!output.is_error, "{}", text_of(&output));
+    let lines = json_of(&output)["lines"].clone();
+    let lines = lines.as_array().expect("lines");
+    let script_error = lines
+        .iter()
+        .find(|line| {
+            line["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Invalid access to property or key 'name'"))
+        })
+        .unwrap_or_else(|| panic!("the runtime's logger missed the script error: {lines:?}"));
+    assert!(
+        script_error["stack"]
+            .as_array()
+            .is_some_and(|stack| stack.iter().any(|frame| frame
+                .as_str()
+                .is_some_and(|frame| frame.contains("_fails_in_script")))),
+        "{script_error}"
+    );
+    assert!(
+        lines.iter().any(|line| line["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("async function without"))),
+        "{lines:?}"
+    );
+
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+}
+
+/// A game that loads the registry and the output marks from the runtime's own copy and reports
+/// what they do, so both are proved on a real engine before anything loads an adapter itself.
+fn registry_probe_project() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("project");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("scenes")).unwrap();
+    std::fs::write(
+        root.join("project.godot"),
+        "config_version=5\n\n[application]\n\nconfig/name=\"RegistryProbe\"\nrun/main_scene=\"res://scenes/registry.tscn\"\nconfig/features=PackedStringArray(\"4.5\")\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("adapter.gd"), common::adapter::FIXTURE_ADAPTER).unwrap();
+    std::fs::write(
+        root.join("registry_probe.gd"),
+        r#"extends Node
+
+var registry
+var adapter
+var runtime_dir := ""
+
+func _ready() -> void:
+    runtime_dir = (get_node("/root/GodotMcpRuntime").get_script() as Script).resource_path.get_base_dir()
+    registry = load(runtime_dir + "/ops/rt_registry.gd").new()
+    adapter = load("res://adapter.gd").new()
+    adapter.register(registry)
+
+func registry_report() -> Dictionary:
+    return {
+        "states": registry.state_names(),
+        "commands": registry.command_help(),
+        "refused": registry.refused(),
+        "balls": registry.call_provider("balls"),
+        "level": registry.call_provider("level"),
+        "missing": registry.call_provider("no_such_state"),
+        "grant": registry.call_command("grant", {"name": "machine_gun"}),
+        "refusal": registry.call_command("grant", {}),
+        "error_entry": registry.call_command("clear", {}),
+        "unknown": registry.call_command("nothing", {}),
+        "has_grant": registry.has_command("grant"),
+        "has_nothing": registry.has_command("nothing"),
+    }
+
+func _fail() -> void:
+    var nothing: Variant = {}.get("x")
+    nothing.name
+
+func mark_report() -> Dictionary:
+    var output = load(runtime_dir + "/ops/rt_output.gd")
+    var start: int = output.call("mark")
+    print("mark-print")
+    push_warning("mark-warning")
+    push_error("mark-error")
+    _fail()
+    var entries: Array = output.call("lines_since", start)
+    var later: int = output.call("mark")
+    return {"entries": entries, "later_is_after": later > start, "after_later": output.call("lines_since", later).size()}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("scenes/registry.tscn"),
+        "[gd_scene load_steps=2 format=3]\n\n[ext_resource type=\"Script\" path=\"res://registry_probe.gd\" id=\"1\"]\n\n[node name=\"RegistryProbe\" type=\"Node\"]\nscript = ExtResource(\"1\")\n",
+    )
+    .unwrap();
+    dir
+}
+
+async fn start_registry_probe() -> (tempfile::TempDir, Arc<ToolManager>, String) {
+    let project = registry_probe_project();
+    let tools = manager(project.path());
+    let started = call(
+        &tools,
+        "godot_run_project",
+        json!({
+            "project_path": project.path(),
+            "scene": "res://scenes/registry.tscn",
+            "mode": "process",
+            "headless": true
+        }),
+    )
+    .await;
+    assert!(!started.is_error, "{}", text_of(&started));
+    let run_id = run_id_of(&started);
+    (project, tools, run_id)
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn registry_keeps_what_an_adapter_registers_and_lists_what_it_refused() {
+    let _ = IGNORE;
+    let (_project, tools, run_id) = start_registry_probe().await;
+
+    let report = game_method(&tools, &run_id, "registry_report").await;
+    assert_eq!(report["states"], json!(common::adapter::STATES), "{report}");
+    let help = report["commands"].as_object().expect("commands");
+    let names: Vec<&str> = help.keys().map(String::as_str).collect();
+    assert_eq!(names, common::adapter::COMMANDS, "{report}");
+    assert_eq!(help["grant"], "Grants {name}.", "{report}");
+    assert_eq!(help["clear"], "Clears the level.", "{report}");
+    let refused = report["refused"].as_array().expect("refused");
+    let named: Vec<(&str, &str)> = refused
+        .iter()
+        .map(|entry| {
+            (
+                entry["name"].as_str().unwrap_or("?"),
+                entry["kind"].as_str().unwrap_or("?"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        named,
+        vec![
+            ("takes_argument", "state"),
+            ("", "state"),
+            ("no_argument", "command")
+        ],
+        "{report}"
+    );
+    assert!(
+        refused.iter().all(|entry| entry["reason"]
+            .as_str()
+            .is_some_and(|text| !text.is_empty())),
+        "{report}"
+    );
+    assert_eq!(
+        report["balls"],
+        json!({"value": [1, 2]}),
+        "the later registration wins: {report}"
+    );
+    assert_eq!(report["level"]["value"]["index"], 3, "{report}");
+    assert!(report["missing"]["error"].is_string(), "{report}");
+    assert_eq!(
+        report["grant"],
+        json!({"value": {"granted": "machine_gun"}}),
+        "{report}"
+    );
+    assert_eq!(
+        report["refusal"],
+        json!({"bad_args": "name is required"}),
+        "{report}"
+    );
+    assert_eq!(
+        report["error_entry"]["value"]["error"], "an entry named error is a result, not a refusal",
+        "{report}"
+    );
+    assert!(report["unknown"]["error"].is_string(), "{report}");
+    assert_eq!(report["has_grant"], true, "{report}");
+    assert_eq!(report["has_nothing"], false, "{report}");
+
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn output_marks_return_what_was_logged_since_with_the_script_errors_told_apart() {
+    let _ = IGNORE;
+    let (_project, tools, run_id) = start_registry_probe().await;
+
+    let report = game_method(&tools, &run_id, "mark_report").await;
+    let entries = report["entries"].as_array().expect("entries");
+    let seen: Vec<(&str, &str, bool)> = entries
+        .iter()
+        .map(|entry| {
+            (
+                entry["level"].as_str().unwrap_or("?"),
+                entry["text"].as_str().unwrap_or("?"),
+                entry["script"].as_bool().unwrap_or(false),
+            )
+        })
+        .collect();
+    assert_eq!(seen.len(), 4, "{report}");
+    assert_eq!(seen[0], ("info", "mark-print", false), "{report}");
+    assert_eq!(seen[1], ("warning", "mark-warning", false), "{report}");
+    assert_eq!(seen[2], ("error", "mark-error", false), "{report}");
+    assert_eq!(seen[3].0, "error", "{report}");
+    assert!(
+        seen[3]
+            .1
+            .contains("Invalid access to property or key 'name'"),
+        "{report}"
+    );
+    assert!(seen[3].2, "a script error is told apart: {report}");
+    assert!(
+        entries[3]["stack"]
+            .as_array()
+            .is_some_and(|stack| !stack.is_empty()),
+        "{report}"
+    );
+    assert_eq!(report["later_is_after"], true, "{report}");
+    assert_eq!(report["after_later"], 0, "{report}");
+
+    // The marks are not part of what the output tool shows.
+    let output = call(&tools, "godot_run_output", json!({"run_id": run_id})).await;
+    assert!(!output.is_error, "{}", text_of(&output));
+    assert!(
+        json_of(&output)["lines"]
+            .as_array()
+            .is_some_and(|lines| lines.iter().all(|line| line.get("script").is_none())),
+        "{}",
+        text_of(&output)
+    );
+
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+}
+
+/// A game with a plain scene and, when asked, a project setting that names an adapter and an
+/// adapter script at `res://adapter.gd`.
+fn adapter_game_project(setting: Option<&str>, adapter: Option<&str>) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("project");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("scenes")).unwrap();
+    let mut config = String::from(
+        "config_version=5\n\n[application]\n\nconfig/name=\"AdapterProbe\"\nrun/main_scene=\"res://scenes/game.tscn\"\nconfig/features=PackedStringArray(\"4.5\")\n",
+    );
+    if let Some(setting) = setting {
+        config.push_str(&format!("\n[godot_mcp]\n\nadapter=\"{setting}\"\n"));
+    }
+    std::fs::write(root.join("project.godot"), config).unwrap();
+    if let Some(adapter) = adapter {
+        std::fs::write(root.join("adapter.gd"), adapter).unwrap();
+    }
+    std::fs::write(
+        root.join("game.gd"),
+        "extends Node\n\nfunc ping() -> bool:\n    return true\n\nfunc finish() -> void:\n    get_tree().quit()\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("scenes/game.tscn"),
+        "[gd_scene load_steps=2 format=3]\n\n[ext_resource type=\"Script\" path=\"res://game.gd\" id=\"1\"]\n\n[node name=\"Game\" type=\"Node\"]\nscript = ExtResource(\"1\")\n",
+    )
+    .unwrap();
+    dir
+}
+
+async fn start_adapter_game(project: &Path) -> (Arc<ToolManager>, String) {
+    let tools = manager(project);
+    let started = call(
+        &tools,
+        "godot_run_project",
+        json!({
+            "project_path": project,
+            "scene": "res://scenes/game.tscn",
+            "mode": "process",
+            "headless": true
+        }),
+    )
+    .await;
+    assert!(!started.is_error, "{}", text_of(&started));
+    let run_id = run_id_of(&started);
+    (tools, run_id)
+}
+
+/// The adapter status the game announced, as the run status shows it. A call to the game first
+/// makes sure the announcement has arrived.
+async fn adapter_status(tools: &Arc<ToolManager>, run_id: &str) -> Value {
+    let pong = game_method(tools, run_id, "ping").await;
+    assert_eq!(pong, true);
+    let status = call(tools, "godot_get_run_status", json!({})).await;
+    assert!(!status.is_error, "{}", text_of(&status));
+    let body = json_of(&status);
+    body["process_runs"]
+        .as_array()
+        .and_then(|runs| runs.iter().find(|run| run["run_id"] == run_id))
+        .map(|run| run["adapter"].clone())
+        .unwrap_or_else(|| panic!("no run {run_id} in {body}"))
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn a_game_without_an_adapter_setting_announces_none() {
+    let _ = IGNORE;
+    let project = adapter_game_project(None, Some(common::adapter::FIXTURE_ADAPTER));
+    let (tools, run_id) = start_adapter_game(project.path()).await;
+    let status = adapter_status(&tools, &run_id).await;
+    assert_eq!(status, json!({"configured": false}), "{status}");
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+}
+
+fn assert_fixture_registered(status: &Value) {
+    assert_eq!(status["configured"], true, "{status}");
+    assert_eq!(status["loaded"], true, "{status}");
+    assert!(status.get("error").is_none(), "{status}");
+    assert_eq!(status["states"], json!(common::adapter::STATES), "{status}");
+    let help = status["commands"].as_object().expect("commands");
+    let names: Vec<&str> = help.keys().map(String::as_str).collect();
+    assert_eq!(names, common::adapter::COMMANDS, "{status}");
+    assert_eq!(help["grant"], "Grants {name}.", "{status}");
+    let refused = status["refused"].as_array().expect("refused");
+    assert_eq!(refused.len(), 3, "{status}");
+    assert_eq!(refused[0]["name"], "takes_argument", "{status}");
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn an_adapter_named_by_path_or_by_uid_registers_what_it_offers() {
+    let _ = IGNORE;
+    let project = adapter_game_project(
+        Some("res://adapter.gd"),
+        Some(common::adapter::FIXTURE_ADAPTER),
+    );
+    let (tools, run_id) = start_adapter_game(project.path()).await;
+    let status = adapter_status(&tools, &run_id).await;
+    assert_fixture_registered(&status);
+    assert_eq!(status["path"], "res://adapter.gd", "{status}");
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+
+    // Project Settings stores a uid when the script is picked with the file chooser. An import
+    // makes the engine write the script's uid file and register it.
+    let by_uid = adapter_game_project(None, Some(common::adapter::FIXTURE_ADAPTER));
+    let imported = std::process::Command::new(godot_path())
+        .args(["--headless", "--path"])
+        .arg(by_uid.path())
+        .arg("--import")
+        .output()
+        .expect("import");
+    assert!(imported.status.success(), "{imported:?}");
+    let uid = std::fs::read_to_string(by_uid.path().join("adapter.gd.uid"))
+        .expect("the import writes the script's uid file")
+        .trim()
+        .to_string();
+    assert!(uid.starts_with("uid://"), "{uid}");
+    let config = std::fs::read_to_string(by_uid.path().join("project.godot")).unwrap();
+    std::fs::write(
+        by_uid.path().join("project.godot"),
+        format!("{config}\n[godot_mcp]\n\nadapter=\"{uid}\"\n"),
+    )
+    .unwrap();
+    let (tools, run_id) = start_adapter_game(by_uid.path()).await;
+    let status = adapter_status(&tools, &run_id).await;
+    assert_fixture_registered(&status);
+    assert_eq!(status["path"], uid.as_str(), "{status}");
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn an_adapter_that_cannot_be_used_says_why_and_keeps_what_it_registered() {
+    let _ = IGNORE;
+    let raising = "extends RefCounted\n\nfunc register(registry) -> void:\n    registry.add_state(\"early\", _early)\n    var nothing: Variant = {}.get(\"x\")\n    nothing.name\n    registry.add_state(\"late\", _early)\n\nfunc _early() -> int:\n    return 1\n";
+    let cases: [(&str, Option<&str>, &str); 5] = [
+        (
+            "user://adapter.gd",
+            Some(common::adapter::FIXTURE_ADAPTER),
+            "res://",
+        ),
+        ("res://missing.gd", None, "no script"),
+        (
+            "res://adapter.gd",
+            Some("extends RefCounted\n"),
+            "register(registry)",
+        ),
+        (
+            "res://adapter.gd",
+            Some(
+                "extends RefCounted\n\nfunc register(registry) -> void:\n    var x: int = \"text\"\n",
+            ),
+            "cannot be loaded",
+        ),
+        (
+            "res://adapter.gd",
+            Some(raising),
+            "Invalid access to property or key 'name'",
+        ),
+    ];
+    for (setting, source, expected) in cases {
+        let project = adapter_game_project(Some(setting), source);
+        let (tools, run_id) = start_adapter_game(project.path()).await;
+        let status = adapter_status(&tools, &run_id).await;
+        assert_eq!(status["configured"], true, "{setting}: {status}");
+        assert_eq!(status["loaded"], false, "{setting}: {status}");
+        assert!(
+            status["error"]
+                .as_str()
+                .is_some_and(|text| text.contains(expected)),
+            "{setting}: expected {expected:?} in {status}"
+        );
+        if source == Some(raising) {
+            assert_eq!(
+                status["states"],
+                json!(["early"]),
+                "what was registered before the error stays: {status}"
+            );
+        }
+        let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+        assert!(!stopped.is_error, "{}", text_of(&stopped));
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn an_adapter_that_is_a_node_outside_the_tree_is_freed_when_the_game_ends() {
+    let _ = IGNORE;
+    let adapter = "extends Node\n\nfunc register(registry) -> void:\n    registry.add_state(\"alive\", _alive)\n\nfunc _alive() -> bool:\n    return true\n";
+    let project = adapter_game_project(Some("res://adapter.gd"), Some(adapter));
+    let (tools, run_id) = start_adapter_game(project.path()).await;
+    let status = adapter_status(&tools, &run_id).await;
+    assert_eq!(status["loaded"], true, "{status}");
+    assert_eq!(status["states"], json!(["alive"]), "{status}");
+
+    let reply = call(
+        &tools,
+        "godot_game_call",
+        json!({"run_id": run_id, "path": ".", "method": "finish", "permit": ["finish"]}),
+    )
+    .await;
+    assert!(!reply.is_error, "{}", text_of(&reply));
+    for _ in 0..50 {
+        let status = json_of(&call(&tools, "godot_get_run_status", json!({})).await);
+        if status["process_runs"][0]["running"] == false {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let output = call(&tools, "godot_run_output", json!({"run_id": run_id})).await;
+    assert!(!output.is_error, "{}", text_of(&output));
+    assert!(
+        !text_of(&output).contains("leaked"),
+        "the adapter node was left behind: {}",
+        text_of(&output)
+    );
+}
+
+async fn fixture_game() -> (tempfile::TempDir, Arc<ToolManager>, String) {
+    let project = adapter_game_project(
+        Some("res://adapter.gd"),
+        Some(common::adapter::FIXTURE_ADAPTER),
+    );
+    let (tools, run_id) = start_adapter_game(project.path()).await;
+    let status = adapter_status(&tools, &run_id).await;
+    assert_eq!(status["loaded"], true, "{status}");
+    (project, tools, run_id)
+}
+
+async fn read_states(tools: &Arc<ToolManager>, run_id: &str, names: Value) -> ToolResult {
+    let mut args = json!({"run_id": run_id});
+    if !names.is_null() {
+        args["names"] = names;
+    }
+    call(tools, "godot_game_state", args).await
+}
+
+async fn run_command(
+    tools: &Arc<ToolManager>,
+    run_id: &str,
+    name: &str,
+    args: Value,
+) -> ToolResult {
+    let mut params = json!({"run_id": run_id, "name": name});
+    if !args.is_null() {
+        params["args"] = args;
+    }
+    call(tools, "godot_game_command", params).await
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn states_are_read_by_name_with_each_failure_kept_to_its_own_entry() {
+    let _ = IGNORE;
+    let (_project, tools, run_id) = fixture_game().await;
+
+    // No names reads every provider; one that fails inside its script fails alone.
+    let all = read_states(&tools, &run_id, Value::Null).await;
+    assert!(!all.is_error, "{}", text_of(&all));
+    let all = json_of(&all);
+    let values = &all["values"];
+    assert_eq!(values["level"]["index"], 3, "{all}");
+    assert_eq!(values["balls"], json!([1, 2]), "{all}");
+    assert!(values["nothing"].is_null(), "{all}");
+    assert_eq!(values["position"], json!([1.0, 2.0]), "{all}");
+    assert_eq!(values["deferred"], 0, "{all}");
+    assert!(
+        values["broken"]["error"]
+            .as_str()
+            .is_some_and(|text| text.contains("Invalid access to property or key 'name'")),
+        "{all}"
+    );
+    assert_eq!(
+        values.as_object().map(|map| map.len()),
+        Some(common::adapter::STATES.len()),
+        "{all}"
+    );
+    assert!(
+        all["errors"]
+            .as_array()
+            .is_some_and(|errors| errors.iter().any(|entry| entry["level"] == "error")),
+        "the error the engine logged comes with the answer: {all}"
+    );
+    assert_eq!(all["adapter"]["loaded"], true, "{all}");
+
+    // An empty list is the same as none; an unknown name is its own entry beside the others.
+    let some = json_of(&read_states(&tools, &run_id, json!(["level", "no_such_state"])).await);
+    assert_eq!(some["values"]["level"]["index"], 3, "{some}");
+    assert!(
+        some["values"]["no_such_state"]["error"]
+            .as_str()
+            .is_some_and(|text| text.contains("no_such_state")),
+        "{some}"
+    );
+    let empty = json_of(&read_states(&tools, &run_id, json!([])).await);
+    assert_eq!(empty["values"].as_object().map(|m| m.len()), Some(7));
+
+    // An answer over the bound is refused with the size of each state, never cut.
+    let grown = run_command(&tools, &run_id, "grow", Value::Null).await;
+    assert!(!grown.is_error, "{}", text_of(&grown));
+    let too_big = read_states(&tools, &run_id, json!(["big", "level"])).await;
+    assert!(too_big.is_error, "{}", text_of(&too_big));
+    let message = text_of(&too_big);
+    assert!(
+        message.contains("BAD_PARAMS") && message.contains("\"sizes\"") && message.contains("big"),
+        "{message}"
+    );
+    let still_fine = json_of(&read_states(&tools, &run_id, json!(["level"])).await);
+    assert_eq!(still_fine["values"]["level"]["index"], 3, "{still_fine}");
+
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn commands_run_by_name_and_every_kind_of_failure_is_told_apart() {
+    let _ = IGNORE;
+    let (_project, tools, run_id) = fixture_game().await;
+
+    let granted = run_command(&tools, &run_id, "grant", json!({"name": "machine_gun"})).await;
+    assert!(!granted.is_error, "{}", text_of(&granted));
+    let granted = json_of(&granted);
+    assert_eq!(
+        granted["value"],
+        json!({"granted": "machine_gun"}),
+        "{granted}"
+    );
+    assert_eq!(granted["name"], "grant", "{granted}");
+    assert_eq!(granted["run_id"], run_id.as_str(), "{granted}");
+
+    // Arguments arrive as parsed JSON: a whole number is a float.
+    let typed = json_of(&run_command(&tools, &run_id, "float_arg", json!({"n": 3})).await);
+    assert_eq!(typed["value"]["is_float"], true, "{typed}");
+
+    // A command may do what a method call is refused: here it frees a node.
+    let freed = json_of(&run_command(&tools, &run_id, "free_a_node", Value::Null).await);
+    assert_eq!(freed["value"]["freed"], true, "{freed}");
+
+    // An entry named error is a result, not a failure.
+    let cleared = json_of(&run_command(&tools, &run_id, "clear", Value::Null).await);
+    assert_eq!(
+        cleared["value"]["error"], "an entry named error is a result, not a refusal",
+        "{cleared}"
+    );
+
+    // The command's own refusal of its arguments.
+    let refused = run_command(&tools, &run_id, "grant", json!({})).await;
+    assert!(refused.is_error, "{}", text_of(&refused));
+    assert!(
+        text_of(&refused).contains("BAD_PARAMS") && text_of(&refused).contains("name is required"),
+        "{}",
+        text_of(&refused)
+    );
+
+    // An unknown name lists the registered ones.
+    let unknown = run_command(&tools, &run_id, "no_such_command", Value::Null).await;
+    assert!(unknown.is_error, "{}", text_of(&unknown));
+    let message = text_of(&unknown);
+    assert!(
+        message.contains("NOT_FOUND") && message.contains("grant") && message.contains("clear"),
+        "{message}"
+    );
+
+    // A script error inside the command, and a command that awaits.
+    let failed = run_command(&tools, &run_id, "fail", Value::Null).await;
+    assert!(failed.is_error, "{}", text_of(&failed));
+    let message = text_of(&failed);
+    assert!(
+        message.contains("GODOT_ERROR")
+            && message.contains("Invalid access to property or key 'name'")
+            && message.contains("may have changed the game"),
+        "{message}"
+    );
+    let awaited = run_command(&tools, &run_id, "wait", Value::Null).await;
+    assert!(awaited.is_error, "{}", text_of(&awaited));
+    let message = text_of(&awaited);
+    assert!(
+        message.contains("GODOT_ERROR") && message.contains("async function without"),
+        "{message}"
+    );
+    assert!(
+        message.to_lowercase().contains("must not await"),
+        "the hint says why: {message}"
+    );
+    // Neither ended the dispatch: the next call is answered at once.
+    let after = run_command(&tools, &run_id, "grant", json!({"name": "again"})).await;
+    assert!(!after.is_error, "{}", text_of(&after));
+
+    // A value over the bound is refused after the command ran, and the answer says so.
+    let big = run_command(&tools, &run_id, "big_value", Value::Null).await;
+    assert!(big.is_error, "{}", text_of(&big));
+    assert!(
+        text_of(&big).contains("ran") && text_of(&big).contains("bytes"),
+        "{}",
+        text_of(&big)
+    );
+
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn a_game_without_a_usable_adapter_refuses_both_tools_and_says_how_to_name_one() {
+    let _ = IGNORE;
+    let project = adapter_game_project(None, Some(common::adapter::FIXTURE_ADAPTER));
+    let (tools, run_id) = start_adapter_game(project.path()).await;
+    let _ = adapter_status(&tools, &run_id).await;
+    for result in [
+        read_states(&tools, &run_id, Value::Null).await,
+        run_command(&tools, &run_id, "grant", Value::Null).await,
+    ] {
+        assert!(result.is_error, "{}", text_of(&result));
+        let message = text_of(&result);
+        assert!(
+            message.contains("UNSUPPORTED") && message.contains("godot_mcp/adapter"),
+            "{message}"
+        );
+        assert!(
+            message.contains("godot_set_project_setting"),
+            "the hint names the way: {message}"
+        );
+    }
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+
+    let broken = adapter_game_project(Some("res://missing.gd"), None);
+    let (tools, run_id) = start_adapter_game(broken.path()).await;
+    let _ = adapter_status(&tools, &run_id).await;
+    let result = read_states(&tools, &run_id, Value::Null).await;
+    assert!(result.is_error, "{}", text_of(&result));
+    assert!(
+        text_of(&result).contains("no script exists at res://missing.gd"),
+        "{}",
+        text_of(&result)
+    );
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn a_held_game_answers_both_tools_and_what_a_command_defers_lands_on_the_next_tick() {
+    let _ = IGNORE;
+    let (_project, tools, run_id) = fixture_game().await;
+    hold_now(&tools, &run_id).await;
+
+    let read = json_of(&read_states(&tools, &run_id, json!(["deferred", "level"])).await);
+    assert_eq!(read["values"]["deferred"], 0, "{read}");
+    let scheduled = run_command(&tools, &run_id, "defer", Value::Null).await;
+    assert!(!scheduled.is_error, "{}", text_of(&scheduled));
+    assert_eq!(json_of(&scheduled)["value"]["scheduled"], true);
+
+    // Nothing advances while the game is held, so the deferred call has not run.
+    let before = json_of(&read_states(&tools, &run_id, json!(["deferred"])).await);
+    assert_eq!(before["values"]["deferred"], 0, "{before}");
+    let stepped = held_step(&tools, &run_id, json!({"ticks": 1})).await;
+    assert!(!stepped.is_error, "{}", text_of(&stepped));
+    let after = json_of(&read_states(&tools, &run_id, json!(["deferred"])).await);
+    assert_eq!(after["values"]["deferred"], 1, "{after}");
+
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+}
+
+/// The adapter is loaded by the in-game component and only by it: a game that has the component
+/// in its autoloads but no debugger attached never runs the adapter's `register`.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn a_game_started_without_a_debugger_never_loads_the_adapter() {
+    let _ = IGNORE;
+    let adapter = "extends RefCounted\n\nfunc register(registry) -> void:\n    print(\"adapter-registered\")\n    registry.add_state(\"alive\", _alive)\n\nfunc _alive() -> bool:\n    return true\n";
+    let project = adapter_game_project(Some("res://adapter.gd"), Some(adapter));
+    let addon = project.path().join("addons/godot_mcp");
+    copy_tree(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("addons/godot_mcp"),
+        &addon,
+    );
+    std::fs::write(
+        project.path().join("override.cfg"),
+        "[autoload]\n\nGodotMcpRuntime=\"res://addons/godot_mcp/runtime/mcp_runtime.gd\"\n",
+    )
+    .unwrap();
+    let plain = std::process::Command::new(godot_path())
+        .args(["--headless", "--path"])
+        .arg(project.path())
+        .args(["--quit-after", "10"])
+        .output()
+        .expect("run the game");
+    let printed = format!(
+        "{}{}",
+        String::from_utf8_lossy(&plain.stdout),
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    assert!(
+        !printed.contains("adapter-registered"),
+        "no debugger, no adapter: {printed}"
+    );
+    std::fs::remove_file(project.path().join("override.cfg")).unwrap();
+
+    // The same project under the server, which attaches a debugger, loads it.
+    let (tools, run_id) = start_adapter_game(project.path()).await;
+    let status = adapter_status(&tools, &run_id).await;
+    assert_eq!(status["loaded"], true, "{status}");
+    let output = call(&tools, "godot_run_output", json!({"run_id": run_id})).await;
+    assert!(
+        text_of(&output).contains("adapter-registered"),
+        "{}",
+        text_of(&output)
+    );
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+}
+
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
 }

@@ -12,6 +12,7 @@ use super::{ToolManager, str_arg, string_list};
 mod catalog;
 mod debug;
 mod input;
+mod project;
 mod record;
 mod screenshot;
 mod session;
@@ -59,6 +60,8 @@ pub fn handles(name: &str) -> bool {
             | "godot_game_signals"
             | "godot_game_observe"
             | "godot_game_snapshot"
+            | "godot_game_state"
+            | "godot_game_command"
             | "godot_game_input"
             | "godot_game_input_release"
             | "godot_game_wait"
@@ -82,6 +85,8 @@ pub async fn call(tools: &ToolManager, name: &str, args: Value) -> ToolResult {
         "godot_game_signals" => runtime(tools, &args, "game.signals").await,
         "godot_game_observe" => runtime(tools, &args, "game.observe").await,
         "godot_game_snapshot" => runtime(tools, &args, "game.snapshot").await,
+        "godot_game_state" => project::state(tools, &args).await,
+        "godot_game_command" => project::command(tools, &args).await,
         "godot_game_input" => game_input(tools, &args).await,
         "godot_game_input_release" => runtime(tools, &args, "input.release_all").await,
         "godot_game_wait" => runtime(tools, &args, "input.wait").await,

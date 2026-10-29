@@ -31,6 +31,7 @@ const TIMED_STEPS: Array[String] = ["wait", "text", "swipe", "path"]
 const SERVED: Array[String] = [
     "game.tree", "game.get", "game.set", "game.call", "game.signals", "game.snapshot",
     "game.body", "game.pause", "game.physics", "rt.output", "input.release_all",
+    "project.state", "project.command",
 ]
 
 static var _armed := false

@@ -14,6 +14,19 @@ static func methods() -> Dictionary:
     return {"rt.output": {"fn": output}}
 
 
+## The number the next logged line will have. Lines logged after this call come back from
+## `lines_since` with this number; -1 when output capture is not active.
+static func mark() -> int:
+    return _logger.next_seq() if _logger != null else -1
+
+
+## The lines logged since `first_seq` (a number from `mark`), oldest first, each `{level, text, stack,
+## script}`; `script` is true for an error the engine raised in a script, as against one a script
+## pushed. Empty when output capture is not active.
+static func lines_since(first_seq: int) -> Array:
+    return _logger.entries_since(first_seq) if _logger != null else []
+
+
 static func note_scene(context: Dictionary) -> void:
     _pending_scene = context.duplicate(true)
     if _logger != null:
@@ -51,6 +64,7 @@ static func output(_rt: Node, params: Dictionary) -> Dictionary:
             continue
         if level == "warning" and entry["level"] == "info":
             continue
+        entry.erase("script")
         page.append(entry)
         if page.size() >= limit:
             break
@@ -102,9 +116,9 @@ class OutputLogger extends Logger:
                 frames.append("%s:%d in %s()" % [backtrace.get_frame_file(index), backtrace.get_frame_line(index), backtrace.get_frame_function(index)])
         if frames.is_empty() and not file.is_empty():
             frames.append("%s:%d in %s()" % [file, line, function])
-        _add("warning" if warning else "error", text, frames)
+        _add("warning" if warning else "error", text, frames, error_type == ERROR_TYPE_SCRIPT)
 
-    func _add(level: String, text: String, frames: Array) -> void:
+    func _add(level: String, text: String, frames: Array, script: bool = false) -> void:
         if text.length() > MAX_TEXT:
             text = text.substr(0, MAX_TEXT)
         _mutex.lock()
@@ -114,6 +128,7 @@ class OutputLogger extends Logger:
             "level": level,
             "text": text,
             "stack": frames,
+            "script": script,
             "scene": _scene.duplicate(true),
         })
         _seq += 1
@@ -124,6 +139,29 @@ class OutputLogger extends Logger:
         while _entries.size() > MAX_LINES:
             _entries.pop_front()
         _mutex.unlock()
+
+    func next_seq() -> int:
+        _mutex.lock()
+        var next := _seq
+        _mutex.unlock()
+        return next
+
+    func entries_since(first_seq: int) -> Array:
+        var found: Array = []
+        _mutex.lock()
+        for index in range(_entries.size() - 1, -1, -1):
+            var entry: Dictionary = _entries[index]
+            if int(entry["seq"]) < first_seq:
+                break
+            found.append({
+                "level": entry["level"],
+                "text": entry["text"],
+                "stack": (entry["stack"] as Array).duplicate(),
+                "script": entry["script"],
+            })
+        _mutex.unlock()
+        found.reverse()
+        return found
 
     func snapshot() -> Dictionary:
         _mutex.lock()

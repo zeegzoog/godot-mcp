@@ -3892,6 +3892,184 @@ async fn game_set_refusal_leaves_the_node_untouched_and_reads_vector_axes() {
     assert!(!stopped.is_error, "{}", text_of(&stopped));
 }
 
+/// A level with a box `Body` (no material) and saved resources to assign to it while it runs.
+fn resource_path_project() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("project");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("scenes")).unwrap();
+    std::fs::create_dir_all(root.join("resources")).unwrap();
+    std::fs::write(
+        root.join("project.godot"),
+        "config_version=5\n\n[application]\n\nconfig/name=\"ResourcePathProbe\"\nrun/main_scene=\"res://scenes/main.tscn\"\nconfig/features=PackedStringArray(\"4.5\")\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("resources/quad.tres"),
+        "[gd_resource type=\"QuadMesh\" format=3]\n\n[resource]\nsize = Vector2(3, 3)\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("resources/tint.tres"),
+        "[gd_resource type=\"StandardMaterial3D\" format=3]\n\n[resource]\nalbedo_color = Color(1, 0, 0, 1)\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("scenes/main.tscn"),
+        "[gd_scene load_steps=2 format=3]\n\n[sub_resource type=\"BoxMesh\" id=\"1\"]\n\n[node name=\"Level\" type=\"Node3D\"]\n\n[node name=\"Body\" type=\"MeshInstance3D\" parent=\".\"]\nmesh = SubResource(\"1\")\n",
+    )
+    .unwrap();
+    dir
+}
+
+/// The Body's mesh, material and transparency as godot_game_get reads them.
+async fn body_state(tools: &Arc<ToolManager>, run_id: &str) -> Value {
+    let read = call(
+        tools,
+        "godot_game_get",
+        json!({"run_id": run_id, "path": "Body", "properties": ["mesh", "material_override", "transparency"]}),
+    )
+    .await;
+    assert!(!read.is_error, "{}", text_of(&read));
+    json_of(&read)["properties"].clone()
+}
+
+/// An empty Object property, which godot_game_get reads as a typed null.
+fn no_object(value: &Value) -> bool {
+    value.is_null() || value == "<Object#null>"
+}
+
+/// A res:// path written to an Object property of a live node loads that resource in the game
+/// and assigns it, whether the property held a resource or null. A missing file, a resource of
+/// the wrong class and text that is not a path are refused by name, and nothing is written.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn game_set_assigns_a_saved_resource_by_its_path() {
+    let _ = IGNORE;
+    let project = resource_path_project();
+    let tools = manager(project.path());
+    let started = call(
+        &tools,
+        "godot_run_project",
+        json!({
+            "project_path": project.path(),
+            "scene": "res://scenes/main.tscn",
+            "mode": "process",
+            "headless": true
+        }),
+    )
+    .await;
+    assert!(!started.is_error, "{}", text_of(&started));
+    let run_id = run_id_of(&started);
+    let ready = call(
+        &tools,
+        "godot_game_wait",
+        json!({"run_id": run_id, "node": "Body", "timeout": 180}),
+    )
+    .await;
+    assert!(!ready.is_error, "{}", text_of(&ready));
+    let before = body_state(&tools, &run_id).await;
+    assert!(
+        before["mesh"].as_str().unwrap_or("").contains("BoxMesh"),
+        "{before}"
+    );
+    assert!(no_object(&before["material_override"]), "{before}");
+
+    let assigned = call(
+        &tools,
+        "godot_game_set",
+        json!({
+            "run_id": run_id,
+            "path": "Body",
+            "properties": {
+                "mesh": "res://resources/quad.tres",
+                "material_override": "res://resources/tint.tres"
+            }
+        }),
+    )
+    .await;
+    assert!(!assigned.is_error, "{}", text_of(&assigned));
+    let after = body_state(&tools, &run_id).await;
+    assert!(
+        after["mesh"].as_str().unwrap_or("").contains("QuadMesh"),
+        "{after}"
+    );
+    assert!(
+        after["material_override"]
+            .as_str()
+            .unwrap_or("")
+            .contains("StandardMaterial3D"),
+        "{after}"
+    );
+    // The loaded resource itself, not a copy: its saved size is there.
+    let size = call(
+        &tools,
+        "godot_game_get",
+        json!({"run_id": run_id, "path": "Body", "properties": ["mesh:size"]}),
+    )
+    .await;
+    assert_eq!(
+        json_of(&size)["properties"]["mesh:size"],
+        json!([3.0, 3.0]),
+        "{}",
+        text_of(&size)
+    );
+
+    let refusals = [
+        (
+            json!({"mesh": "res://resources/tint.tres"}),
+            vec!["Mesh", "res://resources/tint.tres", "StandardMaterial3D"],
+        ),
+        (
+            json!({"mesh": "res://resources/missing.tres"}),
+            vec!["res://resources/missing.tres"],
+        ),
+        (
+            json!({"mesh": "res://../outside.tres"}),
+            vec!["res://../outside.tres"],
+        ),
+        (json!({"mesh": "QuadMesh"}), vec!["res://", "Mesh"]),
+        // A good value before a refused one is not written either.
+        (
+            json!({"transparency": 0.5, "material_override": "res://resources/quad.tres"}),
+            vec!["Material", "QuadMesh"],
+        ),
+    ];
+    for (properties, needles) in refusals {
+        let refused = call(
+            &tools,
+            "godot_game_set",
+            json!({"run_id": run_id, "path": "Body", "properties": properties}),
+        )
+        .await;
+        let message = text_of(&refused);
+        assert!(refused.is_error, "{properties}: {message}");
+        for needle in needles {
+            assert!(
+                message.contains(needle),
+                "{properties}: {message} lacks {needle}"
+            );
+        }
+        assert!(message.contains("Nothing was changed"), "{message}");
+        assert_eq!(body_state(&tools, &run_id).await, after, "{properties}");
+    }
+
+    let cleared = call(
+        &tools,
+        "godot_game_set",
+        json!({"run_id": run_id, "path": "Body", "properties": {"material_override": null}}),
+    )
+    .await;
+    assert!(!cleared.is_error, "{}", text_of(&cleared));
+    let cleared_state = body_state(&tools, &run_id).await;
+    assert!(
+        no_object(&cleared_state["material_override"]),
+        "{cleared_state}"
+    );
+
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+}
+
 #[tokio::test]
 #[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
 async fn headless_game_sets_a_shader_parameter_on_a_material() {

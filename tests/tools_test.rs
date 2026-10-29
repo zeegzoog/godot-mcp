@@ -257,6 +257,32 @@ async fn an_offline_editor_names_the_bridge_port_the_server_is_using() {
 }
 
 #[tokio::test]
+async fn an_unknown_argument_is_refused_with_its_name_and_the_accepted_ones() {
+    let project = project_dir();
+    let result = call(
+        "godot_create_script",
+        json!({"script_path": "res://patch.gd", "contents": "extends SceneTree\n",
+               "project_path": project.path()}),
+    )
+    .await;
+    assert!(result.is_error);
+    let shown = text(&result);
+    assert!(shown.contains("Unknown parameter 'contents'"), "{shown}");
+    for accepted in [
+        "'script_path'",
+        "'file_path'",
+        "'extends_class'",
+        "'overwrite'",
+    ] {
+        assert!(shown.contains(accepted), "{accepted} missing: {shown}");
+    }
+    assert!(
+        !project.path().join("patch.gd").exists(),
+        "nothing may be written for a call that was refused"
+    );
+}
+
+#[tokio::test]
 async fn needs_a_project_when_the_editor_is_offline() {
     let result = call("godot_create_script", json!({"file_path": "res://a.gd"})).await;
     assert!(result.is_error);

@@ -635,7 +635,12 @@ fn tool_catalog() -> &'static [Tool] {
 }
 
 fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> Tool {
-    let mut input_schema = json!({ "type": "object", "properties": properties });
+    // Closed, so a misspelled or invented key is refused instead of silently ignored.
+    let mut input_schema = json!({
+        "type": "object",
+        "properties": properties,
+        "additionalProperties": false
+    });
     if !required.is_empty() {
         input_schema["required"] = json!(required);
     }

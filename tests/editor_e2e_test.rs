@@ -2974,3 +2974,77 @@ async fn set_node_properties_adds_metadata_the_way_the_inspector_does() {
     assert!(read.get("metadata/count").is_none(), "{read}");
     assert_eq!(read["position"]["value"], "Vector2(5, 7)", "{read}");
 }
+
+/// The editor's played game loads the project's adapter like a managed run does, and the same two
+/// tools reach it through the plugin's relay.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn editor_play_answers_the_project_adapter() {
+    use godot_mcp::cli_runner::CliRunner;
+    use godot_mcp::tools::ToolManager;
+    use std::sync::Arc;
+
+    if cfg!(target_os = "linux")
+        && std::env::var_os("DISPLAY").is_none()
+        && std::env::var_os("WAYLAND_DISPLAY").is_none()
+    {
+        eprintln!("skipped: editor Play needs a display");
+        return;
+    }
+
+    let editor = start_editor_with(
+        None,
+        "",
+        &[("adapter.gd", common::adapter::FIXTURE_ADAPTER)],
+        "\n[godot_mcp]\n\nadapter=\"res://adapter.gd\"\n",
+    )
+    .await;
+    let (godot, _) = godot_binaries();
+    let tools = Arc::new(
+        ToolManager::new(BridgeClient::new(editor.port), CliRunner::new(godot))
+            .with_working_dir(editor.project.clone()),
+    );
+    let started = Arc::clone(&tools)
+        .call_tool("godot_run_project", json!({"scene": "res://main.tscn"}))
+        .await;
+    assert!(!started.is_error, "{}", tool_text(&started));
+
+    let read = Arc::clone(&tools)
+        .call_tool("godot_game_state", json!({"names": ["level", "balls"]}))
+        .await;
+    assert!(!read.is_error, "{}", tool_text(&read));
+    let read_json: Value = serde_json::from_str(&tool_text(&read)).expect("state json");
+    assert_eq!(read_json["values"]["level"]["index"], 3, "{read_json}");
+    assert_eq!(read_json["values"]["balls"], json!([1, 2]), "{read_json}");
+    assert_eq!(read_json["adapter"]["loaded"], true, "{read_json}");
+    assert_eq!(read_json["run_id"], "editor", "{read_json}");
+
+    let ran = Arc::clone(&tools)
+        .call_tool(
+            "godot_game_command",
+            json!({"name": "grant", "args": {"name": "machine_gun"}}),
+        )
+        .await;
+    assert!(!ran.is_error, "{}", tool_text(&ran));
+    let ran_json: Value = serde_json::from_str(&tool_text(&ran)).expect("command json");
+    assert_eq!(
+        ran_json["value"],
+        json!({"granted": "machine_gun"}),
+        "{ran_json}"
+    );
+
+    let unknown = Arc::clone(&tools)
+        .call_tool("godot_game_command", json!({"name": "no_such_command"}))
+        .await;
+    assert!(unknown.is_error, "{}", tool_text(&unknown));
+    assert!(
+        tool_text(&unknown).contains("NOT_FOUND") && tool_text(&unknown).contains("grant"),
+        "{}",
+        tool_text(&unknown)
+    );
+
+    let stopped = Arc::clone(&tools)
+        .call_tool("godot_stop_project", json!({}))
+        .await;
+    assert!(!stopped.is_error, "{}", tool_text(&stopped));
+}

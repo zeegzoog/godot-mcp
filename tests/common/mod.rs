@@ -2,6 +2,8 @@
 //! `godot-mcp` binary, and a scriptable fake Godot editor bridge.
 #![allow(dead_code)]
 
+pub mod adapter;
+
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};

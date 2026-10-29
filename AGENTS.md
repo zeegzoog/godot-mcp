@@ -99,6 +99,8 @@ Before submitting or committing changes, agents must execute and pass the comple
    godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_result.gd
    godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_view.gd
    godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_record.gd
+   godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_registry.gd
+   godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_project.gd
    ```
 
 5. **Editor End-to-End Tests** (whenever `addons/godot_mcp/` changed; needs the Godot build named in `.github/godot-version`, ignored by default). Run the ignored end-to-end suites with `--test-threads=1`: windowed tests and process-heavy tests interfere when they run in parallel.
@@ -146,6 +148,7 @@ When interacting with a Godot project, agents must adhere to the following workf
    - Pass game flags with `godot_run_project` `user_args` and `mode: "process"`. They go after `--`. Do not put Godot engine options there.
    - `godot_game_call` runs only a method named in `permit`, and never one that quits, evaluates, calls another method by name, sets a property by name or frees or replaces a node.
    - To act, advance a known amount and look, hold the game with `godot_game_physics` (`hold`, then `step`, `resume`), starting it with `godot_run_project` `held: true` when the steps must be exact. Check `deterministic` in the answers. A held game refuses waits, signal watches, screenshot sheets, recordings and timed input; step instead. Resume or stop the run when done: a held game does not advance on its own.
+   - When the project names an adapter (`adapter` in `godot_get_run_status`, set by the project setting `godot_mcp/adapter`), read its states with `godot_game_state` and run its commands with `godot_game_command` before walking the tree: `adapter.commands` lists the commands with their help. A command does what the project wrote and may leave the game changed; read the state again after it, and step a held game first when it defers work.
    - For a repeatable play-through, use `godot_game_scenario` instead of writing a GDScript test. It presses Input Map actions and pointers, advances a known number of physics ticks, and returns that call's snapshots, warnings and errors. The schema, the determinism limits and an example are in [docs/game-checks.md](docs/game-checks.md).
 
 5. **Feedback to the Maintainers**:

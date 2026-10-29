@@ -10,6 +10,7 @@ extends Node
 
 const R := preload("ops/rt_result.gd")
 const Hold := preload("ops/rt_hold.gd")
+const Project := preload("ops/rt_project.gd")
 const PROTOCOL_VERSION := 1
 const MODULES: Array = [
     preload("ops/rt_live.gd"),
@@ -17,6 +18,7 @@ const MODULES: Array = [
     preload("ops/rt_view.gd"),
     preload("ops/rt_output.gd"),
     preload("ops/rt_record.gd"),
+    preload("ops/rt_project.gd"),
 ]
 
 var _methods: Dictionary = {}
@@ -51,6 +53,7 @@ func _enter_tree() -> void:
 
 func _ready() -> void:
     if _registered:
+        Project.load_adapter()
         _send_hello.call_deferred()
 
 
@@ -85,6 +88,7 @@ func _exit_tree() -> void:
     if _registered and EngineDebugger.has_capture("mcp"):
         EngineDebugger.unregister_message_capture("mcp")
     if _registered:
+        Project.unload()
         preload("ops/rt_output.gd").uninstall()
     _registered = false
 
@@ -114,6 +118,7 @@ func _send_hello() -> void:
         "current_scene": scene.scene_file_path if scene != null else "",
         "display": DisplayServer.get_name(),
         "methods": _method_names(),
+        "adapter": Project.status(),
     })
 
 

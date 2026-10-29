@@ -3133,3 +3133,76 @@ fn every_tool_declares_all_four_hints() {
     assert_eq!(hints("godot_submit_feedback")["openWorldHint"], true);
     assert_eq!(hints("godot_get_scene_tree")["openWorldHint"], false);
 }
+
+#[tokio::test]
+async fn the_project_tools_check_their_arguments_before_a_game_is_asked() {
+    let many: Vec<String> = (0..65).map(|index| format!("state{index}")).collect();
+    let long = "x".repeat(257);
+    for (tool, args, needle) in [
+        ("godot_game_state", json!({"names": many}), "64"),
+        ("godot_game_state", json!({"names": [""]}), "names"),
+        ("godot_game_state", json!({"names": [long.clone()]}), "256"),
+        ("godot_game_state", json!({"names": [1]}), "names"),
+        ("godot_game_command", json!({}), "name"),
+        ("godot_game_command", json!({"name": ""}), "name"),
+        ("godot_game_command", json!({"name": long}), "256"),
+        (
+            "godot_game_command",
+            json!({"name": "grant", "args": [1]}),
+            "args",
+        ),
+    ] {
+        let result = call(tool, args.clone()).await;
+        assert!(result.is_error, "{tool} {args}: {}", text(&result));
+        assert!(
+            text(&result).contains(needle),
+            "{tool} {args}: expected {needle:?} in {}",
+            text(&result)
+        );
+    }
+    // A valid call without a game fails on the game, not on the arguments.
+    for (tool, args) in [
+        ("godot_game_state", json!({"names": ["level"]})),
+        (
+            "godot_game_command",
+            json!({"name": "grant", "args": {"name": "x"}}),
+        ),
+    ] {
+        let result = call(tool, args).await;
+        assert!(result.is_error, "{tool}: {}", text(&result));
+    }
+}
+
+#[test]
+fn the_project_tools_are_listed_with_their_hints_and_say_what_a_command_may_do() {
+    let listed = serde_json::to_value(ToolManager::list_tools()).expect("tools serialize");
+    let tools = listed.as_array().expect("tool array");
+    let find = |name: &str| {
+        tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("no tool {name}"))
+            .clone()
+    };
+    let state = find("godot_game_state");
+    assert_eq!(state["annotations"]["readOnlyHint"], true);
+    assert_eq!(state["annotations"]["idempotentHint"], true);
+    assert_eq!(state["inputSchema"]["properties"]["names"]["type"], "array");
+    let command = find("godot_game_command");
+    assert_eq!(command["annotations"]["readOnlyHint"], false);
+    assert_eq!(command["annotations"]["destructiveHint"], true);
+    assert_eq!(command["annotations"]["idempotentHint"], false);
+    assert_eq!(command["inputSchema"]["required"], json!(["name"]));
+    assert_eq!(
+        command["inputSchema"]["properties"]["args"]["type"],
+        "object"
+    );
+    let described = command["description"].as_str().unwrap_or("").to_lowercase();
+    for word in ["project wrote", "files", "godot_mcp/adapter", "await"] {
+        assert!(described.contains(word), "{word} missing: {described}");
+    }
+    let described = state["description"].as_str().unwrap_or("").to_lowercase();
+    for word in ["godot_mcp/adapter", "commands", "bytes"] {
+        assert!(described.contains(word), "{word} missing: {described}");
+    }
+}

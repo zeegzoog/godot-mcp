@@ -673,6 +673,7 @@ fn annotations(name: &str) -> Option<ToolAnnotations> {
         | "godot_game_signals"
         | "godot_game_observe"
         | "godot_game_snapshot"
+        | "godot_game_state"
         | "godot_game_screenshot"
         | "godot_debug_state"
         | "godot_code_diagnostics"
@@ -712,7 +713,9 @@ fn annotations(name: &str) -> Option<ToolAnnotations> {
         | "godot_edit_input_action"
         | "godot_delete_file"
         | "godot_game_set" => [false, true, true],
-        "godot_run_script" | "godot_edit_script" | "godot_game_call" => [false, true, false],
+        "godot_run_script" | "godot_edit_script" | "godot_game_call" | "godot_game_command" => {
+            [false, true, false]
+        }
         _ => return None,
     };
     Some(ToolAnnotations {

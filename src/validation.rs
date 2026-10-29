@@ -1,5 +1,5 @@
-//! Minimal JSON-Schema checks for tool arguments: required keys, primitive types, enums and
-//! the numeric `minimum` / `maximum` of a parameter.
+//! Minimal JSON-Schema checks for tool arguments: unknown keys (`additionalProperties: false`),
+//! required keys, primitive types, enums and the numeric `minimum` / `maximum` of a parameter.
 //!
 //! Catching wrong types here gives the caller an immediate, specific error instead of a
 //! script error inside the editor that would only surface as a timeout.
@@ -18,6 +18,10 @@ pub fn validate_arguments(schema: &Value, arguments: &Value) -> Result<(), Strin
             ));
         }
     };
+
+    if let Some(problem) = unknown_parameters(schema, arguments) {
+        return Err(problem);
+    }
 
     if let Some(required) = schema.get("required").and_then(Value::as_array) {
         for name in required.iter().filter_map(Value::as_str) {
@@ -40,6 +44,48 @@ pub fn validate_arguments(schema: &Value, arguments: &Value) -> Result<(), Strin
         check_value(name, value, property)?;
     }
     Ok(())
+}
+
+/// A key the schema does not declare would otherwise be dropped without a word, and the tool
+/// would report success for a call that did not do what was asked. A null value is absent.
+fn unknown_parameters(schema: &Value, arguments: &Map<String, Value>) -> Option<String> {
+    if schema.get("additionalProperties") != Some(&Value::Bool(false)) {
+        return None;
+    }
+    let properties = schema.get("properties").and_then(Value::as_object);
+    let declared = |name: &str| properties.is_some_and(|properties| properties.contains_key(name));
+    let unknown: Vec<&str> = arguments
+        .iter()
+        .filter(|(name, value)| !value.is_null() && !declared(name))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if unknown.is_empty() {
+        return None;
+    }
+    let quoted = |names: Vec<&str>| {
+        names
+            .iter()
+            .map(|name| format!("'{name}'"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let accepted: Vec<&str> = properties
+        .map(|properties| properties.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    let noun = if unknown.len() == 1 {
+        "Unknown parameter"
+    } else {
+        "Unknown parameters"
+    };
+    Some(if accepted.is_empty() {
+        format!("{noun} {}: this tool takes no parameters", quoted(unknown))
+    } else {
+        format!(
+            "{noun} {}; accepted parameters: {}",
+            quoted(unknown),
+            quoted(accepted)
+        )
+    })
 }
 
 fn check_value(name: &str, value: &Value, property: &Value) -> Result<(), String> {
@@ -224,11 +270,54 @@ mod tests {
         assert_eq!(validate_arguments(&optional, &Value::Null), Ok(()));
     }
 
+    fn closed(mut schema: Value) -> Value {
+        schema["additionalProperties"] = json!(false);
+        schema
+    }
+
     #[test]
-    fn unknown_properties_are_ignored() {
+    fn unknown_properties_are_ignored_when_the_schema_allows_them() {
         assert_eq!(
             validate_arguments(&schema(), &json!({"path": "x", "extra": 1})),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn unknown_properties_are_refused_with_the_accepted_names() {
+        let err = validate_arguments(&closed(schema()), &json!({"path": "x", "content": "y"}))
+            .expect_err("unknown");
+        assert!(err.contains("Unknown parameter 'content'"), "{err}");
+        for name in ["path", "count", "flag", "map", "list", "mode"] {
+            assert!(err.contains(&format!("'{name}'")), "{name} missing: {err}");
+        }
+
+        let err = validate_arguments(&closed(schema()), &json!({"pth": "x", "cont": 1}))
+            .expect_err("two unknown");
+        assert!(
+            err.contains("Unknown parameters") && err.contains("'pth'") && err.contains("'cont'"),
+            "{err}"
+        );
+        // The unknown key is named before the missing required one it probably misspells.
+        assert!(!err.contains("Missing required"), "{err}");
+    }
+
+    #[test]
+    fn a_null_unknown_property_counts_as_absent() {
+        assert_eq!(
+            validate_arguments(&closed(schema()), &json!({"path": "x", "extra": null})),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_tool_without_parameters_says_so() {
+        let schema = json!({"type": "object", "properties": {}, "additionalProperties": false});
+        assert_eq!(validate_arguments(&schema, &json!({})), Ok(()));
+        let err = validate_arguments(&schema, &json!({"verbose": true})).expect_err("unknown");
+        assert!(
+            err.contains("'verbose'") && err.contains("takes no parameters"),
+            "{err}"
         );
     }
 }

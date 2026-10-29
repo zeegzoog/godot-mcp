@@ -2687,6 +2687,78 @@ async fn run_script_parses_script_errors_and_kills_a_hang() {
 }
 
 #[tokio::test]
+async fn run_script_refuses_a_script_that_does_not_extend_scene_tree_before_starting_godot() {
+    let project = project_dir();
+    let root = project.path();
+    std::fs::create_dir_all(root.join(".godot")).unwrap();
+    std::fs::write(
+        root.join(".godot/global_script_class_cache.cfg"),
+        "list=[{\n\"base\": &\"Node\",\n\"class\": &\"Pond\",\n\"icon\": \"\",\n\"language\": &\"GDScript\",\n\"path\": \"res://pond.gd\"\n}, {\n\"base\": &\"SceneTree\",\n\"class\": &\"Checker\",\n\"icon\": \"\",\n\"language\": &\"GDScript\",\n\"path\": \"res://checker.gd\"\n}]\n",
+    )
+    .unwrap();
+    write_script(root, "pond.gd", b"class_name Pond\nextends Node\n");
+    write_script(
+        root,
+        "checker.gd",
+        b"class_name Checker extends SceneTree\n",
+    );
+    write_script(root, "node_base.gd", b"extends Node2D\n");
+    write_script(root, "tree_base.gd", b"@tool\nextends SceneTree\n");
+    // The binary does not exist, so a script that gets past the check fails to start instead.
+    let tools = manager_in(root, PathBuf::from("godot-binary-that-does-not-exist"));
+    let refused = [
+        (
+            "node.gd",
+            "extends Node\nfunc _init():\n\tprint('hi')\n",
+            "Node",
+        ),
+        (
+            "bare.gd",
+            "# Patches a shader.\nfunc _init():\n\tpass\n",
+            "no extends",
+        ),
+        (
+            "tool.gd",
+            "@tool\n@icon(\"res://icon.svg\")\nextends Control\n",
+            "Control",
+        ),
+        ("by_path.gd", "extends \"res://node_base.gd\"\n", "Node2D"),
+        ("by_class.gd", "extends Pond\n", "Node"),
+        ("unknown.gd", "extends Frog\n", "Frog"),
+    ];
+    for (name, source, base) in refused {
+        write_script(root, name, source.as_bytes());
+        let result = call_with(&tools, json!({"script": name, "project_path": root})).await;
+        let body = text(&result);
+        assert!(result.is_error, "{name}: {body}");
+        assert!(
+            body.contains(&format!("res://{name}"))
+                && body.contains(base)
+                && body.contains("SceneTree or MainLoop")
+                && !body.contains("Failed to run the script"),
+            "{name} was not refused before Godot started: {body}"
+        );
+    }
+    let accepted = [
+        ("tree.gd", "## Runs once.\nextends SceneTree\n"),
+        ("loop.gd", "extends MainLoop\n"),
+        ("named.gd", "class_name Named extends SceneTree\n"),
+        ("chain_path.gd", "extends \"tree_base.gd\"\n"),
+        ("chain_class.gd", "extends Checker\n"),
+        ("inner.gd", "extends \"res://tree_base.gd\".Inner\n"),
+    ];
+    for (name, source) in accepted {
+        write_script(root, name, source.as_bytes());
+        let result = call_with(&tools, json!({"script": name, "project_path": root})).await;
+        let body = text(&result);
+        assert!(
+            body.contains("Failed to run the script"),
+            "{name} was refused by the base class check: {body}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn run_script_names_the_uids_and_null_shader_parameters_a_headless_save_dropped() {
     let project = project_dir();
     let root = project.path();
@@ -2771,6 +2843,82 @@ exit 0
         .expect("write saving godot");
         path
     }
+}
+
+#[tokio::test]
+async fn run_script_reports_a_script_that_godot_did_not_load_as_a_failure() {
+    let project = project_dir();
+    write_script(project.path(), "wrongbase.gd", b"extends SceneTree\n");
+    write_script(
+        project.path(),
+        "broken.gd",
+        b"extends SceneTree\nfunc _init():\n\tvar x =\n",
+    );
+    write_script(project.path(), "gone.gd", b"extends SceneTree\n");
+    let tools = manager_in(project.path(), scripted_godot(project.path()));
+
+    // Godot 4.8 exits 0 for each of these, so the exit code alone looked like success.
+    let wrong = call_with(
+        &tools,
+        json!({"script": "wrongbase.gd", "project_path": project.path()}),
+    )
+    .await;
+    let wrong_text = text(&wrong);
+    assert!(wrong.is_error, "{wrong_text}");
+    assert!(wrong_text.contains("did not run"), "{wrong_text}");
+    assert!(
+        wrong_text.contains("doesn't inherit from SceneTree or MainLoop"),
+        "{wrong_text}"
+    );
+    assert!(
+        !wrong_text.contains("\"script_errors\": []"),
+        "script_errors stayed empty: {wrong_text}"
+    );
+    assert!(
+        wrong_text.contains("\"file\": \"res://wrongbase.gd\""),
+        "{wrong_text}"
+    );
+
+    let broken = call_with(
+        &tools,
+        json!({"script": "broken.gd", "project_path": project.path()}),
+    )
+    .await;
+    let broken_text = text(&broken);
+    assert!(broken.is_error, "{broken_text}");
+    assert!(
+        broken_text.contains("did not run") && broken_text.contains("res://broken.gd:3"),
+        "{broken_text}"
+    );
+    assert!(
+        broken_text.contains("\"load_error\": \"Failed to load script"),
+        "{broken_text}"
+    );
+
+    let gone = call_with(
+        &tools,
+        json!({"script": "gone.gd", "project_path": project.path()}),
+    )
+    .await;
+    let gone_text = text(&gone);
+    assert!(gone.is_error, "{gone_text}");
+    assert!(
+        gone_text.contains("did not run") && gone_text.contains("Can't load script"),
+        "{gone_text}"
+    );
+
+    // A script that loads and fails on its own still reports its own error, not a load failure.
+    write_script(project.path(), "fine.gd", b"extends SceneTree\n");
+    let fine = call_with(
+        &tools,
+        json!({"script": "fine.gd", "project_path": project.path()}),
+    )
+    .await;
+    let fine_text = text(&fine);
+    assert!(
+        fine_text.contains("\"load_error\": null") && !fine_text.contains("did not run"),
+        "{fine_text}"
+    );
 }
 
 #[tokio::test]
@@ -2872,7 +3020,9 @@ async fn call_with(tools: &Arc<ToolManager>, args: Value) -> ToolResult {
     Arc::clone(tools).call_tool("godot_run_script", args).await
 }
 
-/// A Godot stand-in: prints a SCRIPT ERROR for boom.gd, and sleeps (with a child) for hang.gd.
+/// A Godot stand-in: prints a SCRIPT ERROR for boom.gd, sleeps (with a child) for hang.gd, and
+/// prints what Godot 4.8 prints, with exit code 0, when it cannot load wrongbase.gd, broken.gd or
+/// gone.gd.
 fn scripted_godot(dir: &Path) -> PathBuf {
     #[cfg(unix)]
     {
@@ -2887,6 +3037,22 @@ case "$*" in
     echo HANGING
     sleep 30 &
     wait
+    ;;
+  *wrongbase.gd*)
+    echo 'ERROR: Can'"'"'t load the script "wrongbase.gd" as it doesn'"'"'t inherit from SceneTree or MainLoop.' >&2
+    echo '   at: start (main/main.cpp:4409)' >&2
+    exit 0
+    ;;
+  *broken.gd*)
+    echo 'SCRIPT ERROR: Parse Error: Expected expression for variable initial value after "=".' >&2
+    echo '          at: GDScript::reload (res://broken.gd:3)' >&2
+    echo 'ERROR: Failed to load script "res://broken.gd" with error "Parse error".' >&2
+    exit 0
+    ;;
+  *gone.gd*)
+    echo "ERROR: Attempt to open script 'res://gone.gd' resulted in error 'File not found'." >&2
+    echo "ERROR: Can't load script: gone.gd" >&2
+    exit 0
     ;;
   *idle.gd*)
     echo 'SCRIPT ERROR: Parse Error: unexpected.'
@@ -2910,7 +3076,7 @@ esac
         let path = dir.join("scripted_godot.bat");
         std::fs::write(
             &path,
-            "@echo off\r\necho ARGS %*\r\necho %* | findstr hang.gd >nul\r\nif %errorlevel%==0 (\r\n  echo HANGING\r\n  ping -n 30 127.0.0.1 >nul\r\n  exit /b 0\r\n)\r\necho %* | findstr idle.gd >nul\r\nif %errorlevel%==0 (\r\n  echo SCRIPT ERROR: Parse Error: unexpected.\r\n  echo    at: _init ^(res://idle.gd:3^)\r\n  ping -n 30 127.0.0.1 >nul\r\n  exit /b 0\r\n)\r\necho SCRIPT ERROR: Assertion failed.\r\necho    at: _initialize (res://scripts/boom.gd:4)\r\nexit /b 3\r\n",
+            "@echo off\r\necho ARGS %*\r\necho %* | findstr hang.gd >nul\r\nif %errorlevel%==0 (\r\n  echo HANGING\r\n  ping -n 30 127.0.0.1 >nul\r\n  exit /b 0\r\n)\r\necho %* | findstr wrongbase.gd >nul\r\nif %errorlevel%==0 (\r\n  echo ERROR: Can't load the script \"wrongbase.gd\" as it doesn't inherit from SceneTree or MainLoop. 1>&2\r\n  exit /b 0\r\n)\r\necho %* | findstr broken.gd >nul\r\nif %errorlevel%==0 (\r\n  echo SCRIPT ERROR: Parse Error: Expected expression. 1>&2\r\n  echo           at: GDScript::reload ^(res://broken.gd:3^) 1>&2\r\n  echo ERROR: Failed to load script \"res://broken.gd\" with error \"Parse error\". 1>&2\r\n  exit /b 0\r\n)\r\necho %* | findstr gone.gd >nul\r\nif %errorlevel%==0 (\r\n  echo ERROR: Can't load script: gone.gd 1>&2\r\n  exit /b 0\r\n)\r\necho %* | findstr idle.gd >nul\r\nif %errorlevel%==0 (\r\n  echo SCRIPT ERROR: Parse Error: unexpected.\r\n  echo    at: _init ^(res://idle.gd:3^)\r\n  ping -n 30 127.0.0.1 >nul\r\n  exit /b 0\r\n)\r\necho SCRIPT ERROR: Assertion failed.\r\necho    at: _initialize (res://scripts/boom.gd:4)\r\nexit /b 3\r\n",
         )
         .expect("write scripted godot");
         path

@@ -115,7 +115,7 @@ impl ToolManager {
             "godot_get_run_status" => self.handle_run_status().await,
             "godot_get_scene_tree" => self.handle_bridge_call("get_scene_tree", args).await,
             "godot_get_open_scenes" => self.handle_bridge_call("get_open_scenes", args).await,
-            "godot_add_node" => self.handle_bridge_call("add_node", args).await,
+            "godot_add_node" => self.handle_add_node(args).await,
             "godot_remove_node" => self.handle_bridge_call("remove_node", args).await,
             "godot_get_node_properties" => {
                 self.handle_bridge_call("get_node_properties", args).await
@@ -182,6 +182,25 @@ impl ToolManager {
         match self.bridge.send_command(command_type, params).await {
             Ok(res) => ToolResult::text(serde_json::to_string_pretty(&res).unwrap_or_default()),
             Err(error) => bridge_error_result(&error),
+        }
+    }
+
+    /// A node comes from exactly one source: a class (`node_type`) or a saved scene (`scene`).
+    async fn handle_add_node(&self, args: Value) -> ToolResult {
+        let given = |key: &str| str_arg(&args, key).is_some_and(|value| !value.trim().is_empty());
+        match (given("node_type"), given("scene")) {
+            (false, false) => ToolResult::error(
+                "Pass node_type or scene: the class to create, or the saved scene to instance",
+                &[
+                    "Pass node_type, such as 'Node2D', or a global script class_name",
+                    "Pass scene, the res:// path of a .tscn or .scn file",
+                ],
+            ),
+            (true, true) => ToolResult::error(
+                "Pass node_type or scene, not both: an instanced scene's root type comes from the scene",
+                &["Drop node_type to instance the scene, or drop scene to create a plain node"],
+            ),
+            _ => self.handle_bridge_call("add_node", args).await,
         }
     }
 
@@ -906,7 +925,7 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
         ),
         tool(
             "godot_add_node",
-            "Adds a new node to the active scene in Godot Editor with undo/redo support. node_type is any instantiable Node class or a global script class_name.",
+            "Adds a node to the active scene in Godot Editor as one undoable action. Pass exactly one of node_type (any instantiable Node class or global script class_name) or scene (a saved .tscn/.scn added as an instance of that scene, as the editor's Instantiate Child Scene does: it saves as an instance=ExtResource node that keeps the scene's uid, and its own nodes stay inside the scene file). A scene that is missing, is not a PackedScene, or contains the scene being edited is refused. properties sets initial values (such as position or transform) the way godot_set_node_properties converts them; a bad one rejects the whole call.",
             json!({
                 "parent_node_path": {
                     "type": "string",
@@ -914,14 +933,22 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
                 },
                 "node_type": {
                     "type": "string",
-                    "description": "Godot class name to instantiate (e.g. 'Sprite2D', 'Camera3D', 'Node')."
+                    "description": "Godot class name to instantiate (e.g. 'Sprite2D', 'Camera3D', 'Node'). Leave out when scene is given."
+                },
+                "scene": {
+                    "type": "string",
+                    "description": "res:// path of a saved scene to add as an instance (e.g. 'res://props/stump.tscn'). Leave out when node_type is given."
                 },
                 "node_name": {
                     "type": "string",
-                    "description": "Optional custom name for the new node. Godot may adjust invalid characters; the result reports the final name."
+                    "description": "Optional custom name for the new node. Godot may adjust invalid characters; the result reports the final name. An instanced scene defaults to its root's name."
+                },
+                "properties": {
+                    "type": "object",
+                    "description": "Optional initial property values of the new node, such as {\"position\": [10, 0, 5]} or {\"transform\": \"Transform3D(...)\"}; converted as in godot_set_node_properties."
                 }
             }),
-            &["node_type"],
+            &[],
         ),
         tool(
             "godot_remove_node",

@@ -3611,3 +3611,47 @@ fn the_project_tools_are_listed_with_their_hints_and_say_what_a_command_may_do()
         assert!(described.contains(word), "{word} missing: {described}");
     }
 }
+
+#[test]
+fn add_node_lists_a_scene_to_instance_beside_the_node_type() {
+    let listed = serde_json::to_value(ToolManager::list_tools()).expect("tools serialize");
+    let add = listed
+        .as_array()
+        .expect("tool array")
+        .iter()
+        .find(|tool| tool["name"] == "godot_add_node")
+        .expect("godot_add_node")
+        .clone();
+    let schema = &add["inputSchema"];
+    assert_eq!(schema["properties"]["scene"]["type"], "string", "{add}");
+    assert_eq!(
+        schema["properties"]["properties"]["type"], "object",
+        "{add}"
+    );
+    assert!(schema.get("required").is_none(), "{add}");
+    let described = add["description"].as_str().unwrap_or("");
+    for word in ["scene", "node_type", "instance", "undo"] {
+        assert!(described.contains(word), "{word} missing: {described}");
+    }
+}
+
+#[tokio::test]
+async fn add_node_needs_exactly_one_of_node_type_and_scene_before_the_editor_is_asked() {
+    for (args, needle) in [
+        (json!({"parent_node_path": "."}), "node_type or scene"),
+        (
+            json!({"node_type": "Node2D", "scene": "res://snag.tscn"}),
+            "not both",
+        ),
+        (json!({"scene": " "}), "node_type or scene"),
+    ] {
+        let result = call("godot_add_node", args.clone()).await;
+        assert!(result.is_error, "{args}: {}", text(&result));
+        assert!(text(&result).contains(needle), "{args}: {}", text(&result));
+        assert!(
+            !text(&result).contains("bridge is not reachable"),
+            "{args}: refused only after asking the editor: {}",
+            text(&result)
+        );
+    }
+}

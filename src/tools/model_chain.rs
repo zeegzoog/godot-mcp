@@ -747,10 +747,15 @@ async fn read_reply<R: AsyncBufRead + Unpin>(reader: &mut R, id: u64) -> Result<
 async fn write_line(stdin: &mut tokio::process::ChildStdin, value: &Value) -> Result<(), String> {
     let mut line = serde_json::to_string(value).map_err(|error| error.to_string())?;
     line.push('\n');
-    stdin
-        .write_all(line.as_bytes())
-        .await
-        .map_err(|error| format!("writing to froxel mcp: {error}"))
+    stdin.write_all(line.as_bytes()).await.map_err(|error| {
+        // A program that has already exited (a missing mcp mode, a crash) closes its end of the
+        // pipe; whether the write or the exit comes first is a race, so both read the same.
+        if error.kind() == std::io::ErrorKind::BrokenPipe {
+            "Froxel closed before it read the request".to_string()
+        } else {
+            format!("writing to froxel mcp: {error}")
+        }
+    })
 }
 
 fn text_json(result: &ToolResult) -> Value {
@@ -1061,6 +1066,19 @@ exec sleep 3
         .unwrap_err();
         assert!(error.to_string().contains("deadline"), "{error}");
         assert!(start.elapsed() < Duration::from_secs(2));
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_request_written_after_froxel_exited_says_froxel_closed() {
+        // The stub's exit can come before or after the first write; a write after it must not
+        // surface as a broken pipe of this server.
+        let mut child = froxel_command(OsStr::new("true")).spawn().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        child.wait().await.unwrap();
+        let error = write_line(&mut stdin, &json!({"jsonrpc":"2.0","id":1}))
+            .await
+            .unwrap_err();
+        assert!(error.starts_with("Froxel closed"), "{error}");
     }
     #[cfg(unix)]
     #[tokio::test]

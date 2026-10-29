@@ -882,6 +882,23 @@ func convert_property_value(info: Dictionary, raw: Variant) -> Dictionary:
 
     return {"error": "expected %s but got %s (%s)" % [property_type_name(info), type_string(typeof(raw)), describe_value(raw)]}
 
+const META_PREFIX: String = "metadata/"
+
+## The value of a metadata entry the node does not have yet: the JSON value as it is, except that
+## a whole number becomes an int (JSON does not tell 3 from 3.0). Returns {"value": Variant} or
+## {"error": String}.
+func new_meta_value(meta_name: String, raw: Variant) -> Dictionary:
+    # set_meta refuses a name that is not an identifier with an engine error and no reply.
+    if not meta_name.is_valid_identifier():
+        return {"error": "a new metadata name must be a valid identifier (letters, digits and _, not starting with a digit)"}
+    if raw == null:
+        return {"error": "null removes metadata and cannot create it; pass a value"}
+    if typeof(raw) == TYPE_FLOAT:
+        var number: float = raw
+        if is_finite(number) and number == floorf(number) and absf(number) < 9.0e15:
+            return {"value": int(number)}
+    return {"value": raw}
+
 func set_node_properties(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
     var node_path: String = params.get("node_path", "")
     var properties: Dictionary = params.get("properties", {})
@@ -900,9 +917,18 @@ func set_node_properties(peer: WebSocketPeer, cmd_id: String, params: Dictionary
 
     # Validate and convert everything first so a bad value never leaves a half-applied change.
     var converted: Dictionary = {}
+    # metadata/<name> entries the node does not have yet, created as the inspector's Add Metadata does.
+    var new_meta: Dictionary = {}
     var problems: PackedStringArray = []
     for key: Variant in properties.keys():
         var prop_name: String = str(key)
+        if not known.has(prop_name) and prop_name.begins_with(META_PREFIX):
+            var meta_result: Dictionary = new_meta_value(prop_name.substr(META_PREFIX.length()), properties[key])
+            if meta_result.has("error"):
+                problems.append("%s: %s" % [prop_name, meta_result["error"]])
+            else:
+                new_meta[prop_name] = meta_result["value"]
+            continue
         if not known.has(prop_name):
             problems.append("Unknown property '%s' on %s" % [prop_name, target_node.get_class()])
             continue
@@ -920,11 +946,22 @@ func set_node_properties(peer: WebSocketPeer, cmd_id: String, params: Dictionary
         for prop_name: String in converted:
             undo_redo.add_do_property(target_node, prop_name, converted[prop_name])
             undo_redo.add_undo_property(target_node, prop_name, target_node.get(prop_name))
+        for prop_name: String in new_meta:
+            var meta_name: StringName = StringName(prop_name.substr(META_PREFIX.length()))
+            undo_redo.add_do_method(target_node, "set_meta", meta_name, new_meta[prop_name])
+            undo_redo.add_undo_method(target_node, "remove_meta", meta_name)
+        # The inspector lists metadata from the property list, so it must redraw.
+        if not new_meta.is_empty():
+            undo_redo.add_do_method(target_node, "notify_property_list_changed")
+            undo_redo.add_undo_method(target_node, "notify_property_list_changed")
         undo_redo.commit_action()
     else:
         for prop_name: String in converted:
             target_node.set(prop_name, converted[prop_name])
+        for prop_name: String in new_meta:
+            target_node.set_meta(StringName(prop_name.substr(META_PREFIX.length())), new_meta[prop_name])
 
+    converted.merge(new_meta)
     var applied: Dictionary = {}
     for prop_name: String in converted:
         applied[prop_name] = describe_value(target_node.get(prop_name))

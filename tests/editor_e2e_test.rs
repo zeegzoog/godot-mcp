@@ -2896,3 +2896,81 @@ async fn files_are_deleted_through_the_editor_with_companions_and_tabs() {
     }
     assert!(project.join("used.gd").is_file() && project.join("dirty.tscn").is_file());
 }
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn set_node_properties_adds_metadata_the_way_the_inspector_does() {
+    let editor = start_editor(true).await;
+    let bridge = &editor.bridge;
+    let call = |command: &'static str, params: Value| async move {
+        bridge.send_command(command, params).await
+    };
+    let props = || async {
+        call("get_node_properties", json!({"node_path": "Player"}))
+            .await
+            .expect("props")["properties"]
+            .clone()
+    };
+    call("open_scene", json!({"scene_path": "res://main.tscn"}))
+        .await
+        .expect("open main");
+
+    // A metadata entry the node does not have yet is created, with the JSON value's own type.
+    let set = call(
+        "set_node_properties",
+        json!({"node_path": "Player", "properties": {
+            "metadata/catch_hint": "text",
+            "metadata/count": 3,
+            "metadata/ratio": 1.5,
+            "metadata/tags": ["a", "b"],
+            "position": [1, 2]
+        }}),
+    )
+    .await
+    .expect("add metadata");
+    assert_eq!(set["applied"]["metadata/catch_hint"], "\"text\"", "{set}");
+    let read = props().await;
+    assert_eq!(read["metadata/catch_hint"]["type"], "String", "{read}");
+    assert_eq!(read["metadata/count"]["type"], "int", "{read}");
+    assert_eq!(read["metadata/ratio"]["type"], "float", "{read}");
+    assert_eq!(read["metadata/tags"]["type"], "Array", "{read}");
+
+    // An existing entry keeps its type.
+    call(
+        "set_node_properties",
+        json!({"node_path": "Player", "properties": {"metadata/count": "7"}}),
+    )
+    .await
+    .expect("update metadata");
+    assert_eq!(props().await["metadata/count"]["value"], "7");
+
+    // A name Godot refuses, an empty name, and null are rejected without a partial change.
+    for (key, value, needle) in [
+        ("metadata/1bad", json!(1), "identifier"),
+        ("metadata/", json!(1), "identifier"),
+        ("metadata/fresh", Value::Null, "null"),
+    ] {
+        expect_error(
+            call(
+                "set_node_properties",
+                json!({"node_path": "Player", "properties": {key: value, "position": [9, 9]}}),
+            )
+            .await,
+            needle,
+        );
+    }
+    let read = props().await;
+    assert_eq!(read["position"]["value"], "Vector2(1, 2)", "{read}");
+    assert!(read.get("metadata/fresh").is_none(), "{read}");
+
+    // The new entries are saved with the scene and undo removes them.
+    call("save_scene", json!({})).await.expect("save");
+    let saved = std::fs::read_to_string(editor.project.join("main.tscn")).expect("saved scene");
+    assert!(saved.contains("metadata/catch_hint = \"text\""), "{saved}");
+    call("__test_undo", json!({})).await.expect("undo update");
+    call("__test_undo", json!({})).await.expect("undo add");
+    let read = props().await;
+    assert!(read.get("metadata/catch_hint").is_none(), "{read}");
+    assert!(read.get("metadata/count").is_none(), "{read}");
+    assert_eq!(read["position"]["value"], "Vector2(5, 7)", "{read}");
+}

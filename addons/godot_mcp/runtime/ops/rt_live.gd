@@ -224,8 +224,14 @@ static func _prepare_leaf(name: String, looked: Dictionary, raw: Variant) -> Dic
     if not (container is Dictionary or (container is Object and container != null)):
         return R.err(R.BAD_PARAMS, "Cannot write '%s'." % name)
     var expected: int = typeof(current) if current != null else TYPE_NIL
-    var decoded: Variant = _coerce(raw, expected)
     var declared := _declared_type(container, leaf)
+    if declared == TYPE_OBJECT and raw is String:
+        # Only a property declared as an Object: a Variant variable keeps a String as it is.
+        var loaded := _load_resource(name, _property_info(container, leaf), raw)
+        if R.is_err(loaded):
+            return loaded
+        return {"name": name, "container": container, "leaf": leaf, "current": current, "value": loaded["value"]}
+    var decoded: Variant = _coerce(raw, expected)
     if declared == TYPE_NIL and current != null and not container is Dictionary:
         declared = expected
     if declared != TYPE_NIL and declared != TYPE_OBJECT and not _type_compatible(decoded, declared):
@@ -264,12 +270,76 @@ static func _put_leaf(step: Dictionary, value: Variant) -> Variant:
 
 ## The type an Object property declares, or TYPE_NIL for a Variant property or a Dictionary key.
 static func _declared_type(container: Variant, leaf: String) -> int:
+    return int(_property_info(container, leaf).get("type", TYPE_NIL))
+
+
+## The property list entry of an Object property, or {} for a Dictionary key or an unlisted name.
+static func _property_info(container: Variant, leaf: String) -> Dictionary:
     if not container is Object or container == null:
-        return TYPE_NIL
+        return {}
     for info: Dictionary in (container as Object).get_property_list():
         if str(info.get("name", "")) == leaf:
-            return int(info.get("type", TYPE_NIL))
-    return TYPE_NIL
+            return info
+    return {}
+
+
+## Loads the saved resource a res:// path names for an Object property, as the editor's
+## godot_set_node_properties does, and checks that it is a class the property takes. Any other
+## text is refused: no Object is built from it.
+static func _load_resource(name: String, info: Dictionary, raw: String) -> Dictionary:
+    var classes := _resource_classes(info)
+    var wanted := " or ".join(classes) if not classes.is_empty() else "Resource"
+    var path := raw.strip_edges()
+    if not path.begins_with("res://"):
+        return R.err(R.BAD_PARAMS, "Property '%s' takes a %s and the text '%s' is not a res:// path. Nothing was changed. Pass the res:// path of a saved %s, or null to clear it." % [name, wanted, raw, wanted])
+    var relative := path.trim_prefix("res://")
+    if relative.is_empty() or ".." in relative.split("/"):
+        return R.err(R.BAD_PARAMS, "Property '%s': '%s' is not a path inside the project. Nothing was changed. Pass the res:// path of a saved %s." % [name, raw, wanted])
+    if not ResourceLoader.exists(path):
+        return R.err(R.BAD_PARAMS, "Property '%s': no resource found at %s. Nothing was changed. Pass the res:// path of a saved %s." % [name, path, wanted])
+    var resource: Resource = ResourceLoader.load(path)
+    if resource == null:
+        return R.err(R.BAD_PARAMS, "Property '%s': %s could not be loaded. Nothing was changed. The loader error is in godot_run_output." % [name, path])
+    if not classes.is_empty() and not _is_any_class(resource, classes):
+        return R.err(R.BAD_PARAMS, "Property '%s' takes a %s, and %s is a %s. Nothing was changed. Pass the res:// path of a saved %s." % [name, wanted, path, _class_of(resource), wanted])
+    return {"value": resource}
+
+
+## The classes an Object property accepts, from its hint, or [] when it takes any Resource.
+static func _resource_classes(info: Dictionary) -> PackedStringArray:
+    var classes := PackedStringArray()
+    var hint_string := str(info.get("hint_string", ""))
+    if int(info.get("hint", PROPERTY_HINT_NONE)) == PROPERTY_HINT_RESOURCE_TYPE and not hint_string.is_empty():
+        for part: String in hint_string.split(",", false):
+            classes.append(part.strip_edges())
+        return classes
+    var class_named := str(info.get("class_name", ""))
+    if not class_named.is_empty():
+        classes.append(class_named)
+    return classes
+
+
+## Whether a resource is one of these engine classes or script classes (class_name).
+static func _is_any_class(resource: Resource, classes: PackedStringArray) -> bool:
+    for wanted_class: String in classes:
+        if resource.is_class(wanted_class):
+            return true
+        var script: Variant = resource.get_script()
+        while script is Script:
+            if str((script as Script).get_global_name()) == wanted_class:
+                return true
+            script = (script as Script).get_base_script()
+    return false
+
+
+## A resource's script class name when it has one, else its engine class.
+static func _class_of(resource: Resource) -> String:
+    var script: Variant = resource.get_script()
+    if script is Script:
+        var global := str((script as Script).get_global_name())
+        if not global.is_empty():
+            return global
+    return resource.get_class()
 
 
 static func _axes_hint(declared: int) -> String:
@@ -292,6 +362,9 @@ static func _same(stored: Variant, written: Variant) -> bool:
             return stored == written
         if (stored is String or stored is StringName) and (written is String or written is StringName):
             return str(stored) == str(written)
+        # null written to an Object property reads back as an empty Object, not as nil.
+        if written == null and typeof(stored) == TYPE_OBJECT:
+            return not is_instance_valid(stored)
         return false
     match typeof(stored):
         TYPE_FLOAT:

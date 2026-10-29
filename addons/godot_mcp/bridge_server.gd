@@ -749,6 +749,10 @@ func add_node(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
     var new_meta: Dictionary = initial["new_meta"]
     for prop_name: String in new_meta:
         new_node.set_meta(StringName(prop_name.substr(META_PREFIX.length())), new_meta[prop_name])
+    var stepped: Dictionary = initial["stepped"]
+    for prop_name: String in stepped:
+        var step: Array = stepped[prop_name]
+        (step[0] as Object).set(step[1], step[2])
 
     if undo_redo != null:
         var action: String = "Instantiate Scene " if created.has("path") else "Add Node "
@@ -1030,8 +1034,10 @@ func new_meta_value(meta_name: String, raw: Variant) -> Dictionary:
     return {"value": raw}
 
 ## Converts requested property values to the node's property types without setting any.
-## Returns {"converted": Dictionary, "new_meta": Dictionary, "problems": PackedStringArray};
-## new_meta holds metadata/<name> entries the node does not have yet.
+## Returns {"converted": Dictionary, "new_meta": Dictionary, "stepped": Dictionary,
+## "problems": PackedStringArray}; new_meta holds metadata/<name> entries the node does not have
+## yet, and stepped holds the properties of the node's own resources named with ':' steps
+## (name -> [resource, property, value]).
 func convert_properties(target_node: Node, properties: Dictionary) -> Dictionary:
     var known: Dictionary = {}
     for prop: Dictionary in target_node.get_property_list():
@@ -1070,7 +1076,7 @@ func convert_properties(target_node: Node, properties: Dictionary) -> Dictionary
             problems.append("%s: %s" % [prop_name, result["error"]])
         else:
             converted[prop_name] = result["value"]
-    return {"converted": converted, "new_meta": new_meta, "problems": problems}
+    return {"converted": converted, "new_meta": new_meta, "stepped": stepped, "problems": problems}
 
 func set_node_properties(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
     var node_path: String = params.get("node_path", "")
@@ -1089,6 +1095,7 @@ func set_node_properties(peer: WebSocketPeer, cmd_id: String, params: Dictionary
     var converted: Dictionary = checked["converted"]
     # metadata/<name> entries the node does not have yet, created as the inspector's Add Metadata does.
     var new_meta: Dictionary = checked["new_meta"]
+    var stepped: Dictionary = checked["stepped"]
     var problems: PackedStringArray = checked["problems"]
     if not problems.is_empty():
         send_error(peer, cmd_id, "No properties were changed. " + "; ".join(problems))

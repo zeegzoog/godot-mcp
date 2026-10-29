@@ -128,6 +128,8 @@ To report a vulnerability, follow [SECURITY.md](SECURITY.md). Never open a publi
 
 `project_path` can be omitted when the server runs inside the project: tools then use the project open in the editor, else the first folder with a `project.godot` from the server's working directory upwards, else the only subfolder that has one (such as `app/`). A `project_path` you give always wins: when the open editor has another project, the tools that can work on files (reading and editing a script, creating a scene or a resource, project settings) use the files of the project you named and leave the editor alone, and an answer that changed something names the project directory.
 
+Every tool takes only the parameters its schema lists (`additionalProperties: false`). A call with any other key does nothing and is refused with an error that names the unknown key and the accepted ones, so a misspelled or invented parameter is never dropped while the call reports success. A key set to `null` counts as absent.
+
 | Tool | Needs | What it does |
 | --- | --- | --- |
 | `godot_get_version` | — | Engine version, from the editor or the Godot binary. |

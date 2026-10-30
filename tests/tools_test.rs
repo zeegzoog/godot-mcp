@@ -2758,43 +2758,105 @@ async fn run_script_refuses_a_script_that_does_not_extend_scene_tree_before_star
     }
 }
 
-#[tokio::test]
-async fn run_script_names_the_uids_and_null_shader_parameters_a_headless_save_dropped() {
+const POND_EDITOR_SAVED: &str = "[gd_scene load_steps=2 format=3 uid=\"uid://cpond\"]\n\n[ext_resource type=\"Shader\" uid=\"uid://dshader\" path=\"res://water.gdshader\" id=\"1_a\"]\n\n[sub_resource type=\"ShaderMaterial\" id=\"ShaderMaterial_a\"]\nshader = ExtResource(\"1_a\")\nshader_parameter/speed = 2.0\n\n[node name=\"Pond\" type=\"Node3D\"]\n";
+
+/// What Godot 4.8 writes for the same scene after a headless load, edit and save.
+const POND_HEADLESS_SAVED: &str = "[gd_scene format=3]\n\n[ext_resource type=\"Shader\" path=\"res://water.gdshader\" id=\"1_a\"]\n\n[sub_resource type=\"ShaderMaterial\" id=\"ShaderMaterial_a\"]\nshader = ExtResource(\"1_a\")\nshader_parameter/tint = null\nshader_parameter/speed = 3.0\n\n[node name=\"Pond\" type=\"Node3D\" unique_id=1]\n";
+
+fn pond_project() -> tempfile::TempDir {
     let project = project_dir();
     let root = project.path();
     std::fs::write(root.join("water.gdshader.uid"), "uid://dshader\n").expect("uid");
-    std::fs::write(
-        root.join("pond.tscn"),
-        "[gd_scene load_steps=2 format=3 uid=\"uid://cpond\"]\n\n[ext_resource type=\"Shader\" uid=\"uid://dshader\" path=\"res://water.gdshader\" id=\"1_a\"]\n\n[sub_resource type=\"ShaderMaterial\" id=\"ShaderMaterial_a\"]\nshader = ExtResource(\"1_a\")\nshader_parameter/speed = 2.0\n\n[node name=\"Pond\" type=\"Node3D\"]\n",
-    )
-    .expect("scene");
-    // What Godot 4.8 writes for the same scene after a headless load, edit and save.
-    std::fs::write(
-        root.join("headless.txt"),
-        "[gd_scene format=3]\n\n[ext_resource type=\"Shader\" path=\"res://water.gdshader\" id=\"1_a\"]\n\n[sub_resource type=\"ShaderMaterial\" id=\"ShaderMaterial_a\"]\nshader = ExtResource(\"1_a\")\nshader_parameter/tint = null\nshader_parameter/speed = 3.0\n\n[node name=\"Pond\" type=\"Node3D\" unique_id=1]\n",
-    )
-    .expect("headless output");
+    std::fs::write(root.join("pond.tscn"), POND_EDITOR_SAVED).expect("scene");
+    std::fs::write(root.join("headless.txt"), POND_HEADLESS_SAVED).expect("headless output");
     write_script(root, "edit.gd", b"extends SceneTree\n");
+    write_script(root, "lock.gd", b"extends SceneTree\n");
     write_script(root, "quiet.gd", b"extends SceneTree\n");
+    project
+}
+
+fn answer_body(answer: &str) -> Value {
+    serde_json::from_str(&answer[answer.find('{').expect("json")..])
+        .expect("answer is JSON after any warning line")
+}
+
+#[tokio::test]
+async fn run_script_writes_back_the_uids_a_headless_save_dropped() {
+    let project = pond_project();
+    let root = project.path();
     let tools = manager_in(root, saving_godot(root));
 
     let quiet = call_with(&tools, json!({"script": "quiet.gd", "project_path": root})).await;
-    assert!(!quiet.is_error, "{}", text(&quiet));
-    assert!(
-        text(&quiet).contains("\"resource_damage\": []") && !text(&quiet).contains("WARNING"),
-        "{}",
-        text(&quiet)
-    );
+    let quiet_text = text(&quiet);
+    assert!(!quiet.is_error, "{quiet_text}");
+    let body = answer_body(&quiet_text);
+    assert_eq!(body["resource_repairs"], json!([]), "{quiet_text}");
+    assert_eq!(body["resource_damage"], json!([]), "{quiet_text}");
+    assert!(!quiet_text.contains("WARNING"), "{quiet_text}");
 
     let saved = call_with(&tools, json!({"script": "edit.gd", "project_path": root})).await;
     let saved_text = text(&saved);
+    assert!(!saved.is_error, "{saved_text}");
+    assert!(!saved_text.contains("WARNING"), "{saved_text}");
+    let body = answer_body(&saved_text);
+    assert_eq!(
+        body["resource_repairs"],
+        json!([{
+            "path": "res://pond.tscn",
+            "uid": "uid://cpond",
+            "new_uid": false,
+            "ext_resource_uids": [{"path": "res://water.gdshader", "uid": "uid://dshader"}],
+            "removed_null_shader_parameters": ["tint"],
+        }])
+    );
+    assert_eq!(body["resource_damage"], json!([]), "{saved_text}");
+    assert_eq!(
+        body["editor_refresh"],
+        Value::Null,
+        "no editor is connected"
+    );
+    assert!(
+        body["summary"]
+            .as_str()
+            .is_some_and(|summary| summary.contains("repaired res://pond.tscn")),
+        "{saved_text}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("pond.tscn")).expect("pond"),
+        POND_HEADLESS_SAVED
+            .replace(
+                "[gd_scene format=3]",
+                "[gd_scene format=3 uid=\"uid://cpond\"]"
+            )
+            .replace(
+                "type=\"Shader\" path",
+                "type=\"Shader\" uid=\"uid://dshader\" path"
+            )
+            .replace("shader_parameter/tint = null\n", "")
+    );
+}
+
+#[tokio::test]
+async fn run_script_names_the_uids_and_null_shader_parameters_it_could_not_repair() {
+    let project = pond_project();
+    let root = project.path();
+    let tools = manager_in(root, saving_godot(root));
+
+    // lock.gd leaves pond.tscn read-only, so the server cannot write the uids back.
+    let saved = call_with(&tools, json!({"script": "lock.gd", "project_path": root})).await;
+    let saved_text = text(&saved);
+    let pond = root.join("pond.tscn");
+    let mut writable = std::fs::metadata(&pond).expect("pond").permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    writable.set_readonly(false);
+    std::fs::set_permissions(&pond, writable).expect("unlock");
     assert!(!saved.is_error, "{saved_text}");
     assert!(
         saved_text.starts_with("WARNING") && saved_text.contains("res://pond.tscn"),
         "{saved_text}"
     );
-    let body: Value = serde_json::from_str(&saved_text[saved_text.find('{').expect("json")..])
-        .expect("answer is JSON after the warning line");
+    let body = answer_body(&saved_text);
+    assert_eq!(body["resource_repairs"], json!([]), "{saved_text}");
     assert_eq!(
         body["resource_damage"],
         json!([{
@@ -2806,7 +2868,8 @@ async fn run_script_names_the_uids_and_null_shader_parameters_a_headless_save_dr
     );
 }
 
-/// A Godot stand-in that, for edit.gd, overwrites pond.tscn with headless.txt.
+/// A Godot stand-in that, for edit.gd and lock.gd, overwrites pond.tscn with headless.txt; lock.gd
+/// then makes it read-only.
 fn saving_godot(dir: &Path) -> PathBuf {
     #[cfg(unix)]
     {
@@ -2825,6 +2888,7 @@ for arg in "$@"; do
 done
 case "$*" in
   *edit.gd*) cp "$proj/headless.txt" "$proj/pond.tscn" ;;
+  *lock.gd*) cp "$proj/headless.txt" "$proj/pond.tscn"; chmod a-w "$proj/pond.tscn" ;;
 esac
 exit 0
 "#,
@@ -2838,7 +2902,7 @@ exit 0
         let path = dir.join("saving_godot.bat");
         std::fs::write(
             &path,
-            "@echo off\r\nsetlocal enabledelayedexpansion\r\nset PREV=\r\nset PROJ=\r\nfor %%A in (%*) do (\r\n  if \"!PREV!\"==\"--path\" set PROJ=%%~A\r\n  set PREV=%%A\r\n)\r\necho %* | findstr edit.gd >nul\r\nif %errorlevel%==0 copy /Y \"%PROJ%\\headless.txt\" \"%PROJ%\\pond.tscn\" >nul\r\nexit /b 0\r\n",
+            "@echo off\r\nsetlocal enabledelayedexpansion\r\nset PREV=\r\nset PROJ=\r\nfor %%A in (%*) do (\r\n  if \"!PREV!\"==\"--path\" set PROJ=%%~A\r\n  set PREV=%%A\r\n)\r\necho %* | findstr edit.gd >nul\r\nif %errorlevel%==0 copy /Y \"%PROJ%\\headless.txt\" \"%PROJ%\\pond.tscn\" >nul\r\necho %* | findstr lock.gd >nul\r\nif %errorlevel%==0 (\r\n  copy /Y \"%PROJ%\\headless.txt\" \"%PROJ%\\pond.tscn\" >nul\r\n  attrib +r \"%PROJ%\\pond.tscn\"\r\n)\r\nexit /b 0\r\n",
         )
         .expect("write saving godot");
         path

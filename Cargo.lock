@@ -277,7 +277,7 @@ dependencies = [
 
 [[package]]
 name = "godot-mcp"
-version = "0.10.0+godot.4.6"
+version = "0.11.0+godot.4.6"
 dependencies = [
  "anyhow",
  "clap",

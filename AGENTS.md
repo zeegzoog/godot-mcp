@@ -144,6 +144,7 @@ When interacting with a Godot project, agents must adhere to the following workf
 
 4. **Runtime Monitoring**:
    - After `godot_run_project`, check `godot_get_run_status` and stop the run with `godot_stop_project` when done: without `run_id` it stops the editor's Play mode and every managed run, and lists what it stopped.
+   - Close an editor you opened (with `godot_launch_editor` or otherwise) with `godot_close_editor` when done. It refuses while the editor has unsaved scenes or scripts and lists them: save them or ask the person; pass `discard: true` only when losing them is intended.
    - Read logs and errors with `godot_run_output`. Inspect the live tree with `godot_game_tree` before `godot_game_set` or `godot_game_call`.
    - Capture the game with `godot_game_screenshot`. A headless game returns an error and no image; do not treat that error as a picture. For a series of frames on disk, use `godot_game_record`.
    - Pass game flags with `godot_run_project` `user_args` and `mode: "process"`. They go after `--`. Do not put Godot engine options there.

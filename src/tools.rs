@@ -319,10 +319,10 @@ impl ToolManager {
             .ok()
             .map(|relative| format!("res://{}", relative.to_string_lossy().replace('\\', "/")));
         let replacing = overwrite && fs::try_exists(&target).await.unwrap_or(false);
-        // A named project may still be the one the editor has open, with the script in a tab.
+        // A named project may still be the one the editor has open, with the script in a tab;
+        // a new script there must reach the editor too, or its class_name stays unknown to it.
         let editor_holds_project = project.from_editor
-            || (replacing
-                && str_arg(&args, "project_path").is_some()
+            || (str_arg(&args, "project_path").is_some()
                 && self.editor_may_serve(&project.dir).await);
         let open_tab = match (&res_path, editor_holds_project && replacing) {
             (Some(res_path), true) => match self.script_tab(res_path, false).await {

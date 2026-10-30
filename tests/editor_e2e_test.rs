@@ -3764,3 +3764,116 @@ async fn a_class_written_behind_the_editors_back_is_registered_before_validation
         .await;
     assert!(!validated.is_error, "{}", tool_text(&validated));
 }
+
+const UID_PROBE_HOOK: &str = r#"        "__test_uid_probe":
+            var path: String = str(params.get("path", ""))
+            var id: int = ResourceLoader.get_resource_uid(path)
+            send_success(peer, cmd_id, {"uid": ResourceUID.id_to_text(id) if id != ResourceUID.INVALID_ID else "", "cached_path": ResourceUID.get_id_path(id) if ResourceUID.has_id(id) else "", "in_filesystem": _filesystem_has(EditorInterface.get_resource_filesystem(), path)})
+"#;
+
+/// A level placed by a headless script, as Frog World places its scenes: a new scene that
+/// instances another scene and uses a shader and a script, plus an existing scene saved again.
+const PLACE_SCRIPT: &str = "extends SceneTree\n\nfunc _initialize() -> void:\n\tvar root := Node3D.new()\n\troot.name = \"Placed\"\n\tvar frog: Node = (load(\"res://frog.tscn\") as PackedScene).instantiate()\n\troot.add_child(frog)\n\tfrog.owner = root\n\tvar water := MeshInstance3D.new()\n\twater.name = \"Water\"\n\troot.add_child(water)\n\twater.owner = root\n\tvar material := ShaderMaterial.new()\n\tmaterial.shader = load(\"res://water.gdshader\")\n\tmaterial.set_shader_parameter(\"speed\", 2.0)\n\twater.material_override = material\n\twater.set_script(load(\"res://helper.gd\"))\n\tvar placed := PackedScene.new()\n\tplaced.pack(root)\n\tprint(\"PLACED \", ResourceSaver.save(placed, \"res://placed.tscn\"))\n\troot.free()\n\tvar frog_scene: PackedScene = load(\"res://frog.tscn\")\n\tprint(\"FROG \", ResourceSaver.save(frog_scene))\n\tquit(0)\n";
+
+/// godot_run_script with the editor open on the same project: the uids the headless saver drops
+/// are written back, and the editor's file system and uid cache learn the new scene's uid.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn run_script_keeps_uids_and_the_editor_follows_the_saved_files() {
+    use godot_mcp::cli_runner::CliRunner;
+    use godot_mcp::tools::ToolManager;
+    use std::sync::Arc;
+
+    let hook = format!("{UID_PROBE_HOOK}{UNDO_HOOK}");
+    let editor = start_editor_with(
+        Some(&hook),
+        "",
+        &[
+            (
+                "water.gdshader",
+                "shader_type spatial;\nuniform float speed = 1.0;\nuniform vec4 tint : source_color = vec4(1.0);\nvoid fragment() { ALBEDO = tint.rgb * speed; }\n",
+            ),
+            ("helper.gd", "extends Node\n"),
+            (
+                "frog.tscn",
+                "[gd_scene format=3 uid=\"uid://cfrogscene1\"]\n\n[node name=\"Frog\" type=\"Node3D\"]\n",
+            ),
+            ("place.gd", PLACE_SCRIPT),
+        ],
+        "",
+    )
+    .await;
+    let project = editor.project.clone();
+    let uid_file = |name: &str| {
+        std::fs::read_to_string(project.join(name))
+            .unwrap_or_else(|_| panic!("{name}: the import gives it a .uid"))
+            .trim()
+            .to_string()
+    };
+    let shader_uid = uid_file("water.gdshader.uid");
+    let helper_uid = uid_file("helper.gd.uid");
+    let (godot, _) = godot_binaries();
+    let tools = Arc::new(
+        ToolManager::new(BridgeClient::new(editor.port), CliRunner::new(godot))
+            .with_working_dir(project.clone()),
+    );
+
+    let result = Arc::clone(&tools)
+        .call_tool(
+            "godot_run_script",
+            json!({"script": "res://place.gd", "timeout_seconds": 120}),
+        )
+        .await;
+    let answer = tool_text(&result);
+    assert!(!result.is_error, "{answer}");
+    assert!(
+        answer.contains("PLACED 0") && answer.contains("FROG 0") && !answer.starts_with("WARNING"),
+        "{answer}"
+    );
+    let body: Value = serde_json::from_str(&answer).expect("JSON answer");
+    assert_eq!(body["resource_damage"], json!([]), "{answer}");
+
+    let frog = std::fs::read_to_string(project.join("frog.tscn")).expect("frog");
+    assert!(
+        frog.starts_with("[gd_scene format=3 uid=\"uid://cfrogscene1\"]"),
+        "{frog}"
+    );
+    let placed = std::fs::read_to_string(project.join("placed.tscn")).expect("placed");
+    let header = placed.lines().next().unwrap_or_default();
+    let placed_uid = header
+        .split("uid=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .unwrap_or_else(|| panic!("the new scene has no uid: {placed}"))
+        .to_string();
+    for (target, uid) in [
+        ("res://frog.tscn", "uid://cfrogscene1"),
+        ("res://water.gdshader", shader_uid.as_str()),
+        ("res://helper.gd", helper_uid.as_str()),
+    ] {
+        assert!(
+            placed.contains(&format!("uid=\"{uid}\" path=\"{target}\"")),
+            "{target} lost its uid {uid}:\n{placed}"
+        );
+    }
+    assert!(!placed.contains("= null"), "{placed}");
+
+    let refreshed = body["editor_refresh"]["refreshed"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        refreshed.contains(&json!("res://placed.tscn"))
+            && refreshed.contains(&json!("res://frog.tscn")),
+        "{answer}"
+    );
+    let probe = editor
+        .bridge
+        .send_command("__test_uid_probe", json!({"path": "res://placed.tscn"}))
+        .await
+        .expect("uid probe");
+    assert_eq!(
+        probe,
+        json!({"uid": placed_uid, "cached_path": "res://placed.tscn", "in_filesystem": true})
+    );
+}

@@ -3,13 +3,15 @@
 //! A `godot --headless -s` script that saves a `.tscn` or `.tres` runs without the editor's file
 //! system, and Godot's text saver then writes no `uid=` at all: neither the file's own nor any
 //! `[ext_resource]`'s. Without a renderer, a `ShaderMaterial` also reports `null` for every uniform
-//! it never set, and the saver writes `shader_parameter/<name> = null`. Both are engine behaviour;
-//! this module only finds them after the run so the answer can say what was lost.
+//! it never set, and the saver writes `shader_parameter/<name> = null`. Both are engine behaviour:
+//! the saver asks for uids through a callback only the editor's file system installs. This module
+//! finds them after the run, writes back what the editor would have written, and reports what is
+//! still lost.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::paths::skipped_by_godot;
@@ -45,6 +47,22 @@ pub struct ResourceDamage {
     pub null_shader_parameters: Vec<String>,
 }
 
+/// What a repair wrote back into one rewritten file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceRepair {
+    /// `res://` path of the repaired file.
+    pub path: String,
+    /// The uid written into the file's header: the one it had before the run, or a new one for a
+    /// file the run created.
+    pub uid: Option<String>,
+    /// Whether `uid` was created for a file that had none before the run.
+    pub new_uid: bool,
+    /// `(target path, uid)` of each `[ext_resource]` that got its uid back.
+    pub ext_resource_uids: Vec<(String, String)>,
+    /// Shader parameters whose `null` line was removed (an unset uniform reads its default).
+    pub removed_null_shader_parameters: Vec<String>,
+}
+
 impl TextResourceSnapshot {
     /// Reads the header and the `[ext_resource]` lines of every text scene and resource.
     pub fn take(project: &Path) -> Self {
@@ -71,12 +89,100 @@ impl TextResourceSnapshot {
     /// gained a `null` shader parameter. Sorted by path.
     pub fn damage_since(&self, project: &Path) -> Vec<ResourceDamage> {
         let mut found = Vec::new();
+        for (res, _, text) in self.changed_since(project) {
+            if let Some(damage) = inspect(project, &res, &text, self.files.get(&res)) {
+                found.push(damage);
+            }
+        }
+        found.sort_by(|a, b| a.path.cmp(&b.path));
+        found
+    }
+
+    /// Writes back into each text scene and resource rewritten since
+    /// [`TextResourceSnapshot::take`] what the editor's saver would have written: the file's own
+    /// uid (the one it had, or a new one for a new file), the uid of each `[ext_resource]` whose
+    /// target has one, and no `shader_parameter/<name> = null` lines. A file that cannot be
+    /// written is left as it is, so [`TextResourceSnapshot::damage_since`] still reports it.
+    /// Sorted by path.
+    pub fn repair_since(&self, project: &Path) -> Vec<ResourceRepair> {
+        let changed = self.changed_since(project);
+        // Every header uid first, so a scene that references another rewritten file gets that
+        // file's uid even though its header on disk has none yet.
+        let mut own: BTreeMap<String, (String, bool)> = BTreeMap::new();
+        for (res, _, text) in &changed {
+            let header = text.lines().next().unwrap_or("");
+            if !is_resource_header(header) || attribute(header, "uid").is_some() {
+                continue;
+            }
+            let entry = match self.files.get(res).and_then(|old| old.uid.clone()) {
+                Some(uid) => (uid, false),
+                None => (new_uid(), true),
+            };
+            own.insert(res.clone(), entry);
+        }
+        let mut repairs = Vec::new();
+        for (res, file, text) in &changed {
+            let before = self.files.get(res);
+            let mut repair = ResourceRepair {
+                path: res.clone(),
+                uid: None,
+                new_uid: false,
+                ext_resource_uids: Vec::new(),
+                removed_null_shader_parameters: Vec::new(),
+            };
+            let mut out = String::with_capacity(text.len() + 256);
+            for (index, line) in text.split_inclusive('\n').enumerate() {
+                let body = line.trim_end_matches(['\r', '\n']);
+                let ending = &line[body.len()..];
+                if index == 0 {
+                    if let (Some((uid, fresh)), Some(open)) = (own.get(res), body.strip_suffix(']'))
+                    {
+                        out.push_str(&format!("{open} uid=\"{uid}\"]{ending}"));
+                        repair.uid = Some(uid.clone());
+                        repair.new_uid = *fresh;
+                        continue;
+                    }
+                } else if body.starts_with("[ext_resource") && attribute(body, "uid").is_none() {
+                    let known = attribute(body, "path").and_then(|target| {
+                        own.get(&target)
+                            .map(|(uid, _)| uid.clone())
+                            .or_else(|| uid_of(project, &target))
+                            .or_else(|| before.and_then(|old| old.ext_uids.get(&target).cloned()))
+                            .filter(|uid| is_uid_text(uid))
+                            .map(|uid| (target, uid))
+                    });
+                    if let (Some((target, uid)), Some(at)) = (known, body.find(" path=\"")) {
+                        out.push_str(&format!(
+                            "{} uid=\"{uid}\"{}{ending}",
+                            &body[..at],
+                            &body[at..]
+                        ));
+                        repair.ext_resource_uids.push((target, uid));
+                        continue;
+                    }
+                } else if let Some(name) = null_shader_parameter(body) {
+                    repair.removed_null_shader_parameters.push(name);
+                    continue;
+                }
+                out.push_str(line);
+            }
+            if out != *text && fs::write(file, &out).is_ok() {
+                repairs.push(repair);
+            }
+        }
+        repairs.sort_by(|a, b| a.path.cmp(&b.path));
+        repairs
+    }
+
+    /// `(res path, file, text)` of each text scene and resource whose size or modification time
+    /// changed since the snapshot, or that is new. Files over [`MAX_READ`] are skipped.
+    fn changed_since(&self, project: &Path) -> Vec<(String, PathBuf, String)> {
+        let mut changed = Vec::new();
         walk(project, project, &mut |res, file| {
             let Ok(meta) = fs::metadata(file) else {
                 return;
             };
-            let before = self.files.get(&res);
-            if before.is_some_and(|old| {
+            if self.files.get(&res).is_some_and(|old| {
                 old.len == meta.len()
                     && old.modified.is_some()
                     && old.modified == meta.modified().ok()
@@ -89,12 +195,9 @@ impl TextResourceSnapshot {
             let Ok(text) = fs::read_to_string(file) else {
                 return;
             };
-            if let Some(damage) = inspect(project, &res, &text, before) {
-                found.push(damage);
-            }
+            changed.push((res, file.to_path_buf(), text));
         });
-        found.sort_by(|a, b| a.path.cmp(&b.path));
-        found
+        changed
     }
 }
 
@@ -124,12 +227,8 @@ fn inspect(
             if let Some(uid) = known {
                 ext_resources_without_uid.push((target, uid));
             }
-        } else if let Some(rest) = line.strip_prefix("shader_parameter/") {
-            if let Some((name, value)) = rest.split_once('=') {
-                if value.trim() == "null" {
-                    null_shader_parameters.push(name.trim().to_string());
-                }
-            }
+        } else if let Some(name) = null_shader_parameter(line) {
+            null_shader_parameters.push(name);
         }
     }
     if lost_uid.is_none()
@@ -179,6 +278,47 @@ fn uid_of(project: &Path, target: &str) -> Option<String> {
         return read_head(&file).and_then(|(uid, _)| uid);
     }
     None
+}
+
+/// The name of a `shader_parameter/<name> = null` line.
+fn null_shader_parameter(line: &str) -> Option<String> {
+    let (name, value) = line.strip_prefix("shader_parameter/")?.split_once('=')?;
+    (value.trim() == "null").then(|| name.trim().to_string())
+}
+
+fn is_resource_header(line: &str) -> bool {
+    line.starts_with("[gd_scene") || line.starts_with("[gd_resource")
+}
+
+/// `uid://` followed by the characters Godot's uid text uses.
+fn is_uid_text(text: &str) -> bool {
+    text.strip_prefix("uid://").is_some_and(|rest| {
+        !rest.is_empty()
+            && rest
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+    })
+}
+
+/// A new uid as Godot's `ResourceUID::create_id` makes one: 63 random bits, written with its
+/// `id_to_text` alphabet (`a`-`y`, then `0`-`8`), most significant digit first.
+fn new_uid() -> String {
+    let bits = uuid::Uuid::new_v4().as_u128();
+    uid_text(((bits >> 64) as u64 ^ bits as u64) & 0x7FFF_FFFF_FFFF_FFFF)
+}
+
+fn uid_text(mut id: u64) -> String {
+    const DIGITS: &[u8; 34] = b"abcdefghijklmnopqrstuvwxy012345678";
+    let mut digits = Vec::new();
+    loop {
+        digits.push(DIGITS[(id % 34) as usize]);
+        id /= 34;
+        if id == 0 {
+            break;
+        }
+    }
+    digits.reverse();
+    format!("uid://{}", String::from_utf8_lossy(&digits))
 }
 
 fn read_small(path: &Path) -> Option<String> {
@@ -364,6 +504,114 @@ shader_parameter/speed = 3.0
         )
         .expect("rewrite");
         assert!(snapshot.damage_since(root).is_empty());
+    }
+
+    #[test]
+    fn repair_puts_back_what_the_editor_would_have_written() {
+        let dir = tempfile::tempdir().expect("project");
+        let root = dir.path();
+        fs::write(root.join("pond.tscn"), EDITOR_SAVED).expect("scene");
+        fs::write(
+            root.join("frog.tscn"),
+            "[gd_scene format=3 uid=\"uid://bfrog\"]\n",
+        )
+        .expect("frog");
+        let snapshot = TextResourceSnapshot::take(root);
+        fs::write(root.join("pond.tscn"), HEADLESS_SAVED.replace('\n', "\r\n")).expect("rewrite");
+
+        let repairs = snapshot.repair_since(root);
+        assert_eq!(
+            repairs,
+            vec![ResourceRepair {
+                path: "res://pond.tscn".into(),
+                uid: Some("uid://cpond".into()),
+                new_uid: false,
+                ext_resource_uids: vec![
+                    ("res://water.gdshader".into(), "uid://dshader".into()),
+                    ("res://frog.tscn".into(), "uid://bfrog".into()),
+                ],
+                removed_null_shader_parameters: vec!["tint".into()],
+            }]
+        );
+        let repaired = fs::read_to_string(root.join("pond.tscn")).expect("repaired");
+        assert_eq!(
+            repaired,
+            HEADLESS_SAVED
+                .replace(
+                    "[gd_scene format=3]",
+                    "[gd_scene format=3 uid=\"uid://cpond\"]"
+                )
+                .replace(
+                    "type=\"Shader\" path",
+                    "type=\"Shader\" uid=\"uid://dshader\" path"
+                )
+                .replace(
+                    "type=\"PackedScene\" path",
+                    "type=\"PackedScene\" uid=\"uid://bfrog\" path"
+                )
+                .replace("shader_parameter/tint = null\n", "")
+                .replace('\n', "\r\n")
+        );
+        assert!(snapshot.damage_since(root).is_empty());
+        // A second pass finds nothing left to do.
+        assert!(snapshot.repair_since(root).is_empty());
+    }
+
+    #[test]
+    fn repair_gives_new_files_a_uid_that_their_references_share() {
+        let dir = tempfile::tempdir().expect("project");
+        let root = dir.path();
+        fs::write(root.join("water.gdshader.uid"), "uid://dshader\n").expect("uid");
+        let snapshot = TextResourceSnapshot::take(root);
+        fs::write(
+            root.join("mat.tres"),
+            "[gd_resource type=\"ShaderMaterial\" format=3]\n\n[ext_resource type=\"Shader\" path=\"res://water.gdshader\" id=\"1\"]\n\n[resource]\nshader = ExtResource(\"1\")\n",
+        )
+        .expect("material");
+        fs::write(
+            root.join("level.tscn"),
+            "[gd_scene format=3]\n\n[ext_resource type=\"Material\" path=\"res://mat.tres\" id=\"1\"]\n[ext_resource type=\"Texture2D\" path=\"res://plain.png\" id=\"2\"]\n\n[node name=\"Level\" type=\"Node3D\"]\n",
+        )
+        .expect("level");
+
+        let repairs = snapshot.repair_since(root);
+        assert_eq!(repairs.len(), 2, "{repairs:?}");
+        let (level, material) = (&repairs[0], &repairs[1]);
+        let material_uid = material.uid.clone().expect("material uid");
+        assert!(
+            material.new_uid && is_uid_text(&material_uid),
+            "{material:?}"
+        );
+        assert_eq!(
+            material.ext_resource_uids,
+            vec![("res://water.gdshader".into(), "uid://dshader".into())]
+        );
+        assert!(level.new_uid && level.uid != material.uid, "{level:?}");
+        // plain.png has no uid anywhere, so its line stays as the script wrote it.
+        assert_eq!(
+            level.ext_resource_uids,
+            vec![("res://mat.tres".into(), material_uid.clone())]
+        );
+        let text = fs::read_to_string(root.join("level.tscn")).expect("level");
+        assert!(
+            text.contains(&format!("uid=\"{material_uid}\" path=\"res://mat.tres\""))
+                && text.contains(
+                    "[ext_resource type=\"Texture2D\" path=\"res://plain.png\" id=\"2\"]"
+                ),
+            "{text}"
+        );
+        assert_eq!(
+            read_head(&root.join("mat.tres")).and_then(|(uid, _)| uid),
+            Some(material_uid)
+        );
+    }
+
+    #[test]
+    fn uid_text_matches_godot() {
+        // ResourceUID.id_to_text(5610405182049170494) in Godot 4.8.
+        assert_eq!(uid_text(5_610_405_182_049_170_494), "uid://cl6ys3a78gc43");
+        assert_eq!(uid_text(0x7FFF_FFFF_FFFF_FFFF), "uid://d4n4ub6itg400");
+        assert_eq!(uid_text(0), "uid://a");
     }
 
     #[test]

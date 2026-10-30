@@ -17,6 +17,7 @@ use tokio::io::AsyncWriteExt;
 
 mod authoring;
 mod code;
+mod editor;
 mod feedback;
 mod files;
 mod game;
@@ -41,6 +42,8 @@ pub struct ToolManager {
     feedback: feedback::FeedbackState,
     games: GameHub,
     lsp: LspHub,
+    /// Editors started by godot_launch_editor, so godot_close_editor can see them exit.
+    editors: editor::LaunchedEditors,
 }
 
 impl ToolManager {
@@ -53,6 +56,7 @@ impl ToolManager {
             feedback: feedback::FeedbackState::new(FeedbackMode::default(), None),
             games: GameHub::new(godot.clone()),
             lsp: LspHub::new(godot),
+            editors: editor::LaunchedEditors::default(),
         }
     }
 
@@ -110,6 +114,7 @@ impl ToolManager {
             "godot_get_version" => self.handle_get_version().await,
             "godot_get_project_info" => self.handle_bridge_call("get_project_info", args).await,
             "godot_launch_editor" => self.handle_launch_editor(args).await,
+            "godot_close_editor" => self.handle_close_editor(args).await,
             "godot_run_project" => self.handle_run_project(args).await,
             "godot_stop_project" => self.handle_stop_project(args).await,
             "godot_get_run_status" => self.handle_run_status().await,
@@ -235,7 +240,12 @@ impl ToolManager {
             Err(result) => return result,
         };
 
-        match self.cli.launch_editor(&path).await {
+        let launched = self.cli.launch_editor(&path).await.and_then(|child| {
+            let pid = crate::cli_runner::process_id(&child, "Godot Editor")?;
+            self.editors.add(pid, path.clone(), child);
+            Ok(pid)
+        });
+        match launched {
             Ok(pid) => ToolResult::text(format!(
                 "Godot Editor launched successfully for '{}' (PID: {pid}).",
                 path.display()
@@ -811,9 +821,8 @@ fn annotations(name: &str) -> Option<ToolAnnotations> {
         | "godot_edit_input_action"
         | "godot_delete_file"
         | "godot_game_set" => [false, true, true],
-        "godot_run_script" | "godot_edit_script" | "godot_game_call" | "godot_game_command" => {
-            [false, true, false]
-        }
+        "godot_run_script" | "godot_edit_script" | "godot_game_call" | "godot_game_command"
+        | "godot_close_editor" => [false, true, false],
         _ => return None,
     };
     Some(ToolAnnotations {
@@ -845,6 +854,27 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
                 "project_path": {
                     "type": "string",
                     "description": "Absolute path to the Godot project directory containing project.godot. Optional when the server runs inside the project."
+                }
+            }),
+            &[],
+        ),
+        tool(
+            "godot_close_editor",
+            "Closes the Godot Editor of a project and waits until its process has exited. The project is project_path, else the project the server was started in, else the connected editor's own. An editor connected to the bridge is asked to quit without saving anything: when it has unsaved scenes or scripts it stays open and the answer lists them, unless discard is true, which closes it and loses them. An editor that has another project open is never closed. Without a connected editor, only an editor this server launched with godot_launch_editor for the project can be stopped, by its PID, and only with discard true, since its unsaved changes cannot be checked.",
+            json!({
+                "project_path": {
+                    "type": "string",
+                    "description": "Absolute path to the project directory whose editor should close. Optional when the server runs inside the project."
+                },
+                "discard": {
+                    "type": "boolean",
+                    "description": "Close even when the editor has unsaved scenes or scripts, losing those changes. Required to stop a launched editor that is not connected to the bridge. Default false."
+                },
+                "timeout_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 120,
+                    "description": "How long to wait for the editor process to exit. Default 30."
                 }
             }),
             &[],

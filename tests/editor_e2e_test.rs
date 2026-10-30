@@ -4065,3 +4065,102 @@ async fn an_editor_without_a_port_setting_is_found_on_the_derived_port() {
         }
     }
 }
+
+/// A tool manager that talks to `editor` and runs in its project.
+fn tools_for(editor: &Editor) -> std::sync::Arc<godot_mcp::tools::ToolManager> {
+    let (godot, _) = godot_binaries();
+    std::sync::Arc::new(
+        godot_mcp::tools::ToolManager::new(
+            BridgeClient::new(editor.port),
+            godot_mcp::cli_runner::CliRunner::new(godot),
+        )
+        .with_working_dir(editor.project.clone()),
+    )
+}
+
+fn result_text(result: &godot_mcp::protocol::ToolResult) -> String {
+    format!("{:?}", result.content)
+}
+
+/// godot_close_editor quits the editor through its bridge and answers once the process is gone.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn close_editor_quits_the_editor_and_its_process_exits() {
+    let mut editor = start_editor(false).await;
+    let pid = editor._child.id().expect("editor pid");
+    let tools = tools_for(&editor);
+
+    // This test is the editor's parent, so it reaps the process; until then the editor would
+    // stay a zombie that still looks alive to the server.
+    let (closed, status) = tokio::join!(
+        tools.call_tool("godot_close_editor", json!({})),
+        timeout(Duration::from_secs(60), editor._child.wait())
+    );
+    assert!(!closed.is_error, "{}", result_text(&closed));
+    let shown = result_text(&closed);
+    assert!(shown.contains("exited"), "{shown}");
+    assert!(shown.contains(&pid.to_string()), "{shown}");
+    let status = status
+        .expect("the editor process did not exit")
+        .expect("wait for the editor");
+    eprintln!("editor exited with {status}");
+}
+
+/// Unsaved scene changes keep the editor open and are named; discard closes it anyway.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn close_editor_refuses_unsaved_changes_until_discard() {
+    let mut editor = start_editor(false).await;
+    editor
+        .bridge
+        .send_command("open_scene", json!({"scene_path": "res://main.tscn"}))
+        .await
+        .expect("open main.tscn");
+    editor
+        .bridge
+        .send_command(
+            "add_node",
+            json!({"parent_node_path": ".", "node_type": "Node2D", "node_name": "Unsaved"}),
+        )
+        .await
+        .expect("add a node");
+    let tools = tools_for(&editor);
+
+    let refused = std::sync::Arc::clone(&tools)
+        .call_tool("godot_close_editor", json!({}))
+        .await;
+    assert!(refused.is_error, "{}", result_text(&refused));
+    let shown = result_text(&refused);
+    assert!(shown.contains("res://main.tscn"), "{shown}");
+    assert!(shown.contains("discard"), "{shown}");
+    sleep(Duration::from_secs(1)).await;
+    assert!(
+        editor._child.try_wait().expect("poll editor").is_none(),
+        "the editor quit although its changes were not saved"
+    );
+    editor
+        .bridge
+        .send_command("ping", json!({}))
+        .await
+        .expect("the bridge still answers");
+
+    let (closed, status) = tokio::join!(
+        tools.call_tool("godot_close_editor", json!({"discard": true})),
+        timeout(Duration::from_secs(60), editor._child.wait())
+    );
+    assert!(!closed.is_error, "{}", result_text(&closed));
+    assert!(
+        result_text(&closed).contains("res://main.tscn"),
+        "the answer names what was discarded: {}",
+        result_text(&closed)
+    );
+    status
+        .expect("the editor process did not exit")
+        .expect("wait for the editor");
+    assert!(
+        !std::fs::read_to_string(editor.project.join("main.tscn"))
+            .expect("main.tscn")
+            .contains("Unsaved"),
+        "the discarded change was saved"
+    );
+}

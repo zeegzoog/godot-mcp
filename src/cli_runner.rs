@@ -4,7 +4,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
@@ -201,8 +201,11 @@ impl CliRunner {
         }
     }
 
-    /// Launch Godot Editor for a designated project directory
-    pub async fn launch_editor(&self, project_path: &Path) -> Result<u32> {
+    /// Launch Godot Editor for a designated project directory.
+    ///
+    /// The handle is returned so the server can tell when the editor exits; dropping it neither
+    /// stops nor waits for the editor.
+    pub async fn launch_editor(&self, project_path: &Path) -> Result<Child> {
         let mut cmd = Command::new(&self.godot_binary);
         cmd.arg("--editor").arg("--path").arg(project_path);
         if let Some(port) = self.bridge_port {
@@ -221,7 +224,8 @@ impl CliRunner {
         if let Some(scene_file) = scene {
             cmd.arg(scene_file);
         }
-        spawn_detached(&mut cmd, "Godot project")
+        let child = spawn_detached(&mut cmd, "Godot project")?;
+        process_id(&child, "Godot project")
     }
 
     /// Runs a `SceneTree` script headless: `godot --headless --path <project> -s <script> [-- args]`.
@@ -467,7 +471,7 @@ fn create_scratch_dir() -> Result<PathBuf> {
     ))
 }
 
-fn spawn_detached(command: &mut Command, what: &str) -> Result<u32> {
+fn spawn_detached(command: &mut Command, what: &str) -> Result<Child> {
     // Ctrl+C in the MCP client's terminal reaches every process attached to its console
     // (Windows) or in its foreground process group (Unix), which would close the editor with
     // unsaved work. No console and a process group of its own keep the child out of reach.
@@ -482,12 +486,15 @@ fn spawn_detached(command: &mut Command, what: &str) -> Result<u32> {
     #[cfg(windows)]
     make_std_handles_private();
 
-    let child = command
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|e| McpError::Process(format!("Failed to spawn {what} process: {e}")))?;
+        .map_err(|e| McpError::Process(format!("Failed to spawn {what} process: {e}")))
+}
+
+pub(crate) fn process_id(child: &Child, what: &str) -> Result<u32> {
     child
         .id()
         .ok_or_else(|| McpError::Process(format!("Failed to obtain {what} process ID")))
@@ -763,10 +770,11 @@ SCRIPT ERROR: Assertion failed: boom\n\
         .expect("write script");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 
-        let pid = CliRunner::new(script)
+        let child = CliRunner::new(script)
             .launch_editor(dir.path())
             .await
             .expect("spawn");
+        let pid = child.id().expect("pid");
 
         for _ in 0..100 {
             if report.exists() {

@@ -3719,3 +3719,292 @@ async fn add_node_needs_exactly_one_of_node_type_and_scene_before_the_editor_is_
         );
     }
 }
+
+/// A stand-in for the Godot executable that stays alive for a minute, like an editor left open.
+fn lingering_godot(dir: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let path = dir.join("lingering_godot.bat");
+        std::fs::write(&path, "@echo off\r\nping -n 61 127.0.0.1 > nul\r\n")
+            .expect("write lingering godot");
+        path
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("lingering_godot.sh");
+        std::fs::write(&path, "#!/bin/sh\nexec sleep 60\n").expect("write lingering godot");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod lingering godot");
+        path
+    }
+}
+
+/// Whether a process with this id still runs (Unix only: `kill -0` sends no signal).
+#[cfg(unix)]
+fn process_runs(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(unix)]
+fn launched_pid(result: &ToolResult) -> u32 {
+    let shown = text(result);
+    shown
+        .split("PID: ")
+        .nth(1)
+        .and_then(|rest| rest.split(')').next())
+        .and_then(|pid| pid.parse().ok())
+        .unwrap_or_else(|| panic!("no PID in {shown}"))
+}
+
+#[test]
+fn close_editor_schema_offers_project_discard_and_timeout() {
+    let listed = ToolManager::list_tools();
+    let close = listed
+        .iter()
+        .find(|tool| tool.name == "godot_close_editor")
+        .expect("godot_close_editor is listed");
+    let schema = &close.input_schema;
+    assert_eq!(schema["properties"]["project_path"]["type"], "string");
+    assert_eq!(schema["properties"]["discard"]["type"], "boolean");
+    assert_eq!(schema["properties"]["timeout_seconds"]["type"], "integer");
+    assert!(schema.get("required").is_none(), "{schema}");
+    for word in ["unsaved", "discard", "another project", "PID"] {
+        assert!(
+            close.description.contains(word),
+            "{word} missing: {}",
+            close.description
+        );
+    }
+}
+
+#[tokio::test]
+async fn close_editor_asks_the_connected_editor_to_quit_and_waits_for_its_process() {
+    use common::{MockBridge, Reply};
+    use std::sync::Mutex;
+
+    let project = project_dir();
+    let engine = tempfile::tempdir().expect("engine dir");
+    // The process that plays the editor; the fake bridge ends it when asked to quit.
+    let editor = std::process::Command::new(lingering_godot(engine.path()))
+        .spawn()
+        .expect("spawn stand-in editor");
+    let pid = editor.id();
+    let editor = Arc::new(Mutex::new(Some(editor)));
+    let dir = project.path().to_string_lossy().to_string();
+    let bridge = MockBridge::start({
+        let editor = Arc::clone(&editor);
+        move |command| match command["type"].as_str() {
+            Some("get_project_info") => Reply::Ok(json!({"project_dir": dir})),
+            Some("close_editor") => {
+                let quitting = editor.lock().expect("editor lock").take();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    if let Some(mut child) = quitting {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                });
+                Reply::Ok(json!({"closing": true, "pid": pid, "discarded_scenes": [], "discarded_scripts": []}))
+            }
+            _ => Reply::Ok(json!({})),
+        }
+    })
+    .await;
+    let cwd = tempfile::tempdir().expect("working dir");
+    let manager = Arc::new(
+        ToolManager::new(
+            BridgeClient::new(bridge.port),
+            CliRunner::new(PathBuf::from("unused-godot")),
+        )
+        .with_working_dir(cwd.path().to_path_buf()),
+    );
+
+    let result = manager
+        .call_tool(
+            "godot_close_editor",
+            json!({"project_path": project.path()}),
+        )
+        .await;
+    assert!(!result.is_error, "{}", text(&result));
+    let shown = text(&result);
+    assert!(shown.contains(&pid.to_string()), "{shown}");
+    assert!(shown.contains("exited"), "{shown}");
+    let close = bridge
+        .received()
+        .into_iter()
+        .find(|command| command["type"] == "close_editor")
+        .expect("close_editor was sent");
+    assert_eq!(close["params"]["discard"], false, "{close}");
+}
+
+#[tokio::test]
+async fn close_editor_reports_unsaved_changes_instead_of_closing() {
+    use common::{MockBridge, Reply};
+
+    let project = project_dir();
+    let dir = project.path().to_string_lossy().to_string();
+    let bridge = MockBridge::start(move |command| match command["type"].as_str() {
+        Some("get_project_info") => Reply::Ok(json!({"project_dir": dir})),
+        Some("close_editor") => Reply::Ok(json!({
+            "closing": false,
+            "unsaved_scenes": ["res://main.tscn"],
+            "unsaved_scripts": ["res://player.gd"],
+        })),
+        _ => Reply::Ok(json!({})),
+    })
+    .await;
+    let manager = Arc::new(
+        ToolManager::new(
+            BridgeClient::new(bridge.port),
+            CliRunner::new(PathBuf::from("unused-godot")),
+        )
+        .with_working_dir(project.path().to_path_buf()),
+    );
+
+    let result = manager.call_tool("godot_close_editor", json!({})).await;
+    assert!(result.is_error, "{}", text(&result));
+    let shown = text(&result);
+    for needle in [
+        "res://main.tscn",
+        "res://player.gd",
+        "discard",
+        "not closed",
+    ] {
+        assert!(shown.contains(needle), "{needle} missing: {shown}");
+    }
+}
+
+#[tokio::test]
+async fn close_editor_never_closes_an_editor_that_has_another_project_open() {
+    use common::{MockBridge, Reply};
+
+    let mine = project_dir();
+    let theirs = project_dir();
+    let dir = theirs.path().to_string_lossy().to_string();
+    let bridge = MockBridge::start(move |command| match command["type"].as_str() {
+        Some("get_project_info") => Reply::Ok(json!({"project_dir": dir})),
+        _ => Reply::Ok(json!({"closing": true, "pid": 1})),
+    })
+    .await;
+    let manager = Arc::new(ToolManager::new(
+        BridgeClient::new(bridge.port),
+        CliRunner::new(PathBuf::from("unused-godot")),
+    ));
+
+    let result = manager
+        .call_tool(
+            "godot_close_editor",
+            json!({"project_path": mine.path(), "discard": true}),
+        )
+        .await;
+    assert!(result.is_error, "{}", text(&result));
+    let shown = text(&result);
+    assert!(
+        shown.contains(&theirs.path().display().to_string()),
+        "the answer names the editor's own project: {shown}"
+    );
+    assert!(
+        bridge
+            .received()
+            .iter()
+            .all(|command| command["type"] != "close_editor"),
+        "an editor of another project was asked to quit: {:?}",
+        bridge.received()
+    );
+}
+
+#[tokio::test]
+async fn close_editor_without_any_editor_says_there_is_nothing_to_close() {
+    let project = project_dir();
+    let result = call(
+        "godot_close_editor",
+        json!({"project_path": project.path(), "discard": true}),
+    )
+    .await;
+    assert!(result.is_error, "{}", text(&result));
+    let shown = text(&result);
+    assert!(shown.contains("No Godot editor"), "{shown}");
+    assert!(shown.contains("did not launch"), "{shown}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn close_editor_stops_an_editor_it_launched_only_with_discard_when_no_bridge_answers() {
+    let project = project_dir();
+    let engine = tempfile::tempdir().expect("engine dir");
+    let manager = manager_in(project.path(), lingering_godot(engine.path()));
+
+    let launched = Arc::clone(&manager)
+        .call_tool("godot_launch_editor", json!({}))
+        .await;
+    assert!(!launched.is_error, "{}", text(&launched));
+    let pid = launched_pid(&launched);
+    assert!(process_runs(pid));
+
+    let refused = Arc::clone(&manager)
+        .call_tool("godot_close_editor", json!({}))
+        .await;
+    assert!(refused.is_error, "{}", text(&refused));
+    let shown = text(&refused);
+    assert!(shown.contains(&pid.to_string()), "{shown}");
+    assert!(shown.contains("discard"), "{shown}");
+    assert!(process_runs(pid), "the editor was stopped without discard");
+
+    let closed = Arc::clone(&manager)
+        .call_tool("godot_close_editor", json!({"discard": true}))
+        .await;
+    assert!(!closed.is_error, "{}", text(&closed));
+    assert!(
+        text(&closed).contains(&pid.to_string()),
+        "{}",
+        text(&closed)
+    );
+    assert!(!process_runs(pid), "the editor still runs");
+
+    let again = manager
+        .call_tool("godot_close_editor", json!({"discard": true}))
+        .await;
+    assert!(again.is_error, "{}", text(&again));
+    assert!(text(&again).contains("No Godot editor"), "{}", text(&again));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn close_editor_leaves_an_editor_launched_for_another_project_running() {
+    let mine = project_dir();
+    let theirs = project_dir();
+    let engine = tempfile::tempdir().expect("engine dir");
+    let cwd = tempfile::tempdir().expect("working dir");
+    let manager = manager_in(cwd.path(), lingering_godot(engine.path()));
+
+    let launched = Arc::clone(&manager)
+        .call_tool(
+            "godot_launch_editor",
+            json!({"project_path": theirs.path()}),
+        )
+        .await;
+    assert!(!launched.is_error, "{}", text(&launched));
+    let pid = launched_pid(&launched);
+
+    let result = Arc::clone(&manager)
+        .call_tool(
+            "godot_close_editor",
+            json!({"project_path": mine.path(), "discard": true}),
+        )
+        .await;
+    assert!(result.is_error, "{}", text(&result));
+    assert!(process_runs(pid), "the other project's editor was stopped");
+
+    let cleanup = manager
+        .call_tool(
+            "godot_close_editor",
+            json!({"project_path": theirs.path(), "discard": true}),
+        )
+        .await;
+    assert!(!cleanup.is_error, "{}", text(&cleanup));
+}

@@ -8,6 +8,10 @@ Each Godot version has its own release line and branch (`godot-v4.5`, `godot-v4.
 
 ## [Unreleased]
 
+### Added
+
+- `godot_close_editor` closes a project's editor and answers once its process has exited, so an agent can close the editors it opened. The connected editor is asked to quit without saving anything; unsaved scenes and scripts keep it open and are listed, and `discard: true` closes it anyway. An editor that has another project open is never closed. When no editor is connected, an editor this server launched for the project with `godot_launch_editor` is stopped by its PID, only with `discard: true`. Thanks to @theromis.
+
 ### Changed
 
 - The editor bridge port is derived from the project path when no port is set, so editors of several projects, such as git worktrees of one repository, can run at once, each reached by a server started in its own project directory. The plugin uses the project setting `godot_mcp/bridge_port`, then the editor's `GODOT_DEBUG_PORT`, then FNV-1a 32 of the canonical project path mapped to 10000–29999; the server uses `--debug-port`, then `GODOT_DEBUG_PORT`, then the same formula for the project found from its working directory, and `9333` outside any project. A plugin with no configured port also listens on `9333` while that is free, so configs that set `GODOT_DEBUG_PORT=9333` keep reaching the first editor. Editors started by `godot_launch_editor` get the server's port. The busy-port and unreachable-editor errors name where the port came from. Thanks to @theromis.

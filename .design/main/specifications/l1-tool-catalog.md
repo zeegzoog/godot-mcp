@@ -1,6 +1,6 @@
 # Tool Catalog
 
-**Version:** 1.9.0
+**Version:** 1.10.0
 **Status:** Stable
 **Layer:** concept
 
@@ -45,6 +45,7 @@ Agents call tools without seeing the implementation; a tool's contract has to be
 - **TL-9 Editor stays in sync.** After a host-side write into the project the connected editor has open, the editor is asked to refresh that file so it is picked up (and assigned a UID) without a manual rescan.
 - **TL-10 The named project wins over the editor.** A tool given `project_path` acts on that project. When a connected editor has a different project open, the editor is not used for the call: the tool takes its host-side path when it has one (reading and editing a script, creating a scene or a resource, project settings), and otherwise refuses with both directories and the fix. An answer that changed a file or a setting names the project directory it acted on. [ADDED]
 - **TL-11 Stopping and asking about runs are honest.** `godot_stop_project` without a run id stops everything that runs: the editor's Play mode when it plays, and every managed run that is still running; the answer lists each one it stopped, or says that nothing was running. `godot_get_run_status` and `godot_run_output` answer that nothing runs when that is so, and do not report an absent editor as a failure when no editor is needed. [ADDED]
+- **TL-12 Closing an editor loses nothing unasked.** `godot_close_editor` closes only the editor of the named project (else the server's project, else the connected editor's own): an editor that reports another project is never asked to quit. It saves nothing; unsaved scenes and scripts keep the editor open and are listed, unless the caller passes `discard`, and the answer then names what was lost. It answers once the process has exited, or says that it still runs. An editor the server cannot reach through the bridge is stopped only when the server launched it for that project and the caller passes `discard`. [ADDED]
 
 ## 5. Detailed Design
 
@@ -54,7 +55,8 @@ Agents call tools without seeing the implementation; a tool's contract has to be
 | --- | --- | --- | --- |
 | `godot_get_version` | live-first | no | Engine version from the editor, else the binary |
 | `godot_get_project_info` | editor | no | Name, main scene, features, directory |
-| `godot_launch_editor` | host | process | Starts the editor for the resolved project |
+| `godot_launch_editor` | host | process | Starts the editor for the resolved project; the server keeps the process handle [MODIFIED] |
+| `godot_close_editor` | live-first | process | Quits the project's editor without saving and waits for its process to exit; unsaved scenes or scripts refuse unless `discard`; never an editor of another project; without a bridge, stops only an editor the server launched, with `discard` [ADDED] |
 | `godot_run_project` | live-first | process / play state | Editor Play mode; without an editor (or with `mode: "process"`) a managed game with the remote debugger attached; `user_args` (managed run only) go to the game after `--` [MODIFIED] |
 | `godot_stop_project` | live-first | play state | Stops editor Play mode and managed runs, and says which [MODIFIED] |
 | `godot_get_run_status` | live-first | no | Whether a scene plays, and the managed runs [MODIFIED] |
@@ -140,3 +142,4 @@ graph TD
 | 1.7.0 | 2026-10-26 | Agent (magic.spec) | [ADDED] `godot_create_project`, `godot_game_scenario` and `godot_check_voxel_model` in the catalog; [MODIFIED] the input row (Input Map actions) and TL-6 (a helper program the server waits for). Stable → RFC → Stable after Post-Update Review. |
 | 1.8.0 | 2026-10-29 | Agent (magic.spec) | [ADDED] `godot_game_state` and `godot_game_command` in the catalog and the link to the project adapter concept. Stable → RFC → Stable after Post-Update Review. |
 | 1.9.0 | 2026-10-29 | Agent (magic.spec) | [MODIFIED] `godot_create_script` takes optional `content`, validated after writing; the drawback that rejected free-form content is reversed with the reason. Stable → RFC → Stable after Post-Update Review. |
+| 1.10.0 | 2026-10-29 | Agent (magic.spec) | [ADDED] `godot_close_editor` in the catalog and TL-12 (closing an editor loses nothing unasked and never touches another project's editor); [MODIFIED] the `godot_launch_editor` row: the server keeps the launched process. |

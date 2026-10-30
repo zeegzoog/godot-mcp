@@ -1,6 +1,6 @@
 # Godot Editor Addon
 
-**Version:** 1.8.0
+**Version:** 1.9.0
 **Status:** Stable
 **Layer:** implementation
 **Implements:** l1-editor-bridge.md
@@ -78,6 +78,7 @@ addons/godot_mcp/
 - `bridge_server.gd` start-up: when the port is taken (`Already in use`, typically a second editor), the failure message says that probably another editor uses the port and that a server connected to it talks to that editor, and names the two settings that change the port. It is printed to the Output and, when the editor has a toaster (`has_method` guard, not measured in a window), shown as an error toast. [MODIFIED]
 - `plugin.gd`: with the environment variable `GODOT_MCP_NO_BRIDGE=1` the plugin still registers the export exclusion but opens no bridge and says so in the log; the server sets it for the private editor of the language server.
 - `game_status`, relay: the plugin lists the played games and their `hello`; the host waits for it before it sends anything to a game started by Play.
+- `close_editor` (`discard`): lists unsaved scenes (`EditorInterface.get_unsaved_scenes` and the bridge's own undo-version check) and script tabs with unsaved typing; with any and no `discard` it answers `closing: false` with the lists and stays open. Otherwise it answers `closing: true` with `OS.get_process_id()` and what it discarded, stops Play, and calls `get_tree().quit()` three frames later, after the reply has left. [ADDED]
 
 ### 5.3 Script Commands
 
@@ -148,3 +149,4 @@ Every reply path sends exactly one answer (BR-3); the parameters are read untype
 | 1.6.0 | 2026-10-22 | Agent (magic.run) | [MODIFIED] `list_signals` answers objects with `target` and `method`; the byte order mark note records the measurement; the port clash message and toast as built. Stable → RFC → Stable after Post-Update Review. |
 | 1.7.0 | 2026-10-29 | Agent (magic.spec) | [MODIFIED] BR-7: a missing `metadata/<name>` entry is created by `set_node_properties` inside the same undo action, with the identifier and non-null checks; the all-or-nothing rule is unchanged. Source: pull request 63. Stable → RFC → Stable after Post-Update Review. |
 | 1.8.0 | 2026-10-29 | Agent (magic.spec) | [MODIFIED] BR-7: `:` resource steps in `set_node_properties` and `get_node_properties`, shared resources refused, the optional `properties` list of the read. Source: pull request 68. Stable → RFC → Stable after Post-Update Review. |
+| 1.9.0 | 2026-10-29 | Agent (magic.spec) | [ADDED] the `close_editor` command: the unsaved check, the `discard` option, the process id in the answer and the quit after the reply. |

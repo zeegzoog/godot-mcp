@@ -488,8 +488,11 @@ func close_editor(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> vo
     var discard: bool = bool(params.get("discard", false))
     _track_open_scenes()
     var scenes: PackedStringArray = PackedStringArray()
-    for scene_path: String in EditorInterface.get_unsaved_scenes():
-        scenes.append(scene_path if not scene_path.is_empty() else "(a new scene that was never saved)")
+    # EditorInterface.get_unsaved_scenes() exists from Godot 4.7: older editors list only the
+    # open scenes whose tracked state shows unsaved changes (the loop below).
+    if EditorInterface.has_method("get_unsaved_scenes"):
+        for scene_path: String in EditorInterface.call("get_unsaved_scenes"):
+            scenes.append(scene_path if not scene_path.is_empty() else "(a new scene that was never saved)")
     for scene_path: String in EditorInterface.get_open_scenes():
         if not scenes.has(scene_path) and _has_unsaved_changes(scene_path):
             scenes.append(scene_path)

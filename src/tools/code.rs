@@ -320,8 +320,8 @@ pub(super) struct UnregisteredClass {
 }
 
 /// The classes that error diagnostics in `value` call unknown and that another script of the
-/// project at `project` declares with `class_name`. Hidden directories and directories with a
-/// `.gdignore` file are skipped, as Godot skips them.
+/// project at `project` declares with `class_name`. What Godot does not scan
+/// ([`crate::paths::skipped_by_godot`]) is skipped.
 pub(super) fn unregistered_classes(
     project: &Path,
     file: &Path,
@@ -335,9 +335,6 @@ pub(super) fn unregistered_classes(
     let mut found = Vec::new();
     let mut pending = vec![project.to_path_buf()];
     while let Some(dir) = pending.pop() {
-        if dir != project && dir.join(".gdignore").exists() {
-            continue;
-        }
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
@@ -346,12 +343,13 @@ pub(super) fn unregistered_classes(
                 continue;
             };
             let path = entry.path();
+            if crate::paths::skipped_by_godot(&path, kind.is_dir()) {
+                continue;
+            }
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if kind.is_dir() {
-                if !name.starts_with('.') {
-                    pending.push(path);
-                }
+                pending.push(path);
                 continue;
             }
             if !kind.is_file() || !name.ends_with(".gd") {
@@ -515,6 +513,9 @@ mod tests {
         std::fs::create_dir_all(root.join("world")).unwrap();
         std::fs::create_dir_all(root.join("ignored")).unwrap();
         std::fs::write(root.join("ignored/.gdignore"), "").unwrap();
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::write(root.join("nested/project.godot"), "").unwrap();
+        std::fs::write(root.join("nested/other.gd"), "class_name Nested\n").unwrap();
         std::fs::write(
             root.join("world/stream_lane.gd"),
             "@icon(\"res://lane.svg\")\nclass_name StreamLane\nextends Path3D\n",
@@ -535,6 +536,7 @@ mod tests {
             error("Identifier \"ReedGate\" not declared in the current scope."),
             error("Could not find type \"Missing\" in the current scope."),
             error("Could not find type \"Hidden\" in the current scope."),
+            error("Could not find type \"Nested\" in the current scope."),
             error("Could not find type \"StreamCurrent\" in the current scope."),
             {"range": {"start": {"line": 2}}, "severity": 2, "message": "Could not find type \"Unused\"."},
         ]});

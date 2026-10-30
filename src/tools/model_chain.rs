@@ -1075,9 +1075,19 @@ exec sleep 3
         let mut child = froxel_command(OsStr::new("true")).spawn().unwrap();
         let mut stdin = child.stdin.take().unwrap();
         child.wait().await.unwrap();
-        let error = write_line(&mut stdin, &json!({"jsonrpc":"2.0","id":1}))
-            .await
-            .unwrap_err();
+        // Another test's spawn can hold a copy of the pipe's read end for a moment, so the first
+        // write after the exit may still succeed; write until the pipe reports it is closed.
+        let mut refused = None;
+        for _ in 0..200 {
+            match write_line(&mut stdin, &json!({"jsonrpc":"2.0","id":1})).await {
+                Ok(()) => tokio::time::sleep(Duration::from_millis(10)).await,
+                Err(error) => {
+                    refused = Some(error);
+                    break;
+                }
+            }
+        }
+        let error = refused.expect("the pipe of an exited program never closed");
         assert!(error.starts_with("Froxel closed"), "{error}");
     }
     #[cfg(unix)]

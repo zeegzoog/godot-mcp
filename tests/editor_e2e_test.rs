@@ -152,6 +152,9 @@ async fn start_editor_with(
     std::fs::write(project.join("main.tscn"), MAIN_SCENE).expect("main.tscn");
     std::fs::write(project.join("script.gd"), "extends Node\n").expect("script.gd");
     for (name, text) in files {
+        if let Some(parent) = project.join(name).parent() {
+            std::fs::create_dir_all(parent).expect("fixture folder");
+        }
         std::fs::write(project.join(name), text).expect("fixture file");
     }
 
@@ -1968,6 +1971,55 @@ async fn edit_script_replaces_one_fragment_and_never_overwrites_typing() {
         "must be of type",
     );
     assert_eq!(file("notes.txt"), "hello\n");
+}
+
+/// Two scripts with the same file name in different folders are both open in the script
+/// editor, whose tabs then carry the parent folder ("b/x.gd"); each edits through its own tab.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn same_named_scripts_in_different_folders_edit_through_their_own_tabs() {
+    let a_text = "extends Node\n\nvar a = 1\n";
+    let b_text = "extends Node\n\nvar b = 1\n";
+    let editor = start_editor_with(
+        Some(SCRIPT_PROBE_HOOK),
+        SCRIPT_PROBE_HELPERS,
+        &[("a/x.gd", a_text), ("b/x.gd", b_text)],
+        "",
+    )
+    .await;
+    let bridge = &editor.bridge;
+    let file = |name: &str| std::fs::read_to_string(editor.project.join(name)).expect("file");
+    let edit = |path: &'static str, old: &str, new: &str| {
+        let params = json!({"script_path": path, "old_text": old, "new_text": new});
+        async move { bridge.send_command("edit_script", params).await }
+    };
+
+    edit("res://a/x.gd", "var a = 1", "var a = 2")
+        .await
+        .expect("edit a/x.gd while only it is open");
+    // b/x.gd is closed: the edit opens it next to a/x.gd, and both tabs get folder prefixes.
+    edit("res://b/x.gd", "var b = 1", "var b = 2")
+        .await
+        .expect("edit b/x.gd, which the edit opens next to a/x.gd");
+    assert_eq!(file("b/x.gd"), "extends Node\n\nvar b = 2\n");
+    edit("res://a/x.gd", "var a = 2", "var a = 3")
+        .await
+        .expect("edit a/x.gd while both are open");
+    edit("res://b/x.gd", "var b = 2", "var b = 3")
+        .await
+        .expect("edit b/x.gd while both are open");
+    assert_eq!(file("a/x.gd"), "extends Node\n\nvar a = 3\n");
+    assert_eq!(file("b/x.gd"), "extends Node\n\nvar b = 3\n");
+
+    let read = bridge
+        .send_command("read_script", json!({"script_path": "res://b/x.gd"}))
+        .await
+        .expect("read b/x.gd");
+    assert_eq!(read["text"], "extends Node\n\nvar b = 3\n", "{read}");
+    assert!(
+        read.get("editor_state").is_none(),
+        "the read matches the tab: {read}"
+    );
 }
 
 /// A script tab that shows older text than the file is reported by a read, reloaded by

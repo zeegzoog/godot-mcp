@@ -7,7 +7,7 @@
 
 use crate::error::{McpError, Result};
 use crate::lsp::framing::{MessageReader, encode_message};
-use crate::paths::same_directory;
+use crate::paths::{same_directory, skipped_by_godot};
 use crate::util::lock;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
@@ -358,17 +358,13 @@ impl LspHub {
 }
 
 /// The scripts of the project at `root` and its `project.godot`, which declares the autoloads.
-/// Hidden directories (`.godot`, `.git`) and directories with a `.gdignore` file are skipped,
-/// as Godot skips them; symbolic links are not followed.
+/// What Godot does not scan ([`skipped_by_godot`]) is skipped; symbolic links are not followed.
 async fn script_stamp(root: &Path) -> ScriptStamp {
     let root = root.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let mut stamp = ScriptStamp::new();
         let mut pending = vec![root.clone()];
         while let Some(dir) = pending.pop() {
-            if dir != root && dir.join(".gdignore").exists() {
-                continue;
-            }
             let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;
             };
@@ -377,12 +373,13 @@ async fn script_stamp(root: &Path) -> ScriptStamp {
                     continue;
                 };
                 let path = entry.path();
+                if skipped_by_godot(&path, kind.is_dir()) {
+                    continue;
+                }
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
                 if kind.is_dir() {
-                    if !name.starts_with('.') {
-                        pending.push(path);
-                    }
+                    pending.push(path);
                 } else if kind.is_file()
                     && (name.ends_with(".gd") || (dir == root && name == "project.godot"))
                 {

@@ -2818,7 +2818,8 @@ const DELETE_PROBE_HOOK: &str = r#"        "__test_delete_probe":
 
 /// godot_delete_file through the editor: a referenced script and a scene with unsaved changes are
 /// refused; a script with its .uid, an imported image with its .import and imported data, and an
-/// open scene are deleted, their tabs closed and the FileSystem dock updated.
+/// open scene are deleted, their tabs closed and the FileSystem dock updated. A reference from a
+/// nested project, which Godot does not scan, does not count.
 #[tokio::test]
 #[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
 async fn files_are_deleted_through_the_editor_with_companions_and_tabs() {
@@ -2838,6 +2839,11 @@ async fn files_are_deleted_through_the_editor_with_companions_and_tabs() {
                 "[gd_scene format=3]\n\n[ext_resource type=\"Script\" path=\"res://used.gd\" id=\"1\"]\n\n[node name=\"Uses\" type=\"Node\"]\nscript = ExtResource(\"1\")\n",
             ),
             ("old.gd", "extends Node\n"),
+            ("nested/project.godot", "config_version=5\n"),
+            (
+                "nested/uses_old.tscn",
+                "[gd_scene format=3]\n\n[ext_resource type=\"Script\" path=\"res://old.gd\" id=\"1\"]\n\n[node name=\"Uses\" type=\"Node\"]\nscript = ExtResource(\"1\")\n",
+            ),
             ("old_scene.tscn", simple_scene),
             ("dirty.tscn", simple_scene),
             (

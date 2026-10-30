@@ -104,6 +104,7 @@ godot --headless --check-only --path . --script addons/godot_mcp/editor/game_rel
 godot --headless --check-only --path . --script addons/godot_mcp/editor/script_ops.gd
 godot --headless --check-only --path . --script addons/godot_mcp/editor/file_ops.gd
 godot --headless --check-only --path . --script addons/godot_mcp/core/runtime_override.gd
+godot --headless --check-only --path . --script addons/godot_mcp/core/bridge_port.gd
 godot --headless --check-only --path . --script addons/godot_mcp/runtime/mcp_runtime.gd
 godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_hold.gd
 godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_input.gd

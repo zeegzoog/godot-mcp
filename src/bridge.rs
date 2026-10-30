@@ -231,7 +231,7 @@ impl Drop for PendingGuard {
 impl BridgeClient {
     fn unavailable(&self, detail: &str) -> McpError {
         McpError::BridgeUnavailable(format!(
-            "ws://127.0.0.1:{}: {detail}. This server is using {}. The Godot MCP addon must listen on that same port: set the project setting godot_mcp/bridge_port to it, or leave that unset and start the editor with the same GODOT_DEBUG_PORT",
+            "ws://127.0.0.1:{}: {detail}. This server is using {}. The Godot MCP addon must listen on that same port. With no port configured, the addon listens on the port derived from its own project path (and on 9333 while that is free), so a server started in the editor's project directory finds it; otherwise set the same port on both sides: the project setting godot_mcp/bridge_port or GODOT_DEBUG_PORT for the editor, --debug-port or GODOT_DEBUG_PORT for this server",
             self.port, self.port_origin
         ))
     }

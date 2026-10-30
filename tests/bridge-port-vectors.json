@@ -1,0 +1,88 @@
+{
+  "_comment": "Bridge ports derived from canonical project paths. Checked by src/bridge_port.rs (cargo test) and tests/bridge_port_check.gd (editor_e2e_test). Formula: FNV-1a 32 of the UTF-8 bytes, modulo 20000, plus 10000.",
+  "ports": [
+    {
+      "path": "/",
+      "port": 18254
+    },
+    {
+      "path": "/Users/roman/work/frog-world",
+      "port": 28714
+    },
+    {
+      "path": "/Users/roman/work/frog-world/.claude/worktrees/loop-frame-model-1aeb06",
+      "port": 12821
+    },
+    {
+      "path": "/private/tmp/project",
+      "port": 11721
+    },
+    {
+      "path": "/home/dev/games/my game",
+      "port": 20006
+    },
+    {
+      "path": "/home/dev/игра/проект",
+      "port": 14059
+    },
+    {
+      "path": "c:/users/dev/documents/godot/project",
+      "port": 28598
+    },
+    {
+      "path": "c:",
+      "port": 23752
+    },
+    {
+      "path": "",
+      "port": 26261
+    }
+  ],
+  "normalize": [
+    {
+      "input": "/Users/dev/game/",
+      "windows": false,
+      "canonical": "/Users/dev/game"
+    },
+    {
+      "input": "/Users/dev/game",
+      "windows": false,
+      "canonical": "/Users/dev/game"
+    },
+    {
+      "input": "/",
+      "windows": false,
+      "canonical": "/"
+    },
+    {
+      "input": "/Users/Dev/Game\\Odd//",
+      "windows": false,
+      "canonical": "/Users/Dev/Game\\Odd"
+    },
+    {
+      "input": "C:\\Users\\Dev\\Game\\",
+      "windows": true,
+      "canonical": "c:/users/dev/game"
+    },
+    {
+      "input": "\\\\?\\C:\\Users\\Dev\\Game",
+      "windows": true,
+      "canonical": "c:/users/dev/game"
+    },
+    {
+      "input": "C:/Users/Dev/Game/",
+      "windows": true,
+      "canonical": "c:/users/dev/game"
+    },
+    {
+      "input": "D:/Игры/Ägypten",
+      "windows": true,
+      "canonical": "d:/Игры/Ägypten"
+    },
+    {
+      "input": "C:/",
+      "windows": true,
+      "canonical": "c:"
+    }
+  ]
+}

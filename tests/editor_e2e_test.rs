@@ -136,6 +136,17 @@ async fn start_editor_with(
     files: &[(&str, &str)],
     project_tail: &str,
 ) -> Editor {
+    start_editor_with_args(hook, helpers, files, project_tail, &[]).await
+}
+
+/// `start_editor_with`, passing `editor_args` to the editor as well.
+async fn start_editor_with_args(
+    hook: Option<&str>,
+    helpers: &str,
+    files: &[(&str, &str)],
+    project_tail: &str,
+    editor_args: &[&str],
+) -> Editor {
     let (godot, console) = godot_binaries();
     let dir = tempfile::tempdir().expect("project dir");
     let project = dir.path().to_path_buf();
@@ -204,6 +215,7 @@ async fn start_editor_with(
     let child = Command::new(&console)
         .args(["--headless", "--editor", "--path"])
         .arg(&project)
+        .args(editor_args)
         .env("GODOT_DEBUG_PORT", port.to_string())
         .stdout(Stdio::from(log_file.try_clone().expect("clone log")))
         .stderr(Stdio::from(log_file))
@@ -2359,6 +2371,75 @@ async fn a_new_script_in_the_named_editor_project_is_picked_up_by_the_editor() {
     }
 }
 
+/// Creates `StreamLane` (class_name) through the editor and then a script that uses it as a
+/// type, and validates that script with a server whose language server port is `lsp_port`.
+async fn validate_a_script_using_a_class_created_just_before(
+    editor: &Editor,
+    lsp_port: u16,
+) -> godot_mcp::protocol::ToolResult {
+    use godot_mcp::cli_runner::CliRunner;
+    use godot_mcp::tools::ToolManager;
+    use std::sync::Arc;
+
+    let (godot, _) = godot_binaries();
+    let tools = Arc::new(
+        ToolManager::new(BridgeClient::new(editor.port), CliRunner::new(godot))
+            .with_working_dir(editor.project.clone())
+            .with_lsp_port(lsp_port),
+    );
+    let call = |name: &'static str, args: Value| {
+        let tools = Arc::clone(&tools);
+        async move { tools.call_tool(name, args).await }
+    };
+    let lane = call(
+        "godot_create_script",
+        json!({
+            "script_path": "res://world/stream_lane.gd",
+            "extends_class": "Path3D",
+            "class_name": "StreamLane",
+        }),
+    )
+    .await;
+    assert!(!lane.is_error, "{}", tool_text(&lane));
+    let current = call(
+        "godot_create_script",
+        json!({
+            "script_path": "res://world/stream_current.gd",
+            "content": "extends Node3D\n\n@export var lane_path: NodePath\n\nfunc lane() -> StreamLane:\n\tvar node: Node = get_node_or_null(lane_path)\n\tif node is StreamLane:\n\t\treturn node as StreamLane\n\treturn null\n",
+        }),
+    )
+    .await;
+    assert!(!current.is_error, "{}", tool_text(&current));
+    call(
+        "godot_validate_script",
+        json!({"script_path": "res://world/stream_current.gd"}),
+    )
+    .await
+}
+
+/// The project's own editor serves the language server. A class created through it and a script
+/// that uses that class right away validate clean: the editor's class list is not stale.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn a_script_using_a_class_created_just_before_validates_in_the_editors_language_server() {
+    let lsp_port = common::free_port();
+    let lsp_arg = lsp_port.to_string();
+    let editor = start_editor_with_args(None, "", &[], "", &["--lsp-port", &lsp_arg]).await;
+    let validated = validate_a_script_using_a_class_created_just_before(&editor, lsp_port).await;
+    assert!(!validated.is_error, "{}", tool_text(&validated));
+}
+
+/// The editor's language server is not reachable (its port was taken by another editor), so
+/// the headless check runs. It knows a class the editor registered moments ago.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn a_script_using_a_class_created_just_before_validates_in_the_headless_check() {
+    let editor = start_editor(false).await;
+    let validated =
+        validate_a_script_using_a_class_created_just_before(&editor, common::free_port()).await;
+    assert!(!validated.is_error, "{}", tool_text(&validated));
+}
+
 /// A second editor on a port that is taken says so, and says what it means for the server.
 #[tokio::test]
 #[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
@@ -3643,4 +3724,43 @@ async fn node_properties_step_through_the_scenes_own_resources() {
         std::fs::read_to_string(editor.project.join("shared_glow.tres")).expect("tres"),
         shared_before
     );
+}
+
+/// A class_name script written to disk while the editor is open is not in the editor's class
+/// list until the editor rescans, so its language server calls the class unknown. Validation
+/// registers the declaring script through the editor and asks again.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn a_class_written_behind_the_editors_back_is_registered_before_validation() {
+    use godot_mcp::cli_runner::CliRunner;
+    use godot_mcp::tools::ToolManager;
+    use std::sync::Arc;
+
+    let lsp_port = common::free_port();
+    let lsp_arg = lsp_port.to_string();
+    let editor = start_editor_with_args(None, "", &[], "", &["--lsp-port", &lsp_arg]).await;
+    std::fs::create_dir_all(editor.project.join("world")).expect("world dir");
+    std::fs::write(
+        editor.project.join("world/stream_lane.gd"),
+        "class_name StreamLane\nextends Path3D\n",
+    )
+    .expect("stream_lane.gd");
+    std::fs::write(
+        editor.project.join("world/stream_current.gd"),
+        "extends Node3D\n\nfunc lane(node: Node) -> StreamLane:\n\tif node is StreamLane:\n\t\treturn node as StreamLane\n\treturn null\n",
+    )
+    .expect("stream_current.gd");
+    let (godot, _) = godot_binaries();
+    let tools = Arc::new(
+        ToolManager::new(BridgeClient::new(editor.port), CliRunner::new(godot))
+            .with_working_dir(editor.project.clone())
+            .with_lsp_port(lsp_port),
+    );
+    let validated = tools
+        .call_tool(
+            "godot_validate_script",
+            json!({"script_path": "res://world/stream_current.gd"}),
+        )
+        .await;
+    assert!(!validated.is_error, "{}", tool_text(&validated));
 }

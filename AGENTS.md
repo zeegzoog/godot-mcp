@@ -14,7 +14,7 @@ Agents must treat the Godot Editor as a live, stateful environment while ensurin
 
 ### 1. Dual-Mode Operation
 
-- **Live Mode (Primary)**: Connect to the Godot Editor bridge via WebSocket on `GODOT_DEBUG_PORT` (default `9333`). All scene, node, and property mutations must execute in real time. The bridge listens on loopback only and every command carries the shared token (`<user data dir>/godot-mcp/bridge-<port>.token` or `GODOT_MCP_TOKEN`); never add a code path that skips either.
+- **Live Mode (Primary)**: Connect to the Godot Editor bridge via WebSocket on `GODOT_DEBUG_PORT`; when no port is set, both the server and the addon derive it from the project path (`src/bridge_port.rs` and `addons/godot_mcp/core/bridge_port.gd` must stay equal: `tests/bridge-port-vectors.json`). All scene, node, and property mutations must execute in real time. The bridge listens on loopback only and every command carries the shared token (`<user data dir>/godot-mcp/bridge-<port>.token` or `GODOT_MCP_TOKEN`); never add a code path that skips either.
 - **Headless Mode (Fallback)**: When the editor GUI is not running, fall back to headless CLI invocation (`godot --headless --script ...`) for batch operations, scene scaffolding, and automated testing. Never fail silently if the editor socket is temporarily unreachable; provide clear diagnostic context and suggest launching the editor or falling back to CLI.
 
 ### 2. Safety & Undo/Redo Integration
@@ -91,6 +91,7 @@ Before submitting or committing changes, agents must execute and pass the comple
    godot --headless --check-only --path . --script addons/godot_mcp/editor/script_ops.gd
    godot --headless --check-only --path . --script addons/godot_mcp/editor/file_ops.gd
    godot --headless --check-only --path . --script addons/godot_mcp/core/runtime_override.gd
+   godot --headless --check-only --path . --script addons/godot_mcp/core/bridge_port.gd
    godot --headless --check-only --path . --script addons/godot_mcp/runtime/mcp_runtime.gd
    godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_hold.gd
    godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_input.gd

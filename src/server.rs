@@ -47,9 +47,10 @@ impl McpServer {
         ToolManager::configure_catalog(config.feedback);
         let godot_bin = config.resolve_godot_path();
         info!("Using Godot binary at: {}", godot_bin.display());
+        info!("Editor bridge: {}", config.bridge_port_origin());
 
         let bridge = BridgeClient::with_port_origin(config.debug_port, config.bridge_port_origin());
-        let cli = CliRunner::new(godot_bin);
+        let cli = CliRunner::new(godot_bin).with_bridge_port(config.debug_port);
         let tool_manager = Arc::new(
             ToolManager::new(bridge, cli).with_feedback(config.feedback, config.gh_path.clone()),
         );

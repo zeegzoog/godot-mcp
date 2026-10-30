@@ -81,11 +81,23 @@ func _init() -> void:
 #[derive(Clone, Debug)]
 pub struct CliRunner {
     godot_binary: PathBuf,
+    /// The bridge port of the server, given to the editors it launches.
+    bridge_port: Option<u16>,
 }
 
 impl CliRunner {
     pub fn new(godot_binary: PathBuf) -> Self {
-        Self { godot_binary }
+        Self {
+            godot_binary,
+            bridge_port: None,
+        }
+    }
+
+    /// Launched editors listen on `port` (as `GODOT_DEBUG_PORT`), so the server reaches the
+    /// editor it launched even when that editor's project would derive another port.
+    pub fn with_bridge_port(mut self, port: u16) -> Self {
+        self.bridge_port = Some(port);
+        self
     }
 
     /// The Godot executable this runner was configured with.
@@ -193,6 +205,9 @@ impl CliRunner {
     pub async fn launch_editor(&self, project_path: &Path) -> Result<u32> {
         let mut cmd = Command::new(&self.godot_binary);
         cmd.arg("--editor").arg("--path").arg(project_path);
+        if let Some(port) = self.bridge_port {
+            cmd.env("GODOT_DEBUG_PORT", port.to_string());
+        }
         spawn_detached(&mut cmd, "Godot Editor")
     }
 
@@ -765,5 +780,41 @@ SCRIPT ERROR: Assertion failed: boom\n\
             child_group.trim(),
             process_group_of(&std::process::id().to_string())
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_launched_editor_is_given_the_servers_bridge_port() {
+        use super::CliRunner;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let report = dir.path().join("port.txt");
+        let script = dir.path().join("fake_godot.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"$GODOT_DEBUG_PORT\" > '{0}.tmp' && mv '{0}.tmp' '{0}'\n",
+                report.display()
+            ),
+        )
+        .expect("write script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        CliRunner::new(script)
+            .with_bridge_port(23456)
+            .launch_editor(dir.path())
+            .await
+            .expect("spawn");
+
+        for _ in 0..100 {
+            if report.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let port = std::fs::read_to_string(&report).expect("child reported its port");
+        assert_eq!(port.trim(), "23456");
     }
 }

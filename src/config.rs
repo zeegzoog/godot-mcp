@@ -1,10 +1,12 @@
 use clap::parser::ValueSource;
 use clap::{CommandFactory, FromArgMatches, Parser};
 use std::convert::Infallible;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
 
-const DEFAULT_DEBUG_PORT: u16 = 9333;
+/// The port of a server started outside any project, and the extra port an addon without a
+/// configured port also listens on while it is free, for setups made before ports were derived.
+pub const LEGACY_DEBUG_PORT: u16 = 9333;
 
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -22,8 +24,13 @@ pub struct Config {
     #[arg(long, env = "GODOT_CONSOLE_PATH", value_parser = parse_path)]
     pub godot_console_path: Option<PathBuf>,
 
-    /// WebSocket port for Godot Editor bridge communication
-    #[arg(long, env = "GODOT_DEBUG_PORT", default_value = "9333", value_parser = parse_port)]
+    /// WebSocket port for Godot Editor bridge communication. When unset, derived from the path
+    /// of the project the server was started in, as the editor addon does; 9333 outside a project
+    #[arg(id = "debug_port", long = "debug-port", env = "GODOT_DEBUG_PORT", value_parser = parse_port)]
+    port_setting: Option<PortSetting>,
+
+    /// The port the server dials. Set by `load` (or `resolve_bridge_port`).
+    #[arg(skip = LEGACY_DEBUG_PORT)]
     pub debug_port: u16,
 
     /// Agent feedback channel: `off`, `draft` (notes and drafts only) or `full` (adds
@@ -108,24 +115,46 @@ fn parse_path(raw: &str) -> Result<PathBuf, Infallible> {
     Ok(PathBuf::from(raw))
 }
 
+/// A `--debug-port` or `GODOT_DEBUG_PORT` value; an empty one means "not set".
+#[derive(Debug, Clone, Copy)]
+pub struct PortSetting(Option<u16>);
+
+/// Where the bridge port came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortOrigin<'a> {
+    CommandLine,
+    Environment,
+    /// Derived from this canonical project path.
+    Project(&'a str),
+    /// No setting and no project found from the working directory.
+    Default,
+}
+
 /// Names the port the server will dial and the place that value was read from.
-pub fn describe_bridge_port(port: u16, source: Option<ValueSource>) -> String {
-    match source {
-        Some(ValueSource::CommandLine) => format!("port {port} from --debug-port"),
-        Some(ValueSource::EnvVariable) => {
+pub fn describe_bridge_port(port: u16, origin: PortOrigin) -> String {
+    match origin {
+        PortOrigin::CommandLine => format!("port {port} from --debug-port"),
+        PortOrigin::Environment => {
             format!("port {port} from the environment variable GODOT_DEBUG_PORT")
         }
-        _ => format!("port {port}, the default when --debug-port and GODOT_DEBUG_PORT are unset"),
+        PortOrigin::Project(path) => format!(
+            "port {port} derived from the project path {path} (--debug-port and GODOT_DEBUG_PORT are unset)"
+        ),
+        PortOrigin::Default => format!(
+            "port {port}, the default when --debug-port and GODOT_DEBUG_PORT are unset and no project.godot was found from the working directory"
+        ),
     }
 }
 
-/// Like `u16`, except that an empty value selects the default port.
-fn parse_port(raw: &str) -> Result<u16, String> {
+/// Like `u16`, except that an empty value means "not set".
+fn parse_port(raw: &str) -> Result<PortSetting, String> {
     let raw = raw.trim();
     if raw.is_empty() {
-        return Ok(DEFAULT_DEBUG_PORT);
+        return Ok(PortSetting(None));
     }
-    raw.parse::<u16>().map_err(|err| format!("{err}"))
+    raw.parse::<u16>()
+        .map(|port| PortSetting(Some(port)))
+        .map_err(|err| format!("{err}"))
 }
 
 /// Loads a `.env` file from the working directory (or a parent) if there is one.
@@ -149,9 +178,37 @@ impl Config {
         load_dotenv();
         let matches = Self::command().get_matches();
         let mut config = Self::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
-        config.bridge_port_origin =
-            describe_bridge_port(config.debug_port, matches.value_source("debug_port"));
+        let cwd = std::env::current_dir().ok();
+        config.resolve_bridge_port(cwd.as_deref(), matches.value_source("debug_port"));
         config
+    }
+
+    /// Picks the bridge port: an explicit setting, else the one derived from the project found
+    /// from `cwd` (the addon derives the same one), else the legacy default.
+    pub fn resolve_bridge_port(&mut self, cwd: Option<&Path>, source: Option<ValueSource>) {
+        let explicit = self.port_setting.and_then(|setting| setting.0);
+        let (port, origin) = match explicit {
+            Some(port) if source == Some(ValueSource::CommandLine) => {
+                (port, describe_bridge_port(port, PortOrigin::CommandLine))
+            }
+            Some(port) => (port, describe_bridge_port(port, PortOrigin::Environment)),
+            None => match cwd.and_then(|cwd| crate::paths::find_project(cwd).ok()) {
+                Some(project) => {
+                    let canonical = crate::bridge_port::canonical_project_path(&project);
+                    let port = crate::bridge_port::port_for(&canonical);
+                    (
+                        port,
+                        describe_bridge_port(port, PortOrigin::Project(&canonical)),
+                    )
+                }
+                None => (
+                    LEGACY_DEBUG_PORT,
+                    describe_bridge_port(LEGACY_DEBUG_PORT, PortOrigin::Default),
+                ),
+            },
+        };
+        self.debug_port = port;
+        self.bridge_port_origin = origin;
     }
 
     /// The port the editor addon has to listen on, and the flag or variable that set it.
@@ -295,10 +352,10 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, FeedbackMode, describe_bridge_port};
+    use super::{Config, FeedbackMode, LEGACY_DEBUG_PORT, PortOrigin, describe_bridge_port};
     use clap::parser::ValueSource;
-    use clap::{CommandFactory, Parser};
-    use std::path::PathBuf;
+    use clap::{CommandFactory, FromArgMatches, Parser};
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn the_feedback_mode_defaults_to_full_and_accepts_any_case() {
@@ -347,7 +404,7 @@ mod tests {
 
     #[test]
     fn an_offline_bridge_is_told_the_port_the_server_actually_reads() {
-        let from_env = describe_bridge_port(19333, Some(ValueSource::EnvVariable));
+        let from_env = describe_bridge_port(19333, PortOrigin::Environment);
         assert!(from_env.contains("19333"), "{from_env}");
         assert!(
             from_env.contains("environment variable GODOT_DEBUG_PORT"),
@@ -355,17 +412,24 @@ mod tests {
         );
         assert!(!from_env.contains("default: 9333"), "{from_env}");
 
-        let from_flag = describe_bridge_port(19444, Some(ValueSource::CommandLine));
+        let from_flag = describe_bridge_port(19444, PortOrigin::CommandLine);
         assert!(
             from_flag.contains("19444") && from_flag.contains("--debug-port"),
             "{from_flag}"
         );
         assert!(!from_flag.contains("GODOT_DEBUG_PORT"), "{from_flag}");
 
-        let fallback = describe_bridge_port(9333, None);
+        let fallback = describe_bridge_port(9333, PortOrigin::Default);
         assert!(
             fallback.contains("9333") && fallback.contains("default"),
             "{fallback}"
+        );
+
+        let derived = describe_bridge_port(12345, PortOrigin::Project("/work/game"));
+        assert!(
+            derived.contains("12345")
+                && derived.contains("derived from the project path /work/game"),
+            "{derived}"
         );
 
         let matches = Config::command()
@@ -375,6 +439,63 @@ mod tests {
             matches.value_source("debug_port"),
             Some(ValueSource::CommandLine)
         );
+    }
+
+    fn resolved(args: &[&str], cwd: Option<&Path>) -> Config {
+        let mut full = vec!["godot-mcp"];
+        full.extend_from_slice(args);
+        let matches = Config::command()
+            .try_get_matches_from(full)
+            .expect("valid arguments");
+        let mut config = Config::from_arg_matches(&matches).expect("config");
+        config.resolve_bridge_port(cwd, matches.value_source("debug_port"));
+        config
+    }
+
+    fn project_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("project.godot"), "config_version=5\n").expect("write");
+        dir
+    }
+
+    #[test]
+    fn without_a_port_setting_the_port_is_derived_from_the_project_found_from_the_cwd() {
+        let project = project_dir();
+        let nested = project.path().join("scenes");
+        std::fs::create_dir(&nested).expect("mkdir");
+        let expected = crate::bridge_port::derived_port(project.path());
+
+        let config = resolved(&[], Some(&nested));
+        assert_eq!(config.debug_port, expected);
+        let origin = config.bridge_port_origin();
+        assert!(origin.contains("derived from the project path"), "{origin}");
+        assert!(
+            origin.contains(&crate::bridge_port::canonical_project_path(project.path())),
+            "{origin}"
+        );
+
+        // An empty value is a placeholder, not a setting.
+        assert_eq!(
+            resolved(&["--debug-port", ""], Some(&nested)).debug_port,
+            expected
+        );
+    }
+
+    #[test]
+    fn an_explicit_port_wins_over_the_derived_one() {
+        let project = project_dir();
+        let config = resolved(&["--debug-port", "19444"], Some(project.path()));
+        assert_eq!(config.debug_port, 19444);
+        assert!(config.bridge_port_origin().contains("--debug-port"));
+    }
+
+    #[test]
+    fn outside_any_project_the_legacy_port_is_used() {
+        let empty = tempfile::tempdir().expect("tempdir");
+        let config = resolved(&[], Some(empty.path()));
+        assert_eq!(config.debug_port, LEGACY_DEBUG_PORT);
+        assert!(config.bridge_port_origin().contains("no project.godot"));
+        assert_eq!(resolved(&[], None).debug_port, LEGACY_DEBUG_PORT);
     }
 
     fn parse(args: &[&str]) -> Config {

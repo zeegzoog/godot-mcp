@@ -3877,3 +3877,181 @@ async fn run_script_keeps_uids_and_the_editor_follows_the_saved_files() {
         json!({"uid": placed_uid, "cached_path": "res://placed.tscn", "in_filesystem": true})
     );
 }
+
+/// Runs `tests/bridge-port-vectors.json` through the addon's formula and prints the canonical
+/// path and port of its own project.
+const BRIDGE_PORT_CHECK: &str = r#"extends SceneTree
+
+const BridgePort: GDScript = preload("res://bridge_port.gd")
+
+func _init() -> void:
+    var vectors: Dictionary = JSON.parse_string(FileAccess.get_file_as_string(OS.get_cmdline_user_args()[0]))
+    var failures: int = 0
+    for case: Dictionary in vectors["ports"]:
+        var port: int = BridgePort.port_for(str(case["path"]))
+        if port != int(case["port"]):
+            failures += 1
+            print("MISMATCH port ", case["path"], " ", port, " != ", int(case["port"]))
+    for case: Dictionary in vectors["normalize"]:
+        var canonical: String = BridgePort.normalize(str(case["input"]), bool(case["windows"]))
+        if canonical != str(case["canonical"]):
+            failures += 1
+            print("MISMATCH normalize ", case["input"], " -> ", canonical, " != ", case["canonical"])
+    var project: String = BridgePort.project_path()
+    print("PROJECT=", project)
+    print("PORT=", BridgePort.port_for(project))
+    print("FAILURES=", failures)
+    quit()
+"#;
+
+/// The addon and the server compute the same bridge port: the shared vectors hold for the
+/// GDScript formula, and both canonicalize a project reached through a symlink the same way.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn the_addon_derives_the_same_bridge_port_as_the_server() {
+    let (godot, _) = godot_binaries();
+    let dir = tempfile::tempdir().expect("project dir");
+    let real = dir.path().join("real");
+    std::fs::create_dir(&real).expect("mkdir");
+    std::fs::write(real.join("project.godot"), "config_version=5\n").expect("project.godot");
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("addons/godot_mcp/core/bridge_port.gd"),
+        real.join("bridge_port.gd"),
+    )
+    .expect("copy bridge_port.gd");
+    std::fs::write(real.join("check.gd"), BRIDGE_PORT_CHECK).expect("check.gd");
+    // The temporary directory is itself reached through a symlink on macOS (/var -> /private/var).
+    #[cfg(unix)]
+    let project = {
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        link
+    };
+    #[cfg(not(unix))]
+    let project = real.clone();
+
+    let output = timeout(
+        Duration::from_secs(120),
+        Command::new(&godot)
+            .args(["--headless", "--path"])
+            .arg(&project)
+            .args(["--script", "res://check.gd", "--"])
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/bridge-port-vectors.json"))
+            .stdin(Stdio::null())
+            .output(),
+    )
+    .await
+    .expect("check timed out")
+    .expect("run godot");
+    let text = String::from_utf8_lossy(&output.stdout).to_string()
+        + &String::from_utf8_lossy(&output.stderr);
+    let line = |key: &str| {
+        text.lines()
+            .find_map(|line| line.strip_prefix(key))
+            .unwrap_or_else(|| panic!("no {key} line in:\n{text}"))
+            .trim()
+            .to_string()
+    };
+    assert_eq!(line("FAILURES="), "0", "{text}");
+    let canonical = godot_mcp::bridge_port::canonical_project_path(&project);
+    assert_eq!(line("PROJECT="), canonical, "{text}");
+    assert_eq!(
+        line("PORT="),
+        godot_mcp::bridge_port::port_for(&canonical).to_string(),
+        "{text}"
+    );
+}
+
+/// With no port configured on either side, a server started in the project reaches the
+/// editor on the port derived from the project path.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn an_editor_without_a_port_setting_is_found_on_the_derived_port() {
+    use clap::Parser;
+    use godot_mcp::config::Config;
+
+    let (godot, console) = godot_binaries();
+    let dir = tempfile::tempdir().expect("project dir");
+    let project = dir.path();
+    std::fs::write(
+        project.join("project.godot"),
+        "config_version=5\n\n[application]\n\nconfig/name=\"Derived Port\"\nconfig/features=PackedStringArray(\"4.5\")\n\n\
+         [editor_plugins]\n\nenabled=PackedStringArray(\"res://addons/godot_mcp/plugin.cfg\")\n",
+    )
+    .expect("project.godot");
+    copy_dir(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("addons/godot_mcp"),
+        &project.join("addons/godot_mcp"),
+    );
+    let imported = timeout(
+        Duration::from_secs(180),
+        Command::new(&godot)
+            .args(["--headless", "--path"])
+            .arg(project)
+            .arg("--import")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status(),
+    )
+    .await
+    .expect("import timed out")
+    .expect("run godot --import");
+    assert!(imported.success(), "godot --import failed");
+
+    // The server side: no --debug-port, no GODOT_DEBUG_PORT, started inside the project.
+    let mut config = Config::try_parse_from(["godot-mcp", "--debug-port", ""]).expect("config");
+    config.resolve_bridge_port(Some(&project.join("addons")), None);
+    let port = config.debug_port;
+    assert_eq!(port, godot_mcp::bridge_port::derived_port(project));
+    assert!(
+        config
+            .bridge_port_origin()
+            .contains("derived from the project path"),
+        "{}",
+        config.bridge_port_origin()
+    );
+
+    let log = project.join("editor.log");
+    let log_file = std::fs::File::create(&log).expect("log file");
+    let _child = Command::new(&console)
+        .args(["--headless", "--editor", "--path"])
+        .arg(project)
+        .env_remove("GODOT_DEBUG_PORT")
+        .stdout(Stdio::from(log_file.try_clone().expect("clone log")))
+        .stderr(Stdio::from(log_file))
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn godot editor");
+
+    let bridge = BridgeClient::with_port_origin(port, config.bridge_port_origin());
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        if bridge.send_command("ping", json!({})).await.is_ok() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "editor bridge did not come up on port {port}; log:\n{}",
+            std::fs::read_to_string(&log).unwrap_or_default()
+        );
+        sleep(Duration::from_millis(500)).await;
+    }
+    let text = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        text.contains(&format!(
+            "listening on 127.0.0.1:{port} (derived from the project path"
+        )),
+        "{text}"
+    );
+    // The editor is killed, so it cannot remove its token files itself. The legacy one is
+    // only ours when this editor said it took the legacy port.
+    let mut ports = vec![port];
+    if text.contains("Also listening on the legacy port") {
+        ports.push(godot_mcp::config::LEGACY_DEBUG_PORT);
+    }
+    for port in ports {
+        if let Some(path) = token_path(port) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}

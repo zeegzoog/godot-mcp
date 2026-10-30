@@ -629,7 +629,7 @@ fn bridge_error_result(error: &McpError) -> ToolResult {
             &[
                 "Launch Godot Editor with your project (godot_launch_editor can do it)",
                 "Ensure 'Godot MCP Bridge' plugin is enabled in Project Settings -> Plugins",
-                "Set the addon's project setting godot_mcp/bridge_port to the port named in the error, or start the editor with that same GODOT_DEBUG_PORT",
+                "Start this server in the editor's project directory so both derive the same port, or set the addon's project setting godot_mcp/bridge_port to the port named in the error (the editor's Output panel shows the port it listens on)",
             ],
         ),
         McpError::Bridge(detail) => ToolResult::error(

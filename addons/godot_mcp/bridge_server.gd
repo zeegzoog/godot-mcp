@@ -9,8 +9,11 @@ extends Node
 ## Listens on loopback only and requires the shared token (see prepare_token) on every
 ## command, so neither other machines nor web pages can drive the editor.
 
-## Port on which the WebSocket bridge server listens.
-const DEFAULT_PORT: int = 9333
+## Without a configured port the bridge listens on the port derived from the project path
+## (core/bridge_port.gd), and also on this one while it is free, for setups made before ports
+## were derived (a server outside any project, or one configured with 9333).
+const LEGACY_PORT: int = 9333
+const BridgePort: GDScript = preload("res://addons/godot_mcp/core/bridge_port.gd")
 const LOOPBACK_ADDRESS: String = "127.0.0.1"
 
 ## Buffer sizes are powers of two because the engine rounds them up. The defaults (64 KiB)
@@ -77,10 +80,14 @@ const OBJECT_FIELDS: Dictionary = {
 }
 
 var server: TCPServer = TCPServer.new()
+## Listens on LEGACY_PORT next to the derived port; null when the port is configured or busy.
+var legacy_server: TCPServer = null
 var peers: Array[WebSocketPeer] = []
 var undo_redo: EditorUndoRedoManager = null
 var game_relay: EditorDebuggerPlugin = null
-var port: int = DEFAULT_PORT
+var port: int = LEGACY_PORT
+## Where port came from, for the log and the busy-port error.
+var port_origin: String = ""
 var verbose: bool = false
 var _script_ops_instance: RefCounted = null
 var _file_ops_instance: RefCounted = null
@@ -97,7 +104,7 @@ var _scene_dirty: Dictionary = {}
 var _scene_undo_version: Dictionary = {}
 
 var _token: String = ""
-var _token_file: String = ""
+var _token_files: PackedStringArray = []
 
 func _ready() -> void:
     read_configuration()
@@ -105,13 +112,18 @@ func _ready() -> void:
 
 func read_configuration() -> void:
     verbose = bool(ProjectSettings.get_setting("godot_mcp/verbose", false))
-    # Read custom port from project settings if defined
     if ProjectSettings.has_setting("godot_mcp/bridge_port"):
         port = int(ProjectSettings.get_setting("godot_mcp/bridge_port"))
-    elif OS.has_environment("GODOT_DEBUG_PORT"):
-        var env_port: String = OS.get_environment("GODOT_DEBUG_PORT")
-        if env_port.is_valid_int():
-            port = int(env_port)
+        port_origin = "the project setting godot_mcp/bridge_port"
+        return
+    var env_port: String = OS.get_environment("GODOT_DEBUG_PORT").strip_edges()
+    if env_port.is_valid_int():
+        port = int(env_port)
+        port_origin = "the environment variable GODOT_DEBUG_PORT"
+        return
+    var project: String = BridgePort.project_path()
+    port = BridgePort.port_for(project)
+    port_origin = "derived from the project path %s" % project
 
 ## Shows an error in the editor itself, not only in the Output panel, where a person may not look.
 func _toast_error(message: String) -> void:
@@ -124,15 +136,21 @@ func _toast_error(message: String) -> void:
 func start_server() -> void:
     var err: Error = server.listen(port, LOOPBACK_ADDRESS)
     if err != OK:
-        var failure: String = "Failed to start bridge server on port %d: %s." % [port, error_string(err)]
+        var failure: String = "Failed to start bridge server on port %d (%s): %s." % [port, port_origin, error_string(err)]
         if err == ERR_ALREADY_IN_USE:
-            failure += " Probably another editor already uses this port; a godot-mcp server connected to it talks to that editor, not to this one. Set the project setting godot_mcp/bridge_port or the environment variable GODOT_DEBUG_PORT to a free port."
+            failure += " Probably another editor already uses this port; a godot-mcp server connected to it talks to that editor, not to this one. Set the project setting godot_mcp/bridge_port or the environment variable GODOT_DEBUG_PORT to a free port, and give the godot-mcp server the same one."
         printerr("[Godot MCP] ", failure)
         _toast_error(failure)
         return
+    if port_origin.begins_with("derived") and port != LEGACY_PORT:
+        legacy_server = TCPServer.new()
+        if legacy_server.listen(LEGACY_PORT, LOOPBACK_ADDRESS) == OK:
+            print("[Godot MCP] Also listening on the legacy port ", LEGACY_PORT, " while no other editor holds it")
+        else:
+            legacy_server = null
     prepare_token()
     _index_open_scenes()
-    print("[Godot MCP] Bridge server listening on ", LOOPBACK_ADDRESS, ":", port)
+    print("[Godot MCP] Bridge server listening on ", LOOPBACK_ADDRESS, ":", port, " (", port_origin, ")")
 
 ## The MCP server finds the token in <user data dir>/godot-mcp/bridge-<port>.token (readable
 ## only by the current user), or in GODOT_MCP_TOKEN if that is set for both processes.
@@ -143,7 +161,12 @@ func prepare_token() -> void:
         return
 
     _token = Crypto.new().generate_random_bytes(24).hex_encode()
-    var token_file: String = OS.get_data_dir().path_join("godot-mcp").path_join("bridge-%d.token" % port)
+    _write_token_file(port)
+    if legacy_server != null:
+        _write_token_file(LEGACY_PORT)
+
+func _write_token_file(for_port: int) -> void:
+    var token_file: String = OS.get_data_dir().path_join("godot-mcp").path_join("bridge-%d.token" % for_port)
     DirAccess.make_dir_recursive_absolute(token_file.get_base_dir())
     var file: FileAccess = FileAccess.open(token_file, FileAccess.WRITE)
     if file == null:
@@ -152,26 +175,25 @@ func prepare_token() -> void:
     file.store_string(_token)
     file.close()
     FileAccess.set_unix_permissions(token_file, FileAccess.UNIX_READ_OWNER | FileAccess.UNIX_WRITE_OWNER)
-    _token_file = token_file
+    _token_files.append(token_file)
 
 func stop_server() -> void:
     for peer in peers:
         peer.close()
     peers.clear()
     server.stop()
-    if not _token_file.is_empty():
-        DirAccess.remove_absolute(_token_file)
-        _token_file = ""
+    if legacy_server != null:
+        legacy_server.stop()
+        legacy_server = null
+    for token_file: String in _token_files:
+        DirAccess.remove_absolute(token_file)
+    _token_files.clear()
     print("[Godot MCP] Bridge server stopped")
 
-func _process(_delta: float) -> void:
-    _track_open_scenes()
-    if not server.is_listening():
-        return
-
-    # Check for incoming TCP connections and upgrade to WebSocket
-    while server.is_connection_available():
-        var tcp_conn: StreamPeerTCP = server.take_connection()
+## Upgrades incoming TCP connections to WebSocket peers.
+func _accept_connections(listener: TCPServer) -> void:
+    while listener.is_connection_available():
+        var tcp_conn: StreamPeerTCP = listener.take_connection()
         if tcp_conn != null:
             var ws_peer: WebSocketPeer = WebSocketPeer.new()
             ws_peer.inbound_buffer_size = INBOUND_BUFFER_SIZE
@@ -182,6 +204,15 @@ func _process(_delta: float) -> void:
                 log_verbose("Client connected")
             else:
                 printerr("[Godot MCP] Failed to accept WebSocket connection: ", error_string(err))
+
+func _process(_delta: float) -> void:
+    _track_open_scenes()
+    if not server.is_listening():
+        return
+
+    _accept_connections(server)
+    if legacy_server != null:
+        _accept_connections(legacy_server)
 
     # Poll connected peers
     var i: int = peers.size() - 1

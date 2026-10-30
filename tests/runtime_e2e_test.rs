@@ -4697,7 +4697,7 @@ async fn run_script_reports_a_script_that_godot_could_not_load() {
 
 #[tokio::test]
 #[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
-async fn run_script_reports_the_uids_and_shader_parameters_a_headless_save_drops() {
+async fn run_script_writes_back_the_uids_and_shader_parameters_a_headless_save_drops() {
     let _ = IGNORE;
     let project = project_dir_with_scripts();
     let root = project.path();
@@ -4730,21 +4730,24 @@ async fn run_script_reports_the_uids_and_shader_parameters_a_headless_save_drops
     .await;
     let answer = text_of(&result);
     assert!(answer.contains("SAVED 0"), "{answer}");
+    assert!(!answer.starts_with("WARNING"), "{answer}");
+    // The repair entry is what shows the engine still drops the uids and writes null uniforms. If
+    // a Godot version keeps them, the list is empty: this test then fails on purpose, and the tool
+    // description needs updating.
+    assert!(
+        answer.contains("\"uid\": \"uid://cpond1234abcd\"")
+            && answer.contains("\"uid\": \"uid://dlh0ah0opc20e\"")
+            && answer.contains("\"removed_null_shader_parameters\": [\n        \"tint\"\n      ]"),
+        "{answer}"
+    );
+    assert!(answer.contains("\"resource_damage\": []"), "{answer}");
     let saved = std::fs::read_to_string(root.join("pond.tscn")).unwrap();
-    // If a Godot version keeps the uids and leaves the uniforms out, the warning has to go: this
-    // test then fails on purpose, and the tool description needs updating.
     assert!(
-        !saved.contains("uid://dlh0ah0opc20e") && saved.contains("shader_parameter/tint = null"),
-        "the headless saver no longer drops uids or writes null uniforms:\n{saved}"
-    );
-    assert!(
-        answer.starts_with("WARNING") && answer.contains("\"lost_uid\": \"uid://cpond1234abcd\""),
-        "{answer}"
-    );
-    assert!(
-        answer.contains("\"uid\": \"uid://dlh0ah0opc20e\"")
-            && answer.contains("\"null_shader_parameters\": [\n        \"tint\"\n      ]"),
-        "{answer}"
+        saved.starts_with("[gd_scene format=3 uid=\"uid://cpond1234abcd\"]")
+            && saved.contains("[ext_resource type=\"Shader\" uid=\"uid://dlh0ah0opc20e\" path=\"res://water.gdshader\"")
+            && saved.contains("shader_parameter/speed = 3.0")
+            && !saved.contains("= null"),
+        "the uids were not written back:\n{saved}"
     );
 }
 

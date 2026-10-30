@@ -6,9 +6,10 @@ use super::{ToolManager, bridge_error_result, code, missing_argument, str_arg, u
 use crate::cli_runner::{ScriptErrorLoc, ScriptRun, script_load_failure};
 use crate::error::McpError;
 use crate::godot::{
-    IMPORTED_EXTENSIONS, ResourceDamage, TextResourceSnapshot, changed_imports, import_fingerprints,
+    IMPORTED_EXTENSIONS, ResourceDamage, ResourceRepair, TextResourceSnapshot, changed_imports,
+    import_fingerprints,
 };
-use crate::paths::{res_display, resolve_in_project};
+use crate::paths::{res_display, resolve_in_project, same_directory};
 use crate::protocol::ToolResult;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -63,9 +64,60 @@ fn damage_report(damage: &[ResourceDamage]) -> (Vec<Value>, Option<String>) {
         .collect::<Vec<_>>()
         .join(", ");
     let warning = format!(
-        "WARNING: the script rewrote {paths} without the editor: resource_damage lists the uid:// references the headless saver dropped and the shader parameters it wrote as null (no renderer, so unset uniforms read back as null). Restore the files from version control, or put the listed uid=\"...\" back and delete the null shader_parameter lines; make such edits through the connected editor instead."
+        "WARNING: the script rewrote {paths} without the editor, and the server could not repair them: resource_damage lists the uid:// references still missing and the shader parameters still written as null. Restore the files from version control, or put the listed uid=\"...\" back and delete the null shader_parameter lines; make sure the files are writable."
     );
     (entries, Some(warning))
+}
+
+/// What the run's answer says about the files the server repaired after the script.
+struct RepairReport {
+    repairs: Vec<ResourceRepair>,
+    /// The connected editor's answer to refreshing the repaired files, when it holds the project.
+    editor: Option<Value>,
+    /// Why the connected editor could not refresh them.
+    editor_error: Option<String>,
+}
+
+impl RepairReport {
+    fn entries(&self) -> Vec<Value> {
+        self.repairs
+            .iter()
+            .map(|item| {
+                json!({
+                    "path": item.path,
+                    "uid": item.uid,
+                    "new_uid": item.new_uid,
+                    "ext_resource_uids": item.ext_resource_uids.iter().map(|(path, uid)| json!({
+                        "path": path,
+                        "uid": uid,
+                    })).collect::<Vec<_>>(),
+                    "removed_null_shader_parameters": item.removed_null_shader_parameters,
+                })
+            })
+            .collect()
+    }
+
+    fn sentence(&self) -> Option<String> {
+        if self.repairs.is_empty() {
+            return None;
+        }
+        let paths = self
+            .repairs
+            .iter()
+            .map(|item| item.path.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let editor = match (&self.editor, &self.editor_error) {
+            (Some(_), _) => " The connected editor refreshed them; reload any of them it has open.",
+            (None, Some(_)) => {
+                " The connected editor could not refresh them (editor_refresh_error); rescan the file system there."
+            }
+            (None, None) => "",
+        };
+        Some(format!(
+            "Headless Godot saves without uids and writes unset shader uniforms as null, so the server repaired {paths}: resource_repairs lists the uids it wrote back and the null shader_parameter lines it removed.{editor}"
+        ))
+    }
 }
 
 fn script_run_result(
@@ -73,6 +125,7 @@ fn script_run_result(
     script_res: &str,
     timeout_seconds: u64,
     damage: &[ResourceDamage],
+    repair: &RepairReport,
 ) -> ToolResult {
     let exit = report
         .exit_code
@@ -118,6 +171,10 @@ fn script_run_result(
         format!("Script finished with exit code {exit}.")
     };
     let (resource_damage, warning) = damage_report(damage);
+    let summary = match repair.sentence() {
+        Some(sentence) => format!("{summary} {sentence}"),
+        None => summary,
+    };
     let summary = match &warning {
         Some(warning) => format!("{summary} {warning}"),
         None => summary,
@@ -135,6 +192,9 @@ fn script_run_result(
             "file": error.file,
             "line": error.line,
         })).collect::<Vec<_>>(),
+        "resource_repairs": repair.entries(),
+        "editor_refresh": repair.editor,
+        "editor_refresh_error": repair.editor_error,
         "resource_damage": resource_damage,
     });
     let mut text = serde_json::to_string_pretty(&body).unwrap_or(summary);
@@ -527,6 +587,52 @@ impl ToolManager {
         ToolResult::text(text)
     }
 
+    /// Repairs the text scenes and resources the script rewrote, then has the editor refresh
+    /// them when it holds the same project, so its file system and uid cache follow the files.
+    async fn repair_resources(
+        &self,
+        project: &Path,
+        snapshot: &TextResourceSnapshot,
+    ) -> RepairReport {
+        let repairs = snapshot.repair_since(project);
+        let mut report = RepairReport {
+            repairs,
+            editor: None,
+            editor_error: None,
+        };
+        if report.repairs.is_empty() {
+            return report;
+        }
+        let holds_project = match self
+            .bridge
+            .send_command("get_project_info", json!({}))
+            .await
+        {
+            Ok(info) => info
+                .get("project_dir")
+                .and_then(Value::as_str)
+                .is_some_and(|dir| same_directory(project, Path::new(dir))),
+            Err(_) => false,
+        };
+        if !holds_project {
+            return report;
+        }
+        let paths = report
+            .repairs
+            .iter()
+            .map(|item| item.path.clone())
+            .collect::<Vec<_>>();
+        let bridge = self.bridge.clone().with_timeout(Self::RESAVE_BRIDGE_WAIT);
+        match bridge
+            .send_command("resave_resources", json!({"paths": paths}))
+            .await
+        {
+            Ok(answer) => report.editor = Some(answer),
+            Err(error) => report.editor_error = Some(error.to_string()),
+        }
+        report
+    }
+
     pub(super) async fn handle_run_script(&self, args: Value) -> ToolResult {
         let Some(script) = str_arg(&args, "script") else {
             return missing_argument("script");
@@ -584,8 +690,9 @@ impl ToolManager {
             .await
         {
             Ok(report) => {
+                let repair = self.repair_resources(&project.dir, &snapshot).await;
                 let damage = snapshot.damage_since(&project.dir);
-                script_run_result(&report, &script_res, timeout_seconds, &damage)
+                script_run_result(&report, &script_res, timeout_seconds, &damage, &repair)
             }
             Err(error) => ToolResult::error(
                 format!("Failed to run the script: {error}"),

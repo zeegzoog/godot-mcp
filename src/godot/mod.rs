@@ -15,6 +15,6 @@ pub use debug_session::DebugSession;
 pub use imports::{
     IMPORTED_EXTENSIONS, changed_imports, import_current, import_fingerprints, stale_imports,
 };
-pub use resource_audit::{ResourceDamage, TextResourceSnapshot};
+pub use resource_audit::{ResourceDamage, ResourceRepair, TextResourceSnapshot};
 pub use runs::{GameHub, ProcessStart, Run, RunInfo, json_id_eq};
 pub use variant::{PacketReader, decode_variant, encode_variant, frame_packet};

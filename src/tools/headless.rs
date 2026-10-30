@@ -287,10 +287,49 @@ impl ToolManager {
                 .diagnostics_if_reachable(dir, external_ok, &file)
                 .await
             {
-                Ok(Some(value)) => {
+                Ok(Some(mut value)) => {
+                    let mut unregistered = code::unregistered_classes(dir, &file, &value);
+                    // A script written outside the editor is unknown to its class list until
+                    // the editor rescans; registering the declaring scripts and asking again
+                    // tells a stale class list apart from a real error.
+                    if !unregistered.is_empty()
+                        && external_ok
+                        && self.register_scripts(&unregistered).await
+                    {
+                        if let Ok(Some(again)) = self
+                            .lsp
+                            .diagnostics_if_reachable(dir, external_ok, &file)
+                            .await
+                        {
+                            value = again;
+                            unregistered = code::unregistered_classes(dir, &file, &value);
+                        }
+                    }
                     let mut report = code::report_diagnostics(script_path, &value);
                     if code::addon_warnings_hidden(dir, &file) {
                         report.text = format!("{}\n{}", report.text, code::ADDON_WARNINGS_HIDDEN);
+                    }
+                    if report.failed && !unregistered.is_empty() {
+                        let scripts: Vec<&str> = unregistered
+                            .iter()
+                            .map(|class| class.script.as_str())
+                            .collect();
+                        let refresh = format!(
+                            "Register the declaring script with godot_resave_resources (paths: {}), or focus the editor so it rescans, then validate again",
+                            scripts.join(", ")
+                        );
+                        return ScriptCheck::Checked(ToolResult::error(
+                            format!(
+                                "{}\n{}",
+                                report.text,
+                                code::unregistered_classes_note(&unregistered)
+                            ),
+                            &[
+                                refresh.as_str(),
+                                "godot_run_script compiles scripts with the project's own class list, without the language server",
+                                "Fix the other error lines. A warning is listed and does not by itself fail this check",
+                            ],
+                        ));
                     }
                     return ScriptCheck::Checked(if report.failed {
                         ToolResult::error(
@@ -336,6 +375,18 @@ impl ToolManager {
                 ],
             )),
         }
+    }
+
+    /// Asks the connected editor to register the scripts that declare `classes`, waiting for its
+    /// file system. False when no editor answered, so nothing changed.
+    async fn register_scripts(&self, classes: &[code::UnregisteredClass]) -> bool {
+        let paths: Vec<&str> = classes.iter().map(|class| class.script.as_str()).collect();
+        self.bridge
+            .clone()
+            .with_timeout(Self::RESAVE_BRIDGE_WAIT)
+            .send_command("resave_resources", json!({"paths": paths, "wait": true}))
+            .await
+            .is_ok()
     }
 
     /// The editor answers a scan-and-wait within 60s, which is the addon's limit.

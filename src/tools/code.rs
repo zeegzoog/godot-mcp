@@ -263,6 +263,136 @@ pub(super) fn addon_warnings_hidden(project: &Path, file: &Path) -> bool {
     true
 }
 
+/// What the analyzer says about a name it does not know, up to the quoted name.
+const UNKNOWN_NAME_PREFIXES: [&str; 4] = [
+    "Could not find type \"",
+    "Could not find base class \"",
+    "Could not resolve class \"",
+    "Identifier \"",
+];
+
+/// The names that error diagnostics in `value` call unknown, each once.
+fn unknown_names(value: &Value) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let items = value.get("diagnostics").and_then(Value::as_array);
+    for item in items.into_iter().flatten() {
+        if item.get("severity").and_then(Value::as_i64).unwrap_or(1) != 1 {
+            continue;
+        }
+        let message = item.get("message").and_then(Value::as_str).unwrap_or("");
+        for prefix in UNKNOWN_NAME_PREFIXES {
+            let Some(rest) = message.strip_prefix(prefix) else {
+                continue;
+            };
+            let Some((name, tail)) = rest.split_once('"') else {
+                continue;
+            };
+            if prefix == "Identifier \"" && !tail.starts_with(" not declared") {
+                continue;
+            }
+            if !names.iter().any(|known| known == name) {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names
+}
+
+/// The `class_name` a script declares, if any.
+fn declared_class(source: &str) -> Option<&str> {
+    source.lines().find_map(|line| {
+        let rest = line.trim_start().strip_prefix("class_name")?;
+        if !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
+        let name = rest.split_whitespace().next()?;
+        crate::paths::is_valid_identifier(name).then_some(name)
+    })
+}
+
+/// A class the language server called unknown although a script of the project declares it:
+/// the server's class list does not have that script yet.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct UnregisteredClass {
+    pub name: String,
+    /// The `res://` path of the script that declares it.
+    pub script: String,
+}
+
+/// The classes that error diagnostics in `value` call unknown and that another script of the
+/// project at `project` declares with `class_name`. Hidden directories and directories with a
+/// `.gdignore` file are skipped, as Godot skips them.
+pub(super) fn unregistered_classes(
+    project: &Path,
+    file: &Path,
+    value: &Value,
+) -> Vec<UnregisteredClass> {
+    let names = unknown_names(value);
+    if names.is_empty() {
+        return Vec::new();
+    }
+    let file = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
+    let mut found = Vec::new();
+    let mut pending = vec![project.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        if dir != project && dir.join(".gdignore").exists() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if kind.is_dir() {
+                if !name.starts_with('.') {
+                    pending.push(path);
+                }
+                continue;
+            }
+            if !kind.is_file() || !name.ends_with(".gd") {
+                continue;
+            }
+            if path.canonicalize().unwrap_or_else(|_| path.clone()) == file {
+                continue;
+            }
+            let Ok(source) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            if let Some(class) = declared_class(&source)
+                && names.iter().any(|unknown| unknown == class)
+                && !found
+                    .iter()
+                    .any(|item: &UnregisteredClass| item.name == class)
+            {
+                found.push(UnregisteredClass {
+                    name: class.to_string(),
+                    script: crate::paths::res_display(project, &path),
+                });
+            }
+        }
+    }
+    found.sort_by(|a, b| a.name.cmp(&b.name));
+    found
+}
+
+/// Says that the errors about `classes` come from the language server's class list, not from
+/// the script.
+pub(super) fn unregistered_classes_note(classes: &[UnregisteredClass]) -> String {
+    let listed: Vec<String> = classes
+        .iter()
+        .map(|class| format!("{} (class_name in {})", class.name, class.script))
+        .collect();
+    format!(
+        "The language server does not know {}, although the project declares it. Its class list does not have that script yet, so the errors naming it may not be errors in this script.",
+        listed.join(", ")
+    )
+}
+
 /// A line or column parameter: an integer of at least 1, as in the editor.
 fn position(description: &str) -> Value {
     json!({"type": "integer", "minimum": 1, "description": description})
@@ -376,6 +506,59 @@ mod tests {
         )
         .unwrap();
         assert!(addon_warnings_hidden(root, &addon));
+    }
+
+    #[test]
+    fn a_class_another_script_declares_is_told_apart_from_a_missing_one() {
+        let dir = tempfile::tempdir().expect("project");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("world")).unwrap();
+        std::fs::create_dir_all(root.join("ignored")).unwrap();
+        std::fs::write(root.join("ignored/.gdignore"), "").unwrap();
+        std::fs::write(
+            root.join("world/stream_lane.gd"),
+            "@icon(\"res://lane.svg\")\nclass_name StreamLane\nextends Path3D\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("world/gate.gd"),
+            "class_name ReedGate extends Node3D\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("ignored/hidden.gd"), "class_name Hidden\n").unwrap();
+        let file = root.join("world/stream_current.gd");
+        std::fs::write(&file, "class_name StreamCurrent\nextends Node3D\n").unwrap();
+        let error = |message: &str| json!({"range": {"start": {"line": 1, "character": 1}}, "severity": 1, "message": message});
+        let value = json!({"diagnostics": [
+            error("Could not find type \"StreamLane\" in the current scope."),
+            error("Could not find type \"StreamLane\" in the current scope."),
+            error("Identifier \"ReedGate\" not declared in the current scope."),
+            error("Could not find type \"Missing\" in the current scope."),
+            error("Could not find type \"Hidden\" in the current scope."),
+            error("Could not find type \"StreamCurrent\" in the current scope."),
+            {"range": {"start": {"line": 2}}, "severity": 2, "message": "Could not find type \"Unused\"."},
+        ]});
+        let found = unregistered_classes(root, &file, &value);
+        assert_eq!(
+            found,
+            vec![
+                UnregisteredClass {
+                    name: "ReedGate".into(),
+                    script: "res://world/gate.gd".into()
+                },
+                UnregisteredClass {
+                    name: "StreamLane".into(),
+                    script: "res://world/stream_lane.gd".into()
+                },
+            ]
+        );
+        let note = unregistered_classes_note(&found);
+        assert!(
+            note.contains("StreamLane (class_name in res://world/stream_lane.gd)"),
+            "{note}"
+        );
+        // Nothing unknown, nothing scanned.
+        assert!(unregistered_classes(root, &file, &json!({"diagnostics": []})).is_empty());
     }
 
     #[test]

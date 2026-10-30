@@ -1773,6 +1773,121 @@ async fn language_server_answers_the_same_script_again() {
     }
 }
 
+/// The diagnostics of `script` in `project` that are errors (LSP severity 1).
+async fn script_errors(tools: &Arc<ToolManager>, project: &Path, script: &str) -> Vec<String> {
+    let result = call(
+        tools,
+        "godot_code_diagnostics",
+        json!({"project_path": project, "script_path": script}),
+    )
+    .await;
+    assert!(!result.is_error, "{script}: {}", text_of(&result));
+    let body = json_of(&result);
+    body["diagnostics"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{script}: {body}"))
+        .iter()
+        .filter(|item| item["severity"].as_i64() == Some(1))
+        .map(|item| item["message"].to_string())
+        .collect()
+}
+
+/// An editor with another project open holds the language server port, as the first of several
+/// open editors does with 6005. Its answers are about its own project: a class the caller's
+/// project just declared is unknown there. The tools must use a language server of the caller's
+/// project, and one that sees scripts created after it started.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn diagnostics_come_from_the_scripts_own_project() {
+    let other = project();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .expect("free port")
+        .port();
+    let mut other_editor = tokio::process::Command::new(godot_path())
+        .args(["--headless", "--editor", "--path"])
+        .arg(other.path())
+        .args(["--lsp-port", &port.to_string()])
+        .env("GODOT_MCP_NO_BRIDGE", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("start the other project's editor");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the other editor did not open its language server"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    let mine = project();
+    let tools = Arc::new(
+        ToolManager::new(BridgeClient::new(9_001), CliRunner::new(godot_path()))
+            .with_working_dir(mine.path().to_path_buf())
+            .with_lsp_port(port),
+    );
+    let created = call(
+        &tools,
+        "godot_create_script",
+        json!({
+            "project_path": mine.path(),
+            "script_path": "res://scripts/crate_lift.gd",
+            "extends_class": "Node3D",
+            "class_name": "CrateLift",
+        }),
+    )
+    .await;
+    assert!(!created.is_error, "{}", text_of(&created));
+    std::fs::write(
+        mine.path().join("scripts/uses_lift.gd"),
+        "extends Node\n\nconst LIFT := preload(\"res://scripts/crate_lift.gd\")\n\nfunc _ready() -> void:\n\tvar lift: CrateLift = LIFT.new()\n\tprint(lift)\n",
+    )
+    .unwrap();
+    let errors = script_errors(&tools, mine.path(), "res://scripts/uses_lift.gd").await;
+    assert!(errors.is_empty(), "{errors:?}");
+    let validated = call(
+        &tools,
+        "godot_validate_script",
+        json!({"project_path": mine.path(), "script_path": "res://scripts/uses_lift.gd"}),
+    )
+    .await;
+    assert!(!validated.is_error, "{}", text_of(&validated));
+
+    // A class declared after the project's language server started is found too.
+    let created = call(
+        &tools,
+        "godot_create_script",
+        json!({
+            "project_path": mine.path(),
+            "script_path": "res://scripts/reed_gate.gd",
+            "extends_class": "Node3D",
+            "class_name": "ReedGate",
+        }),
+    )
+    .await;
+    assert!(!created.is_error, "{}", text_of(&created));
+    std::fs::write(
+        mine.path().join("scripts/uses_gate.gd"),
+        "extends Node\n\nfunc _ready() -> void:\n\tvar gate: ReedGate = ReedGate.new()\n\tprint(gate)\n",
+    )
+    .unwrap();
+    let errors = script_errors(&tools, mine.path(), "res://scripts/uses_gate.gd").await;
+    assert!(errors.is_empty(), "{errors:?}");
+    let validated = call(
+        &tools,
+        "godot_validate_script",
+        json!({"project_path": mine.path(), "script_path": "res://scripts/uses_gate.gd"}),
+    )
+    .await;
+    assert!(!validated.is_error, "{}", text_of(&validated));
+
+    let _ = other_editor.start_kill();
+}
+
 #[tokio::test]
 #[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
 async fn windowed_screenshot_returns_a_sheet_and_a_diff() {

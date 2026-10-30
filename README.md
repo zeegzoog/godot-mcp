@@ -96,7 +96,7 @@ The server reads its settings from CLI flags, the environment (e.g. the MCP clie
 | --- | --- | --- | --- |
 | `GODOT_PATH` | `--godot-path` | auto-detect | Godot executable. If unset, the server tries a few common install locations, then `godot` on `PATH`; set it explicitly. A value that points to a missing file is not replaced: tools that run Godot fail and name the path. |
 | `GODOT_DEBUG_PORT` | `--debug-port` | `9333` | Editor bridge port. |
-| `GODOT_MCP_LSP_PORT` | | `6005` | Port of a running editor's GDScript language server. The `godot_code_*` tools use it if an editor listens there, and otherwise start a private headless editor. |
+| `GODOT_MCP_LSP_PORT` | | `6005` | Port of a running editor's GDScript language server. The `godot_code_*` tools and `godot_validate_script` use it if an editor with the same project open listens there, and otherwise start a private headless editor of the project (started again when another script of the project changed). |
 | `GODOT_MCP_TOKEN` | | generated | Shared secret for the bridge. Normally unnecessary, see [Security](#security). |
 | `GODOT_CONSOLE_PATH` | `--godot-console-path` | | Windows console wrapper. Unused by the server; the editor end-to-end tests use it for editor logs. |
 | `GODOT_MCP_FEEDBACK` | `--feedback` | `full` | Feedback channel for the maintainers: `off`, `draft` (the AI can write a report but never send one) or `full`. A value the server does not recognize gives `draft`. See [Feedback](#feedback-to-the-maintainers). |

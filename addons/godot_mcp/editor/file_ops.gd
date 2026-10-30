@@ -313,7 +313,8 @@ func _collect(folder: String, into: Array[String]) -> void:
         if name.begins_with("."):
             continue
         var child: String = folder.path_join(name)
-        if FileAccess.file_exists(child.path_join(".gdignore")):
+        # Godot does not scan these folders, nor a nested project (its own project.godot).
+        if FileAccess.file_exists(child.path_join(".gdignore")) or FileAccess.file_exists(child.path_join("project.godot")):
             continue
         _collect(child, into)
 

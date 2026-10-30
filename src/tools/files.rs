@@ -499,8 +499,8 @@ struct Unchecked {
 }
 
 /// Fills `referenced_by` of every file target with the project files that name it by path or
-/// UID. The targets and their companions do not count. The `.godot` cache, hidden folders and
-/// folders with a `.gdignore` are not searched, as Godot does not load them.
+/// UID. The targets and their companions do not count. What Godot does not scan (the `.godot`
+/// cache, hidden entries, folders with a `.gdignore`, nested projects) is not searched.
 fn find_references(project: &Path, targets: &mut [Target]) -> Unchecked {
     let mut unchecked = Unchecked::default();
     if targets.iter().all(|target| target.directory) {
@@ -565,11 +565,11 @@ fn collect(folder: &Path, into: &mut Vec<PathBuf>) {
         let Ok(kind) = entry.file_type() else {
             continue;
         };
+        if crate::paths::skipped_by_godot(&path, kind.is_dir()) {
+            continue;
+        }
         if kind.is_dir() {
-            let hidden = entry.file_name().to_string_lossy().starts_with('.');
-            if !hidden && !path.join(".gdignore").exists() {
-                collect(&path, into);
-            }
+            collect(&path, into);
         } else if kind.is_file() {
             into.push(path);
         }
@@ -661,6 +661,26 @@ mod tests {
         assert_eq!(
             requested_paths(&json!({"paths": ["res://a.gd"]})).ok(),
             Some(vec!["res://a.gd".to_string()])
+        );
+    }
+
+    #[test]
+    fn references_are_searched_only_where_godot_scans() {
+        let dir = tempfile::tempdir().expect("project");
+        let root = dir.path();
+        for folder in [".hidden", "docs", "nested", "scenes"] {
+            std::fs::create_dir(root.join(folder)).expect("mkdir");
+            std::fs::write(root.join(folder).join("a.tscn"), "").expect("scene");
+        }
+        std::fs::write(root.join("project.godot"), "").expect("project");
+        std::fs::write(root.join(".hidden.tscn"), "").expect("scene");
+        std::fs::write(root.join("docs/.gdignore"), "").expect("gdignore");
+        std::fs::write(root.join("nested/project.godot"), "").expect("nested");
+        let mut found = Vec::new();
+        collect(root, &mut found);
+        assert_eq!(
+            found,
+            vec![root.join("project.godot"), root.join("scenes/a.tscn")]
         );
     }
 }

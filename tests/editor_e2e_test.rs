@@ -2269,6 +2269,44 @@ func on_ready() -> void:
     }
 }
 
+/// A new script created with a project_path that names the editor's project is picked up by the
+/// editor at once (it gets its .uid), so its class_name is known to the editor's language server.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn a_new_script_in_the_named_editor_project_is_picked_up_by_the_editor() {
+    use godot_mcp::cli_runner::CliRunner;
+    use godot_mcp::tools::ToolManager;
+    use std::sync::Arc;
+
+    let editor = start_editor(false).await;
+    let elsewhere = tempfile::tempdir().expect("working dir");
+    let (godot, _) = godot_binaries();
+    let tools = Arc::new(
+        ToolManager::new(BridgeClient::new(editor.port), CliRunner::new(godot))
+            .with_working_dir(elsewhere.path().to_path_buf()),
+    );
+    let created = Arc::clone(&tools)
+        .call_tool(
+            "godot_create_script",
+            json!({
+                "project_path": editor.project,
+                "script_path": "res://crate_lift.gd",
+                "class_name": "CrateLift",
+            }),
+        )
+        .await;
+    assert!(!created.is_error, "{}", tool_text(&created));
+    let uid = editor.project.join("crate_lift.gd.uid");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !uid.is_file() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the editor did not pick up the new script"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 /// A second editor on a port that is taken says so, and says what it means for the server.
 #[tokio::test]
 #[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]

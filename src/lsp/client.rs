@@ -1,13 +1,16 @@
 //! Minimal JSON-RPC client for the GDScript language server inside a Godot editor.
 //!
-//! Prefers an editor already listening on `GODOT_MCP_LSP_PORT` (default 6005). Otherwise
-//! starts one private headless editor with `--lsp-port` and stops it when the hub is dropped.
+//! Prefers an editor already listening on `GODOT_MCP_LSP_PORT` (default 6005) when that editor
+//! has the same project open. Otherwise starts one private headless editor with `--lsp-port` and
+//! stops it when the hub is dropped. A private editor never learns about scripts written after
+//! it started, so it is started again when the project's scripts change.
 
 use crate::error::{McpError, Result};
 use crate::lsp::framing::{MessageReader, encode_message};
+use crate::paths::same_directory;
 use crate::util::lock;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -34,6 +37,9 @@ struct ClientInner {
     /// Set when the server closed the connection, which nothing writing to it would notice
     /// until the next write.
     closed: AtomicBool,
+    /// The project directory the server says it has open, when that is not the root this client
+    /// asked for: Godot answers such an `initialize` with `gdscript_client/changeWorkspace`.
+    workspace: Mutex<Option<String>>,
 }
 
 impl ClientInner {
@@ -46,6 +52,19 @@ struct Live {
     client: Arc<ClientInner>,
     child: Option<Child>,
     root: PathBuf,
+    /// The project's scripts when the private editor started; `None` for an editor's server.
+    scripts: Option<ScriptStamp>,
+}
+
+/// Each script of a project (and `project.godot`) with its modification time and size.
+type ScriptStamp = BTreeMap<PathBuf, (Option<std::time::SystemTime>, u64)>;
+
+/// Whether the hub has a usable client for a project.
+enum LiveState {
+    Ready(Arc<ClientInner>),
+    /// A private editor whose project changed since it started: its answers would be stale.
+    Stale,
+    Missing,
 }
 
 impl Drop for Live {
@@ -91,12 +110,13 @@ impl LspHub {
         external_ok: bool,
         file: &Path,
     ) -> Result<Value> {
-        let client = self.client_for(project, external_ok).await?;
+        let client = self.client_for(project, external_ok, file).await?;
         publish_diagnostics(&client, project, file).await
     }
 
     /// Diagnostics when a language server is already running for `project`: one this hub
-    /// started, or an editor listening on the configured port. Does not start an editor.
+    /// started, or an editor of this project listening on the configured port. Does not start an
+    /// editor, except to replace a private one that no longer sees the project's scripts.
     /// `Ok(None)` means nothing was listening.
     pub async fn diagnostics_if_reachable(
         &self,
@@ -105,8 +125,15 @@ impl LspHub {
         file: &Path,
     ) -> Result<Option<Value>> {
         let project = std::fs::canonicalize(project).unwrap_or_else(|_| project.to_path_buf());
-        if let Some(client) = self.live_client(&project, external_ok) {
-            return publish_diagnostics(&client, &project, file).await.map(Some);
+        match self.live_state(&project, external_ok, file).await {
+            LiveState::Ready(client) => {
+                return publish_diagnostics(&client, &project, file).await.map(Some);
+            }
+            LiveState::Stale => {
+                let client = self.client_for(&project, external_ok, file).await?;
+                return publish_diagnostics(&client, &project, file).await.map(Some);
+            }
+            LiveState::Missing => {}
         }
         if !external_ok {
             return Ok(None);
@@ -126,13 +153,14 @@ impl LspHub {
                 client,
                 child: None,
                 root: project,
+                scripts: None,
             });
         }
         Ok(Some(value))
     }
 
     pub async fn symbols(&self, project: &Path, external_ok: bool, file: &Path) -> Result<Value> {
-        let client = self.client_for(project, external_ok).await?;
+        let client = self.client_for(project, external_ok, file).await?;
         self.open_quiet(&client, file).await?;
         let result = client
             .request(
@@ -211,7 +239,7 @@ impl LspHub {
         (line, character): (u32, u32),
         mut extra: Value,
     ) -> Result<Value> {
-        let client = self.client_for(project, external_ok).await?;
+        let client = self.client_for(project, external_ok, file).await?;
         self.open_quiet(&client, file).await?;
         if let Value::Object(map) = &mut extra {
             map.insert("textDocument".into(), json!({"uri": path_to_uri(file)}));
@@ -245,23 +273,30 @@ impl LspHub {
             .await
     }
 
-    async fn client_for(&self, project: &Path, external_ok: bool) -> Result<Arc<ClientInner>> {
+    async fn client_for(
+        &self,
+        project: &Path,
+        external_ok: bool,
+        file: &Path,
+    ) -> Result<Arc<ClientInner>> {
         let godot = self.godot.clone();
         let port = self.port;
-        self.client_with(project, external_ok, |root, external_ok| async move {
+        self.client_with(project, external_ok, file, |root, external_ok| async move {
             connect_or_start(&godot, &root, external_ok, port).await
         })
         .await
     }
 
-    /// The client for `project`: the live one, or the one `start` makes when there is none
-    /// or its connection has closed. Only one start runs at a time. `external_ok` says whether a
+    /// The client for `project`: the live one, or the one `start` makes when there is none,
+    /// its connection has closed, or it is a private editor that started before a script other
+    /// than `file` changed. Only one start runs at a time. `external_ok` says whether a
     /// language server an editor already runs may be used (CI-7): when it is false, only a server
     /// this hub started itself is reused, and `start` is told not to connect to the configured port.
     async fn client_with<F, Fut>(
         &self,
         project: &Path,
         external_ok: bool,
+        file: &Path,
         start: F,
     ) -> Result<Arc<ClientInner>>
     where
@@ -269,32 +304,99 @@ impl LspHub {
         Fut: Future<Output = StartResult>,
     {
         let project = std::fs::canonicalize(project).unwrap_or_else(|_| project.to_path_buf());
-        if let Some(client) = self.live_client(&project, external_ok) {
+        if let LiveState::Ready(client) = self.live_state(&project, external_ok, file).await {
             return Ok(client);
         }
         let _starting = self.starting.lock().await;
-        if let Some(client) = self.live_client(&project, external_ok) {
-            return Ok(client);
+        match self.live_state(&project, external_ok, file).await {
+            LiveState::Ready(client) => return Ok(client),
+            // Stopped before its replacement starts, so two editors never share the project.
+            LiveState::Stale => drop(lock(&self.live).take()),
+            LiveState::Missing => {}
         }
+        // Taken before the start, so that a script written while the editor starts counts as
+        // a change the next time.
+        let scripts = script_stamp(&project).await;
         let (client, child) = start(project.clone(), external_ok).await?;
+        let scripts = child.is_some().then_some(scripts);
         *lock(&self.live) = Some(Live {
             client: Arc::clone(&client),
             child,
             root: project,
+            scripts,
         });
         Ok(client)
     }
 
-    fn live_client(&self, project: &Path, external_ok: bool) -> Option<Arc<ClientInner>> {
-        lock(&self.live)
-            .as_ref()
-            .filter(|live| {
+    async fn live_state(&self, project: &Path, external_ok: bool, file: &Path) -> LiveState {
+        let (client, started_with) = {
+            let live = lock(&self.live);
+            let Some(live) = live.as_ref().filter(|live| {
                 live.root == project
                     && live.client.is_open()
                     && (external_ok || live.child.is_some())
-            })
-            .map(|live| Arc::clone(&live.client))
+            }) else {
+                return LiveState::Missing;
+            };
+            (Arc::clone(&live.client), live.scripts.clone())
+        };
+        let Some(mut started_with) = started_with else {
+            return LiveState::Ready(client);
+        };
+        // The file asked about is sent to the server with its text, so its own changes do not
+        // make the server stale.
+        let mut now = script_stamp(project).await;
+        let file = std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
+        started_with.remove(&file);
+        now.remove(&file);
+        if now == started_with {
+            LiveState::Ready(client)
+        } else {
+            LiveState::Stale
+        }
     }
+}
+
+/// The scripts of the project at `root` and its `project.godot`, which declares the autoloads.
+/// Hidden directories (`.godot`, `.git`) and directories with a `.gdignore` file are skipped,
+/// as Godot skips them; symbolic links are not followed.
+async fn script_stamp(root: &Path) -> ScriptStamp {
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut stamp = ScriptStamp::new();
+        let mut pending = vec![root.clone()];
+        while let Some(dir) = pending.pop() {
+            if dir != root && dir.join(".gdignore").exists() {
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(kind) = entry.file_type() else {
+                    continue;
+                };
+                let path = entry.path();
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if kind.is_dir() {
+                    if !name.starts_with('.') {
+                        pending.push(path);
+                    }
+                } else if kind.is_file()
+                    && (name.ends_with(".gd") || (dir == root && name == "project.godot"))
+                {
+                    let meta = entry.metadata().ok();
+                    let modified = meta.as_ref().and_then(|meta| meta.modified().ok());
+                    let size = meta.map_or(0, |meta| meta.len());
+                    stamp.insert(path, (modified, size));
+                }
+            }
+        }
+        stamp
+    })
+    .await
+    .unwrap_or_default()
 }
 
 impl ClientInner {
@@ -465,6 +567,7 @@ async fn connect_client(port: u16, project: &Path) -> Result<Arc<ClientInner>> {
         next_id: AtomicI64::new(1),
         diagnostics: Mutex::new(HashMap::new()),
         closed: AtomicBool::new(false),
+        workspace: Mutex::new(None),
     });
     tokio::spawn(async move {
         while let Some(bytes) = queue.recv().await {
@@ -510,6 +613,14 @@ async fn connect_client(port: u16, project: &Path) -> Result<Arc<ClientInner>> {
             Duration::from_secs(20),
         )
         .await?;
+    // Godot sends the notification before its answer, so it has been read by now.
+    let workspace = lock(&client.workspace).clone();
+    if let Some(open) = workspace.filter(|open| !same_directory(project, Path::new(open))) {
+        return Err(McpError::Process(format!(
+            "the language server on port {port} belongs to an editor with another project open ({open}), not {}",
+            project.display()
+        )));
+    }
     client.notify("initialized", json!({})).await?;
     Ok(client)
 }
@@ -549,6 +660,9 @@ fn dispatch(client: &ClientInner, message: Value) {
                 .cloned()
                 .unwrap_or_default();
             lock(&client.diagnostics).insert(uri_key(&uri), items);
+        } else if method == "gdscript_client/changeWorkspace" {
+            let path = message.pointer("/params/path").and_then(Value::as_str);
+            *lock(&client.workspace) = path.map(str::to_string);
         }
         return;
     }
@@ -669,6 +783,7 @@ mod tests {
             next_id: AtomicI64::new(1),
             diagnostics: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
+            workspace: Mutex::new(None),
         });
         (client, inbox)
     }
@@ -694,16 +809,22 @@ mod tests {
     async fn a_server_the_hub_did_not_start_is_not_reused_for_a_project_it_may_not_serve() {
         let hub = LspHub::new(PathBuf::from("godot"));
         let project = tempfile::tempdir().unwrap();
+        let file = project.path().join("a.gd");
         let started = Arc::new(AtomicUsize::new(0));
         let (external, _inbox) = fake_client();
-        hub.client_with(project.path(), true, counted_start(&started, &external))
-            .await
-            .unwrap();
+        hub.client_with(
+            project.path(),
+            true,
+            &file,
+            counted_start(&started, &external),
+        )
+        .await
+        .unwrap();
 
         // The bridge now shows that the editor has another project open (CI-7).
         let (own, _inbox) = fake_client();
         let replaced = hub
-            .client_with(project.path(), false, counted_start(&started, &own))
+            .client_with(project.path(), false, &file, counted_start(&started, &own))
             .await
             .unwrap();
         assert_eq!(
@@ -714,7 +835,7 @@ mod tests {
         assert!(Arc::ptr_eq(&replaced, &own));
 
         // Where an external server is acceptable again, the live one is simply kept.
-        hub.client_with(project.path(), true, counted_start(&started, &own))
+        hub.client_with(project.path(), true, &file, counted_start(&started, &own))
             .await
             .unwrap();
         assert_eq!(started.load(Ordering::SeqCst), 2);
@@ -724,12 +845,23 @@ mod tests {
     async fn two_first_calls_start_one_editor() {
         let hub = LspHub::new(PathBuf::from("godot"));
         let project = tempfile::tempdir().unwrap();
+        let file = project.path().join("a.gd");
         let started = Arc::new(AtomicUsize::new(0));
         let (client, _inbox) = fake_client();
 
         let (first, second) = tokio::join!(
-            hub.client_with(project.path(), true, counted_start(&started, &client)),
-            hub.client_with(project.path(), true, counted_start(&started, &client)),
+            hub.client_with(
+                project.path(),
+                true,
+                &file,
+                counted_start(&started, &client)
+            ),
+            hub.client_with(
+                project.path(),
+                true,
+                &file,
+                counted_start(&started, &client)
+            ),
         );
 
         assert_eq!(
@@ -744,15 +876,26 @@ mod tests {
     async fn a_live_client_is_reused() {
         let hub = LspHub::new(PathBuf::from("godot"));
         let project = tempfile::tempdir().unwrap();
+        let file = project.path().join("a.gd");
         let started = Arc::new(AtomicUsize::new(0));
         let (client, _inbox) = fake_client();
 
-        hub.client_with(project.path(), true, counted_start(&started, &client))
-            .await
-            .unwrap();
-        hub.client_with(project.path(), true, counted_start(&started, &client))
-            .await
-            .unwrap();
+        hub.client_with(
+            project.path(),
+            true,
+            &file,
+            counted_start(&started, &client),
+        )
+        .await
+        .unwrap();
+        hub.client_with(
+            project.path(),
+            true,
+            &file,
+            counted_start(&started, &client),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(started.load(Ordering::SeqCst), 1);
     }
@@ -761,16 +904,22 @@ mod tests {
     async fn a_client_the_server_closed_is_replaced_before_anything_is_written() {
         let hub = LspHub::new(PathBuf::from("godot"));
         let project = tempfile::tempdir().unwrap();
+        let file = project.path().join("a.gd");
         let started = Arc::new(AtomicUsize::new(0));
         let (first, _inbox) = fake_client();
-        hub.client_with(project.path(), true, counted_start(&started, &first))
+        hub.client_with(project.path(), true, &file, counted_start(&started, &first))
             .await
             .unwrap();
 
         first.closed.store(true, Ordering::Release);
         let (second, _inbox) = fake_client();
         let replaced = hub
-            .client_with(project.path(), true, counted_start(&started, &second))
+            .client_with(
+                project.path(),
+                true,
+                &file,
+                counted_start(&started, &second),
+            )
             .await
             .unwrap();
 
@@ -786,9 +935,10 @@ mod tests {
     async fn a_client_whose_connection_closed_is_replaced() {
         let hub = LspHub::new(PathBuf::from("godot"));
         let project = tempfile::tempdir().unwrap();
+        let file = project.path().join("a.gd");
         let started = Arc::new(AtomicUsize::new(0));
         let (first, inbox) = fake_client();
-        hub.client_with(project.path(), true, counted_start(&started, &first))
+        hub.client_with(project.path(), true, &file, counted_start(&started, &first))
             .await
             .unwrap();
 
@@ -796,7 +946,12 @@ mod tests {
         drop(inbox);
         let (second, _inbox) = fake_client();
         let replaced = hub
-            .client_with(project.path(), true, counted_start(&started, &second))
+            .client_with(
+                project.path(),
+                true,
+                &file,
+                counted_start(&started, &second),
+            )
             .await
             .unwrap();
 
@@ -806,6 +961,160 @@ mod tests {
             "the dead client was kept"
         );
         assert!(Arc::ptr_eq(&replaced, &second));
+    }
+
+    /// A start-up that counts itself and returns a running child, as a private editor is.
+    #[cfg(unix)]
+    fn counted_private_start(
+        started: &Arc<AtomicUsize>,
+        client: &Arc<ClientInner>,
+    ) -> impl FnOnce(PathBuf, bool) -> std::pin::Pin<Box<dyn Future<Output = StartResult> + Send>>
+    {
+        let started = Arc::clone(started);
+        let client = Arc::clone(client);
+        move |_root, _external_ok| {
+            Box::pin(async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                let child = Command::new("sleep")
+                    .arg("30")
+                    .kill_on_drop(true)
+                    .spawn()
+                    .unwrap();
+                Ok((client, Some(child)))
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_private_editor_is_started_again_when_another_script_changes() {
+        let hub = LspHub::new(PathBuf::from("godot"));
+        let project = tempfile::tempdir().unwrap();
+        let file = project.path().join("uses_lift.gd");
+        std::fs::write(&file, "extends Node\n").unwrap();
+        let started = Arc::new(AtomicUsize::new(0));
+        let (client, _inbox) = fake_client();
+        hub.client_with(
+            project.path(),
+            true,
+            &file,
+            counted_private_start(&started, &client),
+        )
+        .await
+        .unwrap();
+
+        // The script asked about is sent with its text, so its own edits need no new editor.
+        std::fs::write(&file, "extends Node\n\nvar lift: CrateLift\n").unwrap();
+        hub.client_with(
+            project.path(),
+            true,
+            &file,
+            counted_private_start(&started, &client),
+        )
+        .await
+        .unwrap();
+        assert_eq!(started.load(Ordering::SeqCst), 1);
+
+        // A new class elsewhere is unknown to an editor that started before it was written.
+        std::fs::create_dir(project.path().join("world")).unwrap();
+        std::fs::write(
+            project.path().join("world/crate_lift.gd"),
+            "class_name CrateLift\nextends Node3D\n",
+        )
+        .unwrap();
+        let (second, _inbox) = fake_client();
+        let replaced = hub
+            .client_with(
+                project.path(),
+                true,
+                &file,
+                counted_private_start(&started, &second),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            2,
+            "the stale editor was kept"
+        );
+        assert!(Arc::ptr_eq(&replaced, &second));
+
+        // Files Godot does not read as scripts change nothing.
+        std::fs::create_dir(project.path().join(".godot")).unwrap();
+        std::fs::write(project.path().join(".godot/cache.gd"), "x").unwrap();
+        std::fs::write(project.path().join("notes.txt"), "x").unwrap();
+        hub.client_with(
+            project.path(),
+            true,
+            &file,
+            counted_private_start(&started, &second),
+        )
+        .await
+        .unwrap();
+        assert_eq!(started.load(Ordering::SeqCst), 2);
+    }
+
+    /// A language server that answers `initialize` the way Godot does for a client whose root is
+    /// not the editor's project: a `gdscript_client/changeWorkspace` naming its own, then the
+    /// result. `open` is that project, or `None` when the roots agree.
+    async fn fake_godot_server(open: Option<PathBuf>) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut reader = MessageReader::default();
+            let mut buf = vec![0_u8; 64 * 1024];
+            loop {
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                for message in reader.push(&buf[..n]).unwrap() {
+                    let Some(id) = message.get("id").cloned() else {
+                        continue;
+                    };
+                    if let Some(open) = &open {
+                        let notice = json!({
+                            "jsonrpc": "2.0",
+                            "method": "gdscript_client/changeWorkspace",
+                            "params": {"path": open.to_string_lossy()},
+                        });
+                        stream
+                            .write_all(&encode_message(&notice).unwrap())
+                            .await
+                            .unwrap();
+                    }
+                    let answer =
+                        json!({"jsonrpc": "2.0", "id": id, "result": {"capabilities": {}}});
+                    stream
+                        .write_all(&encode_message(&answer).unwrap())
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn a_language_server_with_another_project_open_is_refused() {
+        let mine = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let port = fake_godot_server(Some(other.path().to_path_buf())).await;
+        let refused = connect_client(port, mine.path()).await;
+        let Err(error) = refused else {
+            panic!("the other project's language server was used");
+        };
+        assert!(error.to_string().contains("another project"), "{error}");
+
+        // The same directory spelled another way (macOS temp paths go through a symbolic
+        // link) is the same project.
+        let port = fake_godot_server(Some(mine.path().to_path_buf())).await;
+        let canonical = std::fs::canonicalize(mine.path()).unwrap();
+        assert!(connect_client(port, &canonical).await.is_ok());
+
+        let port = fake_godot_server(None).await;
+        assert!(connect_client(port, mine.path()).await.is_ok());
     }
 
     #[test]

@@ -65,6 +65,7 @@ const PARAM_TYPES: Dictionary = {
     "edit_input_action": {"action": TYPE_STRING, "add_events": TYPE_ARRAY, "remove_events": TYPE_ARRAY, "deadzone": TYPE_FLOAT, "create": TYPE_BOOL, "delete": TYPE_BOOL},
     "delete_files": {"paths": TYPE_ARRAY, "force": TYPE_BOOL, "allow_empty_dir": TYPE_BOOL, "dry_run": TYPE_BOOL, "trash": TYPE_BOOL},
     "game_send": {"command": TYPE_STRING},
+    "close_editor": {"discard": TYPE_BOOL},
 }
 
 ## Fields accepted when a vector-like value is given as a JSON object.
@@ -359,6 +360,8 @@ func dispatch_command(peer: WebSocketPeer, cmd_id: String, cmd_type: String, par
             game_send(peer, cmd_id, params)
         "game_status":
             game_status(peer, cmd_id)
+        "close_editor":
+            close_editor(peer, cmd_id, params)
         _:
             send_error(peer, cmd_id, "Unknown command type: " + cmd_type)
 
@@ -477,6 +480,40 @@ func get_project_info(peer: WebSocketPeer, cmd_id: String) -> void:
         "features": ProjectSettings.get_setting("application/config/features", []),
         "project_dir": ProjectSettings.globalize_path("res://").trim_suffix("/")
     })
+
+## Quits this editor without saving anything. Unsaved scenes or scripts keep it open and are
+## listed, unless discard is set. The reply carries the process id, so the server can wait for
+## the process to exit; the editor quits a few frames later, once the reply has gone out.
+func close_editor(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
+    var discard: bool = bool(params.get("discard", false))
+    _track_open_scenes()
+    var scenes: PackedStringArray = PackedStringArray()
+    for scene_path: String in EditorInterface.get_unsaved_scenes():
+        scenes.append(scene_path if not scene_path.is_empty() else "(a new scene that was never saved)")
+    for scene_path: String in EditorInterface.get_open_scenes():
+        if not scenes.has(scene_path) and _has_unsaved_changes(scene_path):
+            scenes.append(scene_path)
+    var scripts: PackedStringArray = _script_ops().unsaved_scripts()
+    if not discard and not (scenes.is_empty() and scripts.is_empty()):
+        send_success(peer, cmd_id, {"closing": false, "unsaved_scenes": scenes, "unsaved_scripts": scripts})
+        return
+    send_success(peer, cmd_id, {
+        "closing": true,
+        "pid": OS.get_process_id(),
+        "project_dir": ProjectSettings.globalize_path("res://").trim_suffix("/"),
+        "discarded_scenes": scenes,
+        "discarded_scripts": scripts,
+    })
+    _quit_after_reply()
+
+func _quit_after_reply() -> void:
+    # A reply leaves when the peers are polled in _process, so the editor stays a few frames.
+    for _frame: int in range(3):
+        await get_tree().process_frame
+    if EditorInterface.is_playing_scene():
+        EditorInterface.stop_playing_scene()
+    print("[Godot MCP] Closing the editor as the MCP server asked")
+    get_tree().quit()
 
 func get_scene_tree(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
     var requested: String = params.get("scene_path", "")

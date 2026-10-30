@@ -109,6 +109,8 @@ func edit(res_path: String, old_text: String, new_text: String, version: String)
     if str(pair["state"]) == "none":
         EditorInterface.edit_script(script)
         pair = _pair_editor(res_path)
+        if str(pair["state"]) == "unknown":
+            return {"error": _editor_problem(res_path, file_lf, pair)}
         if str(pair["state"]) != "found":
             return {"error": "The script editor did not open %s. Open it in the editor and repeat the edit." % res_path}
     var base: CodeEdit = _buffer(pair["editor"])
@@ -161,7 +163,8 @@ func _editor_problem(res_path: String, file_lf: String, pair: Dictionary) -> Str
 ## when exactly one editor is matched to the path, {"state": "unknown", "reason": ...} otherwise.
 ## The editor API has no call that names an editor's resource, so the two lists the script
 ## editor offers (same order) are paired. Newer editors also name the tab (the `_tab_name`
-## metadata, absent in Godot 4.5.2), and then the name must start with the file name.
+## metadata, absent in Godot 4.5.2), and then the name must start with the file name, or with
+## the file name behind as many parent folders as the editor added to tell same-named tabs apart.
 func _pair_editor(res_path: String) -> Dictionary:
     var script_editor: ScriptEditor = EditorInterface.get_script_editor()
     if script_editor == null:
@@ -181,10 +184,21 @@ func _pair_editor(res_path: String) -> Dictionary:
             continue
         if editors[index].has_meta("_tab_name"):
             var tab_name: String = str(editors[index].get_meta("_tab_name"))
-            if not tab_name.begins_with(res_path.get_file()):
+            if not _tab_names_path(tab_name, res_path):
                 return {"state": "unknown", "reason": "the tab '%s' does not belong to %s" % [tab_name, res_path.get_file()]}
         return {"state": "found", "editor": editors[index]}
     return {"state": "none"}
+
+## Whether a tab name ("x.gd", "b/x.gd", "a/b/x.gd", each maybe followed by a mark such as "(*)")
+## names the script at res_path.
+func _tab_names_path(tab_name: String, res_path: String) -> bool:
+    var parts: PackedStringArray = res_path.trim_prefix("res://").split("/", false)
+    var suffix: String = ""
+    for index: int in range(parts.size() - 1, -1, -1):
+        suffix = parts[index] if suffix.is_empty() else parts[index] + "/" + suffix
+        if tab_name.begins_with(suffix):
+            return true
+    return tab_name.begins_with(res_path)
 
 func _buffer(editor: Object) -> CodeEdit:
     return editor.call("get_base_editor") as CodeEdit

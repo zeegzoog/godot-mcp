@@ -81,6 +81,18 @@ pub fn res_display(project: &Path, file: &Path) -> String {
     }
 }
 
+/// Whether Godot's editor file system leaves the entry at `path` out of the project, so a walk
+/// of project files must skip it: a hidden entry (a name starting with `.`, which covers
+/// `.godot/` and `.git/`), a directory holding a `.gdignore` file, or a directory holding its own
+/// `project.godot` (a nested project). Apply it to the entries under the project root, never to
+/// the root itself.
+pub fn skipped_by_godot(path: &Path, is_dir: bool) -> bool {
+    let hidden = path
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().starts_with('.'));
+    hidden || (is_dir && (path.join(".gdignore").exists() || path.join("project.godot").exists()))
+}
+
 /// Whether two paths name the same directory: compared after resolving links where the
 /// directory exists, with `\` read as `/`, no trailing separator, no Windows verbatim prefix and,
 /// on Windows, no difference of case.
@@ -167,6 +179,24 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         std::fs::write(dir.path().join("project.godot"), "config_version=5\n").expect("write");
         dir
+    }
+
+    #[test]
+    fn what_godot_does_not_scan_is_skipped() {
+        let dir = project();
+        let root = dir.path();
+        for folder in [".hidden", "docs", "nested", "assets"] {
+            std::fs::create_dir(root.join(folder)).expect("mkdir");
+        }
+        std::fs::write(root.join("docs/.gdignore"), "").expect("write");
+        std::fs::write(root.join("nested/project.godot"), "").expect("write");
+        assert!(skipped_by_godot(&root.join(".hidden"), true));
+        assert!(skipped_by_godot(&root.join(".godot"), true));
+        assert!(skipped_by_godot(&root.join("docs"), true));
+        assert!(skipped_by_godot(&root.join("nested"), true));
+        assert!(skipped_by_godot(&root.join("assets/.x.png.import"), false));
+        assert!(!skipped_by_godot(&root.join("assets"), true));
+        assert!(!skipped_by_godot(&root.join("assets/x.png.import"), false));
     }
 
     #[test]

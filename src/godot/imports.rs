@@ -8,6 +8,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use crate::paths::skipped_by_godot;
+
 /// Extensions the editor imports (a `.import` file is generated next to them).
 /// Kept in step with `IMPORTED_EXTENSIONS` in the editor addon.
 pub const IMPORTED_EXTENSIONS: &[&str] = &[
@@ -16,7 +18,8 @@ pub const IMPORTED_EXTENSIONS: &[&str] = &[
 ];
 
 /// `res://` paths of imported sources newer than their cache, or whose cache file is missing.
-/// Only files with a `.import` sidecar are considered. The result is sorted and has no duplicates.
+/// Only files with a `.import` sidecar are considered, in the folders Godot scans
+/// ([`skipped_by_godot`]). The result is sorted and has no duplicates.
 pub fn stale_imports(project: &Path) -> Vec<String> {
     let mut found = Vec::new();
     walk(project, project, &mut found);
@@ -37,10 +40,10 @@ fn walk(project: &Path, dir: &Path, found: &mut Vec<String>) {
             continue;
         }
         let path = entry.path();
+        if skipped_by_godot(&path, kind.is_dir()) {
+            continue;
+        }
         if kind.is_dir() {
-            if is_skipped_dir(&path) {
-                continue;
-            }
             walk(project, &path, found);
             continue;
         }
@@ -57,13 +60,6 @@ fn walk(project: &Path, dir: &Path, found: &mut Vec<String>) {
             found.push(res);
         }
     }
-}
-
-fn is_skipped_dir(path: &Path) -> bool {
-    matches!(
-        path.file_name().and_then(|name| name.to_str()),
-        Some(".godot" | ".git")
-    )
 }
 
 fn stale_source(project: &Path, import_file: &Path) -> Option<String> {
@@ -110,10 +106,10 @@ fn walk_sidecars(project: &Path, dir: &Path, found: &mut Vec<(String, u64)>) {
             continue;
         }
         let path = entry.path();
+        if skipped_by_godot(&path, kind.is_dir()) {
+            continue;
+        }
         if kind.is_dir() {
-            if is_skipped_dir(&path) {
-                continue;
-            }
             walk_sidecars(project, &path, found);
             continue;
         }
@@ -381,5 +377,50 @@ mod tests {
             stale_imports(root),
             vec!["res://shaders/flow.glsl".to_string()]
         );
+    }
+
+    #[test]
+    fn folders_godot_does_not_scan_are_not_walked() {
+        let project = project_with(true);
+        let root = project.path();
+        // A stale copy of the same source in each folder Godot skips.
+        for folder in [
+            ".hidden",
+            "docs",
+            "nested",
+            ".claude/worktrees/copy/shaders",
+        ] {
+            let dir = root.join(folder);
+            fs::create_dir_all(&dir).unwrap();
+            fs::copy(root.join("shaders/flow.glsl"), dir.join("flow.glsl")).unwrap();
+            fs::copy(
+                root.join("shaders/flow.glsl.import"),
+                dir.join("flow.glsl.import"),
+            )
+            .unwrap();
+            touch(&dir.join("flow.glsl"), Duration::from_secs(10));
+        }
+        fs::write(root.join("docs/.gdignore"), "").unwrap();
+        fs::write(root.join("nested/project.godot"), "config_version=5\n").unwrap();
+        // A hidden source and its sidecar next to a scanned one.
+        fs::copy(
+            root.join("shaders/flow.glsl"),
+            root.join("shaders/.flow.glsl"),
+        )
+        .unwrap();
+        fs::copy(
+            root.join("shaders/flow.glsl.import"),
+            root.join("shaders/.flow.glsl.import"),
+        )
+        .unwrap();
+        assert_eq!(
+            stale_imports(root),
+            vec!["res://shaders/flow.glsl".to_string()]
+        );
+        let fingerprints: Vec<String> = import_fingerprints(root)
+            .into_iter()
+            .map(|(res, _)| res)
+            .collect();
+        assert_eq!(fingerprints, vec!["res://shaders/flow.glsl".to_string()]);
     }
 }

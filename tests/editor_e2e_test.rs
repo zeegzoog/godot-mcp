@@ -2975,6 +2975,191 @@ async fn set_node_properties_adds_metadata_the_way_the_inspector_does() {
     assert_eq!(read["position"]["value"], "Vector2(5, 7)", "{read}");
 }
 
+/// A node whose exports are typed containers, as a global class so godot_add_node can create it.
+const LISTS_SCRIPT: &str = r#"@tool
+class_name Lists
+extends Node
+
+enum Kind { A, B }
+
+@export var paths: Array[NodePath] = []
+@export var names: Array[String] = []
+@export var counts: Array[int] = []
+@export var kinds: Array[Kind] = []
+@export var points: Array[Vector2] = []
+@export var mats: Array[Material] = []
+@export var tags: Array[Tag] = []
+@export var nodes: Array[Node] = []
+@export var loose: Array = []
+@export var weights: Dictionary[String, int] = {}
+var hidden_paths: Array[NodePath] = []
+"#;
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn typed_container_properties_convert_each_element_or_refuse() {
+    let editor = start_editor_with(
+        None,
+        "",
+        &[
+            ("lists.gd", LISTS_SCRIPT),
+            ("tag.gd", "class_name Tag\nextends Resource\n"),
+            (
+                "mat.tres",
+                "[gd_resource type=\"StandardMaterial3D\" format=3]\n\n[resource]\n",
+            ),
+            (
+                "notes.tres",
+                "[gd_resource type=\"Resource\" format=3]\n\n[resource]\n",
+            ),
+            (
+                "tag.tres",
+                "[gd_resource type=\"Resource\" script_class=\"Tag\" format=3]\n\n\
+                 [ext_resource type=\"Script\" path=\"res://tag.gd\" id=\"1_tag\"]\n\n\
+                 [resource]\nscript = ExtResource(\"1_tag\")\n",
+            ),
+        ],
+        "",
+    )
+    .await;
+    let bridge = &editor.bridge;
+    let call = |command: &'static str, params: Value| async move {
+        bridge.send_command(command, params).await
+    };
+    let props = || async {
+        call("get_node_properties", json!({"node_path": "Lists"}))
+            .await
+            .expect("props")["properties"]
+            .clone()
+    };
+    call("open_scene", json!({"scene_path": "res://main.tscn"}))
+        .await
+        .expect("open main");
+
+    // godot_add_node refuses an element that does not convert instead of dropping the array.
+    expect_error(
+        call(
+            "add_node",
+            json!({"parent_node_path": ".", "node_type": "Lists", "node_name": "Lists",
+                   "properties": {"paths": ["../Player"], "counts": [1, "many"]}}),
+        )
+        .await,
+        "counts: element 1",
+    );
+    let tree = call("get_scene_tree", json!({})).await.expect("tree");
+    assert!(find(&tree, "Lists").is_none(), "{tree}");
+
+    // A JSON array becomes the typed array, element by element.
+    call(
+        "add_node",
+        json!({"parent_node_path": ".", "node_type": "Lists", "node_name": "Lists",
+               "properties": {"paths": ["../Player", "../UI"]}}),
+    )
+    .await
+    .expect("add lists");
+    let read = props().await;
+    assert_eq!(read["paths"]["type"], "Array[NodePath]", "{read}");
+    assert_eq!(
+        read["paths"]["value"], "Array[NodePath]([NodePath(\"../Player\"), NodePath(\"../UI\")])",
+        "{read}"
+    );
+
+    let set = call(
+        "set_node_properties",
+        json!({"node_path": "Lists", "properties": {
+            "names": ["a", "b"],
+            "counts": [1, 2],
+            "kinds": [1],
+            "points": [[1, 2], {"x": 3, "y": 4}],
+            "mats": ["res://mat.tres", null],
+            "tags": ["res://tag.tres"],
+            "loose": ["x", 1],
+            "weights": {"a": 1, "b": 2},
+            "hidden_paths": ["../UI"]
+        }}),
+    )
+    .await
+    .expect("set typed containers");
+    let applied = &set["applied"];
+    assert_eq!(applied["names"], "Array[String]([\"a\", \"b\"])", "{set}");
+    assert_eq!(applied["counts"], "Array[int]([1, 2])", "{set}");
+    assert_eq!(applied["kinds"], "Array[int]([1])", "{set}");
+    assert_eq!(
+        applied["points"], "Array[Vector2]([Vector2(1, 2), Vector2(3, 4)])",
+        "{set}"
+    );
+    assert_eq!(
+        applied["weights"], "Dictionary[String, int]({\n\"a\": 1,\n\"b\": 2\n})",
+        "{set}"
+    );
+    assert_eq!(
+        applied["hidden_paths"], "Array[NodePath]([NodePath(\"../UI\")])",
+        "{set}"
+    );
+
+    // A Godot literal still works, and is checked against the element type too.
+    call(
+        "set_node_properties",
+        json!({"node_path": "Lists", "properties": {"paths": "Array[NodePath]([NodePath(\"../UI\")])"}}),
+    )
+    .await
+    .expect("set literal");
+    assert_eq!(
+        props().await["paths"]["value"],
+        "Array[NodePath]([NodePath(\"../UI\")])"
+    );
+
+    // Every refusal names the element and changes nothing, not even the valid entry beside it.
+    for (key, value, needle) in [
+        ("paths", json!([1]), "paths: element 0: expected NodePath"),
+        ("paths", json!("../Player"), "a JSON array"),
+        ("counts", json!([1.5]), "counts: element 0: expected int"),
+        ("points", json!([[1, 2], [1]]), "points: element 1"),
+        ("mats", json!(["res://notes.tres"]), "not a Material"),
+        ("mats", json!(["res://missing.tres"]), "Resource not found"),
+        ("tags", json!(["res://mat.tres"]), "not a Tag"),
+        (
+            "nodes",
+            json!(["../Player"]),
+            "nodes: element 0: expected Node",
+        ),
+        ("weights", json!({"a": "heavy"}), "weights: value of \"a\""),
+        ("weights", json!([1]), "a JSON object"),
+        (
+            "names",
+            json!("Array[NodePath]([NodePath(\"a\")])"),
+            "names: element 0: expected String",
+        ),
+    ] {
+        expect_error(
+            call(
+                "set_node_properties",
+                json!({"node_path": "Lists", "properties": {key: value, "loose": []}}),
+            )
+            .await,
+            needle,
+        );
+    }
+    let read = props().await;
+    assert_eq!(read["loose"]["value"], "[\"x\", 1.0]", "{read}");
+    assert_eq!(
+        read["paths"]["value"],
+        "Array[NodePath]([NodePath(\"../UI\")])"
+    );
+
+    // The typed values are what the scene saves.
+    call("save_scene", json!({})).await.expect("save");
+    let saved = std::fs::read_to_string(editor.project.join("main.tscn")).expect("saved scene");
+    for needle in [
+        "paths = Array[NodePath]([NodePath(\"../UI\")])",
+        "names = Array[String]([\"a\", \"b\"])",
+        "mats = Array[Material]([ExtResource(",
+        "tags = Array[",
+    ] {
+        assert!(saved.contains(needle), "{needle} in {saved}");
+    }
+}
+
 const SNAG_SCENE: &str = r#"[gd_scene format=3 uid="uid://snagfixture"]
 
 [node name="Snag" type="Node2D"]

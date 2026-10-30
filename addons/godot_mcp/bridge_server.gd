@@ -395,6 +395,16 @@ func property_type_name(info: Dictionary) -> String:
     if type_id == TYPE_OBJECT:
         var object_class: String = info.get("class_name", "")
         return object_class if not object_class.is_empty() else "Object"
+    if type_id == TYPE_ARRAY:
+        var element: Dictionary = array_element_info(info)
+        if not element.is_empty() and not element.has("error"):
+            return "Array[%s]" % property_type_name(element)
+    if type_id == TYPE_DICTIONARY:
+        var entries: Dictionary = dictionary_entry_info(info)
+        if not entries.is_empty() and not entries.has("error"):
+            var key_name: String = "Variant" if entries["key"].is_empty() else property_type_name(entries["key"])
+            var value_name: String = "Variant" if entries["value"].is_empty() else property_type_name(entries["value"])
+            return "Dictionary[%s, %s]" % [key_name, value_name]
     return type_string(type_id)
 
 ## Text form of a value in Godot's own syntax, shortened if it is huge.
@@ -954,6 +964,139 @@ func numbers_from(value: Variant, fields: Array) -> Array:
             numbers.append(float(item))
     return numbers
 
+## The property info of one element type from a typed container's hint: "type/hint:hint_string"
+## (PROPERTY_HINT_TYPE_STRING, exported containers) or a type or class name
+## (PROPERTY_HINT_ARRAY_TYPE). Returns {} for a Variant element, else {"type", "hint",
+## "hint_string", "class_name"} or {"error": String}.
+func element_info(description: String) -> Dictionary:
+    if description.is_empty() or description == "Variant":
+        return {}
+    var colon: int = description.find(":")
+    var head: String = description if colon < 0 else description.substr(0, colon)
+    var head_parts: PackedStringArray = head.split("/")
+    if head_parts[0].is_valid_int() and (head_parts.size() == 1 or head_parts[1].is_valid_int()):
+        var type_id: int = head_parts[0].to_int()
+        if type_id == TYPE_NIL:
+            return {}
+        var hint: int = head_parts[1].to_int() if head_parts.size() > 1 else PROPERTY_HINT_NONE
+        var hint_string: String = "" if colon < 0 else description.substr(colon + 1)
+        var object_class: String = ""
+        if type_id == TYPE_OBJECT:
+            var names_class: bool = hint in [PROPERTY_HINT_RESOURCE_TYPE, PROPERTY_HINT_NODE_TYPE] and not hint_string.is_empty()
+            object_class = hint_string if names_class else "Object"
+        return {"type": type_id, "hint": hint, "hint_string": hint_string, "class_name": object_class}
+    for type_id: int in range(TYPE_NIL + 1, TYPE_MAX):
+        if type_id != TYPE_OBJECT and type_string(type_id) == description:
+            return {"type": type_id, "hint": PROPERTY_HINT_NONE, "hint_string": "", "class_name": ""}
+    if ClassDB.class_exists(description) or not global_class_script(description).is_empty():
+        return {"type": TYPE_OBJECT, "hint": PROPERTY_HINT_NONE, "hint_string": description, "class_name": description}
+    return {"error": "cannot read the element type '%s' of this typed container" % description}
+
+## The element type of a typed array property ({} for an untyped one); see element_info.
+func array_element_info(info: Dictionary) -> Dictionary:
+    var hint: int = info.get("hint", PROPERTY_HINT_NONE)
+    if hint != PROPERTY_HINT_TYPE_STRING and hint != PROPERTY_HINT_ARRAY_TYPE:
+        return {}
+    return element_info(str(info.get("hint_string", "")))
+
+## The key and value types of a typed dictionary property: {} for an untyped one, else
+## {"key": Dictionary, "value": Dictionary} (each as element_info) or {"error": String}.
+func dictionary_entry_info(info: Dictionary) -> Dictionary:
+    var hint: int = info.get("hint", PROPERTY_HINT_NONE)
+    var hint_string: String = str(info.get("hint_string", ""))
+    if (hint != PROPERTY_HINT_TYPE_STRING and hint != PROPERTY_HINT_DICTIONARY_TYPE) or not hint_string.contains(";"):
+        return {}
+    var key: Dictionary = element_info(hint_string.get_slice(";", 0))
+    if key.has("error"):
+        return key
+    var value: Dictionary = element_info(hint_string.substr(hint_string.find(";") + 1))
+    if value.has("error"):
+        return value
+    if key.is_empty() and value.is_empty():
+        return {}
+    return {"key": key, "value": value}
+
+## res:// path of the script of a global class_name, or "".
+func global_class_script(global_name: String) -> String:
+    for entry: Dictionary in ProjectSettings.get_global_class_list():
+        if entry["class"] == global_name:
+            return str(entry["path"])
+    return ""
+
+## Whether an object is of a native class or a global script class (or extends it).
+func object_is_class(object: Object, wanted: String) -> bool:
+    if wanted.is_empty() or wanted == "Object":
+        return true
+    if ClassDB.class_exists(wanted):
+        return object.is_class(wanted)
+    var script: Script = object.get_script() as Script
+    while script != null:
+        if String(script.get_global_name()) == wanted:
+            return true
+        script = script.get_base_script()
+    return false
+
+## Converts one element of a typed container. A value already of the element type (from a
+## parsed Godot literal) is kept. Returns {"value": Variant} or {"error": String}.
+func convert_element(element: Dictionary, raw: Variant) -> Dictionary:
+    if element.is_empty():
+        return {"value": raw}
+    var expected: int = element["type"]
+    if expected != TYPE_OBJECT:
+        if typeof(raw) == expected:
+            return {"value": raw}
+        return convert_property_value(element, raw)
+    var result: Dictionary = {"value": raw} if raw == null or raw is Object else convert_property_value(element, raw)
+    if result.has("error") or result["value"] == null:
+        return result
+    var object: Object = result["value"]
+    var wanted: String = element["class_name"]
+    if not object_is_class(object, wanted):
+        return {"error": "%s is a %s, not a %s" % [describe_value(object), object.get_class(), wanted]}
+    return result
+
+## The arguments that type a container's elements: [type, native class, script].
+func container_typing(element: Dictionary) -> Array:
+    if element.is_empty():
+        return [TYPE_NIL, &"", null]
+    if element["type"] != TYPE_OBJECT:
+        return [element["type"], &"", null]
+    var wanted: String = element["class_name"]
+    if ClassDB.class_exists(wanted):
+        return [TYPE_OBJECT, StringName(wanted), null]
+    var script: Script = load(global_class_script(wanted)) as Script
+    if script == null:
+        return [TYPE_OBJECT, &"Object", null]
+    return [TYPE_OBJECT, script.get_instance_base_type(), script]
+
+## Builds a typed array from JSON or parsed items. Returns {"value": Array} or {"error": String}
+## naming the first element that does not convert.
+func typed_array_from(element: Dictionary, items: Array) -> Dictionary:
+    var values: Array = []
+    for index: int in items.size():
+        var converted: Dictionary = convert_element(element, items[index])
+        if converted.has("error"):
+            return {"error": "element %d: %s" % [index, converted["error"]]}
+        values.append(converted["value"])
+    var typing: Array = container_typing(element)
+    return {"value": Array(values, typing[0], typing[1], typing[2])}
+
+## Builds a typed dictionary from JSON or parsed entries. JSON keys are always strings, so a key
+## is converted like an element. Returns {"value": Dictionary} or {"error": String}.
+func typed_dictionary_from(key_element: Dictionary, value_element: Dictionary, items: Dictionary) -> Dictionary:
+    var values: Dictionary = {}
+    for raw_key: Variant in items:
+        var key: Dictionary = convert_element(key_element, raw_key)
+        if key.has("error"):
+            return {"error": "key %s: %s" % [describe_value(raw_key), key["error"]]}
+        var value: Dictionary = convert_element(value_element, items[raw_key])
+        if value.has("error"):
+            return {"error": "value of %s: %s" % [describe_value(raw_key), value["error"]]}
+        values[key["value"]] = value["value"]
+    var key_typing: Array = container_typing(key_element)
+    var value_typing: Array = container_typing(value_element)
+    return {"value": Dictionary(values, key_typing[0], key_typing[1], key_typing[2], value_typing[0], value_typing[1], value_typing[2])}
+
 ## Converts a JSON value to what the property expects. Returns {"value": Variant} or
 ## {"error": String}.
 func convert_property_value(info: Dictionary, raw: Variant) -> Dictionary:
@@ -999,6 +1142,30 @@ func convert_property_value(info: Dictionary, raw: Variant) -> Dictionary:
                 if not ResourceLoader.exists(raw):
                     return {"error": "Resource not found: " + raw}
                 return {"value": load(raw)}
+        TYPE_ARRAY:
+            var element: Dictionary = array_element_info(info)
+            if element.has("error"):
+                return element
+            if not element.is_empty():
+                # A typed array keeps only elements of its type, so assigning a mismatched array
+                # leaves it empty without an error; convert every element or refuse.
+                var items: Variant = str_to_var(raw) if raw is String else raw
+                if not items is Array:
+                    return {"error": "expected %s (a JSON array) but got %s (%s)" % [property_type_name(info), type_string(typeof(raw)), describe_value(raw)]}
+                return typed_array_from(element, items)
+            if raw is Array:
+                return {"value": raw}
+        TYPE_DICTIONARY:
+            var entries: Dictionary = dictionary_entry_info(info)
+            if entries.has("error"):
+                return entries
+            if not entries.is_empty():
+                var items: Variant = str_to_var(raw) if raw is String else raw
+                if not items is Dictionary:
+                    return {"error": "expected %s (a JSON object) but got %s (%s)" % [property_type_name(info), type_string(typeof(raw)), describe_value(raw)]}
+                return typed_dictionary_from(entries["key"], entries["value"], items)
+            if raw is Dictionary:
+                return {"value": raw}
         TYPE_PACKED_BYTE_ARRAY, TYPE_PACKED_INT32_ARRAY, TYPE_PACKED_INT64_ARRAY, TYPE_PACKED_FLOAT32_ARRAY, TYPE_PACKED_FLOAT64_ARRAY, TYPE_PACKED_STRING_ARRAY, TYPE_PACKED_VECTOR2_ARRAY, TYPE_PACKED_VECTOR3_ARRAY, TYPE_PACKED_COLOR_ARRAY, TYPE_PACKED_VECTOR4_ARRAY:
             if raw is Array:
                 var packed: Variant = type_convert(raw, expected)

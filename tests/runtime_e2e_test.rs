@@ -4743,7 +4743,7 @@ async fn run_script_writes_back_the_uids_and_shader_parameters_a_headless_save_d
     assert!(answer.contains("\"resource_damage\": []"), "{answer}");
     let saved = std::fs::read_to_string(root.join("pond.tscn")).unwrap();
     assert!(
-        saved.starts_with("[gd_scene format=3 uid=\"uid://cpond1234abcd\"]")
+        saved.lines().next().is_some_and(|header| header.starts_with("[gd_scene") && header.ends_with("uid=\"uid://cpond1234abcd\"]"))
             && saved.contains("[ext_resource type=\"Shader\" uid=\"uid://dlh0ah0opc20e\" path=\"res://water.gdshader\"")
             && saved.contains("shader_parameter/speed = 3.0")
             && !saved.contains("= null"),

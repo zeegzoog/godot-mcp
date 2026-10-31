@@ -43,20 +43,20 @@ const IMPORTED_EXTENSIONS: PackedStringArray = [
 ## value produces an error response instead of a script error that leaves the caller waiting.
 const PARAM_TYPES: Dictionary = {
     "get_scene_tree": {"scene_path": TYPE_STRING},
-    "add_node": {"parent_node_path": TYPE_STRING, "node_type": TYPE_STRING, "scene": TYPE_STRING, "node_name": TYPE_STRING, "properties": TYPE_DICTIONARY},
+    "add_node": {"parent_node_path": TYPE_STRING, "node_type": TYPE_STRING, "scene": TYPE_STRING, "node_name": TYPE_STRING, "properties": TYPE_DICTIONARY, "make_editable": TYPE_BOOL},
     "remove_node": {"node_path": TYPE_STRING},
     "get_node_properties": {"node_path": TYPE_STRING, "properties": TYPE_ARRAY},
-    "set_node_properties": {"node_path": TYPE_STRING, "properties": TYPE_DICTIONARY},
+    "set_node_properties": {"node_path": TYPE_STRING, "properties": TYPE_DICTIONARY, "make_editable": TYPE_BOOL},
     "capture_viewport": {"view": TYPE_STRING, "max_dimension": TYPE_FLOAT},
     "open_scene": {"scene_path": TYPE_STRING, "reload": TYPE_BOOL, "discard": TYPE_BOOL},
     "run_project": {"scene_path": TYPE_STRING},
     "resave_resources": {"paths": TYPE_ARRAY, "wait": TYPE_BOOL},
     "create_scene": {"scene_path": TYPE_STRING, "root_type": TYPE_STRING, "root_name": TYPE_STRING},
-    "attach_script": {"node_path": TYPE_STRING, "script_path": TYPE_STRING},
+    "attach_script": {"node_path": TYPE_STRING, "script_path": TYPE_STRING, "make_editable": TYPE_BOOL},
     "read_script": {"script_path": TYPE_STRING},
     "script_tab": {"script_path": TYPE_STRING, "reload": TYPE_BOOL},
     "edit_script": {"script_path": TYPE_STRING, "old_text": TYPE_STRING, "new_text": TYPE_STRING, "version": TYPE_STRING},
-    "connect_signal": {"node_path": TYPE_STRING, "signal_name": TYPE_STRING, "method": TYPE_STRING, "target_path": TYPE_STRING},
+    "connect_signal": {"node_path": TYPE_STRING, "signal_name": TYPE_STRING, "method": TYPE_STRING, "target_path": TYPE_STRING, "make_editable": TYPE_BOOL},
     "list_signals": {"node_path": TYPE_STRING},
     "create_resource": {"resource_path": TYPE_STRING, "class_name": TYPE_STRING},
     "set_project_setting": {"key": TYPE_STRING},
@@ -424,6 +424,50 @@ func find_scene_node(root: Node, node_path: String) -> Node:
         return node
     return null
 
+## Instances between the scene root and `node` whose children are not editable, outermost first.
+## Godot saves nothing about a node inside one of them (no property, child or connection), so a
+## change there is lost on the next save.
+func locked_instances(root: Node, node: Node) -> Array[Node]:
+    var locked: Array[Node] = []
+    var current: Node = node
+    while current != root and current.owner != null and current.owner != root:
+        var instance: Node = current.owner
+        if not root.is_editable_instance(instance):
+            locked.push_front(instance)
+        current = instance
+    return locked
+
+## Checks that an edit of `node` would be saved. Returns {"locked": instances to make editable},
+## or an empty dictionary after refusing because make_editable was not passed.
+func editable_instances_or_error(peer: WebSocketPeer, cmd_id: String, root: Node, node: Node, params: Dictionary) -> Dictionary:
+    var locked: Array[Node] = locked_instances(root, node)
+    if locked.is_empty() or params.get("make_editable", false) == true:
+        return {"locked": locked}
+    var names: PackedStringArray = []
+    for instance: Node in locked:
+        names.append("'%s' (%s)" % [String(root.get_path_to(instance)), instance.scene_file_path])
+    var innermost: Node = locked[locked.size() - 1]
+    send_error(peer, cmd_id, ("'%s' is inside the instance %s, whose children are not editable: Godot would drop this change when the scene is saved. "
+        + "Pass make_editable: true to turn on Editable Children for it (as Scene > Editable Children does, undone with the change), "
+        + "or make the change in %s itself.") % [String(root.get_path_to(node)), " inside ".join(names), innermost.scene_file_path])
+    return {}
+
+## Adds turning on Editable Children for `locked` to the action being built.
+func add_make_editable(root: Node, locked: Array[Node]) -> void:
+    for instance: Node in locked:
+        undo_redo.add_do_method(root, "set_editable_instance", instance, true)
+        undo_redo.add_undo_method(root, "set_editable_instance", instance, false)
+
+func make_editable_now(root: Node, locked: Array[Node]) -> void:
+    for instance: Node in locked:
+        root.set_editable_instance(instance, true)
+
+func editable_paths(root: Node, locked: Array[Node]) -> Array[String]:
+    var paths: Array[String] = []
+    for instance: Node in locked:
+        paths.append(String(root.get_path_to(instance)))
+    return paths
+
 func property_type_name(info: Dictionary) -> String:
     var type_id: int = info["type"]
     if type_id == TYPE_OBJECT:
@@ -566,12 +610,16 @@ func serialize_node(node: Node, root: Node) -> Dictionary:
     for child in node.get_children():
         children_data.append(serialize_node(child, root))
 
-    return {
+    var data: Dictionary = {
         "name": String(node.name),
         "class": node.get_class(),
         "path": "." if node == root else String(root.get_path_to(node)),
         "children": children_data
     }
+    if node != root and not node.scene_file_path.is_empty():
+        data["instance"] = node.scene_file_path
+        data["editable_children"] = root.is_editable_instance(node)
+    return data
 
 func open_scene(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
     var requested: String = params.get("scene_path", "")
@@ -805,6 +853,10 @@ func add_node(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
     if parent_node == null:
         send_error(peer, cmd_id, "Parent node not found at path: " + parent_path)
         return
+    var guard: Dictionary = editable_instances_or_error(peer, cmd_id, root, parent_node, params)
+    if guard.is_empty():
+        return
+    var locked: Array[Node] = guard["locked"]
 
     var created: Dictionary = instantiate_scene(scene_param, root) if not scene_param.is_empty() else instantiate_node(node_type)
     if created.has("error"):
@@ -839,8 +891,10 @@ func add_node(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
         undo_redo.add_do_property(new_node, "owner", root)
         undo_redo.add_do_reference(new_node)
         undo_redo.add_undo_method(parent_node, "remove_child", new_node)
+        add_make_editable(root, locked)
         undo_redo.commit_action()
     else:
+        make_editable_now(root, locked)
         parent_node.add_child(new_node, true)
         new_node.owner = root
 
@@ -852,6 +906,8 @@ func add_node(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
     }
     if created.has("path"):
         answer["scene"] = created["path"]
+    if not locked.is_empty():
+        answer["made_editable"] = editable_paths(root, locked)
     send_success(peer, cmd_id, answer)
 
 func collect_owned_nodes(node: Node, root: Node, into: Array[Node]) -> void:
@@ -872,6 +928,12 @@ func remove_node(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> voi
         return
     if target_node == root:
         send_error(peer, cmd_id, "The scene root cannot be removed; remove its children or close the scene instead")
+        return
+    if target_node.owner != null and target_node.owner != root:
+        var instance: Node = target_node.owner
+        send_error(peer, cmd_id, ("'%s' comes from the instance '%s' of %s, and Godot cannot delete a node an instanced scene brings, even with editable children. "
+            + "Hide it with godot_set_node_properties {\"visible\": false} (with make_editable: true), or remove it from %s itself.") % [
+                node_path, String(root.get_path_to(instance)), instance.scene_file_path, instance.scene_file_path])
         return
 
     var parent: Node = target_node.get_parent()
@@ -1324,6 +1386,10 @@ func set_node_properties(peer: WebSocketPeer, cmd_id: String, params: Dictionary
     if target_node == null:
         send_error(peer, cmd_id, "Node not found at path: " + node_path)
         return
+    var guard: Dictionary = editable_instances_or_error(peer, cmd_id, root, target_node, params)
+    if guard.is_empty():
+        return
+    var locked: Array[Node] = guard["locked"]
 
     # Validate and convert everything first so a bad value never leaves a half-applied change.
     var checked: Dictionary = convert_properties(target_node, properties)
@@ -1354,8 +1420,10 @@ func set_node_properties(peer: WebSocketPeer, cmd_id: String, params: Dictionary
         if not new_meta.is_empty():
             undo_redo.add_do_method(target_node, "notify_property_list_changed")
             undo_redo.add_undo_method(target_node, "notify_property_list_changed")
+        add_make_editable(root, locked)
         undo_redo.commit_action()
     else:
+        make_editable_now(root, locked)
         for prop_name: String in converted:
             target_node.set(prop_name, converted[prop_name])
         for prop_name: String in new_meta:
@@ -1372,7 +1440,10 @@ func set_node_properties(peer: WebSocketPeer, cmd_id: String, params: Dictionary
         var step: Array = stepped[prop_name]
         applied[prop_name] = describe_value((step[0] as Object).get(step[1]))
     mark_scene_dirty()
-    send_success(peer, cmd_id, {"updated": true, "node_path": node_path, "applied": applied})
+    var answer: Dictionary = {"updated": true, "node_path": node_path, "applied": applied}
+    if not locked.is_empty():
+        answer["made_editable"] = editable_paths(root, locked)
+    send_success(peer, cmd_id, answer)
 
 # --- Viewport --------------------------------------------------------------------------
 
@@ -1794,6 +1865,10 @@ func attach_script(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> v
     if target == null:
         send_error(peer, cmd_id, "Node not found at path: " + node_path)
         return
+    var guard: Dictionary = editable_instances_or_error(peer, cmd_id, root, target, params)
+    if guard.is_empty():
+        return
+    var locked: Array[Node] = guard["locked"]
     var script_path: String = str(params.get("script_path", ""))
     var script: Script = null
     if not script_path.is_empty() and script_path != "null":
@@ -1809,11 +1884,16 @@ func attach_script(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> v
         undo_redo.create_action("Attach Script", UndoRedo.MERGE_DISABLE, root)
         undo_redo.add_do_property(target, "script", script)
         undo_redo.add_undo_property(target, "script", target.get_script())
+        add_make_editable(root, locked)
         undo_redo.commit_action()
     else:
+        make_editable_now(root, locked)
         target.set_script(script)
     mark_scene_dirty()
-    send_success(peer, cmd_id, {"node_path": node_path, "script_path": script_path})
+    var answer: Dictionary = {"node_path": node_path, "script_path": script_path}
+    if not locked.is_empty():
+        answer["made_editable"] = editable_paths(root, locked)
+    send_success(peer, cmd_id, answer)
 
 ## The script commands keep their logic in editor/script_ops.gd; this only checks the path.
 func read_script(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
@@ -1902,15 +1982,25 @@ func connect_signal(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> 
     if source.is_connected(signal_name, callable):
         send_error(peer, cmd_id, "Signal '%s' is already connected to '%s'" % [signal_name, method_name])
         return
+    # A connection is saved with its source, so only the source's instances matter.
+    var guard: Dictionary = editable_instances_or_error(peer, cmd_id, root, source, params)
+    if guard.is_empty():
+        return
+    var locked: Array[Node] = guard["locked"]
     if undo_redo != null:
         undo_redo.create_action("Connect Signal", UndoRedo.MERGE_DISABLE, root)
         undo_redo.add_do_method(source, "connect", signal_name, callable, CONNECT_PERSIST)
         undo_redo.add_undo_method(source, "disconnect", signal_name, callable)
+        add_make_editable(root, locked)
         undo_redo.commit_action()
     else:
+        make_editable_now(root, locked)
         source.connect(signal_name, callable, CONNECT_PERSIST)
     mark_scene_dirty()
-    send_success(peer, cmd_id, {"signal": signal_name, "method": method_name})
+    var answer: Dictionary = {"signal": signal_name, "method": method_name}
+    if not locked.is_empty():
+        answer["made_editable"] = editable_paths(root, locked)
+    send_success(peer, cmd_id, answer)
 
 func list_signals(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
     var root: Node = scene_root_or_error(peer, cmd_id)

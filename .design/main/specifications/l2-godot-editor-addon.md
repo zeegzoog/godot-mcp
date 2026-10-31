@@ -1,6 +1,6 @@
 # Godot Editor Addon
 
-**Version:** 1.9.0
+**Version:** 1.10.0
 **Status:** Stable
 **Layer:** implementation
 **Implements:** l1-editor-bridge.md
@@ -49,6 +49,7 @@ GDScript fails differently from Rust: assigning a wrongly typed value to a typed
 | BR-9 Version gate | [MODIFIED] `plugin.gd` compares `Engine.get_version_info()` with the line's `MIN_MAJOR`.`MIN_MINOR`: an older version prints an error and the bridge does not start; a newer version prints a warning naming the release line to install ("This godot-mcp build is for Godot 4.6; install the release for Godot 4.7") and the bridge starts (RL-4). |
 | BR-10 Editor-only | `export_plugin.gd` (registered before the bridge so it works even if the bridge fails) skips every file under its own directory; its name sorts before the built-in "GDScript" export plugin, which would otherwise remap `.gd` files first and end the chain. |
 | BR-11 Project-confined paths | `to_res_path` normalizes separators, localizes absolute paths, and rejects anything outside `res://` or containing a `..` segment; used by `open_scene`, `get_scene_tree`, `run_project`, `resave_resources`, `read_script` and `edit_script`. |
+| BR-12 Saved edits only | [ADDED] `set_node_properties`, `add_node` (the parent), `attach_script` and `connect_signal` (the source) walk the node's owner chain up to the edited root (`locked_instances`); an instance on it whose children are not editable (`is_editable_instance`) means Godot would save nothing about the node, so the command is refused with the instance and its scene named, unless `make_editable` is true: then `set_editable_instance(…, true)` joins the same undo action and the answer lists the instances in `made_editable`. `remove_node` refuses a node owned by an instance, which Godot cannot delete. `get_scene_tree` reports `instance` and `editable_children` on instance nodes. |
 
 ## 5. Detailed Design
 
@@ -150,3 +151,4 @@ Every reply path sends exactly one answer (BR-3); the parameters are read untype
 | 1.7.0 | 2026-10-29 | Agent (magic.spec) | [MODIFIED] BR-7: a missing `metadata/<name>` entry is created by `set_node_properties` inside the same undo action, with the identifier and non-null checks; the all-or-nothing rule is unchanged. Source: pull request 63. Stable → RFC → Stable after Post-Update Review. |
 | 1.8.0 | 2026-10-29 | Agent (magic.spec) | [MODIFIED] BR-7: `:` resource steps in `set_node_properties` and `get_node_properties`, shared resources refused, the optional `properties` list of the read. Source: pull request 68. Stable → RFC → Stable after Post-Update Review. |
 | 1.9.0 | 2026-10-29 | Agent (magic.spec) | [ADDED] the `close_editor` command: the unsaved check, the `discard` option, the process id in the answer and the quit after the reply. |
+| 1.10.0 | 2026-10-31 | Agent (magic.spec) | [ADDED] BR-12: edits Godot would not save (inside an instance without editable children) are refused, or `make_editable` turns Editable Children on in the same action; removing a node an instance brings is refused. |

@@ -43,13 +43,13 @@ pub fn catalog() -> Vec<Tool> {
         tool(
             "godot_attach_script",
             "Attaches a script to a node in the edited scene (undoable). The script must exist in the project. Pass an empty script_path to detach.",
-            json!({"node_path": s(""), "script_path": s("res:// path, or empty to detach.")}),
+            json!({"node_path": s(""), "script_path": s("res:// path, or empty to detach."), "make_editable": super::make_editable_param()}),
             &["node_path"],
         ),
         tool(
             "godot_connect_signal",
             "Connects a signal inside the edited scene with CONNECT_PERSIST (undoable). The target must already have the method (attach its script first); a connection that exists is refused.",
-            json!({"node_path": s(""), "signal_name": s(""), "target_path": s("Default: the same node."), "method": s("")}),
+            json!({"node_path": s(""), "signal_name": s(""), "target_path": s("Default: the same node."), "method": s(""), "make_editable": super::make_editable_param()}),
             &["node_path", "signal_name", "method"],
         ),
         tool(

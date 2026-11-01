@@ -636,6 +636,27 @@ fn launch_editor_schema_no_longer_requires_project_path() {
 }
 
 #[test]
+fn node_editing_tools_accept_make_editable() {
+    let tools = ToolManager::list_tools();
+    for name in [
+        "godot_set_node_properties",
+        "godot_add_node",
+        "godot_attach_script",
+        "godot_connect_signal",
+    ] {
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name == name)
+            .unwrap_or_else(|| panic!("{name} is listed"));
+        assert_eq!(
+            tool.input_schema["properties"]["make_editable"]["type"], "boolean",
+            "{name}: {}",
+            tool.input_schema
+        );
+    }
+}
+
+#[test]
 fn node_property_tools_describe_the_resource_step() {
     let tools = ToolManager::list_tools();
     let schema = |name: &str| {

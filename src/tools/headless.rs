@@ -72,7 +72,9 @@ fn damage_report(damage: &[ResourceDamage]) -> (Vec<Value>, Option<String>) {
 /// What the run's answer says about the files the server repaired after the script.
 struct RepairReport {
     repairs: Vec<ResourceRepair>,
-    /// The connected editor's answer to refreshing the repaired files, when it holds the project.
+    /// Every scene, resource, script and shader the script wrote, repaired or not.
+    written: Vec<String>,
+    /// The connected editor's answer to refreshing the written files, when it holds the project.
     editor: Option<Value>,
     /// Why the connected editor could not refresh them.
     editor_error: Option<String>,
@@ -98,25 +100,32 @@ impl RepairReport {
     }
 
     fn sentence(&self) -> Option<String> {
-        if self.repairs.is_empty() {
-            return None;
-        }
-        let paths = self
-            .repairs
-            .iter()
-            .map(|item| item.path.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
         let editor = match (&self.editor, &self.editor_error) {
-            (Some(_), _) => " The connected editor refreshed them; reload any of them it has open.",
-            (None, Some(_)) => {
-                " The connected editor could not refresh them (editor_refresh_error); rescan the file system there."
-            }
-            (None, None) => "",
+            (Some(_), _) => Some(
+                "The connected editor refreshed the files the script wrote and reloaded the shaders, scripts and resources it had loaded (editor_refresh); reload any scene it has open.",
+            ),
+            (None, Some(_)) => Some(
+                "The connected editor could not refresh the files the script wrote (editor_refresh_error), so it may still use their old contents; call godot_resave_resources with those paths.",
+            ),
+            (None, None) => None,
         };
-        Some(format!(
-            "Headless Godot saves without uids and writes unset shader uniforms as null, so the server repaired {paths}: resource_repairs lists the uids it wrote back and the null shader_parameter lines it removed.{editor}"
-        ))
+        let repaired = (!self.repairs.is_empty()).then(|| {
+            let paths = self
+                .repairs
+                .iter()
+                .map(|item| item.path.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "Headless Godot saves without uids and writes unset shader uniforms as null, so the server repaired {paths}: resource_repairs lists the uids it wrote back and the null shader_parameter lines it removed."
+            )
+        });
+        match (repaired, editor) {
+            (Some(repaired), Some(editor)) => Some(format!("{repaired} {editor}")),
+            (Some(repaired), None) => Some(repaired),
+            (None, Some(editor)) => Some(editor.to_string()),
+            (None, None) => None,
+        }
     }
 }
 
@@ -588,7 +597,9 @@ impl ToolManager {
     }
 
     /// Repairs the text scenes and resources the script rewrote, then has the editor refresh
-    /// them when it holds the same project, so its file system and uid cache follow the files.
+    /// every scene, resource, script and shader the script wrote when it holds the same project,
+    /// so its file system, uid cache and loaded resources follow the files: a material that uses
+    /// a rewritten shader sees its new uniforms and defaults before the next scene save.
     async fn repair_resources(
         &self,
         project: &Path,
@@ -597,10 +608,11 @@ impl ToolManager {
         let repairs = snapshot.repair_since(project);
         let mut report = RepairReport {
             repairs,
+            written: snapshot.written_since(project),
             editor: None,
             editor_error: None,
         };
-        if report.repairs.is_empty() {
+        if report.written.is_empty() {
             return report;
         }
         let holds_project = match self
@@ -617,14 +629,9 @@ impl ToolManager {
         if !holds_project {
             return report;
         }
-        let paths = report
-            .repairs
-            .iter()
-            .map(|item| item.path.clone())
-            .collect::<Vec<_>>();
         let bridge = self.bridge.clone().with_timeout(Self::RESAVE_BRIDGE_WAIT);
         match bridge
-            .send_command("resave_resources", json!({"paths": paths}))
+            .send_command("resave_resources", json!({"paths": report.written}))
             .await
         {
             Ok(answer) => report.editor = Some(answer),

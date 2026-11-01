@@ -524,6 +524,14 @@ fn str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
 }
 
 const MAX_USER_ARGS: usize = 32;
+
+/// The make_editable parameter of the tools that edit a node, which may lie inside an instance.
+fn make_editable_param() -> Value {
+    json!({
+        "type": "boolean",
+        "description": "Turn on Editable Children (Scene > Editable Children) for every instanced scene the node lies in whose children are not editable, in the same undo action; without it such an edit is refused, because Godot would drop it when the scene is saved. The answer lists them in made_editable."
+    })
+}
 const MAX_USER_ARG_CHARS: usize = 256;
 
 /// `Some` when the caller sent `user_args`, including an empty array. `None` when the key is absent.
@@ -938,7 +946,7 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
         ),
         tool(
             "godot_get_scene_tree",
-            "Retrieves the complete node hierarchy of a scene open in Godot Editor. Node paths in the result are relative to the scene root ('.' is the root). This read does not reload the scene; when the file on disk differs, the result sets stale to true.",
+            "Retrieves the complete node hierarchy of a scene open in Godot Editor. Node paths in the result are relative to the scene root ('.' is the root). This read does not reload the scene; when the file on disk differs, the result sets stale to true. A node that instances another scene has instance (its res:// path) and editable_children: inside an instance whose children are not editable, Godot saves no change, so the editing tools refuse it unless make_editable is passed.",
             json!({
                 "scene_path": {
                     "type": "string",
@@ -976,13 +984,14 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
                 "properties": {
                     "type": "object",
                     "description": "Optional initial property values of the new node, such as {\"position\": [10, 0, 5]} or {\"transform\": \"Transform3D(...)\"}; converted as in godot_set_node_properties."
-                }
+                },
+                "make_editable": make_editable_param()
             }),
             &[],
         ),
         tool(
             "godot_remove_node",
-            "Removes a node from the active scene tree with undo/redo support. The scene root cannot be removed.",
+            "Removes a node from the active scene tree with undo/redo support. The scene root cannot be removed, nor a node an instanced scene brings (Godot cannot save that deletion even with editable children): hide it with godot_set_node_properties or remove it in its own scene.",
             json!({
                 "node_path": {
                     "type": "string",
@@ -1009,7 +1018,7 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
         ),
         tool(
             "godot_set_node_properties",
-            "Modifies properties of a node in the active scene with undo/redo support. Values are converted to the property's type: vectors, rects and colors accept arrays ([10, 20]) or objects ({\"x\": 10, \"y\": 20}), colors also accept '#rrggbb' or names, resources accept res:// paths, typed arrays and dictionaries (Array[NodePath], Dictionary[String, int]) accept a JSON array or object whose every element is converted to the element type the same way (a bad element is refused with its index), and any Godot literal string (e.g. 'Vector2(1, 2)') is parsed. 'metadata/<name>' sets node metadata: an existing entry keeps its type, a missing one is created (as the inspector's Add Metadata does) with the JSON value's own type, a whole number as int; the name must be an identifier and the value not null. ':' steps through a resource the way godot_game_set does (material_override:shader_parameter/glow_amount); the last segment is a property of that resource, converted the same way, and the change is part of the same undo action. Only a resource built into the edited scene (or not saved yet) is changed this way: one saved in a .tres file or built into another scene is shared, so it is refused and the message names the file. Refuses script and a private segment after ':', and a ':' step through a value that is not a resource. Unknown properties or unconvertible values reject the whole call without changing anything.",
+            "Modifies properties of a node in the active scene with undo/redo support. Values are converted to the property's type: vectors, rects and colors accept arrays ([10, 20]) or objects ({\"x\": 10, \"y\": 20}), colors also accept '#rrggbb' or names, resources accept res:// paths, typed arrays and dictionaries (Array[NodePath], Dictionary[String, int]) accept a JSON array or object whose every element is converted to the element type the same way (a bad element is refused with its index), and any Godot literal string (e.g. 'Vector2(1, 2)') is parsed. 'metadata/<name>' sets node metadata: an existing entry keeps its type, a missing one is created (as the inspector's Add Metadata does) with the JSON value's own type, a whole number as int; the name must be an identifier and the value not null. ':' steps through a resource the way godot_game_set does (material_override:shader_parameter/glow_amount); the last segment is a property of that resource, converted the same way, and the change is part of the same undo action. Only a resource built into the edited scene (or not saved yet) is changed this way: one saved in a .tres file or built into another scene is shared, so it is refused and the message names the file. Refuses script and a private segment after ':', and a ':' step through a value that is not a resource. Unknown properties or unconvertible values reject the whole call without changing anything. A node inside an instanced scene whose children are not editable is refused, since Godot would drop the change on save; make_editable turns Editable Children on, and the answer lists them in made_editable.",
             json!({
                 "node_path": {
                     "type": "string",
@@ -1018,7 +1027,8 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
                 "properties": {
                     "type": "object",
                     "description": "Key-value map of property names to new values. A name may step through resources with ':' (material_override:shader_parameter/glow_amount)."
-                }
+                },
+                "make_editable": make_editable_param()
             }),
             &["node_path", "properties"],
         ),

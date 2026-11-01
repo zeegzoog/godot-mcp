@@ -4154,3 +4154,209 @@ async fn close_editor_refuses_unsaved_changes_until_discard() {
         "the discarded change was saved"
     );
 }
+
+/// A scene with inner nodes, instanced into main by the editable-children test.
+const SHORE_SCENE: &str = r#"[gd_scene format=3]
+
+[node name="Shore" type="Node2D"]
+
+[node name="Bed" type="Node2D" parent="."]
+
+[node name="Timer" type="Timer" parent="Bed"]
+"#;
+
+/// A scene that instances shore.tscn, so its Shore/Bed lies two instances deep.
+const NEST_SCENE: &str = r#"[gd_scene format=3]
+
+[ext_resource type="PackedScene" path="res://shore.tscn" id="1_shore"]
+
+[node name="Nest" type="Node2D"]
+
+[node name="Shore" parent="." instance=ExtResource("1_shore")]
+"#;
+
+/// Godot saves no change to a node inside an instance whose children are not editable, so the
+/// editing commands refuse it instead of reporting a change the next save drops, and
+/// make_editable turns on Editable Children for every instance on the way, in the same undo
+/// action.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn edits_inside_an_instance_need_editable_children() {
+    let editor = start_editor_with(
+        Some(UNDO_HOOK),
+        "",
+        &[
+            ("shore.tscn", SHORE_SCENE),
+            ("nest.tscn", NEST_SCENE),
+            (
+                "hand.gd",
+                "extends Node2D\n\nfunc on_timeout() -> void:\n\tpass\n",
+            ),
+        ],
+        "",
+    )
+    .await;
+    let bridge = &editor.bridge;
+    let call = |command: &'static str, params: Value| async move {
+        bridge.send_command(command, params).await
+    };
+    call("open_scene", json!({"scene_path": "res://main.tscn"}))
+        .await
+        .expect("open main");
+    call(
+        "add_node",
+        json!({"parent_node_path": ".", "scene": "res://shore.tscn", "node_name": "ShoreReview"}),
+    )
+    .await
+    .expect("instance shore");
+    call(
+        "add_node",
+        json!({"parent_node_path": ".", "scene": "res://nest.tscn"}),
+    )
+    .await
+    .expect("instance nest");
+    call(
+        "attach_script",
+        json!({"node_path": "Player", "script_path": "res://hand.gd"}),
+    )
+    .await
+    .expect("script on Player");
+
+    // The tree says which nodes are instances and whether their children are editable.
+    let tree = call("get_scene_tree", json!({})).await.expect("tree");
+    let shore = find(&tree["tree"], "ShoreReview").expect("ShoreReview");
+    assert_eq!(shore["instance"], "res://shore.tscn", "{tree}");
+    assert_eq!(shore["editable_children"], false, "{tree}");
+
+    // Refused, naming the instance and the way on, with nothing changed.
+    for (command, params) in [
+        (
+            "set_node_properties",
+            json!({"node_path": "ShoreReview/Bed", "properties": {"visible": false}}),
+        ),
+        (
+            "add_node",
+            json!({"parent_node_path": "ShoreReview/Bed", "node_type": "Node"}),
+        ),
+        (
+            "attach_script",
+            json!({"node_path": "ShoreReview/Bed", "script_path": "res://hand.gd"}),
+        ),
+        (
+            "connect_signal",
+            json!({"node_path": "ShoreReview/Bed/Timer", "signal_name": "timeout",
+                   "target_path": "Player", "method": "on_timeout"}),
+        ),
+    ] {
+        let err = call(command, params).await.expect_err(command).to_string();
+        for needle in ["'ShoreReview'", "res://shore.tscn", "make_editable"] {
+            assert!(err.contains(needle), "{command}: {needle} in {err}");
+        }
+    }
+    let err = call("remove_node", json!({"node_path": "ShoreReview/Bed"}))
+        .await
+        .expect_err("remove inner node")
+        .to_string();
+    assert!(err.contains("res://shore.tscn"), "{err}");
+    assert!(err.contains("visible"), "{err}");
+    let props = call(
+        "get_node_properties",
+        json!({"node_path": "ShoreReview/Bed", "properties": ["visible"]}),
+    )
+    .await
+    .expect("props")["properties"]
+        .clone();
+    assert_eq!(props["visible"]["value"], "true", "{props}");
+    let tree = call("get_scene_tree", json!({})).await.expect("tree");
+    assert!(find(&tree["tree"], "Bed").is_some(), "{tree}");
+
+    // The instance root itself belongs to main, and a signal into an instance is saved too.
+    call(
+        "set_node_properties",
+        json!({"node_path": "ShoreReview", "properties": {"position": [1, 2]}}),
+    )
+    .await
+    .expect("instance root");
+    call(
+        "connect_signal",
+        json!({"node_path": "Player", "signal_name": "visibility_changed",
+               "target_path": "Player", "method": "on_timeout"}),
+    )
+    .await
+    .expect("signal on own node");
+
+    // make_editable enables Editable Children and says so; later edits need no flag.
+    let set = call(
+        "set_node_properties",
+        json!({"node_path": "ShoreReview/Bed", "properties": {"visible": false}, "make_editable": true}),
+    )
+    .await
+    .expect("set with make_editable");
+    assert_eq!(set["made_editable"], json!(["ShoreReview"]), "{set}");
+    assert_eq!(set["applied"]["visible"], "false", "{set}");
+    let added = call(
+        "add_node",
+        json!({"parent_node_path": "ShoreReview/Bed", "node_type": "Node", "node_name": "Extra"}),
+    )
+    .await
+    .expect("add under an editable instance");
+    assert!(added.get("made_editable").is_none(), "{added}");
+    call(
+        "connect_signal",
+        json!({"node_path": "ShoreReview/Bed/Timer", "signal_name": "timeout",
+               "target_path": "Player", "method": "on_timeout"}),
+    )
+    .await
+    .expect("connect from an editable instance");
+    // Godot cannot delete a node an instance brings, even with editable children.
+    expect_error(
+        call("remove_node", json!({"node_path": "ShoreReview/Bed"})).await,
+        "res://shore.tscn",
+    );
+
+    // Two instances deep, both are made editable; one undo reverts the change and both flags.
+    let nested = call(
+        "set_node_properties",
+        json!({"node_path": "Nest/Shore/Bed", "properties": {"visible": false}, "make_editable": true}),
+    )
+    .await
+    .expect("nested set");
+    assert_eq!(
+        nested["made_editable"],
+        json!(["Nest", "Nest/Shore"]),
+        "{nested}"
+    );
+    call("__test_undo", json!({})).await.expect("undo nested");
+    let tree = call("get_scene_tree", json!({})).await.expect("tree");
+    let nest = find(&tree["tree"], "Nest").expect("Nest");
+    assert_eq!(nest["editable_children"], false, "{tree}");
+    expect_error(
+        call(
+            "set_node_properties",
+            json!({"node_path": "Nest/Shore/Bed", "properties": {"visible": false}}),
+        )
+        .await,
+        "'Nest'",
+    );
+    call(
+        "set_node_properties",
+        json!({"node_path": "Nest/Shore/Bed", "properties": {"visible": false}, "make_editable": true}),
+    )
+    .await
+    .expect("nested set again");
+
+    call("save_scene", json!({})).await.expect("save");
+    let saved = std::fs::read_to_string(editor.project.join("main.tscn")).expect("saved scene");
+    for needle in [
+        r#"[editable path="ShoreReview"]"#,
+        r#"[editable path="Nest"]"#,
+        r#"[editable path="Nest/Shore"]"#,
+        r#"[node name="Bed" parent="ShoreReview""#,
+        r#"[node name="Bed" parent="Nest/Shore""#,
+        r#"[node name="Extra" type="Node" parent="ShoreReview/Bed""#,
+        r#"[connection signal="timeout" from="ShoreReview/Bed/Timer" to="Player" method="on_timeout"]"#,
+        "visible = false",
+    ] {
+        assert!(saved.contains(needle), "{needle} in {saved}");
+    }
+}

@@ -3162,6 +3162,146 @@ async fn set_node_properties_adds_metadata_the_way_the_inspector_does() {
     assert_eq!(read["position"]["value"], "Vector2(5, 7)", "{read}");
 }
 
+/// A bus layout with an SFX bus, the file the editor loads its AudioServer buses from.
+const SFX_BUS_LAYOUT: &str = r#"[gd_resource type="AudioBusLayout" format=3]
+
+[resource]
+bus/1/name = &"SFX"
+bus/1/solo = false
+bus/1/mute = false
+bus/1/bypass_fx = false
+bus/1/volume_db = 0.0
+bus/1/send = &"Master"
+"#;
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn property_edits_refuse_a_value_godot_does_not_keep() {
+    let editor = start_editor(false).await;
+    let bridge = &editor.bridge;
+    let call = |command: &'static str, params: Value| async move {
+        bridge.send_command(command, params).await
+    };
+    call("open_scene", json!({"scene_path": "res://main.tscn"}))
+        .await
+        .expect("open main");
+
+    // The getter answers Master for a bus the editor's AudioServer lacks, and the scene would save
+    // Master, so the node is not added and the message names the bus and the layout file.
+    for needle in [
+        "no bus 'SFX'",
+        "Master",
+        "default_bus_layout",
+        "restart the editor",
+    ] {
+        expect_error(
+            call(
+                "add_node",
+                json!({"parent_node_path": ".", "node_type": "AudioStreamPlayer",
+                       "node_name": "Sound", "properties": {"bus": "SFX"}}),
+            )
+            .await,
+            needle,
+        );
+    }
+    let tree = call("get_scene_tree", json!({})).await.expect("tree");
+    assert!(!tree.to_string().contains("\"Sound\""), "{tree}");
+
+    // Values Godot keeps are added and reported back.
+    let added = call(
+        "add_node",
+        json!({"parent_node_path": ".", "node_type": "AudioStreamPlayer",
+               "node_name": "Sound", "properties": {"bus": "Master", "volume_db": -6.3}}),
+    )
+    .await
+    .expect("add with Master");
+    assert_eq!(added["applied"]["bus"], "&\"Master\"", "{added}");
+    assert!(
+        added["applied"]["volume_db"]
+            .as_str()
+            .is_some_and(|v| v.starts_with("-6.3")),
+        "{added}"
+    );
+
+    // set_node_properties refuses the whole call, including the values that would have stuck.
+    let volume = || async {
+        call(
+            "get_node_properties",
+            json!({"node_path": "Sound", "properties": ["volume_db", "pitch_scale"]}),
+        )
+        .await
+        .expect("props")["properties"]
+            .clone()
+    };
+    let before = volume().await;
+    expect_error(
+        call(
+            "set_node_properties",
+            json!({"node_path": "Sound", "properties": {"volume_db": -1, "bus": "SFX"}}),
+        )
+        .await,
+        "No properties were changed. bus reads back &\"Master\"",
+    );
+    // A setter that refuses a value (pitch_scale must be above 0) is refused the same way.
+    expect_error(
+        call(
+            "set_node_properties",
+            json!({"node_path": "Sound", "properties": {"pitch_scale": 0}}),
+        )
+        .await,
+        "pitch_scale reads back 1.0 after being set to 0",
+    );
+    assert_eq!(volume().await, before);
+
+    // Properties that limit each other are checked together, in the order given.
+    call(
+        "add_node",
+        json!({"parent_node_path": "UI", "node_type": "HSlider", "node_name": "Slider"}),
+    )
+    .await
+    .expect("add slider");
+    let set = call(
+        "set_node_properties",
+        json!({"node_path": "UI/Slider", "properties": {"max_value": 500, "value": 300}}),
+    )
+    .await
+    .expect("raise max, then value");
+    assert_eq!(set["applied"]["value"], "300.0", "{set}");
+    expect_error(
+        call(
+            "set_node_properties",
+            json!({"node_path": "UI/Slider", "properties": {"value": 900}}),
+        )
+        .await,
+        "value reads back 500.0 after being set to 900",
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn audio_bus_from_the_bus_layout_is_kept() {
+    let editor =
+        start_editor_with(None, "", &[("default_bus_layout.tres", SFX_BUS_LAYOUT)], "").await;
+    let bridge = &editor.bridge;
+    let call = |command: &'static str, params: Value| async move {
+        bridge.send_command(command, params).await
+    };
+    call("open_scene", json!({"scene_path": "res://main.tscn"}))
+        .await
+        .expect("open main");
+    let added = call(
+        "add_node",
+        json!({"parent_node_path": ".", "node_type": "AudioStreamPlayer2D",
+               "node_name": "Sound", "properties": {"bus": "SFX"}}),
+    )
+    .await
+    .expect("add with SFX");
+    assert_eq!(added["applied"]["bus"], "&\"SFX\"", "{added}");
+    call("save_scene", json!({})).await.expect("save");
+    let saved = std::fs::read_to_string(editor.project.join("main.tscn")).expect("saved scene");
+    assert!(saved.contains("bus = &\"SFX\""), "{saved}");
+}
+
 /// A node whose exports are typed containers, as a global class so godot_add_node can create it.
 const LISTS_SCRIPT: &str = r#"@tool
 class_name Lists

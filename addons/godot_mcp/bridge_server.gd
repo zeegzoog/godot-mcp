@@ -893,6 +893,18 @@ func add_node(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
     for prop_name: String in stepped:
         var step: Array = stepped[prop_name]
         (step[0] as Object).set(step[1], step[2])
+    var kept: PackedStringArray = check_property_values(property_probes(new_node, converted, stepped))
+    if not kept.is_empty():
+        new_node.free()
+        send_error(peer, cmd_id, "No node was added. " + "; ".join(kept))
+        return
+    converted.merge(new_meta)
+    var applied: Dictionary = {}
+    for prop_name: String in converted:
+        applied[prop_name] = describe_value(new_node.get(prop_name))
+    for prop_name: String in stepped:
+        var step: Array = stepped[prop_name]
+        applied[prop_name] = describe_value((step[0] as Object).get(step[1]))
 
     if undo_redo != null:
         var action: String = "Instantiate Scene " if created.has("path") else "Add Node "
@@ -916,6 +928,8 @@ func add_node(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
     }
     if created.has("path"):
         answer["scene"] = created["path"]
+    if not applied.is_empty():
+        answer["applied"] = applied
     if not locked.is_empty():
         answer["made_editable"] = editable_paths(root, locked)
     send_success(peer, cmd_id, answer)
@@ -1385,6 +1399,82 @@ func convert_properties(target_node: Node, properties: Dictionary) -> Dictionary
             converted[prop_name] = result["value"]
     return {"converted": converted, "new_meta": new_meta, "stepped": stepped, "problems": problems}
 
+## Types whose components are floats, compared with their own is_equal_approx.
+const APPROX_TYPES: Array[int] = [
+    TYPE_VECTOR2, TYPE_VECTOR3, TYPE_VECTOR4, TYPE_RECT2, TYPE_COLOR, TYPE_QUATERNION,
+    TYPE_PLANE, TYPE_AABB, TYPE_BASIS, TYPE_TRANSFORM2D, TYPE_TRANSFORM3D,
+]
+
+## Whether a value read back is the one that was set. A float property stored in single precision
+## reads back slightly off, so floats compare approximately.
+func same_value(read: Variant, wanted: Variant) -> bool:
+    var read_type: int = typeof(read)
+    var wanted_type: int = typeof(wanted)
+    if (read_type == TYPE_FLOAT or wanted_type == TYPE_FLOAT) \
+            and (read_type == TYPE_FLOAT or read_type == TYPE_INT) \
+            and (wanted_type == TYPE_FLOAT or wanted_type == TYPE_INT):
+        return is_equal_approx(float(read), float(wanted))
+    if read_type == wanted_type and APPROX_TYPES.has(read_type):
+        return read.is_equal_approx(wanted)
+    return read == wanted
+
+## Why a property reads back differently from the value it was given. A setter may clamp the value,
+## refuse it, or (an audio bus) keep a name the editor's AudioServer lacks while the getter answers
+## Master, which is what the scene then saves.
+func describe_kept_value(holder: Object, prop_name: String, label: String, wanted: Variant, read: Variant) -> String:
+    var text: String = "%s reads back %s after being set to %s" % [label, describe_value(read), describe_value(wanted)]
+    var bus_name: String = str(wanted)
+    if (typeof(wanted) == TYPE_STRING or typeof(wanted) == TYPE_STRING_NAME) and prop_name.contains("bus") \
+            and AudioServer.get_bus_index(StringName(bus_name)) == -1:
+        var buses: PackedStringArray = []
+        for index: int in AudioServer.bus_count:
+            buses.append(AudioServer.get_bus_name(index))
+        var layout: String = str(ProjectSettings.get_setting("audio/buses/default_bus_layout", "res://default_bus_layout.tres"))
+        return text + (": the editor's AudioServer has no bus '%s' (it has %s), so %s answers %s and the scene would save that. "
+            + "A bus the game creates at run time is unknown to the editor: add it to the bus layout %s (the Audio panel, or the "
+            + "audio/buses/default_bus_layout setting), restart the editor so it loads the layout, and set %s again") % [
+                bus_name, ", ".join(buses), holder.get_class(), describe_value(read), layout, label]
+    return text + ": Godot's setter clamped, rounded or refused it"
+
+## Sets the values on their objects, reads each one back and puts every value back as it was, in reverse
+## order so properties that limit each other (a Range's max_value and value) restore cleanly. Returns a
+## description of each value that did not read back as it was set; empty when all did.
+func probe_property_values(target_node: Node, converted: Dictionary, stepped: Dictionary) -> PackedStringArray:
+    var probes: Array = property_probes(target_node, converted, stepped)
+    var before: Array = []
+    for probe: Array in probes:
+        var holder: Object = probe[0]
+        before.append(holder.get(probe[1]))
+        holder.set(probe[1], probe[3])
+    var kept: PackedStringArray = check_property_values(probes)
+    for index: int in range(probes.size() - 1, -1, -1):
+        (probes[index][0] as Object).set(probes[index][1], before[index])
+    return kept
+
+## [object, property, label, value] for every converted and stepped value of a node.
+func property_probes(target_node: Node, converted: Dictionary, stepped: Dictionary) -> Array:
+    var probes: Array = []
+    for prop_name: String in converted:
+        probes.append([target_node, prop_name, prop_name, converted[prop_name]])
+    for prop_name: String in stepped:
+        var step: Array = stepped[prop_name]
+        probes.append([step[0], str(step[1]), prop_name, step[2]])
+    return probes
+
+## Reads back each [object, property, label, value] that was just set; describes the ones that differ.
+## A node's name is left out: Godot fixes a forbidden character or a sibling's name, and the answer
+## reports the name it chose.
+func check_property_values(probes: Array) -> PackedStringArray:
+    var kept: PackedStringArray = []
+    for probe: Array in probes:
+        var holder: Object = probe[0]
+        if holder is Node and probe[1] == "name":
+            continue
+        var read: Variant = holder.get(probe[1])
+        if not same_value(read, probe[3]):
+            kept.append(describe_kept_value(holder, probe[1], probe[2], probe[3], read))
+    return kept
+
 func set_node_properties(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
     var node_path: String = params.get("node_path", "")
     var properties: Dictionary = params.get("properties", {})
@@ -1410,6 +1500,12 @@ func set_node_properties(peer: WebSocketPeer, cmd_id: String, params: Dictionary
     var problems: PackedStringArray = checked["problems"]
     if not problems.is_empty():
         send_error(peer, cmd_id, "No properties were changed. " + "; ".join(problems))
+        return
+    # A setter may keep another value than the one asked for, so try them first and refuse the call
+    # rather than report a change the scene would not save.
+    var kept: PackedStringArray = probe_property_values(target_node, converted, stepped)
+    if not kept.is_empty():
+        send_error(peer, cmd_id, "No properties were changed. " + "; ".join(kept))
         return
 
     if undo_redo != null:

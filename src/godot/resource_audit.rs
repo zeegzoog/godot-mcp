@@ -28,10 +28,12 @@ struct Before {
     ext_uids: BTreeMap<String, String>,
 }
 
-/// The `.tscn` and `.tres` files of a project, keyed by `res://` path.
+/// The `.tscn` and `.tres` files of a project, keyed by `res://` path, and a fingerprint of the
+/// other files the editor loads as resources from their text: scripts and shaders.
 #[derive(Debug, Clone, Default)]
 pub struct TextResourceSnapshot {
     files: BTreeMap<String, Before>,
+    loaded: BTreeMap<String, (u64, Option<SystemTime>)>,
 }
 
 /// What a rewrite of one file lost.
@@ -67,7 +69,7 @@ impl TextResourceSnapshot {
     /// Reads the header and the `[ext_resource]` lines of every text scene and resource.
     pub fn take(project: &Path) -> Self {
         let mut files = BTreeMap::new();
-        walk(project, project, &mut |res, file| {
+        walk(project, project, is_text_resource, &mut |res, file| {
             let Ok(meta) = fs::metadata(file) else {
                 return;
             };
@@ -82,7 +84,37 @@ impl TextResourceSnapshot {
                 },
             );
         });
-        Self { files }
+        let mut loaded = BTreeMap::new();
+        walk(project, project, is_loaded_text, &mut |res, file| {
+            if let Ok(meta) = fs::metadata(file) {
+                loaded.insert(res, (meta.len(), meta.modified().ok()));
+            }
+        });
+        Self { files, loaded }
+    }
+
+    /// Every text scene, resource, script and shader written or created since
+    /// [`TextResourceSnapshot::take`]: the files an editor holding the project must refresh, and
+    /// reload where it has them loaded. Sorted by path.
+    pub fn written_since(&self, project: &Path) -> Vec<String> {
+        let mut written: Vec<String> = self
+            .changed_since(project)
+            .into_iter()
+            .map(|(res, _, _)| res)
+            .collect();
+        walk(project, project, is_loaded_text, &mut |res, file| {
+            let Ok(meta) = fs::metadata(file) else {
+                return;
+            };
+            let unchanged = self.loaded.get(&res).is_some_and(|(len, modified)| {
+                *len == meta.len() && modified.is_some() && *modified == meta.modified().ok()
+            });
+            if !unchanged {
+                written.push(res);
+            }
+        });
+        written.sort();
+        written
     }
 
     /// Text scenes and resources written since [`TextResourceSnapshot::take`] that lost a uid or
@@ -178,7 +210,7 @@ impl TextResourceSnapshot {
     /// changed since the snapshot, or that is new. Files over [`MAX_READ`] are skipped.
     fn changed_since(&self, project: &Path) -> Vec<(String, PathBuf, String)> {
         let mut changed = Vec::new();
-        walk(project, project, &mut |res, file| {
+        walk(project, project, is_text_resource, &mut |res, file| {
             let Ok(meta) = fs::metadata(file) else {
                 return;
             };
@@ -366,7 +398,19 @@ fn is_text_resource(name: &str) -> bool {
     name.ends_with(".tscn") || name.ends_with(".tres")
 }
 
-fn walk(project: &Path, dir: &Path, visit: &mut dyn FnMut(String, &Path)) {
+/// Scripts and shaders: text files the editor loads as resources but never saves with a uid.
+fn is_loaded_text(name: &str) -> bool {
+    [".gd", ".gdshader", ".gdshaderinc"]
+        .iter()
+        .any(|extension| name.ends_with(extension))
+}
+
+fn walk(
+    project: &Path,
+    dir: &Path,
+    wanted: fn(&str) -> bool,
+    visit: &mut dyn FnMut(String, &Path),
+) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -385,10 +429,10 @@ fn walk(project: &Path, dir: &Path, visit: &mut dyn FnMut(String, &Path)) {
             continue;
         }
         if kind.is_dir() {
-            walk(project, &path, visit);
+            walk(project, &path, wanted, visit);
             continue;
         }
-        if !kind.is_file() || !is_text_resource(name) {
+        if !kind.is_file() || !wanted(name) {
             continue;
         }
         let Ok(relative) = path.strip_prefix(project) else {
@@ -612,6 +656,40 @@ shader_parameter/speed = 3.0
         assert_eq!(uid_text(5_610_405_182_049_170_494), "uid://cl6ys3a78gc43");
         assert_eq!(uid_text(0x7FFF_FFFF_FFFF_FFFF), "uid://d4n4ub6itg400");
         assert_eq!(uid_text(0), "uid://a");
+    }
+
+    #[test]
+    fn written_lists_rewritten_shaders_and_scripts_with_the_text_resources() {
+        let dir = tempfile::tempdir().expect("project");
+        let root = dir.path();
+        let shader = "shader_type spatial;\nuniform float foam_pulse = 0.35;\n";
+        fs::write(root.join("water.gdshader"), shader).expect("shader");
+        fs::write(root.join("foam.gdshaderinc"), "// foam\n").expect("include");
+        fs::write(root.join("helper.gd"), "extends Node\n").expect("script");
+        fs::write(root.join("still.gd"), "extends Node\n").expect("script");
+        fs::write(root.join("pond.tscn"), EDITOR_SAVED).expect("scene");
+        fs::write(root.join("notes.txt"), "a").expect("notes");
+        let snapshot = TextResourceSnapshot::take(root);
+        fs::write(
+            root.join("water.gdshader"),
+            "shader_type spatial;\nuniform float foam_pulse = 0.5;\nuniform float foam_speed = 1.0;\n",
+        )
+        .expect("rewrite shader");
+        fs::write(root.join("foam.gdshaderinc"), "// foam, faster\n").expect("rewrite include");
+        fs::write(root.join("helper.gd"), "extends Node3D\n").expect("rewrite script");
+        fs::write(root.join("new.gdshader"), "shader_type canvas_item;\n").expect("new shader");
+        fs::write(root.join("pond.tscn"), HEADLESS_SAVED).expect("rewrite scene");
+        fs::write(root.join("notes.txt"), "ab").expect("rewrite notes");
+        assert_eq!(
+            snapshot.written_since(root),
+            [
+                "res://foam.gdshaderinc",
+                "res://helper.gd",
+                "res://new.gdshader",
+                "res://pond.tscn",
+                "res://water.gdshader",
+            ]
+        );
     }
 
     #[test]

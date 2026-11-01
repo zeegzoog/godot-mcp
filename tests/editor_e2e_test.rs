@@ -3878,6 +3878,112 @@ async fn run_script_keeps_uids_and_the_editor_follows_the_saved_files() {
     );
 }
 
+/// Holds a material that uses res://water.gdshader and a script without a tab, as an editor does
+/// for an open scene, and reports what the loaded shader and script now hold.
+const LOADED_PROBE_HOOK: &str = r#"        "__test_loaded_probe":
+            if not has_meta("__held_material"):
+                set_meta("__held_material", load("res://foam.tres"))
+                set_meta("__held_script", load("res://mover.gd"))
+            var material: ShaderMaterial = get_meta("__held_material")
+            var names: Array = []
+            for uniform: Dictionary in material.shader.get_shader_uniform_list():
+                names.append(uniform["name"])
+            var held_script: Script = get_meta("__held_script")
+            send_success(peer, cmd_id, {"uniforms": names, "pulse_default": "foam_pulse = 0.5" in material.shader.code, "same_shader": material.shader == load("res://water.gdshader"), "script_source": held_script.source_code})
+        "ping":
+"#;
+
+/// A one-shot script that rewrites a shader and a script with FileAccess, as Frog World tunes its
+/// water shader.
+const REWRITE_SHADER_SCRIPT: &str = "extends SceneTree\n\nfunc _initialize() -> void:\n\tvar shader := FileAccess.open(\"res://water.gdshader\", FileAccess.WRITE)\n\tshader.store_string(\"shader_type spatial;\\nuniform float foam_speed = 1.0;\\nuniform float foam_pulse = 0.5;\\nvoid fragment() { ALBEDO = vec3(foam_pulse * foam_speed); }\\n\")\n\tshader.close()\n\tvar mover := FileAccess.open(\"res://mover.gd\", FileAccess.WRITE)\n\tmover.store_string(\"extends Node\\n\\nconst SPEED: float = 2.0\\n\")\n\tmover.close()\n\tprint(\"REWROTE\")\n\tquit(0)\n";
+
+/// godot_run_script rewrites a shader and a script the editor has loaded: the editor reloads both,
+/// so a material sees the new uniforms and defaults instead of pinning the old ones on next save.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn run_script_has_the_editor_reload_a_shader_and_a_script_it_rewrote() {
+    use godot_mcp::cli_runner::CliRunner;
+    use godot_mcp::tools::ToolManager;
+    use std::sync::Arc;
+
+    let editor = start_editor_with(
+        Some(LOADED_PROBE_HOOK),
+        "",
+        &[
+            (
+                "water.gdshader",
+                "shader_type spatial;\nuniform float foam_pulse = 0.35;\nvoid fragment() { ALBEDO = vec3(foam_pulse); }\n",
+            ),
+            (
+                "foam.tres",
+                "[gd_resource type=\"ShaderMaterial\" load_steps=2 format=3]\n\n[ext_resource type=\"Shader\" path=\"res://water.gdshader\" id=\"1_a\"]\n\n[resource]\nshader = ExtResource(\"1_a\")\n",
+            ),
+            ("mover.gd", "extends Node\n\nconst SPEED: float = 1.0\n"),
+            ("rewrite.gd", REWRITE_SHADER_SCRIPT),
+        ],
+        "",
+    )
+    .await;
+    let before = editor
+        .bridge
+        .send_command("__test_loaded_probe", json!({}))
+        .await
+        .expect("probe before");
+    assert_eq!(before["uniforms"], json!(["foam_pulse"]), "{before}");
+    // The e2e editor is headless and has no renderer, so it reads no uniform default; the
+    // shader's own code says which default it holds.
+    assert_eq!(before["pulse_default"], json!(false), "{before}");
+
+    let (godot, _) = godot_binaries();
+    let tools = Arc::new(
+        ToolManager::new(BridgeClient::new(editor.port), CliRunner::new(godot))
+            .with_working_dir(editor.project.clone()),
+    );
+    let result = Arc::clone(&tools)
+        .call_tool(
+            "godot_run_script",
+            json!({"script": "res://rewrite.gd", "timeout_seconds": 120}),
+        )
+        .await;
+    let answer = tool_text(&result);
+    assert!(!result.is_error, "{answer}");
+    assert!(answer.contains("REWROTE"), "{answer}");
+    let body: Value = serde_json::from_str(&answer).expect("JSON answer");
+    let refresh = &body["editor_refresh"];
+    for path in ["res://mover.gd", "res://water.gdshader"] {
+        assert!(
+            refresh["refreshed"]
+                .as_array()
+                .is_some_and(|paths| paths.contains(&json!(path))),
+            "{path} was not refreshed: {answer}"
+        );
+        assert!(
+            refresh["reloaded_resources"]
+                .as_array()
+                .is_some_and(|paths| paths.contains(&json!(path))),
+            "{path} was not reloaded: {answer}"
+        );
+    }
+
+    let after = editor
+        .bridge
+        .send_command("__test_loaded_probe", json!({}))
+        .await
+        .expect("probe after");
+    assert_eq!(
+        after["uniforms"],
+        json!(["foam_speed", "foam_pulse"]),
+        "{after}"
+    );
+    assert_eq!(after["pulse_default"], json!(true), "{after}");
+    assert_eq!(after["same_shader"], json!(true), "{after}");
+    assert_eq!(
+        after["script_source"],
+        json!("extends Node\n\nconst SPEED: float = 2.0\n"),
+        "{after}"
+    );
+}
+
 /// Runs `tests/bridge-port-vectors.json` through the addon's formula and prints the canonical
 /// path and port of its own project.
 const BRIDGE_PORT_CHECK: &str = r#"extends SceneTree

@@ -1560,6 +1560,34 @@ func _wait_for_filesystem(fs: EditorFileSystem, timeout_msec: int) -> bool:
             return true
     return false
 
+## Refreshes a loaded resource (a shader, a shader include, a .tres) from its changed file in
+## place, so everything holding it sees the new data: a ShaderMaterial gets the new uniforms and
+## defaults. Scenes are left to the editor, which asks before it reloads an open one. False when
+## the editor has not loaded the file or the reload failed.
+func _reload_loaded_resource(res_path: String) -> bool:
+    if not ResourceLoader.has_cached(res_path):
+        return false
+    var cached: Resource = ResourceLoader.load(res_path)
+    if cached == null or cached is PackedScene or cached is Script:
+        return false
+    var reloaded: Resource = ResourceLoader.load(res_path, "", ResourceLoader.CACHE_MODE_REPLACE)
+    return reloaded == cached
+
+## Gives a loaded script that has no open tab the source of its changed file, as the script
+## editor does for an open one. False when the editor has not loaded it or it already matches.
+func _reload_loaded_script(res_path: String) -> bool:
+    if not ResourceLoader.has_cached(res_path):
+        return false
+    var script: Script = ResourceLoader.load(res_path) as Script
+    if script == null:
+        return false
+    var file_text: String = FileAccess.get_file_as_string(res_path)
+    if script.source_code == file_text:
+        return false
+    script.source_code = file_text
+    script.reload(true)
+    return true
+
 func resave_resources(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
     var fs: EditorFileSystem = EditorInterface.get_resource_filesystem()
 
@@ -1674,14 +1702,21 @@ func resave_resources(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -
     # and listed, so the caller can ask the person.
     var reloaded_tabs: PackedStringArray = PackedStringArray()
     var unsaved_tabs: PackedStringArray = PackedStringArray()
+    # update_file() does not touch a resource the editor has loaded, so a material keeps using
+    # the shader it loaded before the file changed. Each loaded resource follows its file here.
+    var reloaded_resources: PackedStringArray = PackedStringArray()
     for res_path: String in to_refresh:
         if res_path.get_extension() != "gd":
+            if _reload_loaded_resource(res_path):
+                reloaded_resources.append(res_path)
             continue
         var tab: Dictionary = _script_ops().tab_state(res_path, true)
         if bool(tab.get("reloaded", false)):
             reloaded_tabs.append(res_path)
         elif bool(tab.get("dirty", false)):
             unsaved_tabs.append(res_path)
+        elif not bool(tab.get("open", false)) and _reload_loaded_script(res_path):
+            reloaded_resources.append(res_path)
 
     var reimported: PackedStringArray = PackedStringArray()
     for res_path: String in to_reimport:
@@ -1703,6 +1738,7 @@ func resave_resources(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -
         "refreshed": to_refresh,
         "reloaded_tabs": reloaded_tabs,
         "unsaved_tabs": unsaved_tabs,
+        "reloaded_resources": reloaded_resources,
         "not_scanned": not_scanned,
         "skipped_missing": missing_paths,
         "skipped_invalid": invalid_paths,

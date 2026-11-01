@@ -2857,6 +2857,67 @@ async fn run_script_writes_back_the_uids_a_headless_save_dropped() {
     );
 }
 
+/// A script that rewrites a shader with FileAccess leaves no scene to repair, yet the editor still
+/// holds the old Shader: saving a scene then pins its old uniform defaults. The server has the
+/// connected editor refresh and reload the shader.
+#[tokio::test]
+async fn run_script_has_the_editor_reload_a_shader_the_script_rewrote() {
+    let project = pond_project();
+    let root = project.path();
+    std::fs::write(
+        root.join("water.gdshader"),
+        "shader_type spatial;\nuniform float foam_pulse = 0.35;\n",
+    )
+    .expect("shader");
+    std::fs::write(
+        root.join("shader.txt"),
+        "shader_type spatial;\nuniform float foam_speed = 1.0;\nuniform float foam_pulse = 0.5;\n",
+    )
+    .expect("new shader");
+    write_script(root, "shader.gd", b"extends SceneTree\n");
+    let (bridge, tools) =
+        manager_with_editor(root, &["resave_resources"], saving_godot(root)).await;
+
+    let run = call_with(&tools, json!({"script": "shader.gd", "project_path": root})).await;
+    let run_text = text(&run);
+    assert!(!run.is_error, "{run_text}");
+    let body = answer_body(&run_text);
+    assert_eq!(body["resource_repairs"], json!([]), "{run_text}");
+    assert_eq!(
+        body["editor_refresh"],
+        json!({"from_editor": "resave_resources"}),
+        "{run_text}"
+    );
+    let resave = bridge
+        .received()
+        .into_iter()
+        .find(|command| command["type"] == "resave_resources")
+        .expect("the editor was asked to refresh");
+    assert_eq!(
+        resave["params"]["paths"],
+        json!(["res://water.gdshader"]),
+        "{resave}"
+    );
+    assert!(
+        body["summary"]
+            .as_str()
+            .is_some_and(|summary| summary.contains("reloaded the shaders")),
+        "{run_text}"
+    );
+
+    // A run that writes nothing does not bother the editor.
+    let before = bridge.received().len();
+    let quiet = call_with(&tools, json!({"script": "quiet.gd", "project_path": root})).await;
+    assert!(!quiet.is_error, "{}", text(&quiet));
+    assert!(
+        bridge.received()[before..]
+            .iter()
+            .all(|command| command["type"] != "resave_resources"),
+        "{:?}",
+        bridge.received()
+    );
+}
+
 #[tokio::test]
 async fn run_script_names_the_uids_and_null_shader_parameters_it_could_not_repair() {
     let project = pond_project();
@@ -2890,7 +2951,7 @@ async fn run_script_names_the_uids_and_null_shader_parameters_it_could_not_repai
 }
 
 /// A Godot stand-in that, for edit.gd and lock.gd, overwrites pond.tscn with headless.txt; lock.gd
-/// then makes it read-only.
+/// then makes it read-only. For shader.gd it overwrites water.gdshader with shader.txt.
 fn saving_godot(dir: &Path) -> PathBuf {
     #[cfg(unix)]
     {
@@ -2910,6 +2971,7 @@ done
 case "$*" in
   *edit.gd*) cp "$proj/headless.txt" "$proj/pond.tscn" ;;
   *lock.gd*) cp "$proj/headless.txt" "$proj/pond.tscn"; chmod a-w "$proj/pond.tscn" ;;
+  *shader.gd*) cp "$proj/shader.txt" "$proj/water.gdshader" ;;
 esac
 exit 0
 "#,
@@ -2923,7 +2985,7 @@ exit 0
         let path = dir.join("saving_godot.bat");
         std::fs::write(
             &path,
-            "@echo off\r\nsetlocal enabledelayedexpansion\r\nset PREV=\r\nset PROJ=\r\nfor %%A in (%*) do (\r\n  if \"!PREV!\"==\"--path\" set PROJ=%%~A\r\n  set PREV=%%A\r\n)\r\necho %* | findstr edit.gd >nul\r\nif %errorlevel%==0 copy /Y \"%PROJ%\\headless.txt\" \"%PROJ%\\pond.tscn\" >nul\r\necho %* | findstr lock.gd >nul\r\nif %errorlevel%==0 (\r\n  copy /Y \"%PROJ%\\headless.txt\" \"%PROJ%\\pond.tscn\" >nul\r\n  attrib +r \"%PROJ%\\pond.tscn\"\r\n)\r\nexit /b 0\r\n",
+            "@echo off\r\nsetlocal enabledelayedexpansion\r\nset PREV=\r\nset PROJ=\r\nfor %%A in (%*) do (\r\n  if \"!PREV!\"==\"--path\" set PROJ=%%~A\r\n  set PREV=%%A\r\n)\r\necho %* | findstr edit.gd >nul\r\nif %errorlevel%==0 copy /Y \"%PROJ%\\headless.txt\" \"%PROJ%\\pond.tscn\" >nul\r\necho %* | findstr lock.gd >nul\r\nif %errorlevel%==0 (\r\n  copy /Y \"%PROJ%\\headless.txt\" \"%PROJ%\\pond.tscn\" >nul\r\n  attrib +r \"%PROJ%\\pond.tscn\"\r\n)\r\necho %* | findstr shader.gd >nul\r\nif %errorlevel%==0 copy /Y \"%PROJ%\\shader.txt\" \"%PROJ%\\water.gdshader\" >nul\r\nexit /b 0\r\n",
         )
         .expect("write saving godot");
         path

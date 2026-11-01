@@ -18,6 +18,7 @@ use tokio::io::AsyncWriteExt;
 mod authoring;
 mod code;
 mod editor;
+mod export;
 mod feedback;
 mod files;
 mod game;
@@ -142,6 +143,7 @@ impl ToolManager {
             name if scripts::handles(name) => scripts::call(&self, name, args).await,
             name if game::handles(name) => game::call(&self, name, args).await,
             name if code::handles(name) => code::call(&self, name, args).await,
+            name if export::handles(name) => export::call(&self, name, args).await,
             feedback::NOTE => self.handle_note_feedback(args).await,
             feedback::DRAFT => self.handle_draft_feedback(args).await,
             feedback::SUBMIT => self.handle_submit_feedback(args).await,
@@ -796,7 +798,8 @@ fn annotations(name: &str) -> Option<ToolAnnotations> {
         | "godot_code_complete"
         | "godot_code_symbols"
         | "godot_code_definition"
-        | "godot_code_references" => [true, false, true],
+        | "godot_code_references"
+        | "godot_list_export_presets" => [true, false, true],
         "godot_capture_viewport"
         | "godot_resave_resources"
         | "godot_create_project"
@@ -827,10 +830,15 @@ fn annotations(name: &str) -> Option<ToolAnnotations> {
         | "godot_attach_script"
         | "godot_set_project_setting"
         | "godot_edit_input_action"
+        | "godot_set_export_preset"
         | "godot_delete_file"
         | "godot_game_set" => [false, true, true],
-        "godot_run_script" | "godot_edit_script" | "godot_game_call" | "godot_game_command"
-        | "godot_close_editor" => [false, true, false],
+        "godot_run_script"
+        | "godot_edit_script"
+        | "godot_game_call"
+        | "godot_game_command"
+        | "godot_close_editor"
+        | "godot_export_project" => [false, true, false],
         _ => return None,
     };
     Some(ToolAnnotations {
@@ -1177,6 +1185,7 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
     tools.extend(scripts::catalog());
     tools.extend(game::catalog());
     tools.extend(code::catalog());
+    tools.extend(export::catalog());
     tools.extend(feedback::catalog(feedback_mode));
     tools
 }

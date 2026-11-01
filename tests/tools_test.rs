@@ -4091,3 +4091,219 @@ async fn close_editor_leaves_an_editor_launched_for_another_project_running() {
         .await;
     assert!(!cleanup.is_error, "{}", text(&cleanup));
 }
+
+/// The presets answer the stand-in engine gives for the preset script: one preset, "Data".
+#[cfg(unix)]
+const ONE_PRESET: &str = r#"GODOT_MCP_PRESETS={"file_exists":true,"presets":[{"index":0,"name":"Data","platform":"Linux","export_path":"build/data.pck","options":{}}]}"#;
+
+/// A stand-in for the Godot executable for the export tools. It appends each command line to
+/// `calls.txt` in `dir`, answers the preset script with `presets`, succeeds on `--import`, and on
+/// an export runs `on_export` with the output path as `$out`.
+#[cfg(unix)]
+fn exporting_godot(dir: &Path, presets: &str, on_export: &str) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let calls = dir.join("calls.txt");
+    let path = dir.join("exporting_godot.sh");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\necho \"$@\" >> '{}'\nfor out; do :; done\ncase \" $* \" in\n  *' --script '*) echo '{presets}' ;;\n  *' --import '*) echo 'imported' ;;\n  *' --export-'*) {on_export} ;;\nesac\n",
+            calls.display()
+        ),
+    )
+    .expect("write exporting godot");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod exporting godot");
+    (path, calls)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_export_imports_first_and_reports_the_written_pack() {
+    let project = project_dir();
+    let engine = tempfile::tempdir().expect("engine dir");
+    let (godot, calls) = exporting_godot(
+        engine.path(),
+        ONE_PRESET,
+        "echo 'savepack: end' ; printf 'GDPC0123456789' > \"$out\"",
+    );
+    let cwd = tempfile::tempdir().expect("working dir");
+    let result = manager_in(cwd.path(), godot)
+        .call_tool(
+            "godot_export_project",
+            json!({"preset": "Data", "project_path": project.path()}),
+        )
+        .await;
+    assert!(!result.is_error, "{}", text(&result));
+    let report: Value = serde_json::from_str(&text(&result)).expect("JSON report");
+    assert_eq!(report["ok"], true);
+    assert_eq!(report["mode"], "pack");
+    assert_eq!(report["size_bytes"], 14);
+    assert_eq!(report["import"]["ran"], true);
+    assert!(report["log"].as_str().unwrap_or("").contains("savepack"));
+    let output = report["output_path"].as_str().expect("output path");
+    assert!(
+        Path::new(output).is_absolute() && output.ends_with("build/data.pck"),
+        "the preset's export_path, made absolute: {output}"
+    );
+
+    let calls = std::fs::read_to_string(&calls).expect("calls");
+    let lines: Vec<&str> = calls.lines().collect();
+    assert_eq!(lines.len(), 3, "presets, import, export: {calls}");
+    assert!(lines[1].ends_with("--import"), "{calls}");
+    assert!(
+        lines[2].ends_with(&format!("--export-pack Data {output}")),
+        "{calls}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_unknown_preset_is_refused_before_anything_is_imported() {
+    let project = project_dir();
+    let engine = tempfile::tempdir().expect("engine dir");
+    let (godot, calls) = exporting_godot(engine.path(), ONE_PRESET, "exit 1");
+    let cwd = tempfile::tempdir().expect("working dir");
+    let result = manager_in(cwd.path(), godot)
+        .call_tool(
+            "godot_export_project",
+            json!({"preset": "Web", "project_path": project.path()}),
+        )
+        .await;
+    assert!(result.is_error);
+    let message = text(&result);
+    assert!(message.contains("\"Data\""), "names the presets: {message}");
+    assert!(message.contains("godot_set_export_preset"), "{message}");
+    let calls = std::fs::read_to_string(&calls).expect("calls");
+    assert_eq!(
+        calls.lines().count(),
+        1,
+        "only the preset list ran: {calls}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_missing_export_template_is_named_with_a_way_out() {
+    let project = project_dir();
+    let engine = tempfile::tempdir().expect("engine dir");
+    let (godot, _) = exporting_godot(
+        engine.path(),
+        ONE_PRESET,
+        "echo 'ERROR: Cannot export project with preset \"Data\" due to configuration errors:' >&2; echo 'No export template found at the expected path:' >&2; exit 1",
+    );
+    let cwd = tempfile::tempdir().expect("working dir");
+    let result = manager_in(cwd.path(), godot)
+        .call_tool(
+            "godot_export_project",
+            json!({"preset": "Data", "mode": "release", "output_path": "build/game.x86_64",
+                   "project_path": project.path()}),
+        )
+        .await;
+    assert!(result.is_error);
+    let message = text(&result);
+    assert!(message.contains("exit code 1"), "{message}");
+    assert!(message.contains("Manage Export Templates"), "{message}");
+    assert!(message.contains("custom_template/release"), "{message}");
+    assert!(message.contains("Cannot export project"), "{message}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_export_that_writes_no_file_is_an_error() {
+    let project = project_dir();
+    let engine = tempfile::tempdir().expect("engine dir");
+    let (godot, _) = exporting_godot(engine.path(), ONE_PRESET, "exit 0");
+    let cwd = tempfile::tempdir().expect("working dir");
+    let result = manager_in(cwd.path(), godot)
+        .call_tool(
+            "godot_export_project",
+            json!({"preset": "Data", "project_path": project.path()}),
+        )
+        .await;
+    assert!(result.is_error);
+    assert!(text(&result).contains("wrote no file"), "{}", text(&result));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn export_outputs_and_preset_names_are_checked_before_godot_runs() {
+    let project = project_dir();
+    let engine = tempfile::tempdir().expect("engine dir");
+    let (godot, calls) = exporting_godot(engine.path(), ONE_PRESET, "exit 0");
+    let cwd = tempfile::tempdir().expect("working dir");
+    let manager = manager_in(cwd.path(), godot);
+    for (args, expected) in [
+        (json!({"preset": "--script"}), "starts with '-'"),
+        (
+            json!({"preset": "Data", "output_path": "../outside.pck"}),
+            "Parent directory",
+        ),
+        (
+            json!({"preset": "Data", "output_path": "build/data.exe"}),
+            ".pck or .zip",
+        ),
+        (
+            json!({"preset": "Data", "output_path": "project.godot", "mode": "release"}),
+            "project file",
+        ),
+    ] {
+        let mut args = args;
+        args["project_path"] = json!(project.path());
+        let result = Arc::clone(&manager)
+            .call_tool("godot_export_project", args.clone())
+            .await;
+        assert!(result.is_error, "{args}");
+        assert!(
+            text(&result).contains(expected),
+            "{args}: {}",
+            text(&result)
+        );
+    }
+    let calls = std::fs::read_to_string(&calls).unwrap_or_default();
+    assert!(
+        !calls.contains("--export-") && !calls.contains("--import"),
+        "nothing was imported or exported: {calls}"
+    );
+}
+
+#[tokio::test]
+async fn a_preset_is_not_changed_while_the_editor_has_the_project_open() {
+    let project = project_dir();
+    let bridge = editor_with_open_tab(project.path(), false).await;
+    let manager = Arc::new(ToolManager::new(
+        BridgeClient::new(bridge.port),
+        CliRunner::new(PathBuf::from("unused-godot")),
+    ));
+    let result = manager
+        .call_tool(
+            "godot_set_export_preset",
+            json!({"name": "webOS", "create": true, "platform": "Linux",
+                   "options": {"binary_format/architecture": "arm32"},
+                   "project_path": project.path()}),
+        )
+        .await;
+    assert!(result.is_error);
+    assert!(
+        text(&result).contains("godot_close_editor"),
+        "{}",
+        text(&result)
+    );
+    assert!(!project.path().join("export_presets.cfg").exists());
+}
+
+#[tokio::test]
+async fn creating_a_preset_needs_a_platform() {
+    let project = project_dir();
+    let result = call(
+        "godot_set_export_preset",
+        json!({"name": "webOS", "create": true, "project_path": project.path()}),
+    )
+    .await;
+    assert!(result.is_error);
+    assert!(
+        text(&result).contains("platform is required"),
+        "{}",
+        text(&result)
+    );
+}

@@ -76,7 +76,7 @@ Before submitting or committing changes, agents must execute and pass the comple
    cargo test --all-targets
    ```
 
-   Includes `tests/version_sync_test.rs`: the version in `addons/godot_mcp/plugin.cfg` must always equal `Cargo.toml` — bump both together — and every file naming the line's Godot version must agree with the version's `+godot.M.N`. New behaviour needs a test first: protocol and tool behaviour in `tests/stdio_protocol_test.rs` / `tests/tools_test.rs` (helpers in `tests/common/`), the agent feedback channel in `tests/feedback_test.rs`, bridge client in `tests/bridge_client_test.rs`, editor commands in `tests/editor_e2e_test.rs`, keeping the addon out of exports in `tests/addon_export_test.rs`, launched processes staying independent of the server in `tests/detach_test.rs`, and a running game in `tests/runtime_e2e_test.rs`.
+   Includes `tests/version_sync_test.rs`: the version in `addons/godot_mcp/plugin.cfg` must always equal `Cargo.toml` — bump both together — and every file naming the line's Godot version must agree with the version's `+godot.M.N`. New behaviour needs a test first: protocol and tool behaviour in `tests/stdio_protocol_test.rs` / `tests/tools_test.rs` (helpers in `tests/common/`), the agent feedback channel in `tests/feedback_test.rs`, bridge client in `tests/bridge_client_test.rs`, editor commands in `tests/editor_e2e_test.rs`, keeping the addon out of exports in `tests/addon_export_test.rs`, export presets and headless exports in `tests/export_e2e_test.rs`, launched processes staying independent of the server in `tests/detach_test.rs`, and a running game in `tests/runtime_e2e_test.rs`.
 
 4. **GDScript Syntax Check**:
 
@@ -113,7 +113,13 @@ Before submitting or committing changes, agents must execute and pass the comple
 
    Set `GODOT_CONSOLE_PATH` as well on Windows to get editor logs in failure output (the editor is started from the console binary when it is set, and `.env` values fill in variables you did not export, so set both when testing a specific Godot version). A `.env` file with double-quoted Windows paths does not load (see `.env.example`) — export the variables instead.
 
-6. **Running game** (whenever the running-game tools, the debugger client, or the GDScript language-server client changed; same Godot build, ignored by default):
+6. **Exports** (whenever the export tools or the headless runner changed; same Godot build, ignored by default):
+
+   ```bash
+   GODOT_PATH=/path/to/godot cargo test --test export_e2e_test -- --ignored --test-threads=1
+   ```
+
+7. **Running game** (whenever the running-game tools, the debugger client, or the GDScript language-server client changed; same Godot build, ignored by default):
 
    ```bash
    GODOT_PATH=/path/to/godot cargo test --test runtime_e2e_test -- --ignored --test-threads=1
@@ -153,7 +159,11 @@ When interacting with a Godot project, agents must adhere to the following workf
    - When the project names an adapter (`adapter` in `godot_get_run_status`, set by the project setting `godot_mcp/adapter`), read its states with `godot_game_state` and run its commands with `godot_game_command` before walking the tree: `adapter.commands` lists the commands with their help. A command does what the project wrote and may leave the game changed; read the state again after it, and step a held game first when it defers work.
    - For a repeatable play-through, use `godot_game_scenario` instead of writing a GDScript test. It presses Input Map actions and pointers, advances a known number of physics ticks, and returns that call's snapshots, warnings and errors. The schema, the determinism limits and an example are in [docs/game-checks.md](docs/game-checks.md).
 
-5. **Feedback to the Maintainers**:
+5. **Exporting**:
+   - List the presets with `godot_list_export_presets` before exporting, and create or change one with `godot_set_export_preset`; never edit `export_presets.cfg` by hand. Check `new_options` in its answer: Godot ignores an option name its platform does not have.
+   - Export with `godot_export_project` and read `ok`, `size_bytes` and `errors`; it imports first. A release or debug export needs export templates or a `custom_template/*` option, a pack does not.
+
+6. **Feedback to the Maintainers**:
    - When godot-mcp itself blocks or misleads you (a tool fails for a reason its message does not explain, a needed capability has no tool, a description or schema is wrong), record it with `godot_note_feedback` in English: what you tried, what came back, what you expected, one problem per note. Do not note your own mistakes or problems in the user's project.
    - When the request is completed or abandoned, and notes exist, call `godot_draft_feedback`, show the user the complete report, and offer: copy it, open the link, submit it, or discard it.
    - Never call `godot_submit_feedback` without the user's explicit yes in the conversation.
@@ -165,6 +175,7 @@ Before concluding any development task, every agent MUST verify the following ch
 - [ ] **Technical Language**: All code, identifiers, comments, and technical docs are in English.
 - [ ] **Verification Pipeline**: `cargo clippy`, `cargo fmt --check`, and `cargo test --all-targets` pass; the GDScript syntax check passes for every addon script.
 - [ ] **Editor End-to-End Tests**: If `addons/godot_mcp/` changed, `editor_e2e_test` and `addon_export_test` pass with the Godot build named in `.github/godot-version`, on every branch the change lands on.
+- [ ] **Export End-to-End Tests**: If the export tools or the headless runner changed, `export_e2e_test` passes with that same Godot build.
 - [ ] **Runtime End-to-End Tests**: If the running game, the debugger client, or the GDScript language-server client changed, `runtime_e2e_test` passes with that same Godot build.
 - [ ] **Tests First**: New behaviour is covered by a test in the matching `tests/` file.
 - [ ] **Version Sync**: The version in `addons/godot_mcp/plugin.cfg` equals the one in `Cargo.toml`.

@@ -475,19 +475,19 @@ async fn requests_for_missing_tools_become_evidence_for_a_missing_feature() {
     let mut session = session().await;
     for _ in 0..2 {
         let reply = session
-            .call_tool("godot_export_project", json!({}), FAST)
+            .call_tool("godot_bake_navigation", json!({}), FAST)
             .await;
         assert_eq!(reply["error"]["code"], -32602);
     }
     note_with(
         &mut session,
-        note("missing_feature", "no way to export the project"),
+        note("missing_feature", "no way to bake a navigation mesh"),
     )
     .await;
 
     let text = draft_text(&mut session, json!({})).await;
 
-    assert!(text.contains("godot_export_project"), "{text}");
+    assert!(text.contains("godot_bake_navigation"), "{text}");
     assert!(text.contains("requested 2 times"), "{text}");
 }
 

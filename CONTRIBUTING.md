@@ -75,6 +75,7 @@ Choose the branch for your pull request:
    | Bridge client | `tests/bridge_client_test.rs` |
    | Editor command behaviour | `tests/editor_e2e_test.rs` |
    | Addon kept out of exported games | `tests/addon_export_test.rs` |
+   | Export presets and headless exports with a real Godot | `tests/export_e2e_test.rs` |
    | Launched processes staying independent of the server | `tests/detach_test.rs` |
    | Running game, input, screenshots, breakpoints, GDScript diagnostics | `tests/runtime_e2e_test.rs` |
    | Version string and release line identity | `tests/version_sync_test.rs` |
@@ -117,6 +118,12 @@ godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_
 godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_project.gd
 GODOT_PATH=/path/to/godot cargo test --test editor_e2e_test -- --ignored --test-threads=1
 GODOT_PATH=/path/to/godot cargo test --test addon_export_test -- --ignored --test-threads=1
+```
+
+When the export tools or the headless runner changed, also run the export tests with the same Godot build:
+
+```bash
+GODOT_PATH=/path/to/godot cargo test --test export_e2e_test -- --ignored --test-threads=1
 ```
 
 When the running-game tools, the debugger client, or the GDScript language-server client changed, also run that with the same Godot build:

@@ -19,6 +19,7 @@ const READER_DRAIN: Duration = Duration::from_secs(2);
 /// process is not going to quit on its own. A script error in `_init` leaves Godot running.
 const SCRIPT_ERROR_IDLE: Duration = Duration::from_millis(1500);
 const IMPORT_TIMEOUT: Duration = Duration::from_secs(120);
+const PRESETS_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One `SCRIPT ERROR` block from a headless script run.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,6 +51,37 @@ pub struct ImportRun {
     pub stderr: String,
 }
 
+/// What a bounded headless Godot run printed: an import or an export.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeadlessRun {
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    pub stdout: String,
+    pub stderr: String,
+    pub duration: Duration,
+}
+
+/// The kind of export `godot --export-*` makes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExportMode {
+    /// Project data only, as a `.pck` or `.zip`: `--export-pack`.
+    Pack,
+    /// The game with a release export template: `--export-release`.
+    Release,
+    /// The game with a debug export template: `--export-debug`.
+    Debug,
+}
+
+impl ExportMode {
+    pub fn flag(self) -> &'static str {
+        match self {
+            Self::Pack => "--export-pack",
+            Self::Release => "--export-release",
+            Self::Debug => "--export-debug",
+        }
+    }
+}
+
 /// What the engine can create under a built-in class name (CA-11).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClassKind {
@@ -77,6 +109,135 @@ func _init() -> void:
 	print(\"GODOT_MCP_CLASS=\", kind)
 	quit()
 ";
+
+/// The script that reads and changes `export_presets.cfg` with Godot's own `ConfigFile`, as the
+/// editor's Export dialog stores it. Fixed text: the request reaches it as `res://request.json`
+/// of its throw-away project, never inside the source or on the command line.
+const EXPORT_PRESETS_SCRIPT: &str = r#"extends SceneTree
+
+const STRING_FIELDS: Array[String] = ["export_path", "include_filter", "exclude_filter", "custom_features"]
+
+
+func _init() -> void:
+	print("GODOT_MCP_PRESETS=", JSON.stringify(_answer()))
+	quit()
+
+
+func _answer() -> Dictionary:
+	var request: Variant = JSON.parse_string(FileAccess.get_file_as_string("res://request.json"))
+	if typeof(request) != TYPE_DICTIONARY:
+		return {"error": "BAD_REQUEST", "message": "the request could not be read"}
+	var file: String = str(request.get("file", ""))
+	var config: ConfigFile = ConfigFile.new()
+	var exists: bool = FileAccess.file_exists(file)
+	if exists:
+		var loaded: Error = config.load(file)
+		if loaded != OK:
+			return {"error": "UNREADABLE", "message": error_string(loaded)}
+	if str(request.get("action", "")) == "list":
+		var presets: Array = []
+		for section: String in _preset_sections(config):
+			presets.append(_describe(config, section))
+		return {"file_exists": exists, "presets": presets}
+	return _change(config, file, request)
+
+
+# The sections Godot loads: preset.0, preset.1, ... up to the first missing number.
+func _preset_sections(config: ConfigFile) -> Array[String]:
+	var sections: Array[String] = []
+	while config.has_section("preset.%d" % sections.size()):
+		sections.append("preset.%d" % sections.size())
+	return sections
+
+
+func _describe(config: ConfigFile, section: String) -> Dictionary:
+	var preset: Dictionary = {"index": section.get_slice(".", 1).to_int()}
+	for key: String in config.get_section_keys(section):
+		preset[key] = _plain(config.get_value(section, key))
+	var options: Dictionary = {}
+	var options_section: String = section + ".options"
+	if config.has_section(options_section):
+		for key: String in config.get_section_keys(options_section):
+			options[key] = _plain(config.get_value(options_section, key))
+	preset["options"] = options
+	return preset
+
+
+func _plain(value: Variant) -> Variant:
+	match typeof(value):
+		TYPE_NIL, TYPE_BOOL, TYPE_INT, TYPE_FLOAT, TYPE_STRING:
+			return value
+		TYPE_STRING_NAME:
+			return str(value)
+		TYPE_PACKED_STRING_ARRAY:
+			return Array(value)
+	return var_to_str(value)
+
+
+func _change(config: ConfigFile, file: String, request: Dictionary) -> Dictionary:
+	var name: String = str(request.get("name", ""))
+	var sections: Array[String] = _preset_sections(config)
+	var section: String = ""
+	var names: Array = []
+	for candidate: String in sections:
+		var candidate_name: String = str(config.get_value(candidate, "name", ""))
+		names.append(candidate_name)
+		if candidate_name == name and section == "":
+			section = candidate
+	var platform: String = str(request.get("platform", ""))
+	var created: bool = false
+	if section == "":
+		if not bool(request.get("create", false)):
+			return {"error": "NOT_FOUND", "names": names}
+		section = "preset.%d" % sections.size()
+		config.set_value(section, "name", name)
+		config.set_value(section, "platform", platform)
+		config.set_value(section, "dedicated_server", false)
+		config.set_value(section, "custom_features", "")
+		config.set_value(section, "export_filter", "all_resources")
+		config.set_value(section, "include_filter", "")
+		config.set_value(section, "exclude_filter", "")
+		config.set_value(section, "export_path", "")
+		created = true
+	elif platform != "" and platform != str(config.get_value(section, "platform", "")):
+		return {"error": "PLATFORM", "platform": str(config.get_value(section, "platform", ""))}
+	var changed: Array = []
+	for field: String in STRING_FIELDS:
+		if request.has(field):
+			var text: String = str(request[field])
+			if created or str(config.get_value(section, field, "")) != text:
+				changed.append(field)
+			config.set_value(section, field, text)
+	var new_options: Array = []
+	var options: Variant = request.get("options", {})
+	if typeof(options) == TYPE_DICTIONARY:
+		var options_section: String = section + ".options"
+		for key: Variant in options:
+			var had: bool = config.has_section_key(options_section, key)
+			var old: Variant = config.get_value(options_section, key) if had else null
+			var value: Variant = _typed(options[key], old)
+			if had and typeof(value) != typeof(old):
+				return {"error": "TYPE", "option": key, "expected": type_string(typeof(old))}
+			if not had:
+				new_options.append(key)
+			if not had or value != old:
+				changed.append("options/" + str(key))
+			config.set_value(options_section, key, value)
+	var saved: Error = config.save(file)
+	if saved != OK:
+		return {"error": "UNWRITABLE", "message": error_string(saved)}
+	return {"created": created, "changed": changed, "new_options": new_options, "preset": _describe(config, section)}
+
+
+# JSON has one number type: a whole number is stored as an int unless the option holds a float.
+func _typed(value: Variant, old: Variant) -> Variant:
+	if typeof(value) == TYPE_FLOAT:
+		if typeof(old) == TYPE_FLOAT:
+			return value
+		if value == floorf(value) and absf(value) < 9.0e15:
+			return int(value)
+	return value
+"#;
 
 #[derive(Clone, Debug)]
 pub struct CliRunner {
@@ -150,7 +311,7 @@ impl CliRunner {
                 "{class:?} is not a class name: use letters, digits and underscores only"
             )));
         }
-        let dir = create_scratch_dir()?;
+        let dir = create_scratch_dir("class-check")?;
         let outcome = self.run_class_check(&dir, class).await;
         let _ = std::fs::remove_dir_all(&dir);
         outcome
@@ -396,6 +557,169 @@ impl CliRunner {
         }
     }
 
+    /// Lists or changes the export presets of a project with Godot's own `ConfigFile`.
+    ///
+    /// `request` names the `export_presets.cfg` (`file`) and the `action` (`list` or `set`). It
+    /// is written as JSON next to a fixed script in a throw-away project, so no project code runs
+    /// and nothing the caller sent reaches the command line. Returns the script's JSON answer.
+    pub async fn export_presets(&self, request: &serde_json::Value) -> Result<serde_json::Value> {
+        let dir = create_scratch_dir("export-presets")?;
+        let outcome = self.run_export_presets(&dir, request).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        outcome
+    }
+
+    async fn run_export_presets(
+        &self,
+        dir: &Path,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        std::fs::write(dir.join("project.godot"), "config_version=5\n")?;
+        std::fs::write(dir.join("request.json"), request.to_string())?;
+        let script = dir.join("export_presets.gd");
+        std::fs::write(&script, EXPORT_PRESETS_SCRIPT)?;
+        let mut command = Command::new(&self.godot_binary);
+        command
+            .arg("--headless")
+            .arg("--path")
+            .arg(dir)
+            .arg("--script")
+            .arg(&script)
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
+        let output = timeout(PRESETS_TIMEOUT, command.output())
+            .await
+            .map_err(|_| {
+                McpError::Process(format!(
+                    "Godot did not read the export presets within {}s",
+                    PRESETS_TIMEOUT.as_secs()
+                ))
+            })?
+            .map_err(|e| {
+                McpError::Process(format!(
+                    "Failed to run the Godot executable at '{}' to read the export presets: {e}",
+                    self.godot_binary.display()
+                ))
+            })?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        stdout
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("GODOT_MCP_PRESETS="))
+            .and_then(|answer| serde_json::from_str(answer).ok())
+            .ok_or_else(|| {
+                McpError::Process(format!(
+                    "Godot gave no answer about the export presets (exit {}): {}",
+                    output.status,
+                    strip_banner(&String::from_utf8_lossy(&output.stderr))
+                ))
+            })
+    }
+
+    /// `godot --headless --path <project> --import`, bounded by `limit`, keeping the last output.
+    pub async fn import_project_within(
+        &self,
+        project_path: &Path,
+        limit: Duration,
+    ) -> Result<HeadlessRun> {
+        let mut command = Command::new(&self.godot_binary);
+        command
+            .arg("--headless")
+            .arg("--path")
+            .arg(project_path)
+            .arg("--import");
+        self.run_bounded(command, limit).await
+    }
+
+    /// `godot --headless --path <project> --export-<mode> <preset> <output>`, bounded by `limit`.
+    ///
+    /// The caller checks that `preset` cannot be read as an engine option and passes an absolute
+    /// `output`, so neither starts with `-`.
+    pub async fn export_project(
+        &self,
+        project_path: &Path,
+        mode: ExportMode,
+        preset: &str,
+        output: &Path,
+        limit: Duration,
+    ) -> Result<HeadlessRun> {
+        let mut command = Command::new(&self.godot_binary);
+        command
+            .arg("--headless")
+            .arg("--path")
+            .arg(project_path)
+            .arg(mode.flag())
+            .arg(preset)
+            .arg(output);
+        self.run_bounded(command, limit).await
+    }
+
+    /// Runs `command` with piped output, keeping the last [`SCRIPT_OUTPUT_CAP`] bytes of each
+    /// stream. After `limit` the process tree is killed and the run reports `timed_out`.
+    async fn run_bounded(&self, mut command: Command, limit: Duration) -> Result<HeadlessRun> {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        command.process_group(0);
+        #[cfg(windows)]
+        {
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+        }
+        let started = tokio::time::Instant::now();
+        let mut child = command.spawn().map_err(|err| {
+            McpError::Process(format!(
+                "failed to spawn Godot at '{}': {err}",
+                self.godot_binary.display()
+            ))
+        })?;
+        let pid = child.id().unwrap_or(0);
+        let stdout_buf = Arc::new(Mutex::new(Vec::new()));
+        let stderr_buf = Arc::new(Mutex::new(Vec::new()));
+        let stdout_task = tokio::spawn(read_tail(
+            child.stdout.take(),
+            SCRIPT_OUTPUT_CAP,
+            Arc::clone(&stdout_buf),
+        ));
+        let stderr_task = tokio::spawn(read_tail(
+            child.stderr.take(),
+            SCRIPT_OUTPUT_CAP,
+            Arc::clone(&stderr_buf),
+        ));
+        let (status, timed_out) = match timeout(limit, child.wait()).await {
+            Ok(Ok(status)) => (Some(status), false),
+            Ok(Err(err)) => {
+                kill_process_tree(pid);
+                return Err(McpError::Process(format!(
+                    "failed to wait for Godot: {err}"
+                )));
+            }
+            Err(_elapsed) => {
+                kill_process_tree(pid);
+                let _ = child.start_kill();
+                let _ = timeout(Duration::from_secs(2), child.wait()).await;
+                (None, true)
+            }
+        };
+        let (stdout, stderr) = finish_readers(
+            stdout_task,
+            stderr_task,
+            stdout_buf.as_ref(),
+            stderr_buf.as_ref(),
+            timed_out,
+        )
+        .await;
+        Ok(HeadlessRun {
+            exit_code: status.and_then(|status| status.code()),
+            timed_out,
+            stdout,
+            stderr,
+            duration: started.elapsed(),
+        })
+    }
+
     /// What a clean `godot --headless --check-only` means: parse errors only.
     pub const HEADLESS_PARSE_CLEAN: &str = "No parse errors (headless check). Analyzer warnings were not checked: no language server is running; use godot_code_diagnostics, which starts one.";
 
@@ -451,13 +775,13 @@ impl CliRunner {
 }
 
 /// Creates a new, empty directory for one engine call; it is removed by the caller.
-fn create_scratch_dir() -> Result<PathBuf> {
+fn create_scratch_dir(purpose: &str) -> Result<PathBuf> {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos());
     for attempt in 0..16u32 {
         let dir = std::env::temp_dir().join(format!(
-            "godot-mcp-class-check-{}-{nanos:x}-{attempt:x}",
+            "godot-mcp-{purpose}-{}-{nanos:x}-{attempt:x}",
             std::process::id()
         ));
         match std::fs::create_dir(&dir) {

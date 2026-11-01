@@ -60,14 +60,15 @@ Tool names are the MCP names. Solo and Vollkorn do not use a `godot_` prefix.
 | Project settings | partial `godot_get_project_settings`, `godot_set_project_setting`. Editor uses `ProjectSettings.save`. Offline path rewrites `project.godot` (tested: escaping, the key check, and that a setting keeps its type). A value of another type than the existing setting is refused. Input map: `godot_get_input_map` and `godot_edit_input_action` (editor only, one undo step, saved with `ProjectSettings.save`; the editor e2e test adds key, mouse and joypad events, refuses a missing event and an unknown key, undoes, creates and deletes). Autoloads are not tools | implemented, plus input map, autoloads, plugins | unsupported | implemented `edit_project_settings`, `manage_autoloads` | `ProjectSettings` | One key at a time |
 | Delete files | implemented `godot_delete_file`. With the editor: tabs closed, cached copy detached, `EditorFileSystem.update_file`, the dock's `file_removed`, system trash by default. Without it: deleted on disk, `rescan_needed`. Companions `.uid`, `.import`, `.godot/imported` data and `.md5`. References by `res://` path or `uid://` in text files (the editor also asks `.scn`/`.res` for their dependencies) refuse the call unless `force`; all or nothing. Verified by `files_are_deleted_on_disk_with_their_companions_unless_still_referenced` and the editor e2e `files_are_deleted_through_the_editor_with_companions_and_tabs`. No move or rename | implemented files tools | unsupported | partial | `OS.move_to_trash`, `EditorFileSystem.update_file` | References by class_name or by a path built at run time are not found |
 | UID rewrite, sprite, mesh library | unsupported | files tools cover moves; uid is implicit | implemented `get_uid`, `update_project_uids`, `load_sprite`, `export_mesh_library` | same plus tile helpers | CLI | Not the reliable path for an AI loop. Left unsupported |
-| Animation, tilemap, navigation, audio, visual shader, export presets, class reference, GUT/GdUnit4 | unsupported | implemented as their own groups | unsupported | partial: animation, tiles, `run_tests`, asset install | various editor APIs | Documented-only. Porting them as one-shot CLI scripts would skip undo and the debugger. Add them on the editor bridge when a workflow needs them |
+| Export | implemented `godot_list_export_presets`, `godot_set_export_preset`, `godot_export_project`. Presets are read and written by Godot's `ConfigFile` in a throw-away project (no project code runs), refused while the editor has the project open. Exports run `godot --headless --import`, then `--export-pack` / `--export-release` / `--export-debug`, with a bounded log, the exit code and the output size. Verified by `tests/export_e2e_test.rs` (a preset created, changed and used for a `.pck`; a release with an unusable template is an error) and the stand-in engine tests in `tests/tools_test.rs` | not compared | unsupported | not compared | `ConfigFile`, `godot --export-*` | Output inside the project only. No patch export, no preset deletion or rename. Option names are not checked against the platform; `new_options` lists the names that were new |
+| Animation, tilemap, navigation, audio, visual shader, class reference, GUT/GdUnit4 | unsupported | implemented as their own groups | unsupported | partial: animation, tiles, `run_tests`, asset install | various editor APIs | Documented-only. Porting them as one-shot CLI scripts would skip undo and the debugger. Add them on the editor bridge when a workflow needs them |
 | Unrestricted eval | unsupported | `godot_game_eval` only with `--allow-eval` | unsupported | `evaluate_expression`, `execute_script` | `Expression` / `GDScript` | Not implemented |
 
 ## Source map (Rust)
 
 | Area | Files |
 | --- | --- |
-| Tool catalog and handlers | `src/tools.rs`, `src/tools/game.rs`, `src/tools/game/*.rs`, `src/tools/code.rs`, `src/tools/authoring.rs`, `src/tools/scripts.rs`, `src/tools/files.rs`, `src/tools/run.rs`, `src/tools/headless.rs`, `src/tools/project.rs` |
+| Tool catalog and handlers | `src/tools.rs`, `src/tools/game.rs`, `src/tools/game/*.rs`, `src/tools/code.rs`, `src/tools/authoring.rs`, `src/tools/scripts.rs`, `src/tools/files.rs`, `src/tools/run.rs`, `src/tools/headless.rs`, `src/tools/project.rs`, `src/tools/export.rs` |
 | Remote debugger session, variant codec | `src/godot/debug_session.rs`, `src/godot/variant.rs` |
 | Breakpoints, pause, step, stack | `src/godot/debug_ctl.rs` |
 | Process runs, `override.cfg` autoload, logs | `src/godot/runs.rs` |
@@ -75,7 +76,7 @@ Tool names are the MCP names. Solo and Vollkorn do not use a `godot_` prefix.
 | Editor bridge commands, stale-scene reload, file deletion | `addons/godot_mcp/bridge_server.gd`, `addons/godot_mcp/editor/file_ops.gd` |
 | In-game runtime | `addons/godot_mcp/runtime/mcp_runtime.gd`, `addons/godot_mcp/runtime/ops/rt_*.gd` |
 | Editor Play relay | `addons/godot_mcp/editor/game_relay.gd`, `addons/godot_mcp/core/runtime_override.gd` |
-| Behavior tests | `src/godot/variant.rs`, `src/godot/debug_session.rs`, `src/lsp/framing.rs`, `src/tools/game.rs`, `src/tools/game/*.rs`, `src/tools/authoring.rs`, `tests/tools_test.rs`, `tests/runtime_e2e_test.rs`, `tests/editor_e2e_test.rs`, `tests/addon_export_test.rs` |
+| Behavior tests | `src/godot/variant.rs`, `src/godot/debug_session.rs`, `src/lsp/framing.rs`, `src/tools/game.rs`, `src/tools/game/*.rs`, `src/tools/authoring.rs`, `tests/tools_test.rs`, `tests/runtime_e2e_test.rs`, `tests/editor_e2e_test.rs`, `tests/addon_export_test.rs`, `tests/export_e2e_test.rs` |
 
 ## Errors and limits
 
@@ -130,6 +131,7 @@ build named in `.github/godot-version` (see the README):
   authoring tools, including reading and editing scripts; and a game tool called right after
   editor Play (skipped on a Linux machine without a display).
 - `addon_export_test`: the addon stays out of exported games.
+- `export_e2e_test`: export presets created and changed through Godot, a `.pck` export, and a failing release export.
 
 No end-to-end test drives: step into/over/out, or language-server completion, definition and
 references. `godot_game_signals` is only checked to answer in a held game. A GUT / GdUnit4
@@ -140,7 +142,8 @@ the end-to-end tests already compile the scripts.
 
 - LSP rename, hover, and the offline class reference (`godot_docs_*`).
 - Input-map, autoload, plugin, and import-option editors.
-- Animation, tilemaps, navigation, audio buses, visual shaders, export.
+- Animation, tilemaps, navigation, audio buses, visual shaders.
+- Export patches, deleting or renaming a preset, and checking option names against the platform.
 - Scene inherit, batch undo, node rename/reparent/duplicate.
 - GUT / GdUnit4 runner.
 - `godot_game_eval` and any arbitrary-method trampoline. Left unsupported.

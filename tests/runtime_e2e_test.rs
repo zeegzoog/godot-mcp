@@ -9,6 +9,7 @@ mod common;
 
 use godot_mcp::bridge::BridgeClient;
 use godot_mcp::cli_runner::CliRunner;
+use godot_mcp::godot::{BinaryUid, binary_uid};
 use godot_mcp::protocol::ToolResult;
 use godot_mcp::tools::ToolManager;
 use serde_json::{Value, json};
@@ -6055,4 +6056,92 @@ fn copy_tree(from: &Path, to: &Path) {
             std::fs::copy(entry.path(), target).unwrap();
         }
     }
+}
+
+/// A tool script that re-saves an existing compressed binary scene, as a level builder does.
+/// Headless Godot writes it without its uid; the server writes the old uid back, and a new binary
+/// scene gets one.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn run_script_writes_back_the_uid_of_a_rewritten_binary_scene() {
+    let dir = tempfile::tempdir().expect("project dir");
+    let root = dir.path();
+    std::fs::write(
+        root.join("project.godot"),
+        "config_version=5\n\n[application]\n\nconfig/name=\"Binary uids\"\n",
+    )
+    .expect("project.godot");
+    std::fs::create_dir_all(root.join("tools")).expect("tools dir");
+    let save = |name: &str, source: &str| {
+        std::fs::write(root.join("tools").join(name), source).expect("script");
+    };
+    save(
+        "make.gd",
+        "extends SceneTree\n\nfunc _init() -> void:\n\tvar root := Node3D.new()\n\troot.name = \"Gate\"\n\tvar scene := PackedScene.new()\n\tscene.pack(root)\n\tResourceSaver.save(scene, \"res://gate.scn\", ResourceSaver.FLAG_COMPRESS)\n\tResourceSaver.set_uid(\"res://gate.scn\", ResourceUID.text_to_id(\"uid://dap714cpjw8pd\"))\n\tquit()\n",
+    );
+    save(
+        "rebuild.gd",
+        "extends SceneTree\n\nfunc _init() -> void:\n\tvar scene: PackedScene = load(\"res://gate.scn\")\n\tvar gate: Node3D = scene.instantiate()\n\tgate.add_child(Node3D.new())\n\tgate.get_child(0).owner = gate\n\tvar packed := PackedScene.new()\n\tpacked.pack(gate)\n\tResourceSaver.save(packed, \"res://gate.scn\", ResourceSaver.FLAG_COMPRESS)\n\tResourceSaver.save(packed, \"res://fresh.res\")\n\tquit()\n",
+    );
+    let tools = manager(root);
+    let run = |script: &'static str| {
+        let tools = Arc::clone(&tools);
+        let root = root.to_path_buf();
+        async move {
+            let result = call(
+                &tools,
+                "godot_run_script",
+                json!({"script": script, "project_path": root, "timeout_seconds": 60}),
+            )
+            .await;
+            let text = text_of(&result);
+            assert!(!result.is_error, "{text}");
+            serde_json::from_str::<Value>(&text[text.find('{').expect("json")..]).expect("JSON")
+        }
+    };
+    run("res://tools/make.gd").await;
+    let before = std::fs::read(root.join("gate.scn")).expect("gate.scn");
+    assert!(before.starts_with(b"RSCC"), "compressed");
+
+    let body = run("res://tools/rebuild.gd").await;
+    let repairs = body["resource_repairs"]
+        .as_array()
+        .expect("repairs")
+        .clone();
+    let gate = repairs
+        .iter()
+        .find(|item| item["path"] == "res://gate.scn")
+        .unwrap_or_else(|| panic!("gate.scn repaired: {body}"));
+    assert_eq!(gate["uid"], "uid://dap714cpjw8pd", "{body}");
+    assert_eq!(gate["new_uid"], false);
+    let fresh = repairs
+        .iter()
+        .find(|item| item["path"] == "res://fresh.res")
+        .unwrap_or_else(|| panic!("fresh.res got a uid: {body}"));
+    assert_eq!(fresh["new_uid"], true, "{body}");
+    assert_eq!(body["resource_damage"], json!([]), "{body}");
+    assert!(
+        std::fs::read(root.join("gate.scn"))
+            .expect("gate.scn")
+            .starts_with(b"RSCC"),
+        "still compressed"
+    );
+
+    assert_eq!(
+        binary_uid(&root.join("gate.scn")),
+        BinaryUid::Uid("uid://dap714cpjw8pd".into())
+    );
+    // The repaired file still loads in Godot, with the rebuilt content.
+    save(
+        "read.gd",
+        "extends SceneTree\n\nfunc _init() -> void:\n\tvar gate: Node = (load(\"res://gate.scn\") as PackedScene).instantiate()\n\tprint(\"GATE_CHILDREN=\", gate.get_child_count())\n\tgate.free()\n\tquit()\n",
+    );
+    let read = run("res://tools/read.gd").await;
+    assert!(
+        read["stdout"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("GATE_CHILDREN=1"),
+        "{read}"
+    );
 }

@@ -7,6 +7,11 @@
 //! Without it, the same script runs in a throw-away project and `godot --headless --import`
 //! reimports. The importer rewrites the sidecar with the options it has, so a name it does not
 //! know is gone afterwards and is reported.
+//!
+//! The importer itself can change too, as the Import dock's "Import As" does: a PNG strip becomes a
+//! Texture3D with the `3d_texture` importer. Godot replaces an importer name it does not have
+//! with the file type's default one, so the name is checked against the built-in importers of
+//! the file type first, and the importer the reimport used is checked after.
 
 use super::export::{editor_has_project, exit_text, import_report, is_option_key, readable};
 use super::{ToolManager, bridge_error_result, str_arg};
@@ -22,6 +27,40 @@ pub const SET: &str = "godot_set_import_params";
 const MAX_PARAMS: usize = 128;
 const MAX_VALUE_CHARS: usize = 4096;
 const DEFAULT_TIMEOUT_SECONDS: u64 = 300;
+const MAX_IMPORTER_CHARS: usize = 64;
+
+/// Source extensions of the image importers.
+const IMAGES: &[&str] = &[
+    "bmp", "dds", "exr", "hdr", "jpeg", "jpg", "ktx", "ktx2", "png", "svg", "tga", "webp",
+];
+const SCENES: &[&str] = &["blend", "dae", "fbx", "glb", "gltf", "obj"];
+const FONTS: &[&str] = &["otc", "otf", "pfb", "pfm", "ttc", "ttf", "woff", "woff2"];
+
+/// Godot's built-in importers: name, the source extensions it imports, the resource it makes.
+/// `keep` and `skip` (the dock's "Keep File" and "Skip") take any file.
+const IMPORTERS: &[(&str, &[&str], &str)] = &[
+    ("texture", IMAGES, "Texture2D"),
+    ("2d_array_texture", IMAGES, "Texture2DArray"),
+    ("cubemap_texture", IMAGES, "Cubemap"),
+    ("cubemap_array_texture", IMAGES, "CubemapArray"),
+    ("3d_texture", IMAGES, "Texture3D"),
+    ("texture_atlas", IMAGES, "AtlasTexture"),
+    ("streamed_texture_2d", IMAGES, "StreamedTexture2D"),
+    ("bitmap", IMAGES, "BitMap"),
+    ("image", IMAGES, "Image"),
+    ("font_data_image", IMAGES, "FontFile"),
+    ("svg", &["svg"], "DPITexture"),
+    ("font_data_dynamic", FONTS, "FontFile"),
+    ("font_data_bmfont", &["fnt", "font"], "FontFile"),
+    ("wav", &["wav"], "AudioStreamWAV"),
+    ("mp3", &["mp3"], "AudioStreamMP3"),
+    ("oggvorbisstr", &["ogg"], "AudioStreamOggVorbis"),
+    ("scene", SCENES, "PackedScene"),
+    ("animation_library", SCENES, "AnimationLibrary"),
+    ("wavefront_obj", &["obj"], "Mesh"),
+    ("csv_translation", &["csv"], "Translation"),
+    ("glsl", &["glsl"], "RDShaderFile"),
+];
 
 pub fn handles(name: &str) -> bool {
     name == GET || name == SET
@@ -45,7 +84,7 @@ pub fn catalog() -> Vec<Tool> {
         ),
         super::tool(
             SET,
-            "Changes a file's import parameters the way the Import dock does, then reimports it: the given options in the [params] section of its .import sidecar are set, after copying every parameter of copy_from's .import when it is given (both files must use the same importer). An option keeps the type it holds: a whole number becomes an int unless the option holds a float, and a string such as \"Vector2(1, 1)\" becomes the option's type when it is a vector, color, rect or packed array. With the editor holding the project, the change goes through the editor's file system (the Import dock and the loaded resource follow); else Godot's ConfigFile edits the file and godot --headless --import reimports it. The importer keeps only the options it has, so check ignored_options (names it dropped: a typo or another importer's option) and new_options (names the file did not hold before). A file with no .import yet is refused: import it with godot_resave_resources first. Example: path res://sky.png, params {\"compress/mode\": 2, \"compress/high_quality\": true} for VRAM-compressed textures.",
+            "Changes a file's import parameters and, with importer, the importer itself (the Import dock's \"Import As\"), then reimports it: the given options in the [params] section of its .import sidecar are set, after copying every parameter of copy_from's .import when it is given (both files must use the same importer). An option keeps the type it holds: a whole number becomes an int unless the option holds a float, and a string such as \"Vector2(1, 1)\" becomes the option's type when it is a vector, color, rect or packed array. With the editor holding the project, the change goes through the editor's file system (the Import dock and the loaded resource follow); else Godot's ConfigFile edits the file and godot --headless --import reimports it. The importer keeps only the options it has, so check ignored_options (names it dropped: a typo or another importer's option) and new_options (names the file did not hold before). A new importer starts from its own default options, as in the dock (the old params are dropped, then copy_from and params apply); its name is checked against Godot's importers for the file type, and the answer gives importer, previous_importer and type (the resource class now imported). A file with no .import yet is refused: import it with godot_resave_resources first. Examples: path res://sky.png, params {\"compress/mode\": 2, \"compress/high_quality\": true} for VRAM-compressed textures; path res://lut.png, importer \"3d_texture\", params {\"slices/horizontal\": 33, \"slices/vertical\": 1} for a Texture3D from a strip of 33 slices.",
             json!({
                 "path": path,
                 "params": {
@@ -53,6 +92,7 @@ pub fn catalog() -> Vec<Tool> {
                     "description": "Options to set, by the name the .import file uses, each a string, number or boolean. Examples: {\"compress/mode\": 2, \"mipmaps/generate\": true, \"process/size_limit\": 1024}.",
                     "additionalProperties": {"type": ["string", "number", "boolean"]}
                 },
+                "importer": {"type": "string", "description": "The importer to import the file with, as the Import dock's \"Import As\" lists them. For an image: texture (Texture2D), 2d_array_texture, cubemap_texture, cubemap_array_texture, 3d_texture (Texture3D), texture_atlas, bitmap, image, font_data_image; for a scene file: scene, animation_library; for any file: keep (exported as is) or skip (not imported). Omit to keep the current importer."},
                 "copy_from": {"type": "string", "description": "Another imported file of the project whose parameters are copied first, such as res://assets/sky.png. params are applied after the copy."},
                 "reimport": {"type": "boolean", "description": "Reimport the file after a change. Default true. With false only the .import file changes; the editor reimports it on its next scan, and godot --headless --import does too."},
                 "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 3600, "description": "Limit for the headless import. Default 300."},
@@ -144,11 +184,27 @@ async fn set(tools: &ToolManager, args: &Value) -> ToolResult {
             Err(result) => return result,
         },
     };
-    if params.is_empty() && copy_from.is_none() {
+    let importer = match str_arg(args, "importer").map(str::trim) {
+        None | Some("") => None,
+        Some(name) => match check_importer(name, &file.source) {
+            Ok(()) => Some(name.to_string()),
+            Err(problem) => {
+                return ToolResult::error(
+                    format!("{problem}; nothing was changed"),
+                    &[
+                        "Pass one of the importers the message lists, as the Import dock's \"Import As\" names them",
+                        "Omit importer to keep the file's current one",
+                    ],
+                );
+            }
+        },
+    };
+    if params.is_empty() && copy_from.is_none() && importer.is_none() {
         return ToolResult::error(
-            "Nothing to change: pass params, copy_from or both",
+            "Nothing to change: pass params, importer, copy_from or a mix",
             &[
                 "Pass params, such as {\"compress/mode\": 2}",
+                "Pass importer to import the file as another resource, such as 3d_texture",
                 "Or pass copy_from: another imported file whose parameters to copy",
             ],
         );
@@ -165,6 +221,9 @@ async fn set(tools: &ToolManager, args: &Value) -> ToolResult {
         if let Some(other) = &copy_from {
             command["copy_from"] = json!(other.res);
         }
+        if let Some(name) = &importer {
+            command["importer"] = json!(name);
+        }
         let bridge = tools.bridge.clone().with_timeout(Duration::from_secs(90));
         let answer = match bridge.send_command("import_params", command).await {
             Ok(answer) => answer,
@@ -177,12 +236,20 @@ async fn set(tools: &ToolManager, args: &Value) -> ToolResult {
         report["source"] = json!("editor");
         report["reimported"] = answer.get("reimported").cloned().unwrap_or(json!(false));
         report["after"] = answer.get("after").cloned().unwrap_or(Value::Null);
+        if answer.get("replaced_loaded") == Some(&json!(true)) {
+            report["note"] = json!(
+                "The editor had the file loaded as the old type; it now loads the new one, and an open scene that holds the old resource keeps it until the scene is reopened"
+            );
+        }
         report
     } else {
         let mut request =
             json!({"action": "set", "file": slashes(&file.sidecar), "params": params});
         if let Some(other) = &copy_from {
             request["copy_from"] = json!(slashes(&other.sidecar));
+        }
+        if let Some(name) = &importer {
+            request["importer"] = json!(name);
         }
         let answer = match tools.cli.import_params(&request).await {
             Ok(answer) => answer,
@@ -193,9 +260,10 @@ async fn set(tools: &ToolManager, args: &Value) -> ToolResult {
         }
         let mut report = changes(&answer);
         report["source"] = json!("headless");
-        let changed = report["changed"]
-            .as_array()
-            .is_some_and(|changed| !changed.is_empty());
+        let changed = report["importer_changed"] == json!(true)
+            || report["changed"]
+                .as_array()
+                .is_some_and(|changed| !changed.is_empty());
         if wants_reimport && changed {
             let limit = Duration::from_secs(
                 args.get("timeout_seconds")
@@ -242,6 +310,28 @@ async fn set(tools: &ToolManager, args: &Value) -> ToolResult {
     if let Some(other) = &copy_from {
         report["copy_from"] = json!(other.res);
     }
+    report["type"] = report["after"].get("type").cloned().unwrap_or(Value::Null);
+    // Godot imports with the file type's default importer when it has no importer by that name.
+    if let Some(name) = &importer {
+        let used = report["after"].get("importer").and_then(Value::as_str);
+        if report["reimported"] == json!(true) && used.is_some_and(|used| used != name) {
+            let used = used.unwrap_or_default();
+            return ToolResult::error(
+                format!(
+                    "Godot has no {name} importer for {}, so the reimport imported it with {used}\n\nDetails:\n{}",
+                    file.res,
+                    serde_json::to_string_pretty(&report).unwrap_or_default()
+                ),
+                &[
+                    &format!(
+                        "Pass an importer Godot has for this file: {}",
+                        offered(&file.source)
+                    ),
+                    "An importer from an editor plugin works only while that plugin is enabled in the project",
+                ],
+            );
+        }
+    }
     // A reimport rewrites the sidecar with the importer's own options only.
     let ignored: Vec<String> = match report["after"].get("params") {
         Some(Value::Object(stored)) if report["reimported"] == json!(true) => params
@@ -273,6 +363,8 @@ async fn set(tools: &ToolManager, args: &Value) -> ToolResult {
 fn changes(answer: &Value) -> Value {
     json!({
         "importer": answer.get("importer").cloned().unwrap_or(Value::Null),
+        "previous_importer": answer.get("previous_importer").cloned().unwrap_or(Value::Null),
+        "importer_changed": answer.get("importer_changed").cloned().unwrap_or(json!(false)),
         "changed": answer.get("changed").cloned().unwrap_or(json!([])),
         "new_options": answer.get("new_options").cloned().unwrap_or(json!([])),
         "copied": answer.get("copied").cloned().unwrap_or(json!(0)),
@@ -311,6 +403,51 @@ fn requested_params(args: &Value) -> Result<Map<String, Value>, String> {
         }
     }
     Ok(params.clone())
+}
+
+/// Checks an importer name for `source`: a name of Godot's built-in importers must import the
+/// file's extension. Another name (an editor plugin's importer) is let through; the importer the
+/// reimport used is checked afterwards.
+fn check_importer(name: &str, source: &Path) -> Result<(), String> {
+    if name.is_empty()
+        || name.chars().count() > MAX_IMPORTER_CHARS
+        || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(format!(
+            "importer {name:?} is not an importer name: letters, digits and _ only, like 3d_texture"
+        ));
+    }
+    if name == "keep" || name == "skip" {
+        return Ok(());
+    }
+    let extension = extension_of(source);
+    match IMPORTERS.iter().find(|(known, _, _)| *known == name) {
+        Some((_, extensions, _)) if !extensions.contains(&extension.as_str()) => Err(format!(
+            "The {name} importer does not import .{extension} files; Godot offers {} for them",
+            offered(source)
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// The built-in importers Godot offers for `source`, with what each makes.
+fn offered(source: &Path) -> String {
+    let extension = extension_of(source);
+    let mut names: Vec<String> = IMPORTERS
+        .iter()
+        .filter(|(_, extensions, _)| extensions.contains(&extension.as_str()))
+        .map(|(name, _, makes)| format!("{name} ({makes})"))
+        .collect();
+    names.push("keep".into());
+    names.push("skip".into());
+    names.join(", ")
+}
+
+fn extension_of(source: &Path) -> String {
+    source
+        .extension()
+        .map(|extension| extension.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default()
 }
 
 /// Resolves an imported file of the project and checks that its `.import` sidecar exists.
@@ -443,6 +580,28 @@ mod tests {
             json!({"params": {"x": "y".repeat(MAX_VALUE_CHARS + 1)}}),
         ] {
             assert!(requested_params(&bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn importers_are_checked_against_the_file_type() {
+        let png = Path::new("lut.png");
+        assert!(check_importer("3d_texture", png).is_ok());
+        assert!(check_importer("texture", Path::new("SKY.PNG")).is_ok());
+        assert!(check_importer("keep", Path::new("notes.txt")).is_ok());
+        assert!(check_importer("my_plugin_importer", png).is_ok());
+        assert!(check_importer("scene", Path::new("frog.glb")).is_ok());
+        let wrong = check_importer("wav", png).expect_err("wav on a png");
+        assert!(wrong.contains("3d_texture (Texture3D)"), "{wrong}");
+        assert!(check_importer("svg", png).is_err());
+        for bad in [
+            "",
+            "3d texture",
+            "a/b",
+            "x\"y",
+            &"a".repeat(MAX_IMPORTER_CHARS + 1),
+        ] {
+            assert!(check_importer(bad, png).is_err(), "{bad}");
         }
     }
 

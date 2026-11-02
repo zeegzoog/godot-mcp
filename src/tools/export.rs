@@ -522,7 +522,7 @@ fn check_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn is_option_key(key: &str) -> bool {
+pub(super) fn is_option_key(key: &str) -> bool {
     !key.is_empty()
         && !key.starts_with(['/', '.', '-'])
         && key
@@ -589,7 +589,7 @@ fn presets_file(project: &Path) -> String {
 }
 
 /// True when the connected editor reports `project` as the project it has open.
-async fn editor_has_project(tools: &ToolManager, project: &Path) -> bool {
+pub(super) async fn editor_has_project(tools: &ToolManager, project: &Path) -> bool {
     match tools
         .bridge
         .send_command("get_project_info", json!({}))
@@ -616,7 +616,7 @@ fn presets_unusable(code: &str, answer: &Value, project: &Path) -> ToolResult {
     )
 }
 
-fn godot_failed(error: &crate::error::McpError) -> ToolResult {
+pub(super) fn godot_failed(error: &crate::error::McpError) -> ToolResult {
     ToolResult::error(
         error.to_string(),
         &[
@@ -635,7 +635,7 @@ fn failure(summary: String, report: &Value, hints: &[&str]) -> ToolResult {
     )
 }
 
-fn import_report(run: &HeadlessRun) -> Value {
+pub(super) fn import_report(run: &HeadlessRun) -> Value {
     json!({
         "ran": true,
         "exit_code": run.exit_code,
@@ -648,7 +648,7 @@ fn import_report(run: &HeadlessRun) -> Value {
 
 /// The output without terminal colors and without the editor's progress lines
 /// (`[  16% ] ...`, `[ DONE ] ...`), which would fill the quoted log of a large project.
-fn readable(mut run: HeadlessRun) -> HeadlessRun {
+pub(super) fn readable(mut run: HeadlessRun) -> HeadlessRun {
     let clean = |text: &str| {
         strip_ansi(text)
             .lines()
@@ -744,7 +744,7 @@ fn modified(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).ok()?.modified().ok()
 }
 
-fn exit_text(code: Option<i32>) -> String {
+pub(super) fn exit_text(code: Option<i32>) -> String {
     code.map_or("none: killed by a signal".into(), |code| code.to_string())
 }
 

@@ -217,3 +217,98 @@ async fn an_unusable_release_template_is_an_error_with_the_log() {
     );
     assert!(!root.join("build/game.x86_64").exists());
 }
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ editor executable"]
+async fn import_params_are_read_set_copied_and_reimported_headless() {
+    let dir = project();
+    let root = dir.path();
+    std::fs::write(root.join("far.svg"), ICON).expect("far.svg");
+    let tools = manager();
+
+    let unimported = call(
+        &tools,
+        "godot_get_import_params",
+        json!({"path": "res://icon.svg"}),
+        root,
+    )
+    .await;
+    assert!(unimported.is_error);
+    assert!(
+        text(&unimported).contains("godot_resave_resources"),
+        "{}",
+        text(&unimported)
+    );
+    report(&call(&tools, "godot_resave_resources", json!({}), root).await);
+
+    let read = report(
+        &call(
+            &tools,
+            "godot_get_import_params",
+            json!({"path": "res://icon.svg"}),
+            root,
+        )
+        .await,
+    );
+    assert_eq!(read["source"], "headless");
+    assert_eq!(read["importer"], "texture");
+    assert_eq!(read["params"]["compress/mode"], 0);
+    assert_eq!(read["types"]["compress/mode"], "int");
+    assert_eq!(read["types"]["svg/scale"], "float");
+
+    let set = report(
+        &call(
+            &tools,
+            "godot_set_import_params",
+            json!({"path": "res://icon.svg", "params": {
+                "compress/mode": 2, "compress/high_quality": true, "svg/scale": 2,
+                "not/an_option": 1
+            }}),
+            root,
+        )
+        .await,
+    );
+    assert_eq!(set["reimported"], true, "{set}");
+    assert_eq!(set["new_options"], json!(["not/an_option"]));
+    assert_eq!(set["ignored_options"], json!(["not/an_option"]));
+    assert_eq!(set["after"]["params"]["compress/mode"], 2);
+    assert_eq!(set["after"]["params"]["compress/high_quality"], true);
+    assert_eq!(
+        set["after"]["types"]["svg/scale"], "float",
+        "a whole number keeps the float type: {set}"
+    );
+    let sidecar = std::fs::read_to_string(root.join("icon.svg.import")).expect("sidecar");
+    assert!(
+        sidecar.contains("\"vram_texture\": true"),
+        "the reimport wrote VRAM-compressed data: {sidecar}"
+    );
+    assert!(!sidecar.contains("not/an_option"), "{sidecar}");
+
+    let wrong_type = call(
+        &tools,
+        "godot_set_import_params",
+        json!({"path": "res://icon.svg", "params": {"compress/mode": "two"}}),
+        root,
+    )
+    .await;
+    assert!(wrong_type.is_error);
+    assert!(
+        text(&wrong_type).contains("holds a int"),
+        "{}",
+        text(&wrong_type)
+    );
+
+    let copied = report(
+        &call(
+            &tools,
+            "godot_set_import_params",
+            json!({"path": "res://far.svg", "copy_from": "res://icon.svg"}),
+            root,
+        )
+        .await,
+    );
+    assert_eq!(copied["reimported"], true, "{copied}");
+    assert_eq!(copied["after"]["params"]["compress/mode"], 2);
+    assert_eq!(copied["after"]["params"]["compress/high_quality"], true);
+    assert_eq!(copied["after"]["params"]["svg/scale"], 2.0);
+}

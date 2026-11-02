@@ -1207,6 +1207,115 @@ func on_ready() -> void:
     );
 }
 
+/// `set_project_setting` through a real editor stores what the server's file fallback stores for
+/// the same input, and refuses what it refuses (the fallback's real-engine test has the same
+/// table): a color from an HTML color or a name, a vector from its `project.godot` text, a whole
+/// number as an integer, the type of a base setting for a feature override, and nothing from an
+/// object text or a string that does not convert.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn project_settings_convert_the_same_text_forms_as_the_file_fallback() {
+    let editor = start_editor(false).await;
+    let bridge = &editor.bridge;
+    let project_file = editor.project.join("project.godot");
+
+    for (key, value) in [
+        ("application/boot_splash/bg_color", json!("#102b38")),
+        ("display/window/size/viewport_width", json!(1280)),
+        ("display/window/size/viewport_height.mobile", json!(720.0)),
+        ("physics/2d/default_gravity_vector", json!("Vector2(0, 2)")),
+        ("custom/tuning/speed", json!(2.5)),
+    ] {
+        bridge
+            .send_command("set_project_setting", json!({"key": key, "value": value}))
+            .await
+            .unwrap_or_else(|error| panic!("{key} = {value}: {error}"));
+    }
+    let written = std::fs::read_to_string(&project_file).expect("project.godot");
+    for line in [
+        "\nboot_splash/bg_color=Color(0.0627451, 0.16862746, 0.21960784, 1)\n",
+        "\nwindow/size/viewport_width=1280\n",
+        "\nwindow/size/viewport_height.mobile=720\n",
+        "\n2d/default_gravity_vector=Vector2(0, 2)\n",
+        "\ntuning/speed=2.5\n",
+    ] {
+        assert!(written.contains(line), "{line:?} missing from:\n{written}");
+    }
+
+    // A color name and a stored color replaced by a new one.
+    bridge
+        .send_command(
+            "set_project_setting",
+            json!({"key": "application/boot_splash/bg_color", "value": "white"}),
+        )
+        .await
+        .expect("a color name");
+    let written = std::fs::read_to_string(&project_file).expect("project.godot");
+    assert!(
+        written.contains("\nboot_splash/bg_color=Color(1, 1, 1, 1)\n"),
+        "{written}"
+    );
+
+    // What does not convert is refused, names the type, and leaves the file as it was.
+    let before = std::fs::read_to_string(&project_file).expect("project.godot");
+    for (key, value, needle) in [
+        (
+            "application/boot_splash/bg_color",
+            json!("#zzzzzz"),
+            "expects a Color",
+        ),
+        (
+            "application/boot_splash/bg_color",
+            json!(3),
+            "expects a Color",
+        ),
+        (
+            "display/window/size/viewport_width",
+            json!("wide"),
+            "expects a int",
+        ),
+        (
+            "display/window/size/viewport_width",
+            json!(1280.5),
+            "expects a int",
+        ),
+        (
+            "physics/2d/default_gravity_vector",
+            json!("Object(Node)"),
+            "expects a Vector2",
+        ),
+        (
+            "physics/2d/default_gravity_vector",
+            json!("Vector3(0, 2, 1)"),
+            "expects a Vector2",
+        ),
+        (
+            "physics/2d/default_gravity_vector",
+            json!(2),
+            "expects a Vector2",
+        ),
+    ] {
+        let result = bridge
+            .send_command("set_project_setting", json!({"key": key, "value": value}))
+            .await;
+        expect_error(result, needle);
+    }
+    expect_error(
+        bridge
+            .send_command(
+                "set_project_setting",
+                json!({"key": "application/boot_splash/bg_color", "value": "#zzzzzz"}),
+            )
+            .await,
+        "#102b38",
+    );
+    assert_eq!(
+        std::fs::read_to_string(&project_file).expect("project.godot"),
+        before,
+        "a refused value changed project.godot"
+    );
+}
+
 fn tool_text(result: &godot_mcp::protocol::ToolResult) -> String {
     result
         .content

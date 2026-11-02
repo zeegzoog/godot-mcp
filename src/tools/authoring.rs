@@ -72,7 +72,7 @@ pub fn catalog() -> Vec<Tool> {
         ),
         tool(
             "godot_set_project_setting",
-            "Sets one project setting and saves it. Uses the live editor when connected. The value must be a string, number or boolean, and of the type the setting already has. Without the editor, project.godot is written and the type comes from the file or the engine's definition of the setting; a setting of another type takes a string: an HTML color (\"#102b38\") for a Color, otherwise the text project.godot stores (\"Vector2i(1152, 648)\"). InputMap actions (input/...) are changed with godot_edit_input_action.",
+            "Sets one project setting and saves it. Uses the live editor when connected. The value must be a string, number or boolean, and of the type the setting has: the stored one, else the engine's definition of the setting (a feature override such as name.mobile has the type of name). A setting of another type takes a string, with and without the editor: an HTML color or color name (\"#102b38\", \"white\") for a Color, otherwise the text project.godot stores (\"Vector2i(1152, 648)\"); an Object is never created. Without the editor, project.godot is written and the engine is asked for the type of a setting that is not stored yet. InputMap actions (input/...) are changed with godot_edit_input_action.",
             json!({"key": s("For example application/config/name."), "value": {"description": "String, number, or boolean."}, "project_path": s("")}),
             &["key", "value"],
         ),

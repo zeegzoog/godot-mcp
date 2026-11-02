@@ -1,3 +1,4 @@
+pub mod addon;
 pub mod bridge;
 pub mod bridge_port;
 pub mod cli_runner;

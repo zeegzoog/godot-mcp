@@ -606,16 +606,8 @@ async fn read_addon_version(project: &Path) -> String {
         return "unknown".to_string();
     };
     match tokio::fs::read_to_string(&manifest).await {
-        Ok(text) => parse_manifest_version(&text).unwrap_or_else(|| "unknown".to_string()),
+        Ok(text) => crate::addon::manifest_version(&text).unwrap_or_else(|| "unknown".to_string()),
         Err(err) if err.kind() == ErrorKind::NotFound => "not installed in the project".to_string(),
         Err(_) => "unknown".to_string(),
     }
-}
-
-fn parse_manifest_version(text: &str) -> Option<String> {
-    text.lines()
-        .map(str::trim)
-        .find_map(|line| line.strip_prefix("version="))
-        .map(|value| value.trim().trim_matches('"').to_string())
-        .filter(|value| !value.is_empty())
 }

@@ -115,9 +115,15 @@ var _scene_dirty: Dictionary = {}
 var _scene_undo_version: Dictionary = {}
 
 var _token: String = ""
+## The addon version this editor loaded (plugin.cfg when the bridge started). An update on disk
+## shows only after the plugin is enabled again, so the server compares this one with its own.
+var _addon_version: String = ""
 var _token_files: PackedStringArray = []
 
 func _ready() -> void:
+    var manifest: ConfigFile = ConfigFile.new()
+    if manifest.load("res://addons/godot_mcp/plugin.cfg") == OK:
+        _addon_version = str(manifest.get_value("plugin", "version", ""))
     read_configuration()
     start_server()
 
@@ -540,7 +546,8 @@ func get_project_info(peer: WebSocketPeer, cmd_id: String) -> void:
         "name": project_name,
         "main_scene": main_scene,
         "features": ProjectSettings.get_setting("application/config/features", []),
-        "project_dir": ProjectSettings.globalize_path("res://").trim_suffix("/")
+        "project_dir": ProjectSettings.globalize_path("res://").trim_suffix("/"),
+        "addon_version": _addon_version,
     })
 
 ## Quits this editor without saving anything. Unsaved scenes or scripts keep it open and are

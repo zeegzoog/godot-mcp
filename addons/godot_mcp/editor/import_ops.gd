@@ -28,17 +28,28 @@ static func describe(import_file: String) -> Dictionary:
         return {"error": "UNREADABLE", "file": import_file, "message": error_string(loaded)}
     return _describe(config)
 
-## request: params (Dictionary of option name to value) and copy_from (another .import file,
-## whose parameters are copied first). An option keeps the type it holds. Saves import_file only
-## when something changed and answers with changed, new_options (names it did not hold before)
-## and copied (how many parameters copy_from gave).
+## request: importer (the importer to switch to, as the Import dock's "Import As"), params
+## (Dictionary of option name to value) and copy_from (another .import file, whose parameters are
+## copied first). A new importer starts from its own defaults, as in the dock: the old [params]
+## are dropped. An option keeps the type it holds. Saves import_file only when something changed
+## and answers with changed, new_options (names it did not hold before), copied (how many
+## parameters copy_from gave), previous_importer and importer_changed.
 static func change(import_file: String, request: Dictionary) -> Dictionary:
     var config: ConfigFile = ConfigFile.new()
     var loaded: Error = config.load(import_file)
     if loaded != OK:
         return {"error": "UNREADABLE", "file": import_file, "message": error_string(loaded)}
-    var importer: String = str(config.get_value("remap", "importer", ""))
+    var previous_importer: String = str(config.get_value("remap", "importer", ""))
+    var importer: String = previous_importer
     var before: Dictionary = _params(config)
+    var requested_importer: String = str(request.get("importer", ""))
+    var importer_changed: bool = not requested_importer.is_empty() and requested_importer != importer
+    if importer_changed:
+        importer = requested_importer
+        config.set_value("remap", "importer", importer)
+        if config.has_section("params"):
+            config.erase_section("params")
+        before = {}
     var copied: int = 0
     var copy_from: String = str(request.get("copy_from", ""))
     if not copy_from.is_empty():
@@ -72,11 +83,15 @@ static func change(import_file: String, request: Dictionary) -> Dictionary:
             changed.append(key)
         elif typeof(before[key]) != typeof(after[key]) or before[key] != after[key]:
             changed.append(key)
-    if not changed.is_empty():
+    if importer_changed or not changed.is_empty():
         var saved: Error = config.save(import_file)
         if saved != OK:
             return {"error": "UNWRITABLE", "file": import_file, "message": error_string(saved)}
-    return {"importer": importer, "changed": changed, "new_options": new_options, "copied": copied}
+    return {
+        "importer": importer, "previous_importer": previous_importer,
+        "importer_changed": importer_changed, "changed": changed, "new_options": new_options,
+        "copied": copied,
+    }
 
 static func _params(config: ConfigFile) -> Dictionary:
     var params: Dictionary = {}

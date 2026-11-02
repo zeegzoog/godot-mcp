@@ -312,3 +312,64 @@ async fn import_params_are_read_set_copied_and_reimported_headless() {
     assert_eq!(copied["after"]["params"]["compress/high_quality"], true);
     assert_eq!(copied["after"]["params"]["svg/scale"], 2.0);
 }
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ editor executable"]
+async fn an_image_is_imported_as_a_texture_3d_headless() {
+    let dir = project();
+    let root = dir.path();
+    std::fs::write(root.join("strip.svg"), STRIP).expect("strip.svg");
+    let tools = manager();
+    report(&call(&tools, "godot_resave_resources", json!({}), root).await);
+
+    let wrong = call(
+        &tools,
+        "godot_set_import_params",
+        json!({"path": "res://strip.svg", "importer": "wav"}),
+        root,
+    )
+    .await;
+    assert!(wrong.is_error, "{}", text(&wrong));
+    assert!(text(&wrong).contains("3d_texture"), "{}", text(&wrong));
+
+    let set = report(
+        &call(
+            &tools,
+            "godot_set_import_params",
+            json!({"path": "res://strip.svg", "importer": "3d_texture",
+                   "params": {"slices/horizontal": 4, "slices/vertical": 1}}),
+            root,
+        )
+        .await,
+    );
+    assert_eq!(set["reimported"], true, "{set}");
+    assert_eq!(set["importer"], "3d_texture");
+    assert_eq!(set["previous_importer"], "texture");
+    assert_eq!(set["type"], "CompressedTexture3D", "{set}");
+    assert_eq!(set["after"]["params"]["slices/horizontal"], 4);
+    assert_eq!(set["after"]["types"]["slices/horizontal"], "int");
+    assert!(
+        set["after"]["params"].get("svg/scale").is_none(),
+        "the texture importer's options are gone: {set}"
+    );
+    let sidecar = std::fs::read_to_string(root.join("strip.svg.import")).expect("sidecar");
+    assert!(sidecar.contains("importer=\"3d_texture\""), "{sidecar}");
+    assert!(sidecar.contains(".ctex3d"), "{sidecar}");
+
+    let fallback = call(
+        &tools,
+        "godot_set_import_params",
+        json!({"path": "res://strip.svg", "importer": "no_such_importer"}),
+        root,
+    )
+    .await;
+    assert!(fallback.is_error, "{}", text(&fallback));
+    assert!(
+        text(&fallback).contains("imported it with"),
+        "{}",
+        text(&fallback)
+    );
+}
+
+/// A 64×16 strip of four 16×16 slices.
+const STRIP: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="64" height="16"><rect width="16" height="16" fill="#000"/><rect x="16" width="16" height="16" fill="#555"/><rect x="32" width="16" height="16" fill="#aaa"/><rect x="48" width="16" height="16" fill="#fff"/></svg>"##;

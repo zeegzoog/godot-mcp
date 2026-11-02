@@ -4977,3 +4977,126 @@ async fn import_params_that_change_nothing_are_not_imported_again() {
     let calls = std::fs::read_to_string(&calls).expect("calls");
     assert!(!calls.contains("--import"), "{calls}");
 }
+
+#[tokio::test]
+async fn an_importer_is_checked_against_the_ones_godot_offers_for_the_file() {
+    let project = project_with_texture();
+    for (importer, expected) in [
+        ("wav", "3d_texture"),
+        ("svg", "Godot offers"),
+        ("3d texture", "letters, digits and _"),
+    ] {
+        let result = call(
+            "godot_set_import_params",
+            json!({"path": "res://sky.png", "importer": importer,
+                   "project_path": project.path()}),
+        )
+        .await;
+        assert!(result.is_error, "{importer}");
+        assert!(
+            text(&result).contains(expected),
+            "{importer}: {}",
+            text(&result)
+        );
+    }
+    let sidecar = std::fs::read_to_string(project.path().join("sky.png.import")).expect("sidecar");
+    assert!(sidecar.contains("importer=\"texture\""), "{sidecar}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn without_the_editor_a_new_importer_is_stored_imported_headless_and_reported() {
+    let project = project_with_texture();
+    let engine = tempfile::tempdir().expect("engine dir");
+    let (godot, calls) = import_params_godot(
+        engine.path(),
+        r#"{"importer":"3d_texture","previous_importer":"texture","importer_changed":true,"changed":["slices/horizontal"],"new_options":["slices/horizontal"],"copied":0}"#,
+        r#"{"importer":"3d_texture","type":"CompressedTexture3D","params":{"slices/horizontal":33,"slices/vertical":1},"types":{}}"#,
+    );
+    let cwd = tempfile::tempdir().expect("working dir");
+    let result = manager_in(cwd.path(), godot)
+        .call_tool(
+            "godot_set_import_params",
+            json!({"path": "res://sky.png", "importer": "3d_texture",
+                   "params": {"slices/horizontal": 33}, "project_path": project.path()}),
+        )
+        .await;
+    assert!(!result.is_error, "{}", text(&result));
+    let report: Value = serde_json::from_str(&text(&result)).expect("JSON report");
+    assert_eq!(report["importer"], "3d_texture");
+    assert_eq!(report["previous_importer"], "texture");
+    assert_eq!(report["importer_changed"], true);
+    assert_eq!(report["type"], "CompressedTexture3D");
+    assert_eq!(report["reimported"], true);
+    let calls = std::fs::read_to_string(&calls).expect("calls");
+    assert!(calls.contains("--import"), "{calls}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_new_importer_alone_is_a_change_and_one_godot_does_not_take_is_an_error() {
+    let project = project_with_texture();
+    let engine = tempfile::tempdir().expect("engine dir");
+    let (godot, _) = import_params_godot(
+        engine.path(),
+        r#"{"importer":"my_plugin_importer","previous_importer":"texture","importer_changed":true,"changed":[],"new_options":[],"copied":0}"#,
+        r#"{"importer":"texture","type":"CompressedTexture2D","params":{},"types":{}}"#,
+    );
+    let cwd = tempfile::tempdir().expect("working dir");
+    let result = manager_in(cwd.path(), godot)
+        .call_tool(
+            "godot_set_import_params",
+            json!({"path": "res://sky.png", "importer": "my_plugin_importer",
+                   "project_path": project.path()}),
+        )
+        .await;
+    assert!(result.is_error, "{}", text(&result));
+    let message = text(&result);
+    assert!(message.contains("my_plugin_importer"), "{message}");
+    assert!(message.contains("imported it with texture"), "{message}");
+}
+
+#[tokio::test]
+async fn an_importer_change_goes_to_the_editor_that_has_the_project() {
+    use common::{MockBridge, Reply};
+    let project = project_with_texture();
+    let dir = project.path().to_string_lossy().replace('\\', "/");
+    let bridge = MockBridge::start(move |command| match command["type"].as_str() {
+        Some("get_project_info") => Reply::Ok(json!({"project_dir": dir})),
+        Some("import_params") => Reply::Ok(json!({
+            "importer": "3d_texture",
+            "previous_importer": "texture",
+            "importer_changed": true,
+            "changed": ["slices/horizontal"],
+            "new_options": ["slices/horizontal"],
+            "copied": 0,
+            "reimported": true,
+            "after": {"importer": "3d_texture", "type": "CompressedTexture3D",
+                      "params": {"slices/horizontal": 33}}
+        })),
+        _ => Reply::Ok(json!({})),
+    })
+    .await;
+    let manager = Arc::new(ToolManager::new(
+        BridgeClient::new(bridge.port),
+        CliRunner::new(PathBuf::from("unused-godot")),
+    ));
+    let result = manager
+        .call_tool(
+            "godot_set_import_params",
+            json!({"path": "sky.png", "importer": "3d_texture",
+                   "params": {"slices/horizontal": 33}}),
+        )
+        .await;
+    assert!(!result.is_error, "{}", text(&result));
+    let report: Value = serde_json::from_str(&text(&result)).expect("JSON report");
+    assert_eq!(report["source"], "editor");
+    assert_eq!(report["type"], "CompressedTexture3D");
+    assert_eq!(report["previous_importer"], "texture");
+    let received = bridge.received.lock().expect("received").clone();
+    let sent = received
+        .iter()
+        .find(|command| command["type"] == "import_params")
+        .expect("import_params sent");
+    assert_eq!(sent["params"]["importer"], "3d_texture");
+}

@@ -11,6 +11,11 @@ Each Godot version has its own release line and branch (`godot-v4.5`, `godot-v4.
 ### Added
 
 - `godot_list_export_presets`, `godot_set_export_preset` and `godot_export_project` export a project without the editor. The presets in `export_presets.cfg` are listed, created and changed through Godot's own `ConfigFile` (an option keeps its type, `new_options` names the options that were not stored before, and the call is refused while the editor has the project open because it writes its own copy back). An export runs `godot --headless --import`, then `--export-pack` (a `.pck` or `.zip`, no template needed), `--export-release` or `--export-debug`, and answers with `ok`, the output path and size, the exit code, the `ERROR`/`WARNING` messages with their reasons and the end of the log. A missing preset, a missing export template, a failed import, an export that wrote no file and a timeout are errors with a way out; the output must stay inside the project. Thanks to @theromis.
+- `godot_create_shader`, `godot_read_shader` and `godot_edit_shader` create, read and edit text shaders (`.gdshader`, `.gdshaderinc`) the way the script tools do for `.gd` files: create from given code without replacing a file unless `overwrite: true`, read the text with a `version` label, and replace one exact fragment. With the editor connected they go through the shader editor and the shader it holds, so an open tab, the editor's copy and the materials using it stay in step, an edit is one undo step, and unsaved typing is never overwritten; without it they work on the file. A new shader gets a `.uid` file, and an existing one keeps its uid. `godot_validate_shader` compiles a saved shader headless with Godot's shader compiler and lists the errors with file and line, including errors inside includes. Thanks to @theromis.
+
+### Fixed
+
+- `godot_open_scene` makes the scene the editor's active tab when it reloads a background tab from disk. The reload used to keep the previous tab active while answering `opened: true`, so the next `godot_set_node_properties`, `godot_add_node` or `godot_save_scene` without `scene_path` acted on another scene. The answer names the active scene in `active_scene`, and the call fails with a way out when the editor did not switch to it. Thanks to @theromis.
 
 ### Fixed
 

@@ -30,6 +30,7 @@ mod project;
 mod run;
 mod scenario;
 mod scripts;
+mod shaders;
 
 use headless::ScriptCheck;
 use project::EditorChoice;
@@ -141,6 +142,7 @@ impl ToolManager {
             name if input_map::handles(name) => input_map::call(&self, name, args).await,
             name if files::handles(name) => files::call(&self, args).await,
             name if scripts::handles(name) => scripts::call(&self, name, args).await,
+            name if shaders::handles(name) => shaders::call(&self, name, args).await,
             name if game::handles(name) => game::call(&self, name, args).await,
             name if code::handles(name) => code::call(&self, name, args).await,
             name if export::handles(name) => export::call(&self, name, args).await,
@@ -785,6 +787,8 @@ fn annotations(name: &str) -> Option<ToolAnnotations> {
         | "godot_get_project_settings"
         | "godot_get_input_map"
         | "godot_read_script"
+        | "godot_read_shader"
+        | "godot_validate_shader"
         | "godot_run_output"
         | "godot_game_tree"
         | "godot_game_get"
@@ -826,6 +830,7 @@ fn annotations(name: &str) -> Option<ToolAnnotations> {
         | "godot_open_scene"
         | "godot_save_scene"
         | "godot_create_script"
+        | "godot_create_shader"
         | "godot_check_voxel_model"
         | "godot_attach_script"
         | "godot_set_project_setting"
@@ -835,6 +840,7 @@ fn annotations(name: &str) -> Option<ToolAnnotations> {
         | "godot_game_set" => [false, true, true],
         "godot_run_script"
         | "godot_edit_script"
+        | "godot_edit_shader"
         | "godot_game_call"
         | "godot_game_command"
         | "godot_close_editor"
@@ -1058,7 +1064,7 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
         ),
         tool(
             "godot_open_scene",
-            "Opens a scene file in the Godot Editor by its res:// path. An absolute path inside the project is converted, including both macOS spellings of /var and /private/var. Reloading an already-open scene from disk drops that scene's undo history. The answer lists in load_errors what Godot reported while loading (for example a node renamed because its name clashed with a child of an instanced scene), names the editor dialog that shows them, and says in unsaved whether the load left the scene with unsaved changes.",
+            "Opens a scene file in the Godot Editor by its res:// path. An absolute path inside the project is converted, including both macOS spellings of /var and /private/var. Reloading an already-open scene from disk drops that scene's undo history. The answer lists in load_errors what Godot reported while loading (for example a node renamed because its name clashed with a child of an instanced scene), names the editor dialog that shows them, and says in unsaved whether the load left the scene with unsaved changes. The opened scene becomes the active tab, named in active_scene, so later calls without scene_path act on it.",
             json!({
                 "scene_path": {
                     "type": "string",
@@ -1183,6 +1189,7 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
     tools.extend(input_map::catalog());
     tools.extend(files::catalog());
     tools.extend(scripts::catalog());
+    tools.extend(shaders::catalog());
     tools.extend(game::catalog());
     tools.extend(code::catalog());
     tools.extend(export::catalog());

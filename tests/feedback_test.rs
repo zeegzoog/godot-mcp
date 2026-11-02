@@ -343,7 +343,7 @@ async fn the_environment_block_comes_from_the_editor_and_the_project() {
     assert_eq!(row(&text, "Editor bridge"), "| Editor bridge | connected |");
     assert_eq!(
         row(&text, "godot-mcp"),
-        format!("| godot-mcp | {} |", env!("CARGO_PKG_VERSION"))
+        format!("| godot-mcp | {} |", godot_mcp::version::build_version())
     );
     assert!(row(&text, "Platform").contains(std::env::consts::OS));
     assert!(text.contains("it failed in {project}"), "{text}");

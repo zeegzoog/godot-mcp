@@ -993,3 +993,100 @@ fn a_bot_may_move_workflow_pins_within_a_major_version_and_do_nothing_else() {
         "a bot's workflow files go through pins_only"
     );
 }
+
+/// The label of a pull request that was merged while its planning update is still owed.
+const PLANNING_LABEL: &str = "status: planning-owed";
+
+/// The `name|colour|description` lines of `labels.sh`, between its heredoc markers.
+fn skill_labels() -> Vec<(String, String, String)> {
+    let script = read(&format!("{SKILL}/scripts/labels.sh"));
+    script
+        .lines()
+        .skip_while(|line| !line.starts_with("wanted()"))
+        .skip_while(|line| !line.starts_with("\tcat <<'EOF'"))
+        .skip(1)
+        .take_while(|line| *line != "EOF")
+        .map(|line| {
+            let mut parts = line.splitn(3, '|');
+            let mut next = || parts.next().unwrap_or_default().to_string();
+            (next(), next(), next())
+        })
+        .collect()
+}
+
+#[test]
+fn the_skill_creates_the_planning_owed_label() {
+    let labels = skill_labels();
+    let (_, colour, description) = labels
+        .iter()
+        .find(|(name, _, _)| name == PLANNING_LABEL)
+        .unwrap_or_else(|| panic!("{SKILL}/scripts/labels.sh must create {PLANNING_LABEL:?}"));
+    assert!(
+        colour.len() == 6 && colour.chars().all(|c| c.is_ascii_hexdigit()),
+        "the label needs a six-digit hex colour, not {colour:?}"
+    );
+    assert!(!description.is_empty(), "the label needs a description");
+    assert!(
+        description.chars().count() <= 100,
+        "GitHub limits a label description to 100 characters: {description:?}"
+    );
+    // Colours stay distinct, so the labels are told apart on the board.
+    let same_colour = labels
+        .iter()
+        .filter(|(_, other, _)| other == colour)
+        .count();
+    assert_eq!(same_colour, 1, "another label has the colour {colour:?}");
+}
+
+#[test]
+fn the_run_settles_planning_owed_after_the_pull_requests() {
+    let skill = read(&format!("{SKILL}/SKILL.md"));
+    let step = skill
+        .lines()
+        .find(|line| line.starts_with("7. **Pull requests**"))
+        .expect("SKILL.md step 7 is the pull request step");
+    for needle in [PLANNING_LABEL, "--state merged"] {
+        assert!(
+            step.contains(needle),
+            "step 7 must settle merged pull requests labelled {PLANNING_LABEL:?}: missing {needle:?} in\n{step}"
+        );
+    }
+    let report = skill
+        .lines()
+        .find(|line| line.starts_with("Planning owed"))
+        .expect("the run report has a Planning owed line");
+    assert!(report.contains(PLANNING_LABEL), "{report}");
+
+    let reference = read(&format!("{SKILL}/reference/pull-requests.md"));
+    let planning = reference
+        .lines()
+        .find(|line| line.starts_with("8. **Planning.**"))
+        .expect("pull-requests.md item 8 is the planning check");
+    for needle in [PLANNING_LABEL, "before the merge", "keeps the label"] {
+        assert!(
+            planning.contains(needle),
+            "item 8 must say {needle:?}:\n{planning}"
+        );
+    }
+}
+
+#[test]
+fn the_planning_owed_text_names_no_planning_artifact() {
+    // The skill is generic: nothing in it names this repository's planning files, and a message
+    // the steward posts never mentions them (SKILL.md, Rules).
+    for file in [
+        "SKILL.md",
+        "reference/pull-requests.md",
+        "scripts/labels.sh",
+    ] {
+        let text = read(&format!("{SKILL}/{file}"));
+        for line in text.lines().filter(|line| line.contains("planning-owed")) {
+            for forbidden in [".design", "TASKS.md", "PLAN.md", "magic."] {
+                assert!(
+                    !line.contains(forbidden),
+                    "{file}: a planning-owed line names {forbidden:?}:\n{line}"
+                );
+            }
+        }
+    }
+}

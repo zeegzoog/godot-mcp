@@ -1,6 +1,6 @@
 # Game Runtime Channel
 
-**Version:** 1.7.0
+**Version:** 1.7.1
 **Status:** Stable
 **Layer:** implementation
 **Implements:** l1-runtime-observability.md
@@ -62,7 +62,7 @@ addons/godot_mcp/
 ├── editor/game_relay.gd       EditorDebuggerPlugin relaying mcp:* messages
 └── runtime/
     ├── mcp_runtime.gd         autoload: registers the "mcp" capture, sends hello, dispatches requests
-    └── ops/rt_*.gd            result helpers, live tree and properties, input and gestures, pictures, output
+    └── ops/rt_*.gd            rt_result (result helpers), rt_live (live tree and properties), rt_input (input and gestures), rt_view (pictures), rt_record (frame series saved as PNG files for godot_game_record), rt_output (output), rt_hold, rt_registry, rt_project
 ```
 
 ### 5.2 Managed Process Run
@@ -138,3 +138,4 @@ A click on a node uses the node's transform with its canvas, so a scrolling came
 | 1.5.0 | 2026-10-26 | Agent (magic.spec) | [ADDED] The runtime operations `game.pause` and `game.body`, the `action` input step with its release (RO-7) and the touch `move` phase, used by the scenario tool. Stable → RFC → Stable after Post-Update Review. The file map and references name the `tools/game/` modules. |
 | 1.6.0 | 2026-10-29 | Agent (magic.spec) | [ADDED] The runtime methods `project.state` and `project.command` in the operations table, realized in [l2-project-adapter.md](l2-project-adapter.md). Stable → RFC → Stable after Post-Update Review. |
 | 1.7.0 | 2026-10-29 | Agent (magic.spec) | [MODIFIED] `game.set`: every value checked before the first write, the vector-axes forms, and the `res://` path of a saved resource for an Object property. Source: pull requests 69 and 74. Stable → RFC → Stable after Post-Update Review. |
+| 1.7.1 | 2026-11-02 | Agent (magic.spec) | The file map names each runtime operation file, including `rt_record.gd` and `rt_result.gd`, which ventilation found unnamed. No requirement changed. |

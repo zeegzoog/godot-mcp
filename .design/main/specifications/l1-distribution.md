@@ -1,6 +1,6 @@
 # Release & Distribution
 
-**Version:** 1.2.0
+**Version:** 1.3.0
 **Status:** Stable
 **Layer:** concept
 
@@ -36,6 +36,8 @@ Users install a prebuilt binary plus an addon folder, often through an AI assist
 - **DS-5 Separate, editor-only addon.** The addon ships as its own archive, is enabled per project, and excludes itself from game exports while enabled; the docs tell users how to exclude it when it is disabled.
 - **DS-6 No machine-specific state in the repository.** Local paths, secrets and client configs with real paths are never committed; examples with placeholders are committed instead.
 - **DS-7 Human confirmation before publishing.** Creating and pushing a release tag happens only after a person has seen the version and the commit and explicitly approved it.
+- **DS-9 A build names its commit.** [ADDED] The version a running server reports adds the commit it was built from as build metadata, so builds between two releases can be told apart although the manifests change only in release commits. A build with no commit to name (no git, a source archive) reports the manifest version alone, and a commit that is not a short hexadecimal id is never put into the version.
+- **DS-10 The release number follows the changes.** [ADDED] The number a release takes is computed from the kind of the changes since the last release, by one script, not judged anew at each release: a breaking change or a new feature moves the minor number while the project is before 1.0, anything else the patch number. The version of the development line is moved to that number when it has fallen behind, in a commit of its own that is never carried to a release line.
 - **DS-8 Scaffold-free artifacts.** No shipped artifact — binary archive, addon archive, or source archive generated from a tag — contains planning or agent-engine directories.
 
 ## 5. Detailed Design
@@ -85,6 +87,7 @@ A release holds these five files for each supported line. Releases 0.1.0 to 0.4.
 | `[CHANGELOG]` | `CHANGELOG.md` | User-facing release notes |
 | `[MANIFEST]` | `Cargo.toml` | Server version and release profile |
 | `[ADDON]` | `addons/godot_mcp/plugin.cfg` | Addon version |
+| `[VERSION]` | `src/version.rs` | The version a server reports, with its commit (DS-9) |
 
 ## Document History
 
@@ -93,3 +96,4 @@ A release holds these five files for each supported line. Releases 0.1.0 to 0.4.
 | 1.0.0 | 2026-10-16 | Agent (magic.analyze first-time) | Reverse-engineered from the release workflow and the release skill at 94e4540. DS-4 and DS-8 added to keep the specification-driven workflow out of user-facing notes and source archives. |
 | 1.1.0 | 2026-10-20 | Agent (magic.spec) | [ADDED] Releases per Godot release line: line in the version string, one numbering, per-line changelog; [MODIFIED] release flow per line and asset names with the line. Stable → RFC → Stable after Post-Update Review. |
 | 1.2.0 | 2026-10-20 | Agent (magic.spec) | [MODIFIED] One release per number holding the files of every supported line, one changelog, release flow and DS-3 accordingly. |
+| 1.3.0 | 2026-11-02 | Agent (magic.spec) | [ADDED] DS-9 (a build names its commit) and DS-10 (the release number follows the changes). Source: the maintainer's observation that the patch number never moves between releases and the minor number only at publication; the manifests changing only in release commits is kept, because identity files differ per line and a per-pull-request bump would conflict on every carry. Stable → RFC → Stable after Post-Update Review. |

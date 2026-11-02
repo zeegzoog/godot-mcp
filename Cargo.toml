@@ -1,8 +1,8 @@
 [package]
 name = "godot-mcp"
-version = "0.12.1-dev+godot.4.8"
+version = "0.13.0-dev+godot.4.8"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.87"
 authors = ["Oleg Alexandrov <alexandrovoleg.ru@gmail.com>"]
 description = "High-performance Model Context Protocol (MCP) server for the Godot Game Engine"
 license = "MIT"
@@ -33,10 +33,10 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 thiserror = "2.0.21"
 anyhow = "1.0.104"
 uuid = { version = "1.29.0", features = ["v4"] }
-ruzstd = { version = "0.8.2", default-features = false, features = ["std"] }
+ruzstd = { version = "0.9.1", default-features = false, features = ["std"] }
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2.189"
+libc = "0.2.191"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [

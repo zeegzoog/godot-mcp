@@ -1,6 +1,6 @@
 # Community Health Files (GitHub)
 
-**Version:** 1.1.0
+**Version:** 1.1.1
 **Status:** Stable
 **Layer:** implementation
 **Implements:** l1-community-health.md
@@ -25,7 +25,7 @@ GitHub shows these files only under fixed names and takes the security policy fr
 - GitHub looks for `SECURITY.md` and `CONTRIBUTING.md` in `.github/`, the root or `docs/`; the root is used (both stubs are already there and the root is what a person browsing the repository sees first).
 - The repository is public, has no Discussions, and private vulnerability reporting is off (checked 2026-10-20); a maintainer turns it on (§5.4).
 - The reporting link is `https://github.com/zeegzoog/godot-mcp/security/advisories/new`.
-- Toolchain minimum from `Cargo.toml`: Rust 1.85 (`rust-version`), edition 2024.
+- Toolchain minimum from `Cargo.toml`: Rust 1.87 (`rust-version`), edition 2024.
 - Commit messages in the history follow Conventional Commits with a scope (`fix(issues): …`, `ci: …`, `build(deps): …`).
 - Both files are Markdown checked against `.markdownlint.json`; no horizontal rules.
 
@@ -113,3 +113,4 @@ Private vulnerability reporting: Settings → Code security → Private vulnerab
 | 1.0.1 | 2026-10-20 | Agent (magic.spec) | [MODIFIED] The Install cell names the release by the tag suffix instead of the title. |
 | 1.0.2 | 2026-10-20 | Agent (magic.spec) | [MODIFIED] The Install cell names the files of the latest release, which holds every line. |
 | 1.1.0 | 2026-10-20 | Agent (magic.spec) | [MODIFIED] CH-5 row and files for the Issues and Pull Requests section, the issue forms, the pull request template and the steward exception in § For AI Agents. Stable → RFC by the parent's amendment (C12) → Stable after Post-Update Review. |
+| 1.1.1 | 2026-11-02 | Agent (magic.spec) | Toolchain minimum 1.87 after the ruzstd and libc updates. No requirement changed. |

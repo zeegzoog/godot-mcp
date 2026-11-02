@@ -188,6 +188,32 @@ fn triple(version: &str) -> Option<(u32, u32, u32)> {
 }
 
 #[test]
+fn the_release_skill_takes_the_number_from_the_readiness_script() {
+    // The number a release takes follows the Conventional Commit types since the last release,
+    // and is computed by one script instead of being judged by hand in each release.
+    let skill = read(".agents/skills/release/SKILL.md");
+    assert!(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(".agents/skills/repo-steward/scripts/readiness.sh")
+            .is_file(),
+        "the readiness script the release skill names does not exist"
+    );
+    let step = skill
+        .split("3. **Choose the version number.**")
+        .nth(1)
+        .and_then(|rest| rest.split("4. **Release commit on every line.**").next())
+        .expect("release skill step 3 (choose the version number)");
+    assert!(
+        step.contains("repo-steward/scripts/readiness.sh"),
+        "step 3 must name the readiness script that computes the number:\n{step}"
+    );
+    assert!(
+        skill.contains("## Between Releases: the Development Version"),
+        "the release skill must say when master's -dev number moves"
+    );
+}
+
+#[test]
 fn development_version_is_newer_than_the_last_release() {
     // `master` is never released, but it must report a number above the newest release in the
     // changelog; otherwise a build of `master` claims to be an older release. A release commit

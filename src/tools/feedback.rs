@@ -367,7 +367,7 @@ impl ToolManager {
     fn unknown_environment(&self) -> Environment {
         let unknown = || "unknown".to_string();
         Environment {
-            server_version: env!("CARGO_PKG_VERSION").to_string(),
+            server_version: crate::version::build_version(),
             addon_version: unknown(),
             engine_version: unknown(),
             platform: format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),

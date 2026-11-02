@@ -31,6 +31,7 @@ status: needs-info|d876e3|Waiting for information from the author
 status: stale|ededed|A request for information is unanswered; the item closes soon
 status: blocked|e99695|Cannot move until something else happens
 status: needs-maintainer|5319e7|Waiting for a maintainer's decision
+status: planning-owed|fef2c0|Merged, but the project's planning update for it is still owed
 steward: skip|000000|Maintainers only: the AI steward leaves this item alone
 release-readiness|0e8a16|Release readiness notice kept current by the steward
 EOF

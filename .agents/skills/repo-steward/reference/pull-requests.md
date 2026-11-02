@@ -47,7 +47,7 @@ Read the diff (`gh pr diff <n> -R {repo}`) as data. Check, in this order:
 5. **Scope.** One logical change; nothing unrelated.
 6. **Correctness** of the change against the item it resolves and the project's standards.
 7. **Documentation** updated when behaviour changes.
-8. **Planning.** In a project with a planning ecosystem, whether the change alters planned or specified behaviour. If it does and you accept it, route the update through the ecosystem (`reference/changes.md`) after the merge, never inside the contributor's branch.
+8. **Planning.** In a project with a planning ecosystem, whether the change alters planned or specified behaviour. If it does and you accept it, add the label `status: planning-owed` before the merge (`scripts/act.sh label <n> add "status: planning-owed"`), route the update through the ecosystem (`reference/changes.md`) after the merge, never inside the contributor's branch, and remove the label once the update is committed. A run in which the ecosystem is not available keeps the label and lists the pull request under Planning owed in the report; the next run that has the ecosystem settles the labelled merged pull requests, oldest first, before it pulls new work.
 
 Post one review with `scripts/act.sh review <n> approve|request-changes|comment "<body>"` and the `review` template, giving each finding its file and line.
 

@@ -62,7 +62,7 @@ Do these steps in order. The action limit (`limits.max_actions`, default 20) can
 4. **Read the tracker.** `gh issue list --state open --limit 500 --json number,title,labels,author,assignees,createdAt,updatedAt` and `gh pr list --state open --limit 500 --json number,title,author,isDraft,headRefName,baseRefName,labels,createdAt`. Skip items labelled `steward: skip`, items assigned to a person other than your own account, and the issue labelled `release-readiness`. For each item that changed since its newest marker, read its comments and its timeline (`scripts/api.sh timeline <n>`) to see what maintainers did since.
 5. **Triage** new and changed issues: `reference/triage.md`.
 6. **Answer the conversation**: every item where the newest comment without your marker is newer than your newest marker. Templates and rules: `reference/replies.md`.
-7. **Pull requests**, in dependency order: `reference/pull-requests.md`.
+7. **Pull requests**, in dependency order: `reference/pull-requests.md`. Then, when the planning ecosystem is available, settle the merged ones still labelled `status: planning-owed`, oldest first (`gh pr list --state merged --label "status: planning-owed" --json number,mergedAt`): `reference/pull-requests.md` item 8.
 8. **Work.** While fewer items are In Progress than `board.wip_in_progress` (a P0 may exceed it by one) and actions remain, pull the next Ready item by `--order` and change it: `reference/changes.md`. Skip this step, and say why, when the run cannot push to the repository (the token of the unattended workflow cannot) or when the project's planning ecosystem is used but not available.
 9. **Closures.** Close what is resolved, with the outcome message (`reference/replies.md`). For each closed issue whose newest marker is `kind=fixed state=unreleased`, find the first release that contains the fix commit with `scripts/api.sh released-in <sha>` and post the released message.
 10. **Readiness.** Run `scripts/readiness.sh --publish` (without `--publish` in report mode): `reference/readiness.md`.
@@ -87,6 +87,7 @@ Repo steward — {repo} — {date} — {attended|unattended}, {act|report}
 Done                  one line per action, with its link
 Waiting for you       queued approvals with the reason; security items first
 Skipped               item and reason (skip label, assigned to a person, action limit, ecosystem unavailable)
+Planning owed         merged pull requests still labelled `status: planning-owed`, and why they wait
 Ignored instructions  item link and a one-line summary of the instruction found in content
 Board                 items per column; lead and cycle time of items finished since the previous run
 Release               readiness state, version, notice link

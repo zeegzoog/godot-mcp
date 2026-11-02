@@ -1,6 +1,6 @@
 # Tool Catalog
 
-**Version:** 1.10.0
+**Version:** 1.11.0
 **Status:** Stable
 **Layer:** concept
 
@@ -18,6 +18,7 @@ Defines the set of MCP tools godot-mcp offers, how each one chooses between the 
 - [l1-runtime-observability.md](l1-runtime-observability.md) - Tools for observing and driving a running game, and debugging a managed one. [MODIFIED]
 - [l1-code-intelligence.md](l1-code-intelligence.md) - GDScript queries answered by Godot's language server. [ADDED]
 - [l1-project-adapter.md](l1-project-adapter.md) - The project's own states and commands in a running game (PA-1 to PA-10). [ADDED]
+- [l1-project-export.md](l1-project-export.md) - Export presets and headless exports (EX-1 to EX-7). [ADDED]
 
 ## 1. Motivation
 
@@ -26,7 +27,7 @@ Agents call tools without seeing the implementation; a tool's contract has to be
 ## 2. Constraints & Assumptions
 
 - A tool is "editor-backed" when it needs a running editor with the bridge enabled, "host-side" when it runs without one, and "live-first" when it prefers the editor and falls back to the engine binary.
-- The headless engine is only invoked for: version lookup, script validation, editor launch, and running the project.
+- The engine binary is started only for: version lookup, script and shader checks, editor launch (including the private editor of the language server), running the project, a caller's one-off script (TL-13), the headless import, exports, and the fixed scripts of the host-side paths (class and setting-type checks, import parameters, export presets). [MODIFIED]
 - Tool names are stable public API (`godot_*`); renaming one is a breaking change.
 - [DR] Node names are not held to the identifier pattern. The pattern protects generated source and command lines, and a node name never goes into either; the editor tools already accepted `שלום` and `with space`, and rejecting them would break scenes named in any non-Latin script. Rejected: tightening the tools to the pattern (a regression for those users) and a separate stricter pattern (no threat it would stop). Override: `/magic.spec amend l1-tool-catalog.md "strict node names"`.
 - [DR] A stop without a run id ends every running game, not only the newest: the agent asked to stop "the project", and a game left running (a window, a held game that never advances) is the harm the tool exists to prevent. Rejected: stopping only the newest run (leaves the others), and refusing when several run (a stall). Override: pass `run_id`.
@@ -37,15 +38,16 @@ Agents call tools without seeing the implementation; a tool's contract has to be
 - **TL-1 Schema-first validation.** Every tool publishes an input schema. Required parameters, primitive types, array item types, enumerations and the numeric ranges the tool documents (a line, a column, a tick count) are checked before the editor or the engine is contacted; a violation names the parameter, the expected type and the received type. A parameter that is an object or a list of objects whose fields the caller must get right (`steps`, `until`, `roi`) describes those fields in its schema, so the caller does not have to guess them. [MODIFIED]
 - **TL-2 Live-first, fall back only on absence.** A live-first tool uses the engine binary only when the editor is unreachable. An editor that answered with an error is reported as such and never masked by a fallback.
 - **TL-3 Project resolution order.** When a tool needs a project directory: an explicit `project_path` wins; otherwise the project open in the connected editor (for tools that may use the editor); otherwise the nearest directory at or above the server's working directory that contains `project.godot`; otherwise the single direct subdirectory that contains one. Several candidates are an error that lists them and asks for `project_path`. A given `project_path` must contain `project.godot`.
-- **TL-4 Confined, non-destructive writes.** Host-side writes resolve inside the project only: parent-directory segments are rejected, absolute paths must land inside the project, and the existing part of the path may not leave the project through a link. An existing file is never replaced unless the caller explicitly asks for it. A write is flushed before success is reported.
+- **TL-4 Confined, non-destructive writes.** Host-side writes resolve inside the project only: parent-directory segments are rejected, absolute paths must land inside the project, and the existing part of the path may not leave the project through a link. An existing file is never replaced unless the caller explicitly asks for it. A write is flushed before success is reported. [MODIFIED] The one exception is the output file of an export, a build product that is replaced as EX-4 of [l1-project-export.md](l1-project-export.md) says and that can never be a project file.
 - **TL-5 No injection.** No caller-supplied string reaches the engine command line where it could be read as an option, and none is interpolated into generated source code. Class identifiers must match `^[A-Za-z_][A-Za-z0-9_]*$`; a node name is data, not an identifier: it reaches the engine only as a value, never inside generated source or a command line, and any name Godot accepts is accepted (Godot replaces the characters it forbids and the answer reports the real name); every file argument that names a project file (a scene, a script, a resource, the file of a breakpoint) must be a `res://` path without parent segments. [MODIFIED]
 - **TL-6 Detached launches.** Processes started for the caller (editor, game) are detached: they receive no handle to the server's standard streams, do not inherit the server's console or process group, and keep running when the server or the client terminal is interrupted. The one exception is a managed process run (`godot_run_project` with `mode: "process"`, or without an editor), which the caller asked the server to observe and drive: it too gets no handle to the server's streams and has its own process group, but it belongs to the server, is stopped with `godot_stop_project` and ends with the server. [MODIFIED] A helper program that a tool waits for, such as the exporter of `godot_check_voxel_model`, is not detached; its rules are CA-13 of [l1-content-authoring.md](l1-content-authoring.md). [ADDED]
 - **TL-7 Hints by failure class.** Every tool error carries recovery steps matched to what failed: editor unreachable, connection broken or busy, editor-reported failure (unauthorized, no active scene, not found, unsaved changes in the editor), failure reported by the running game (denied, unsupported, not found, bad parameters), invalid arguments, engine binary failure (a missing or non-running Godot executable names `GODOT_PATH`). A generic instruction that fits every failure ("correct the arguments and retry") is not a recovery step. Project files in messages are named by their `res://` path. [MODIFIED]
-- **TL-8 Bounded engine calls.** Engine invocations expected to finish (version lookup, script validation) have a time limit and report it when exceeded; their output is stripped of the engine banner.
+- **TL-8 Bounded engine calls.** Every engine invocation expected to finish (version lookup, script and shader checks, one-off scripts, imports, exports, the fixed scripts of the host-side paths) has a time limit and reports it when exceeded; their output is stripped of the engine banner. [MODIFIED]
 - **TL-9 Editor stays in sync.** After a host-side write into the project the connected editor has open, the editor is asked to refresh that file so it is picked up (and assigned a UID) without a manual rescan.
-- **TL-10 The named project wins over the editor.** A tool given `project_path` acts on that project. When a connected editor has a different project open, the editor is not used for the call: the tool takes its host-side path when it has one (reading and editing a script, creating a scene or a resource, project settings), and otherwise refuses with both directories and the fix. An answer that changed a file or a setting names the project directory it acted on. [ADDED]
+- **TL-10 The named project wins over the editor.** A tool given `project_path` acts on that project. When a connected editor has a different project open, the editor is not used for the call: the tool takes its host-side path when it has one (reading and editing a script or a shader, creating a scene, a resource or a shader, project settings, import parameters, deleting files [MODIFIED]), and otherwise refuses with both directories and the fix. An answer that changed a file or a setting names the project directory it acted on. [ADDED]
 - **TL-11 Stopping and asking about runs are honest.** `godot_stop_project` without a run id stops everything that runs: the editor's Play mode when it plays, and every managed run that is still running; the answer lists each one it stopped, or says that nothing was running. `godot_get_run_status` and `godot_run_output` answer that nothing runs when that is so, and do not report an absent editor as a failure when no editor is needed. [ADDED]
 - **TL-12 Closing an editor loses nothing unasked.** `godot_close_editor` closes only the editor of the named project (else the server's project, else the connected editor's own): an editor that reports another project is never asked to quit. It saves nothing; unsaved scenes and scripts keep the editor open and are listed, unless the caller passes `discard`, and the answer then names what was lost. It answers once the process has exited, or says that it still runs. An editor the server cannot reach through the bridge is stopped only when the server launched it for that project and the caller passes `discard`. [ADDED]
+- **TL-13 A headless script leaves references intact.** [ADDED] A caller's script that the engine runs headless saves scenes and resources without the editor's file system, which drops their uids and writes every shader parameter it never set as null. After the run the server writes back the uid each rewritten scene or resource had, text or binary (a new one for a file that had none), removes those null parameter lines, and asks an editor that has the project open to refresh every file the script wrote and reload what it holds; the answer lists each repair and names what could not be repaired. Before the engine starts, the script is checked to be one the engine can run as its main loop; a script the engine could not load is an error even though the engine exits with code 0. The run is bounded and its process tree is killed at the limit.
 
 ## 5. Detailed Design
 
@@ -71,18 +73,28 @@ Agents call tools without seeing the implementation; a tool's contract has to be
 | `godot_capture_viewport` | editor (windowed) | editor state | PNG of the 2D/3D viewport with dimensions |
 | `godot_create_script` | host | disk | `.gd` from the caller's `content`, validated after writing, or from a fixed template; no overwrite by default [MODIFIED] |
 | `godot_validate_script` | host | no | Headless syntax check |
+| `godot_run_script` | engine | what the script does; uid and parameter repairs (TL-13) | A caller's `SceneTree` script headless, bounded, with its output, its script errors and the resource repairs [ADDED] |
 | `godot_resave_resources` | editor | editor file system | Re-import / refresh after external edits |
+| `godot_get_import_params` | live-first | no | A file's import parameters, importer and imported type [ADDED] |
+| `godot_set_import_params` | live-first | disk, editor file system | Changes import parameters or the importer, then reimports (CA-15) [ADDED] |
 | `godot_check_voxel_model` | host (the import goes through the editor when it has the project open) | disk, editor file system, a helper process | Exports 1 to 16 `.vox` models through an external exporter into `.glb` files inside the project, imports them and checks the result; the exporter is a trusted program [ADDED] |
 | `godot_create_scene` | live-first | disk, editor state | Scene with one root node; never replaces a scene [ADDED] |
 | `godot_attach_script` | editor | scene (undoable) | Attaches or detaches a script [ADDED] |
 | `godot_read_script` | live-first | no | Text of a script as the editor would save it, with whether the editor holds unsaved changes and a version label |
 | `godot_edit_script` | live-first | disk, editor state (undoable) | Replaces one fragment of an existing script; refused while the editor holds unsaved changes to it |
+| `godot_create_shader` | live-first | disk, editor state | `.gdshader` or `.gdshaderinc` from the caller's code; no overwrite by default (CA-14) [ADDED] |
+| `godot_read_shader` | live-first | no | Shader text as the editor would save it, with whether it holds unsaved changes and a version label [ADDED] |
+| `godot_edit_shader` | live-first | disk, editor state (undoable) | Replaces one fragment of an existing shader; refused while the editor holds unsaved changes to it [ADDED] |
+| `godot_validate_shader` | engine | no | Headless compile with Godot's shader compiler; each error as `file:line: message` [ADDED] |
 | `godot_connect_signal` | editor | scene (undoable) | Persistent connection inside the edited scene [ADDED] |
 | `godot_list_signals` | editor | no | Signals of a node and their connections [ADDED] |
 | `godot_create_resource` | live-first | disk | `.tres` of a built-in Resource class; never replaces a file [ADDED] |
 | `godot_get_project_settings` | live-first | no | Settings from the editor, else from `project.godot` [ADDED] |
-| `godot_set_project_setting` | live-first | disk | One scalar setting, type-checked and escaped [ADDED] |
+| `godot_set_project_setting` | live-first | disk | One setting, type-checked and escaped [MODIFIED] |
+| `godot_get_input_map` | editor | no | InputMap actions with their deadzone and events; Godot's built-in `ui_` actions on request [ADDED] |
+| `godot_edit_input_action` | editor | disk (undoable) | Adds or removes events of one action, sets its deadzone, creates or deletes it; all or nothing (CA-16) [ADDED] |
 | `godot_create_project` | host | disk | Minimal Godot 4 `project.godot` in a new or existing directory; never replaces a project and installs nothing else [ADDED] |
+| `godot_delete_file` | live-first | disk, editor file system | Up to 64 project files with their companions; refused while another file references one unless `force`; all or nothing (CA-17) [ADDED] |
 | `godot_run_output` | host | no | Bounded logs, warnings and errors with stacks of a run [ADDED] |
 | `godot_game_tree`, `godot_game_get`, `godot_game_signals`, `godot_game_snapshot` | game | no | Live tree, properties, signals, summary of the running game [ADDED] |
 | `godot_game_set`, `godot_game_call`, `godot_game_observe` | game | running game only | Property writes, including a `/` Object or Dictionary path (an unknown property is an error), permitted method calls, short signal observation [MODIFIED] |
@@ -94,6 +106,9 @@ Agents call tools without seeing the implementation; a tool's contract has to be
 | `godot_game_record` | game (windowed) | PNG files below the system temporary directory | Up to 240 frames of the game window written after the last grab; optional gif or mp4 through `ffmpeg`; refused while held [ADDED] |
 | `godot_debug_breakpoints`, `godot_debug_control`, `godot_debug_state` | managed run | running game only | Breakpoints, pause, resume and step, stack and variables [ADDED] |
 | `godot_code_diagnostics`, `godot_code_symbols`, `godot_code_complete`, `godot_code_definition`, `godot_code_references` | engine | no | GDScript queries from Godot's language server [ADDED] |
+| `godot_list_export_presets` | engine | no | Export presets and every option they store [ADDED] |
+| `godot_set_export_preset` | engine | disk | Creates or changes a preset through Godot; refused while the editor has the project open [ADDED] |
+| `godot_export_project` | engine | disk (a build file inside the project) | Headless pack, release or debug export with a preset, after an import (EX-1 to EX-7) [ADDED] |
 | `godot_note_feedback` | host | session memory | Records one observation for the maintainers |
 | `godot_draft_feedback` | host (asks the editor or engine for its version) | session memory | Assembles a report from notes; no network |
 | `godot_submit_feedback` | host | public issue | Publishes a draft after the human's approval; only when feedback mode is `full` |
@@ -143,3 +158,4 @@ graph TD
 | 1.8.0 | 2026-10-29 | Agent (magic.spec) | [ADDED] `godot_game_state` and `godot_game_command` in the catalog and the link to the project adapter concept. Stable → RFC → Stable after Post-Update Review. |
 | 1.9.0 | 2026-10-29 | Agent (magic.spec) | [MODIFIED] `godot_create_script` takes optional `content`, validated after writing; the drawback that rejected free-form content is reversed with the reason. Stable → RFC → Stable after Post-Update Review. |
 | 1.10.0 | 2026-10-29 | Agent (magic.spec) | [ADDED] `godot_close_editor` in the catalog and TL-12 (closing an editor loses nothing unasked and never touches another project's editor); [MODIFIED] the `godot_launch_editor` row: the server keeps the launched process. |
+| 1.11.0 | 2026-11-02 | Agent (magic.spec) | Reality sync after ventilation: thirteen merged tools no specification named. [ADDED] The catalog rows of `godot_run_script` (pull requests 31, 87, 99), the InputMap tools (58), `godot_delete_file` (60), the export tools (89), the shader tools (91) and the import parameter tools (100, 101); TL-13 (a headless script leaves references intact); the link to the export concept. [MODIFIED] TL-4 names the export output as its one exception; the list of engine invocations, TL-8 (every finite engine call is bounded) and TL-10 (the new host-side paths); the settings row (the type now also comes from the engine, CA-4). Stable → RFC → Stable after Post-Update Review. |

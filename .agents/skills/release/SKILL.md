@@ -10,7 +10,7 @@ description: Release godot-mcp (one release holding the files for every supporte
 Read this first; every procedure below uses these terms.
 
 - **Line**: godot-mcp is built per Godot minor version `M.N` (for example `4.6`). Each supported version has a release line on the branch `godot-vM.N`. `master` is the development line: it targets the next Godot version, which has no stable release yet, and it is never released.
-- **Version string**: `X.Y.Z+godot.M.N` on a release line (`0.5.1+godot.4.6`), `X.Y.Z-dev+godot.M.N` on `master`. The same string is in `Cargo.toml` and `addons/godot_mcp/plugin.cfg`.
+- **Version string**: `X.Y.Z+godot.M.N` on a release line (`0.5.1+godot.4.6`), `X.Y.Z-dev+godot.M.N` on `master`. The same string is in `Cargo.toml` and `addons/godot_mcp/plugin.cfg`. The manifests change only in release commits (and when `master`'s `-dev` number moves, see "Between Releases"), never in a pull request, so the version a running server reports adds the commit it was built from as build metadata (`0.13.0-dev+godot.4.8.g6295b51ab`, `src/version.rs`): two builds between releases differ there. The addon's version, from `plugin.cfg`, has no commit.
 - **Release**: one GitHub Release per number `X.Y.Z`, named `vX.Y.Z`, holding the files of every supported line: for each line `M.N` four server archives and one addon archive, all with `-godotM.N` in the name. The supported lines are listed in `.github/lines` on `master`. A line without a change of its own still takes part: its release commit only advances its version.
 - **Tags**: a **line tag** `vX.Y.Z+godot.M.N` on each line's release commit anchors that line's sources and starts nothing. The **release tag** `vX.Y.Z` on the `master` release commit starts the release workflow; it builds every line from its line tag.
 - **Identity files**: the only files that differ between lines on purpose — `Cargo.toml` and `Cargo.lock` (version), `addons/godot_mcp/plugin.cfg` (version), `addons/godot_mcp/plugin.gd` (`MIN_MAJOR`, `MIN_MINOR`), `project.godot` (`config/features`), `.github/godot-version` (the exact Godot build the line is tested against). `cargo test --test version_sync_test` checks that they agree. The release notes are one `CHANGELOG.md` on `master`; the copies on the lines are frozen history.
@@ -49,6 +49,15 @@ Pushing a tag publishes a GitHub Release that cannot be taken back. Every step t
    - When the carried copy goes through a pull request, title it `[4.7] <original title>`.
 4. Skip a line on which the test does not reproduce the problem.
 5. Never carry a release commit (a line's version bump, the changelog section on `master`): each release makes its own.
+
+## Between Releases: the Development Version
+
+After a release `master` says `X.Y.Z+1-dev`, which assumes the next release is a patch. The commits that follow usually say otherwise (every release since 0.5.1 held a `feat`, so every one took a minor number), and `master` then reports a number the release will not have. Keep it honest with one commit, whenever the readiness script's `version=` (see C step 3) is higher than the core of `master`'s `-dev` version:
+
+1. Set `Cargo.toml` and `addons/godot_mcp/plugin.cfg` on `master` to that number with `-dev`, for example `0.13.0-dev+godot.4.8` while `0.12.1-dev+godot.4.8` is there.
+2. `cargo build` (updates `Cargo.lock`), `cargo test --test version_sync_test`, then commit `chore(release): move master to 0.13.0-dev` on its own. It is a `master` commit only: never carry it to a line.
+
+A pull request does not do this (contributors leave versions alone); the maintainer or the steward's readiness notice, which names the number, prompts it. The number a release takes is still chosen in C step 3, not read from `-dev`.
 
 ## C. Release
 
@@ -116,7 +125,13 @@ A release covers every line in `.github/lines`. Work on the branches or on one w
    git tag -l 'v*' | sed 's/^v//; s/[-+].*//' | sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1
    ```
 
-   Bump it by the kind of change (see Numbering). A version the user names wins if it is above that number.
+   Do not judge the bump by hand: the number the commits imply is the `version=` of the first line that the steward's readiness script prints. It reads the Conventional Commit types since the newest release tag (a breaking change or a `feat` bumps the minor number before 1.0, anything else the patch; see Numbering):
+
+   ```bash
+   bash .agents/skills/repo-steward/scripts/readiness.sh | head -n 1     # state=due version=0.13.0
+   ```
+
+   A version the user names wins if it is above that number.
 
 4. **Release commit on every line.** On each line's branch set both manifests to `0.5.1+godot.M.N` (`Cargo.toml` `version = "…"`, `addons/godot_mcp/plugin.cfg` `version="…"`), even when the line has no other change. Then:
 

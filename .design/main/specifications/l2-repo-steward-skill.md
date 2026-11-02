@@ -1,6 +1,6 @@
 # Repo Steward Skill (GitHub)
 
-**Version:** 1.1.0
+**Version:** 1.2.0
 **Status:** Stable
 **Layer:** implementation
 **Implements:** l1-repository-stewardship.md
@@ -157,6 +157,7 @@ Board actions additionally need the `project` scope (or `STEWARD_PROJECT_TOKEN` 
 | Outcome | `duplicate`, `invalid`, `wontfix` | GitHub's defaults, reused |
 | Priority | `priority: P0` … `priority: P3` | created |
 | Waiting | `status: needs-info`, `status: stale`, `status: blocked`, `status: needs-maintainer` | created; `status: stale` is set by the reminder workflow |
+| Planning debt | `status: planning-owed` | created; on a merged pull request whose planned behaviour still has to go through the planning ecosystem ([procedures](l2-repo-steward-procedures.md) §5.1) [ADDED] |
 | Exclusion | `steward: skip` | maintainers only |
 | Notice | `release-readiness` | the readiness issue; never triaged |
 
@@ -173,6 +174,7 @@ Labels are the source of truth for type and priority; the board's Priority and K
  5. triage new or changed items      (reference/triage.md)
  6. answer the conversation          (reference/replies.md)
  7. pull requests in dependency order (reference/pull-requests.md)
+    then merged requests labelled status: planning-owed, oldest first, when the ecosystem is available
  8. while In Progress < WIP and actions left: pull the next Ready item (reference/changes.md)
  9. closures and released messages
 10. readiness.sh --publish           (attended or unattended; report mode prints it)
@@ -212,6 +214,7 @@ Repo steward — {owner}/{repo} — {date} — {attended|unattended}, {act|repor
 Done              one line per action, with link
 Waiting for you   queued approvals with reason; security items first
 Skipped           item, reason (skip label, assigned to a person, limit reached, ecosystem unavailable)
+Planning owed     merged requests still labelled status: planning-owed, and why they wait
 Ignored instructions  item link, one-line summary of the instruction found in content
 Board             counts per column; lead and cycle time of items finished since the previous run
 Release           readiness state, version, notice link
@@ -271,3 +274,4 @@ Manual steps printed by setup (generic):
 | 1.0.4 | 2026-10-20 | Agent (magic.run) | [MODIFIED] Message files are handed to gh as native paths on Windows (found in the first acting run). |
 | 1.0.5 | 2026-10-21 | Agent (magic.spec) | Added the skill directory to Canonical References. No requirement changed. |
 | 1.1.0 | 2026-10-21 | Agent (magic.spec) | [REMOVED] The pull request procedure, planning adapters, board, readiness and workflow templates (former §5.7 to §5.11), the invariant rows ST-7, ST-9, ST-15 and ST-17, five GitHub facts and two alternatives moved to l2-repo-steward-procedures.md; run report and setup renumbered §5.7 and §5.8. No requirement changed. |
+| 1.2.0 | 2026-11-02 | Agent (magic.spec) | [ADDED] The label `status: planning-owed`, the run step that settles labelled merged requests, and the run report line, for the planning-after-merge rule of the procedures. Stable → RFC → Stable after Post-Update Review. |

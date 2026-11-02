@@ -22,6 +22,11 @@ async fn initialize_echoes_a_supported_protocol_version() {
         .request("initialize", json!({"protocolVersion": "2025-06-18"}), FAST)
         .await;
     assert_eq!(reply["result"]["protocolVersion"], "2025-06-18");
+    assert_eq!(
+        reply["result"]["serverInfo"]["version"],
+        godot_mcp::version::build_version(),
+        "the server names the build, not only the manifest version"
+    );
 
     let reply = session
         .request("initialize", json!({"protocolVersion": "1999-01-01"}), FAST)

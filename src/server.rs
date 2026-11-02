@@ -138,7 +138,7 @@ impl McpServer {
                     "capabilities": { "tools": { "listChanged": false } },
                     "serverInfo": {
                         "name": "godot-mcp",
-                        "version": env!("CARGO_PKG_VERSION")
+                        "version": crate::version::build_version()
                     }
                 });
                 if let Some(guidance) = self.tool_manager.guidance() {

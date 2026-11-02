@@ -1,21 +1,39 @@
 ---
 phase: 10
 name: "Project Adapter"
-status: Todo
+status: Done
 subsystem: "addons/godot_mcp/runtime, src/tools/game, src/godot, tests, README"
 requires: [6, 7]
-provides: []
+provides:
+  - "godot_game_state and godot_game_command tools"
+  - "project adapter registry and loader in the in-game component (godot_mcp/adapter)"
+  - "project.state and project.command runtime methods, held and in editor Play"
+  - "adapter status in the hello and in godot_get_run_status"
+  - "proof on the 4.7, 4.6 and 4.5 lines with their own engines"
 key_files:
-  created: []
-  modified: []
-patterns_established: []
+  created:
+    - addons/godot_mcp/runtime/ops/rt_registry.gd
+    - addons/godot_mcp/runtime/ops/rt_project.gd
+    - src/tools/game/project.rs
+    - tests/common/adapter.rs
+  modified:
+    - addons/godot_mcp/runtime/mcp_runtime.gd
+    - addons/godot_mcp/runtime/ops/rt_output.gd
+    - src/tools/game/catalog.rs
+    - src/tools.rs
+    - README.md
+    - AGENTS.md
+patterns_established:
+  - "one development-only adapter script named by a project setting, with godot-dev-bridge's registration contract"
+  - "a failure in the project's own code is reported with its class, never hidden"
+  - "a fixed feasibility test on the real engine gates a design that rests on an engine fact"
 duration_minutes: ~
 ---
 
 # Stage 10 Tasks — Project Adapter
 
 **Phase:** 10
-**Status:** Todo
+**Status:** Done
 **Strategic Goal:** A project names one development-only adapter script in `godot_mcp/adapter`; the in-game component loads it with godot-dev-bridge's registration contract, and an agent reads the project's states with `godot_game_state` and runs its commands with `godot_game_command`, in a managed run and in editor Play, held or not, with failures in the project's code reported instead of hidden. An adapter written for godot-dev-bridge works unchanged.
 
 ## Atomic Checklist
@@ -30,7 +48,7 @@ duration_minutes: ~
 - [x] [T-10C02] Editor Play: the adapter answers in a played game (PA-10)
 - [x] [T-10D01] User-facing text: README, agent guide, check lists, changelog
 - [x] [T-10T01] Validation: pipeline, end-to-end suites and invariant coverage
-- [ ] [T-10E01] Carry to the release lines (after validation)
+- [x] [T-10E01] Prove the adapter on the release lines (carried with 0.12.0)
 
 ## Detailed Tracking
 
@@ -125,15 +143,17 @@ duration_minutes: ~
 
 - **Changes:** On `master` with the 4.8-beta1 build, one step after another: clippy and fmt clean; `cargo test --all-targets` passes (187 unit tests, `tools_test` 84, the rest unchanged); all 17 addon scripts pass `--check-only`; `editor_e2e_test` 19 of 20 (the one failure, `open_scene_returns_what_the_load_errors_dialog_shows`, compares the English dialog title with the Russian "Ошибки загрузки" of this machine's editor: environmental); `addon_export_test` 2 of 2; `runtime_e2e_test` 46 of 46, the analyzer audit included; `scenario_e2e_test` 5 of 5. Coverage of the invariants: PA-1 `a_game_without_an_adapter_setting_announces_none`, `an_adapter_named_by_path_or_by_uid_registers_what_it_offers`, `a_game_without_a_usable_adapter_refuses_both_tools_and_says_how_to_name_one`, and the tool schemas in `the_project_tools_are_listed_with_their_hints_and_say_what_a_command_may_do` (no parameter names or changes the adapter); PA-2 `registry_keeps_what_an_adapter_registers_and_lists_what_it_refused`; PA-3 the unknown names in `commands_run_by_name_and_every_kind_of_failure_is_told_apart` and `states_are_read_by_name_with_each_failure_kept_to_its_own_entry`; PA-4 the hints in the listing test and `free_a_node` in the commands test (a command frees a node, which `godot_game_call` refuses); PA-5 the registry test and the commands test (a refusal against an `error` entry); PA-6 `logger_sees_a_script_error_of_a_called_handler_at_once`, `output_marks_return_what_was_logged_since_with_the_script_errors_told_apart`, `an_adapter_that_cannot_be_used_says_why_and_keeps_what_it_registered` and the script-error and awaiting cases of the commands test; PA-7 the state test (`broken` fails alone); PA-8 the state test (the bound with `sizes`, `position` encoded as `game.get` does) and the commands test (a value over the bound); PA-9 `a_held_game_answers_both_tools_and_what_a_command_defers_lands_on_the_next_tick` and the awaiting case; PA-10 the path-or-uid test, `editor_play_answers_the_project_adapter`, `an_adapter_that_is_a_node_outside_the_tree_is_freed_when_the_game_ends`, `a_game_started_without_a_debugger_never_loads_the_adapter` and the unit tests over the private runtime copy. No row is empty.
 
-### [T-10E01] Carry to the release lines (after validation)
+### [T-10E01] Prove the adapter on the release lines (carried with 0.12.0)
 
 - **Spec:** l2-release-branches.md; l1-release-lines.md; l2-project-adapter.md §5.5
-- **Status:** Blocked
+- **Status:** Done
 - **Assignment:** Agent
-- **Verify:** On `godot-v4.7`, `godot-v4.6` and `godot-v4.5`, in that order, the product commits applied with `cherry-pick -x`; on each, clippy, fmt, `cargo test --all-targets`, the GDScript checks, `editor_e2e_test`, `addon_export_test` and `runtime_e2e_test` (ignored) pass with that line's own Godot build (4.7.2, 4.6.3, 4.5.2 are installed locally), one line after another.
+- **Verify:** The project adapter is on `godot-v4.7`, `godot-v4.6` and `godot-v4.5`: `rt_registry.gd`, `rt_project.gd`, `src/tools/game/project.rs` and `tests/common/adapter.rs` exist on each, `godot_game_state` and `godot_game_command` are in `README.md` and both runtime scripts are in the `AGENTS.md` check list (all checked on 2026-11-02 with `git ls-tree`). Then, on each line with that line's own Godot build (4.7.2, 4.6.3, 4.5.2), one after another: `cargo test --all-targets`, and `runtime_e2e_test` (ignored, `--test-threads=1`) including the adapter tests, pass. The Changes field records the line commits that carried the adapter (found with `git log --format=%h -S godot_game_state <line> -- src/tools/game/catalog.rs`) and the results.
 - **Handoff:** Pushing the branches needs the maintainer's yes in the conversation.
-- **Notes:** Product files only, not the planning files. Nothing here should need a call missing from 4.5.0; if a line's engine refuses one, guard it with `has_method()` + `call()`. Blocked on two things outside this phase: the product changes must be committed on master, and the lines must first receive the master work since their last carry (the 0.9.0 pull requests). Then carry in order 4.7, 4.6, 4.5 with `cherry-pick -x`, one line after another, and run the line checks (fmt, clippy, tests, the 17 script checks, editor, export and runtime suites) with that line's engine.
+- **Notes:** The earlier block (the lines lacked 130 commits of master) no longer holds: the lines were brought up to date and released as 0.12.0, and the adapter was carried with them. What is left is to record the carry and prove the adapter on each line's engine. No cherry-pick is needed; if a check fails on a line, fix it there as a line commit (`cherry-pick -x` from master when the fix exists on master). Product files only. Pushing needs the maintainer's yes in the conversation.
 - **Attempts:**
   - Applied the uncommitted product changes of master as one patch to detached worktrees of `godot-v4.7`, `godot-v4.6` and `godot-v4.5` → refused: the lines lack 130 commits of master (the unreleased 0.9.0 work, #52 to #62, among them the tool hints and the held-list text this patch builds on), so six files do not apply
   - Cherry-pick with `-x` as the task says → not possible yet: the product changes are not committed on master, and nothing here commits without the maintainer's say-so
 - **Changes:** Nothing carried. What was proved instead, against this tree with each line's own engine (4.7.2, 4.6.3, 4.5.2): the 13 end-to-end tests of the adapter, the held game, the unload at exit and the inert component all pass on each of them, so the runtime uses nothing the lines' first releases lack and no `has_method()` guard is needed.
+
+- **Changes (2026-11-02):** The adapter was already on all three lines and needed no carry: `rt_registry.gd`, `rt_project.gd`, `src/tools/game/project.rs` and `tests/common/adapter.rs` exist on `godot-v4.7`, `godot-v4.6` and `godot-v4.5`, which carried it as a240a63, 595f928 and 15e9fa0 and released it with 0.12.0; `README.md` lists both tools and `AGENTS.md` both scripts. Proved on each line's own engine (4.7.2, 4.6.3, 4.5.2), one after another, on the line's release commit (e3c0fc9, c2af857, 6860c90): `cargo test --all-targets` 403 passed, 0 failed; `runtime_e2e_test` (ignored, one thread) 51 of 51, the 11 adapter tests among them. Nothing failed, so no line commit was needed.

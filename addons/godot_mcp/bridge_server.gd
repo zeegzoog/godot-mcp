@@ -22,6 +22,8 @@ const INBOUND_BUFFER_SIZE: int = 1 << 22
 const OUTBOUND_BUFFER_SIZE: int = 1 << 25
 
 const MAX_VALUE_CHARS: int = 2000
+## Frames godot_open_scene waits for the editor to show a reloaded scene's tab.
+const SCENE_SWITCH_FRAMES: int = 30
 ## A full scan with wait, or the first import of a file the editor has never scanned, blocks
 ## the call for at most this long. The MCP client waits slightly longer than this.
 const RESAVE_WAIT_MSEC: int = 60000
@@ -660,9 +662,15 @@ func open_scene(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void
     EditorInterface.open_scene_from_path(scene_path)
     remember_scene_sync(scene_path)
     var active: String = _edited_scene_path()
-    if active != scene_path:
+    # An older editor finishes a reload on a later frame and ignores the switch made before it,
+    # so after a reload the switch is asked again on each frame.
+    var frames_left: int = SCENE_SWITCH_FRAMES if reloaded else 1
+    while active != scene_path and frames_left > 0:
         await get_tree().process_frame
+        if reloaded:
+            EditorInterface.open_scene_from_path(scene_path)
         active = _edited_scene_path()
+        frames_left -= 1
     if active != scene_path:
         send_error(peer, cmd_id, "Opened %s but the editor's active scene is '%s', so edits without scene_path would go to that scene. Click the %s tab in the editor, or call godot_open_scene again, then check godot_get_scene_tree." % [scene_path, active, scene_path.get_file()])
         return
@@ -2200,7 +2208,7 @@ func edit_shader(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> voi
         if not params.has(key):
             send_error(peer, cmd_id, "Missing %s. Pass the fragment to replace as old_text and its replacement as new_text." % key)
             return
-    _send_result(peer, cmd_id, _shader_ops().edit(res_path, str(params["old_text"]), str(params["new_text"]), str(params.get("version", ""))))
+    _send_result(peer, cmd_id, await _shader_ops().edit(res_path, str(params["old_text"]), str(params["new_text"]), str(params.get("version", ""))))
 
 ## The res:// path of the shader_path parameter, or "" after an error reply was sent.
 func _shader_command_path(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> String:

@@ -4735,18 +4735,18 @@ const SHADER_PROBE_HOOK: &str = r#"        "__shader_state":
             if ResourceLoader.has_cached(path):
                 out["memory_code"] = str(load(path).get("code"))
             if str(pair["state"]) == "found":
-                var base: CodeEdit = pair["editor"].call("get_base_editor")
+                var base: CodeEdit = _shader_ops()._buffer(pair["editor"])
                 out["text"] = base.text
                 out["dirty"] = base.get_version() != base.get_saved_version()
             send_success(peer, cmd_id, out)
         "__shader_type":
             var pair: Dictionary = _shader_ops()._pair_editor(str(params.get("path", "")))
-            var base: CodeEdit = pair["editor"].call("get_base_editor")
+            var base: CodeEdit = _shader_ops()._buffer(pair["editor"])
             base.insert_text(str(params.get("text", "")), 0, 0)
             send_success(peer, cmd_id, {"text": base.text})
         "__shader_undo":
             var pair: Dictionary = _shader_ops()._pair_editor(str(params.get("path", "")))
-            var base: CodeEdit = pair["editor"].call("get_base_editor")
+            var base: CodeEdit = _shader_ops()._buffer(pair["editor"])
             base.undo()
             send_success(peer, cmd_id, {"text": base.text})
         "ping":

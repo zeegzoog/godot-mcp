@@ -41,6 +41,14 @@ fn test_tool_definitions() {
     assert!(tool_names.contains(&"godot_resave_resources"));
     assert!(tool_names.contains(&"godot_read_script"));
     assert!(tool_names.contains(&"godot_edit_script"));
+    for shader_tool in [
+        "godot_create_shader",
+        "godot_read_shader",
+        "godot_edit_shader",
+        "godot_validate_shader",
+    ] {
+        assert!(tool_names.contains(&shader_tool), "{shader_tool} is listed");
+    }
 
     // Verify all input schemas are valid JSON objects
     for tool in tools {

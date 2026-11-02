@@ -2359,10 +2359,57 @@ func _is_setting_key(key: String) -> bool:
             return false
     return true
 
-## The value to store for a setting that already exists, or an error. The value must have the
-## type the setting has: a wrong type would be written to project.godot and fail at the next load.
+## The setting whose type governs `key`: the key itself when the engine or the project has it, or,
+## for a feature override (`name.mobile`), the base setting it overrides. "" when neither exists,
+## so a setting the engine does not define keeps the type of the value (as the server's file
+## fallback does).
+func _defined_setting_key(key: String) -> String:
+    if ProjectSettings.has_setting(key):
+        return key
+    var last: String = key.get_slice("/", key.get_slice_count("/") - 1)
+    if last.contains("."):
+        var base: String = key.substr(0, key.rfind("."))
+        if ProjectSettings.has_setting(base):
+            return base
+    return ""
+
+## The value of a setting whose type has no JSON form, from the text the caller sent, or null when
+## the text does not give that type: an HTML color or color name for a Color, a name for a
+## StringName or NodePath, otherwise the text project.godot stores (`Vector2i(1152, 648)`), which
+## must start with the type's own name and parse to that type. An Object is never created.
+## The server's file fallback runs the same rules (SETTING_TYPE_SCRIPT in src/cli_runner.rs).
+func _setting_from_text(value: Variant, type: int) -> Variant:
+    if not value is String:
+        return null
+    var text: String = (value as String).strip_edges()
+    match type:
+        TYPE_COLOR:
+            var missing: Color = Color(-1, -1, -1, -1)
+            var color: Color = Color.from_string(text, missing)
+            if color != missing:
+                return color
+        TYPE_STRING_NAME:
+            return StringName(value)
+        TYPE_NODE_PATH:
+            return NodePath(value)
+    if type == TYPE_OBJECT or not text.begins_with(type_string(type) + "("):
+        return null
+    var parsed: Variant = str_to_var(text)
+    if typeof(parsed) == type:
+        return parsed
+    return null
+
+func _setting_type_refusal(type: int) -> String:
+    if type == TYPE_COLOR:
+        return "This setting expects a Color: send an HTML color such as \"#102b38\" or \"#102b38ff\", or a color name such as \"white\""
+    var type_name: String = type_string(type)
+    return "This setting expects a %s: send it as a string the way project.godot stores it, such as \"%s(...)\". Change settings of other types in the editor's Project Settings." % [type_name, type_name]
+
+## The value to store for a setting of the type of `current`, or an error. The value must have
+## that type: a wrong type would be written to project.godot and fail at the next load.
 func _coerce_setting(current: Variant, value: Variant) -> Dictionary:
-    match typeof(current):
+    var type: int = typeof(current)
+    match type:
         TYPE_STRING:
             if value is String:
                 return {"value": value}
@@ -2375,7 +2422,12 @@ func _coerce_setting(current: Variant, value: Variant) -> Dictionary:
         TYPE_FLOAT:
             if (value is float or value is int) and not value is bool:
                 return {"value": float(value)}
-    return {"error": "This setting expects a %s; a value of another type is not stored. Change settings of other types in the editor's Project Settings." % type_string(typeof(current)).to_lower()}
+        _:
+            var converted: Variant = _setting_from_text(value, type)
+            if converted != null:
+                return {"value": converted}
+            return {"error": _setting_type_refusal(type)}
+    return {"error": "This setting expects a %s; a value of another type is not stored. Change settings of other types in the editor's Project Settings." % type_string(type).to_lower()}
 
 func set_project_setting(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
     var key: String = str(params.get("key", ""))
@@ -2389,7 +2441,9 @@ func set_project_setting(peer: WebSocketPeer, cmd_id: String, params: Dictionary
     var previous: Variant = null
     if ProjectSettings.has_setting(key):
         previous = ProjectSettings.get_setting(key)
-        var coerced: Dictionary = _coerce_setting(previous, value)
+    var governing: String = _defined_setting_key(key)
+    if not governing.is_empty():
+        var coerced: Dictionary = _coerce_setting(ProjectSettings.get_setting(governing), value)
         if coerced.has("error"):
             send_error(peer, cmd_id, "'%s': %s" % [key, coerced["error"]])
             return

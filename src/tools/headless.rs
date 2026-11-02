@@ -64,7 +64,7 @@ fn damage_report(damage: &[ResourceDamage]) -> (Vec<Value>, Option<String>) {
         .collect::<Vec<_>>()
         .join(", ");
     let warning = format!(
-        "WARNING: the script rewrote {paths} without the editor, and the server could not repair them: resource_damage lists the uid:// references still missing and the shader parameters still written as null. Restore the files from version control, or put the listed uid=\"...\" back and delete the null shader_parameter lines; make sure the files are writable."
+        "WARNING: the script rewrote {paths} without the editor, and the server could not repair them: resource_damage lists the uid:// references still missing and the shader parameters still written as null. Restore the files from version control, or put the listed uid=\"...\" back (for a .scn or .res, with ResourceSaver.set_uid in a godot_run_script) and delete the null shader_parameter lines; make sure the files are writable."
     );
     (entries, Some(warning))
 }
@@ -78,6 +78,8 @@ struct RepairReport {
     editor: Option<Value>,
     /// Why the connected editor could not refresh them.
     editor_error: Option<String>,
+    /// Why Godot could not write uids back into binary scenes and resources.
+    binary_error: Option<String>,
 }
 
 impl RepairReport {
@@ -204,6 +206,7 @@ fn script_run_result(
         "resource_repairs": repair.entries(),
         "editor_refresh": repair.editor,
         "editor_refresh_error": repair.editor_error,
+        "binary_uid_error": repair.binary_error,
         "resource_damage": resource_damage,
     });
     let mut text = serde_json::to_string_pretty(&body).unwrap_or(summary);
@@ -605,12 +608,28 @@ impl ToolManager {
         project: &Path,
         snapshot: &TextResourceSnapshot,
     ) -> RepairReport {
-        let repairs = snapshot.repair_since(project);
+        // Binary files first, so a rewritten text scene that refers to one finds its uid again.
+        let plan = snapshot.binary_uid_plan(project);
+        let mut binary_error = None;
+        let mut repairs = Vec::new();
+        if !plan.is_empty() {
+            let uids: Vec<(String, String)> = plan
+                .iter()
+                .map(|fix| (fix.path.clone(), fix.uid.clone()))
+                .collect();
+            if let Err(error) = self.cli.set_binary_uids(project, &uids).await {
+                binary_error = Some(error.to_string());
+            }
+            repairs = snapshot.binary_repairs(project, &plan);
+        }
+        repairs.extend(snapshot.repair_since(project));
+        repairs.sort_by(|a, b| a.path.cmp(&b.path));
         let mut report = RepairReport {
             repairs,
             written: snapshot.written_since(project),
             editor: None,
             editor_error: None,
+            binary_error,
         };
         if report.written.is_empty() {
             return report;

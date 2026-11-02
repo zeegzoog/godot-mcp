@@ -7,6 +7,11 @@
 //! the saver asks for uids through a callback only the editor's file system installs. This module
 //! finds them after the run, writes back what the editor would have written, and reports what is
 //! still lost.
+//!
+//! The binary saver (`.scn`, `.res`) drops the uid the same way. Its header is read here (see
+//! `binary_resource`), and the uid is written back by Godot itself through `ResourceSaver.set_uid`,
+//! so a compressed file stays compressed: [`TextResourceSnapshot::binary_uid_plan`] says which
+//! files need it and [`TextResourceSnapshot::binary_repairs`] checks what took.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -14,6 +19,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use super::binary_resource::{BinaryUid, binary_uid, uid_text};
 use crate::paths::skipped_by_godot;
 
 /// Files larger than this are only fingerprinted, never read.
@@ -34,6 +40,26 @@ struct Before {
 pub struct TextResourceSnapshot {
     files: BTreeMap<String, Before>,
     loaded: BTreeMap<String, (u64, Option<SystemTime>)>,
+    binaries: BTreeMap<String, BinaryBefore>,
+}
+
+/// One binary scene or resource before the run.
+#[derive(Debug, Clone)]
+struct BinaryBefore {
+    len: u64,
+    modified: Option<SystemTime>,
+    uid: BinaryUid,
+}
+
+/// A uid to write into a binary scene or resource the run rewrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinaryUidFix {
+    /// `res://` path of the file.
+    pub path: String,
+    /// The uid it had before the run, or a new one for a file that had none.
+    pub uid: String,
+    /// Whether `uid` was created for a file that had none before the run.
+    pub new_uid: bool,
 }
 
 /// What a rewrite of one file lost.
@@ -90,7 +116,90 @@ impl TextResourceSnapshot {
                 loaded.insert(res, (meta.len(), meta.modified().ok()));
             }
         });
-        Self { files, loaded }
+        let mut binaries = BTreeMap::new();
+        walk(project, project, is_binary_resource, &mut |res, file| {
+            if let Ok(meta) = fs::metadata(file) {
+                binaries.insert(
+                    res,
+                    BinaryBefore {
+                        len: meta.len(),
+                        modified: meta.modified().ok(),
+                        uid: binary_uid(file),
+                    },
+                );
+            }
+        });
+        Self {
+            files,
+            loaded,
+            binaries,
+        }
+    }
+
+    /// The binary scenes and resources written or created since the snapshot, with their files.
+    fn binaries_changed_since(&self, project: &Path) -> Vec<(String, PathBuf)> {
+        let mut changed = Vec::new();
+        walk(project, project, is_binary_resource, &mut |res, file| {
+            let Ok(meta) = fs::metadata(file) else {
+                return;
+            };
+            let unchanged = self.binaries.get(&res).is_some_and(|old| {
+                old.len == meta.len()
+                    && old.modified.is_some()
+                    && old.modified == meta.modified().ok()
+            });
+            if !unchanged {
+                changed.push((res, file.to_path_buf()));
+            }
+        });
+        changed
+    }
+
+    /// The uid each binary scene or resource rewritten since the snapshot needs back: the one its
+    /// header had, when the rewrite dropped or changed it, or a new one for a file without any.
+    /// A header this server cannot read is left alone. Sorted by path.
+    pub fn binary_uid_plan(&self, project: &Path) -> Vec<BinaryUidFix> {
+        let mut plan = Vec::new();
+        for (res, file) in self.binaries_changed_since(project) {
+            let now = binary_uid(&file);
+            if now == BinaryUid::Unreadable {
+                continue;
+            }
+            let fix = match self.binaries.get(&res).map(|old| &old.uid) {
+                Some(BinaryUid::Uid(old)) if now != BinaryUid::Uid(old.clone()) => BinaryUidFix {
+                    path: res,
+                    uid: old.clone(),
+                    new_uid: false,
+                },
+                Some(BinaryUid::Uid(_)) => continue,
+                _ if now == BinaryUid::Missing => BinaryUidFix {
+                    path: res,
+                    uid: new_uid(),
+                    new_uid: true,
+                },
+                _ => continue,
+            };
+            plan.push(fix);
+        }
+        plan.sort_by(|a, b| a.path.cmp(&b.path));
+        plan
+    }
+
+    /// The fixes of `plan` whose uid the file's header now carries, as repairs.
+    pub fn binary_repairs(&self, project: &Path, plan: &[BinaryUidFix]) -> Vec<ResourceRepair> {
+        plan.iter()
+            .filter(|fix| {
+                res_file(project, &fix.path)
+                    .is_some_and(|file| binary_uid(&file) == BinaryUid::Uid(fix.uid.clone()))
+            })
+            .map(|fix| ResourceRepair {
+                path: fix.path.clone(),
+                uid: Some(fix.uid.clone()),
+                new_uid: fix.new_uid,
+                ext_resource_uids: Vec::new(),
+                removed_null_shader_parameters: Vec::new(),
+            })
+            .collect()
     }
 
     /// Every text scene, resource, script and shader written or created since
@@ -102,6 +211,11 @@ impl TextResourceSnapshot {
             .into_iter()
             .map(|(res, _, _)| res)
             .collect();
+        written.extend(
+            self.binaries_changed_since(project)
+                .into_iter()
+                .map(|(res, _)| res),
+        );
         walk(project, project, is_loaded_text, &mut |res, file| {
             let Ok(meta) = fs::metadata(file) else {
                 return;
@@ -124,6 +238,19 @@ impl TextResourceSnapshot {
         for (res, _, text) in self.changed_since(project) {
             if let Some(damage) = inspect(project, &res, &text, self.files.get(&res)) {
                 found.push(damage);
+            }
+        }
+        for (res, file) in self.binaries_changed_since(project) {
+            let Some(BinaryUid::Uid(old)) = self.binaries.get(&res).map(|old| &old.uid) else {
+                continue;
+            };
+            if binary_uid(&file) != BinaryUid::Uid(old.clone()) {
+                found.push(ResourceDamage {
+                    path: res,
+                    lost_uid: Some(old.clone()),
+                    ext_resources_without_uid: Vec::new(),
+                    null_shader_parameters: Vec::new(),
+                });
             }
         }
         found.sort_by(|a, b| a.path.cmp(&b.path));
@@ -309,7 +436,25 @@ fn uid_of(project: &Path, target: &str) -> Option<String> {
     if is_text_resource(&name) {
         return read_head(&file).and_then(|(uid, _)| uid);
     }
+    if is_binary_resource(&name) {
+        if let BinaryUid::Uid(uid) = binary_uid(&file) {
+            return Some(uid);
+        }
+    }
     None
+}
+
+/// The file of a `res://` path inside `project`, refusing `..` and empty parts.
+fn res_file(project: &Path, res: &str) -> Option<PathBuf> {
+    let relative = res.strip_prefix("res://")?;
+    if relative.is_empty()
+        || relative
+            .split('/')
+            .any(|part| part.is_empty() || part == "..")
+    {
+        return None;
+    }
+    Some(project.join(relative))
 }
 
 /// The name of a `shader_parameter/<name> = null` line.
@@ -337,20 +482,6 @@ fn is_uid_text(text: &str) -> bool {
 fn new_uid() -> String {
     let bits = uuid::Uuid::new_v4().as_u128();
     uid_text(((bits >> 64) as u64 ^ bits as u64) & 0x7FFF_FFFF_FFFF_FFFF)
-}
-
-fn uid_text(mut id: u64) -> String {
-    const DIGITS: &[u8; 34] = b"abcdefghijklmnopqrstuvwxy012345678";
-    let mut digits = Vec::new();
-    loop {
-        digits.push(DIGITS[(id % 34) as usize]);
-        id /= 34;
-        if id == 0 {
-            break;
-        }
-    }
-    digits.reverse();
-    format!("uid://{}", String::from_utf8_lossy(&digits))
 }
 
 fn read_small(path: &Path) -> Option<String> {
@@ -396,6 +527,10 @@ fn attribute(line: &str, key: &str) -> Option<String> {
 
 fn is_text_resource(name: &str) -> bool {
     name.ends_with(".tscn") || name.ends_with(".tres")
+}
+
+fn is_binary_resource(name: &str) -> bool {
+    name.ends_with(".scn") || name.ends_with(".res")
 }
 
 /// Scripts and shaders: text files the editor loads as resources but never saves with a uid.
@@ -708,5 +843,77 @@ shader_parameter/speed = 3.0
             fs::write(root.join(folder).join("pond.tscn"), HEADLESS_SAVED).expect("rewrite");
         }
         assert!(snapshot.damage_since(root).is_empty());
+    }
+
+    #[test]
+    fn a_binary_scene_rewritten_without_its_uid_is_planned_and_checked() {
+        use super::super::binary_resource::tests::{rscc, rsrc};
+        let project = tempfile::tempdir().expect("project");
+        let root = project.path();
+        let id = 0x63cf_e4ba_4e3a_8225_i64;
+        fs::write(root.join("gate.scn"), rscc(&rsrc(Some(id)))).expect("gate");
+        fs::write(root.join("kept.res"), rsrc(Some(5))).expect("kept");
+        fs::write(root.join("bare.res"), rsrc(None)).expect("bare");
+        let snapshot = TextResourceSnapshot::take(root);
+        assert!(
+            snapshot.binary_uid_plan(root).is_empty(),
+            "nothing written yet"
+        );
+
+        // The run rewrites gate.scn without its uid, rewrites kept.res with it, creates new.scn.
+        fs::write(
+            root.join("gate.scn"),
+            rscc(&[rsrc(None), vec![1; 50]].concat()),
+        )
+        .expect("gate");
+        fs::write(root.join("kept.res"), [rsrc(Some(5)), vec![1; 50]].concat()).expect("kept");
+        fs::write(root.join("new.scn"), rsrc(None)).expect("new");
+        let plan = snapshot.binary_uid_plan(root);
+        let paths: Vec<&str> = plan.iter().map(|fix| fix.path.as_str()).collect();
+        assert_eq!(paths, ["res://gate.scn", "res://new.scn"], "{plan:?}");
+        assert_eq!(plan[0].uid, "uid://dap714cpjw8pd");
+        assert!(!plan[0].new_uid);
+        assert!(plan[1].new_uid && is_uid_text(&plan[1].uid), "{plan:?}");
+        let damage = snapshot.damage_since(root);
+        assert_eq!(damage.len(), 1, "{damage:?}");
+        assert_eq!(damage[0].lost_uid.as_deref(), Some("uid://dap714cpjw8pd"));
+        assert!(
+            snapshot
+                .written_since(root)
+                .contains(&"res://kept.res".to_string())
+        );
+
+        // Godot wrote the uid back into gate.scn only.
+        fs::write(
+            root.join("gate.scn"),
+            rscc(&[rsrc(Some(id)), vec![1; 50]].concat()),
+        )
+        .expect("gate");
+        let repairs = snapshot.binary_repairs(root, &plan);
+        assert_eq!(repairs.len(), 1, "{repairs:?}");
+        assert_eq!(repairs[0].path, "res://gate.scn");
+        assert!(snapshot.damage_since(root).is_empty());
+    }
+
+    /// How long a snapshot of a large project takes: GODOT_MCP_TIME_SNAPSHOT=<project dir>.
+    #[test]
+    #[ignore = "timing probe for a real project"]
+    fn snapshot_time_of_a_large_project() {
+        let Ok(dir) = std::env::var("GODOT_MCP_TIME_SNAPSHOT") else {
+            return;
+        };
+        let started = std::time::Instant::now();
+        let snapshot = TextResourceSnapshot::take(Path::new(&dir));
+        let uids = snapshot
+            .binaries
+            .values()
+            .filter(|old| matches!(old.uid, BinaryUid::Uid(_)))
+            .count();
+        eprintln!(
+            "{} binaries, {uids} with a uid, {} text, in {:?}",
+            snapshot.binaries.len(),
+            snapshot.files.len(),
+            started.elapsed()
+        );
     }
 }

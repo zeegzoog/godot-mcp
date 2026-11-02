@@ -3665,6 +3665,8 @@ fn every_tool_declares_all_four_hints() {
     for name in [
         "godot_get_scene_tree",
         "godot_read_script",
+        "godot_read_shader",
+        "godot_validate_shader",
         "godot_game_tree",
         "godot_code_references",
     ] {
@@ -3674,6 +3676,8 @@ fn every_tool_declares_all_four_hints() {
         "godot_delete_file",
         "godot_remove_node",
         "godot_edit_script",
+        "godot_edit_shader",
+        "godot_create_shader",
         "godot_run_script",
         "godot_save_scene",
     ] {
@@ -3682,6 +3686,7 @@ fn every_tool_declares_all_four_hints() {
     }
     assert_eq!(hints("godot_add_node")["destructiveHint"], false);
     assert_eq!(hints("godot_edit_script")["idempotentHint"], false);
+    assert_eq!(hints("godot_edit_shader")["idempotentHint"], false);
     assert_eq!(hints("godot_submit_feedback")["openWorldHint"], true);
     assert_eq!(hints("godot_get_scene_tree")["openWorldHint"], false);
 }
@@ -4306,4 +4311,241 @@ async fn creating_a_preset_needs_a_platform() {
         "{}",
         text(&result)
     );
+}
+
+const WATER: &str = "shader_type spatial;\n\nuniform float depth = 1.0;\n\nvoid fragment() {\n\tALBEDO = vec3(0.1, 0.3, depth);\n}\n";
+
+fn shader_args(project: &Path, path: &str) -> Value {
+    json!({"shader_path": path, "project_path": project})
+}
+
+#[tokio::test]
+async fn create_shader_without_an_editor_writes_the_code_and_a_uid() {
+    let project = project_dir();
+    let p = project.path();
+    let mut args = shader_args(p, "res://themes/world/pond_water.gdshader");
+    args["code"] = json!(WATER);
+    let answer = script_answer(&call("godot_create_shader", args.clone()).await);
+    assert_eq!(answer["path"], "res://themes/world/pond_water.gdshader");
+    assert_eq!(answer["created"], true);
+    assert_eq!(answer["source"], "file");
+    assert_eq!(answer["editor_consulted"], false);
+    let file = p.join("themes/world/pond_water.gdshader");
+    assert_eq!(
+        std::fs::read_to_string(&file).expect("shader"),
+        WATER,
+        "the code is written as given, tabs included"
+    );
+    let uid = std::fs::read_to_string(p.join("themes/world/pond_water.gdshader.uid"))
+        .expect("a new shader gets a .uid file");
+    assert_eq!(answer["uid"], uid.trim());
+    assert!(uid.starts_with("uid://") && uid.ends_with('\n'), "{uid:?}");
+
+    // The label is the one a read gives, so an edit can follow at once.
+    let read = script_answer(
+        &call(
+            "godot_read_shader",
+            shader_args(p, "res://themes/world/pond_water.gdshader"),
+        )
+        .await,
+    );
+    assert_eq!(read["text"], WATER);
+    assert_eq!(read["version"], answer["version"]);
+
+    // An existing file is kept unless overwrite is asked for; then its uid is kept too.
+    args["code"] = json!("shader_type canvas_item;\n");
+    let refused = call("godot_create_shader", args.clone()).await;
+    assert!(refused.is_error, "{}", text(&refused));
+    assert!(
+        text(&refused).contains("overwrite: true"),
+        "{}",
+        text(&refused)
+    );
+    assert_eq!(std::fs::read_to_string(&file).expect("shader"), WATER);
+    args["overwrite"] = json!(true);
+    let replaced = script_answer(&call("godot_create_shader", args).await);
+    assert_eq!(replaced["created"], false);
+    assert_eq!(replaced["uid"], uid.trim());
+    assert_eq!(
+        std::fs::read_to_string(&file).expect("shader"),
+        "shader_type canvas_item;\n"
+    );
+    assert_eq!(
+        files_in(&p.join("themes/world")),
+        vec!["pond_water.gdshader", "pond_water.gdshader.uid"],
+        "no temporary file is left"
+    );
+
+    // An include is a shader file too; its existing .uid is not replaced.
+    std::fs::write(p.join("common.gdshaderinc.uid"), "uid://bkeepme\n").expect("uid");
+    let mut include = shader_args(p, "res://common.gdshaderinc");
+    include["code"] = json!("float wave(float x) {\n\treturn sin(x);\n}\n");
+    let answer = script_answer(&call("godot_create_shader", include).await);
+    assert_eq!(answer["uid"], "uid://bkeepme");
+}
+
+#[tokio::test]
+async fn shader_tools_refuse_what_they_should_with_a_fix() {
+    let project = project_dir();
+    let p = project.path();
+    std::fs::write(p.join("water.gdshader"), WATER).expect("shader");
+    std::fs::write(p.join("notes.txt"), "hello\n").expect("notes");
+    let before = files_in(p);
+    let refused = |tool: &'static str, args: Value, needle: &'static str| async move {
+        let result = call(tool, args).await;
+        assert!(result.is_error, "{tool} should refuse: {}", text(&result));
+        assert!(
+            text(&result).contains(needle),
+            "{tool}: {:?} should mention {needle:?}",
+            text(&result)
+        );
+    };
+    let with_code = |path: &str| {
+        let mut args = shader_args(p, path);
+        args["code"] = json!("shader_type spatial;\n");
+        args
+    };
+    refused(
+        "godot_create_shader",
+        with_code("res://water.gd"),
+        ".gdshader",
+    )
+    .await;
+    refused(
+        "godot_create_shader",
+        with_code("res://../outside.gdshader"),
+        "..",
+    )
+    .await;
+    refused(
+        "godot_create_shader",
+        shader_args(p, "res://new.gdshader"),
+        "code",
+    )
+    .await;
+    let mut big = shader_args(p, "res://big.gdshader");
+    big["code"] = json!("/".repeat(1_048_577));
+    refused("godot_create_shader", big, "1 MiB").await;
+    refused(
+        "godot_read_shader",
+        shader_args(p, "res://missing.gdshader"),
+        "godot_create_shader",
+    )
+    .await;
+    refused(
+        "godot_read_shader",
+        shader_args(p, "res://notes.txt"),
+        ".gdshader",
+    )
+    .await;
+    let edit = |old: &str, new: &str| {
+        let mut args = shader_args(p, "res://water.gdshader");
+        args["old_text"] = json!(old);
+        args["new_text"] = json!(new);
+        args
+    };
+    refused("godot_edit_shader", edit("depth = 3.0", "x"), "0 times").await;
+    refused("godot_edit_shader", edit("depth", "x"), "2 times").await;
+    let mut stale = edit("depth = 1.0", "depth = 2.0");
+    stale["version"] = json!("0000000000000000");
+    refused("godot_edit_shader", stale, "godot_read_shader").await;
+    refused(
+        "godot_validate_shader",
+        shader_args(p, "res://missing.gdshader"),
+        "godot_create_shader",
+    )
+    .await;
+    refused(
+        "godot_validate_shader",
+        shader_args(p, "res://notes.txt"),
+        ".gdshader",
+    )
+    .await;
+
+    assert_eq!(
+        std::fs::read_to_string(p.join("water.gdshader")).expect("shader"),
+        WATER
+    );
+    assert_eq!(files_in(p), before, "a refusal writes nothing");
+}
+
+#[tokio::test]
+async fn edit_shader_without_an_editor_replaces_one_fragment() {
+    let project = project_dir();
+    let p = project.path();
+    std::fs::write(p.join("water.gdshader"), WATER.replace('\n', "\r\n")).expect("shader");
+    let read =
+        script_answer(&call("godot_read_shader", shader_args(p, "res://water.gdshader")).await);
+    assert_eq!(read["text"], WATER, "text is given with \\n");
+    let mut args = shader_args(p, "res://water.gdshader");
+    args["old_text"] = json!("\tALBEDO = vec3(0.1, 0.3, depth);");
+    args["new_text"] = json!("\tALBEDO = vec3(0.1, 0.3, depth);\n\tROUGHNESS = 0.2;");
+    args["version"] = read["version"].clone();
+    let answer = script_answer(&call("godot_edit_shader", args).await);
+    assert_eq!(answer["replaced"], 1);
+    assert_eq!(answer["source"], "file");
+    assert_eq!(
+        std::fs::read_to_string(p.join("water.gdshader")).expect("shader"),
+        WATER
+            .replace("depth);\n", "depth);\n\tROUGHNESS = 0.2;\n")
+            .replace('\n', "\r\n"),
+        "the file keeps its line endings"
+    );
+}
+
+#[tokio::test]
+async fn shader_tools_ask_the_editor_first() {
+    use common::{MockBridge, Reply};
+    let project = project_dir();
+    std::fs::write(project.path().join("water.gdshader"), WATER).expect("shader");
+    let open_dir = project.path().to_string_lossy().replace('\\', "/");
+    let bridge = MockBridge::start(move |command| match command["type"].as_str() {
+        Some("get_project_info") => Reply::Ok(json!({"project_dir": open_dir})),
+        Some("read_shader") => Reply::Ok(json!({
+            "path": "res://water.gdshader", "text": "// typed\n", "source": "editor",
+            "dirty": true, "version": "0123456789abcdef"
+        })),
+        Some("create_shader") => Reply::Err(
+            "res://water.gdshader has unsaved changes in the shader editor, so it was not overwritten."
+                .into(),
+        ),
+        _ => Reply::Err("unexpected command".into()),
+    })
+    .await;
+    let manager = Arc::new(ToolManager::new(
+        BridgeClient::new(bridge.port),
+        CliRunner::new(PathBuf::from("unused-godot")),
+    ));
+    let read = manager
+        .clone()
+        .call_tool(
+            "godot_read_shader",
+            shader_args(project.path(), "res://water.gdshader"),
+        )
+        .await;
+    let read = script_answer(&read);
+    assert_eq!(read["source"], "editor");
+    assert_eq!(
+        read["project_dir"],
+        project.path().to_string_lossy().replace('\\', "/")
+    );
+
+    // A refusal from a live editor is returned as it is; the file is not written instead.
+    let mut args = shader_args(project.path(), "res://water.gdshader");
+    args["code"] = json!("shader_type spatial;\n");
+    args["overwrite"] = json!(true);
+    let refused = manager.clone().call_tool("godot_create_shader", args).await;
+    assert!(refused.is_error, "{}", text(&refused));
+    assert!(
+        text(&refused).contains("unsaved changes"),
+        "{}",
+        text(&refused)
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("water.gdshader")).expect("shader"),
+        WATER
+    );
+    let sent: Vec<Value> = bridge.received();
+    assert!(sent.iter().any(|command| command["type"] == "create_shader"
+        && command["params"]["code"] == "shader_type spatial;\n"));
 }

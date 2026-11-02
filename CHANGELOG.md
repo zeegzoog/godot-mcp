@@ -16,9 +16,6 @@ Each Godot version has its own release line and branch (`godot-v4.5`, `godot-v4.
 ### Fixed
 
 - `godot_open_scene` makes the scene the editor's active tab when it reloads a background tab from disk. The reload used to keep the previous tab active while answering `opened: true`, so the next `godot_set_node_properties`, `godot_add_node` or `godot_save_scene` without `scene_path` acted on another scene. The answer names the active scene in `active_scene`, and the call fails with a way out when the editor did not switch to it. Thanks to @theromis.
-
-### Fixed
-
 - `godot_set_project_setting` without an editor stores a setting with the type Godot gives it. A setting not yet in `project.godot` was written with the JSON type of the value, so `application/boot_splash/bg_color = "#102b38"` became the string `"#102b38"` instead of a `Color`, and Godot ignored it. The server now asks the Godot executable (headless, in a throw-away project) for the setting's type and converts the value: an HTML color or a color name for a Color, the `project.godot` text such as `"Vector2i(1152, 648)"` for other types, a whole number for an int. A value that does not convert is refused and nothing is written; when the engine cannot be run, a new setting is refused with a way out. A new entry now goes after the last entry of its section, keeping the blank line before the next section. Thanks to @theromis.
 
 ## [0.12.0] - 2026-11-01

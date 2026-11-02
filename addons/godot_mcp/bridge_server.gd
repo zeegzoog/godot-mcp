@@ -27,6 +27,8 @@ const MAX_VALUE_CHARS: int = 2000
 const RESAVE_WAIT_MSEC: int = 60000
 const SCRIPT_OPS_PATH: String = "res://addons/godot_mcp/editor/script_ops.gd"
 const FILE_OPS_PATH: String = "res://addons/godot_mcp/editor/file_ops.gd"
+## Import parameter edits, shared with the server's headless runner (see the file).
+const ImportOps: GDScript = preload("res://addons/godot_mcp/editor/import_ops.gd")
 ## The running game's property ops. The editor reuses their ':' resource-step resolver, so a
 ## property path means the same in godot_set_node_properties as in godot_game_set.
 const RtLive: GDScript = preload("res://addons/godot_mcp/runtime/ops/rt_live.gd")
@@ -70,6 +72,7 @@ const PARAM_TYPES: Dictionary = {
     "delete_files": {"paths": TYPE_ARRAY, "force": TYPE_BOOL, "allow_empty_dir": TYPE_BOOL, "dry_run": TYPE_BOOL, "trash": TYPE_BOOL},
     "game_send": {"command": TYPE_STRING},
     "close_editor": {"discard": TYPE_BOOL},
+    "import_params": {"path": TYPE_STRING, "action": TYPE_STRING, "params": TYPE_DICTIONARY, "copy_from": TYPE_STRING, "reimport": TYPE_BOOL},
 }
 
 ## Fields accepted when a vector-like value is given as a JSON object.
@@ -373,6 +376,8 @@ func dispatch_command(peer: WebSocketPeer, cmd_id: String, cmd_type: String, par
             game_status(peer, cmd_id)
         "close_editor":
             close_editor(peer, cmd_id, params)
+        "import_params":
+            import_params(peer, cmd_id, params)
         _:
             send_error(peer, cmd_id, "Unknown command type: " + cmd_type)
 
@@ -2116,6 +2121,52 @@ func _script_ops() -> RefCounted:
     if _script_ops_instance == null:
         _script_ops_instance = (load(SCRIPT_OPS_PATH) as GDScript).new() as RefCounted
     return _script_ops_instance
+
+## Reads or changes a file's import parameters as the Import dock does: the [params] section of
+## its .import file is edited (editor/import_ops.gd), then the file is reimported through the
+## editor's file system, which rewrites the sidecar and reloads the imported resource. A refusal
+## is a success answer with "error" (a code), the same codes as the server's headless runner.
+func import_params(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
+    var res_path: String = to_res_path(str(params.get("path", "")))
+    if res_path.is_empty() or not FileAccess.file_exists(res_path):
+        send_error(peer, cmd_id, "Not a file inside the project: " + str(params.get("path", "")))
+        return
+    var import_file: String = res_path + ".import"
+    if not FileAccess.file_exists(import_file):
+        send_success(peer, cmd_id, {"error": "NO_IMPORT", "path": res_path})
+        return
+    if str(params.get("action", "get")) == "get":
+        send_success(peer, cmd_id, ImportOps.describe(import_file))
+        return
+    var fs: EditorFileSystem = EditorInterface.get_resource_filesystem()
+    if is_import_running(fs):
+        send_error(peer, cmd_id, "A resource import is already in progress in the editor; retry once it finishes")
+        return
+    var request: Dictionary = {"params": params.get("params", {})}
+    var copy_from: String = str(params.get("copy_from", ""))
+    if not copy_from.is_empty():
+        var source: String = to_res_path(copy_from)
+        if source.is_empty() or not FileAccess.file_exists(source + ".import"):
+            send_success(peer, cmd_id, {"error": "NO_IMPORT", "path": copy_from})
+            return
+        request["copy_from"] = source + ".import"
+    var result: Dictionary = ImportOps.change(import_file, request)
+    if result.has("error"):
+        send_success(peer, cmd_id, result)
+        return
+    var reimported: bool = false
+    var changed: Array = result.get("changed", [])
+    if bool(params.get("reimport", true)) and not changed.is_empty():
+        # reimport_files() skips a file the editor has never scanned, so it is scanned first.
+        if not _filesystem_has(fs, res_path):
+            fs.update_file(res_path)
+            await _wait_for_filesystem(fs, RESAVE_WAIT_MSEC)
+        # Runs on the main thread and returns once the file is imported, as the dock's Reimport.
+        fs.reimport_files(PackedStringArray([res_path]))
+        reimported = true
+    result["reimported"] = reimported
+    result["after"] = ImportOps.describe(import_file)
+    send_success(peer, cmd_id, result)
 
 ## The shader commands keep their logic in editor/shader_ops.gd; these only check the parameters.
 func create_shader(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:

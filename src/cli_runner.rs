@@ -239,6 +239,30 @@ func _typed(value: Variant, old: Variant) -> Variant:
 	return value
 "#;
 
+/// The main script of an import parameter call. Fixed text: the request reaches it as
+/// `res://request.json`, and the work is done by the addon's `editor/import_ops.gd`, copied next
+/// to it as `res://import_ops.gd`.
+const IMPORT_PARAMS_SCRIPT: &str = r#"extends SceneTree
+
+
+func _init() -> void:
+	print("GODOT_MCP_IMPORT=", JSON.stringify(_answer()))
+	quit()
+
+
+func _answer() -> Dictionary:
+	var request: Variant = JSON.parse_string(FileAccess.get_file_as_string("res://request.json"))
+	if typeof(request) != TYPE_DICTIONARY:
+		return {"error": "BAD_REQUEST", "message": "the request could not be read"}
+	var ops: GDScript = load("res://import_ops.gd")
+	var file: String = str(request.get("file", ""))
+	if str(request.get("action", "")) == "get":
+		return ops.call("describe", file)
+	return ops.call("change", file, request)
+"#;
+
+const IMPORT_OPS_SOURCE: &str = include_str!("../addons/godot_mcp/editor/import_ops.gd");
+
 /// What the engine knows about a project setting, from [`CliRunner::setting_type`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SettingType {
@@ -833,21 +857,66 @@ impl CliRunner {
     /// is written as JSON next to a fixed script in a throw-away project, so no project code runs
     /// and nothing the caller sent reaches the command line. Returns the script's JSON answer.
     pub async fn export_presets(&self, request: &serde_json::Value) -> Result<serde_json::Value> {
-        let dir = create_scratch_dir("export-presets")?;
-        let outcome = self.run_export_presets(&dir, request).await;
+        self.config_script(
+            "export-presets",
+            &[("export_presets.gd", EXPORT_PRESETS_SCRIPT)],
+            request,
+            "GODOT_MCP_PRESETS=",
+            "the export presets",
+        )
+        .await
+    }
+
+    /// Reads (`action` `get`) or changes (`set`) the `[params]` of a `.import` file (`file`) with
+    /// Godot's own `ConfigFile`, through the addon's `editor/import_ops.gd`, the code the editor
+    /// bridge uses. Same throw-away project as [`Self::export_presets`]; `copy_from` names another
+    /// `.import` file and `params` the options to set. Returns the script's JSON answer.
+    pub async fn import_params(&self, request: &serde_json::Value) -> Result<serde_json::Value> {
+        self.config_script(
+            "import-params",
+            &[
+                ("import_params.gd", IMPORT_PARAMS_SCRIPT),
+                ("import_ops.gd", IMPORT_OPS_SOURCE),
+            ],
+            request,
+            "GODOT_MCP_IMPORT=",
+            "the import parameters",
+        )
+        .await
+    }
+
+    /// Runs the first of `files` as the main script of a new throw-away project holding `files`
+    /// and `request` as `res://request.json`, and parses the JSON it prints after `marker`.
+    async fn config_script(
+        &self,
+        label: &str,
+        files: &[(&str, &str)],
+        request: &serde_json::Value,
+        marker: &str,
+        what: &str,
+    ) -> Result<serde_json::Value> {
+        let dir = create_scratch_dir(label)?;
+        let outcome = self
+            .run_config_script(&dir, files, request, marker, what)
+            .await;
         let _ = std::fs::remove_dir_all(&dir);
         outcome
     }
 
-    async fn run_export_presets(
+    async fn run_config_script(
         &self,
         dir: &Path,
+        files: &[(&str, &str)],
         request: &serde_json::Value,
+        marker: &str,
+        what: &str,
     ) -> Result<serde_json::Value> {
         std::fs::write(dir.join("project.godot"), "config_version=5\n")?;
         std::fs::write(dir.join("request.json"), request.to_string())?;
-        let script = dir.join("export_presets.gd");
-        std::fs::write(&script, EXPORT_PRESETS_SCRIPT)?;
+        for (name, text) in files {
+            std::fs::write(dir.join(name), text)?;
+        }
+        let script = dir.join(files.first().map_or("main.gd", |(name, _)| *name));
         let mut command = Command::new(&self.godot_binary);
         command
             .arg("--headless")
@@ -861,24 +930,24 @@ impl CliRunner {
             .await
             .map_err(|_| {
                 McpError::Process(format!(
-                    "Godot did not read the export presets within {}s",
+                    "Godot did not read {what} within {}s",
                     PRESETS_TIMEOUT.as_secs()
                 ))
             })?
             .map_err(|e| {
                 McpError::Process(format!(
-                    "Failed to run the Godot executable at '{}' to read the export presets: {e}",
+                    "Failed to run the Godot executable at '{}' to read {what}: {e}",
                     self.godot_binary.display()
                 ))
             })?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         stdout
             .lines()
-            .find_map(|line| line.trim().strip_prefix("GODOT_MCP_PRESETS="))
+            .find_map(|line| line.trim().strip_prefix(marker))
             .and_then(|answer| serde_json::from_str(answer).ok())
             .ok_or_else(|| {
                 McpError::Process(format!(
-                    "Godot gave no answer about the export presets (exit {}): {}",
+                    "Godot gave no answer about {what} (exit {}): {}",
                     output.status,
                     strip_banner(&String::from_utf8_lossy(&output.stderr))
                 ))

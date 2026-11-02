@@ -800,7 +800,14 @@ async fn project_setting_without_an_editor_cannot_add_lines_to_project_godot() {
     assert!(!fps.is_error, "{}", text(&fps));
     let low = set("application/run/low", json!(false)).await;
     assert!(!low.is_error, "{}", text(&low));
-    let added = set("custom/new/ratio", json!(0.5)).await;
+    // A setting the engine does not define keeps the type of the value.
+    let engine = tempfile::tempdir().expect("engine dir");
+    let (unknown, _) = common::setting_godot(engine.path(), "{}");
+    let added = set_with_engine(
+        unknown,
+        json!({"key": "custom/new/ratio", "value": 0.5, "project_path": project.path()}),
+    )
+    .await;
     assert!(!added.is_error, "{}", text(&added));
     let end = std::fs::read_to_string(&project_file).expect("project.godot");
     assert!(
@@ -810,6 +817,211 @@ async fn project_setting_without_an_editor_cannot_add_lines_to_project_godot() {
     assert!(
         end.contains("[custom]") && end.contains("new/ratio=0.5\n"),
         "{end}"
+    );
+}
+
+/// Calls `godot_set_project_setting` with no editor and the given Godot executable.
+async fn set_with_engine(godot: PathBuf, args: Value) -> ToolResult {
+    let cwd = tempfile::tempdir().expect("working dir");
+    manager_in(cwd.path(), godot)
+        .call_tool("godot_set_project_setting", args)
+        .await
+}
+
+const FROG_PROJECT: &str = "config_version=5\n\n[application]\n\nconfig/name=\"Frog\"\nrun/main_scene=\"res://main.tscn\"\n\n[display]\n\nwindow/stretch/mode=\"viewport\"\n";
+
+#[tokio::test]
+async fn project_setting_without_an_editor_stores_the_engine_type() {
+    let project = project_dir();
+    let project_file = project.path().join("project.godot");
+    std::fs::write(&project_file, FROG_PROJECT).expect("project.godot");
+    let engine = tempfile::tempdir().expect("engine dir");
+    let (godot, request) = common::setting_godot(
+        engine.path(),
+        r#"{"type":"Color","text":"Color(0.0627451, 0.16862746, 0.21960784, 1)"}"#,
+    );
+
+    let result = set_with_engine(
+        godot,
+        json!({"key": "application/boot_splash/bg_color", "value": "#102b38",
+               "project_path": project.path()}),
+    )
+    .await;
+
+    assert!(!result.is_error, "{}", text(&result));
+    // The engine is asked about the setting itself: nothing is stored for it yet.
+    let asked: Value =
+        serde_json::from_str(&std::fs::read_to_string(&request).expect("request")).expect("json");
+    assert_eq!(
+        asked,
+        json!({"key": "application/boot_splash/bg_color", "value": "#102b38"})
+    );
+    assert_eq!(
+        std::fs::read_to_string(&project_file).expect("project.godot"),
+        FROG_PROJECT.replace(
+            "run/main_scene=\"res://main.tscn\"\n",
+            "run/main_scene=\"res://main.tscn\"\nboot_splash/bg_color=Color(0.0627451, 0.16862746, 0.21960784, 1)\n",
+        )
+    );
+}
+
+#[tokio::test]
+async fn project_setting_without_an_editor_asks_about_a_stored_structured_value() {
+    let project = project_dir();
+    let project_file = project.path().join("project.godot");
+    let before = "config_version=5\n\n[application]\n\nboot_splash/bg_color=Color(0, 0, 0, 1)\n";
+    std::fs::write(&project_file, before).expect("project.godot");
+    let engine = tempfile::tempdir().expect("engine dir");
+    let (godot, request) = common::setting_godot(
+        engine.path(),
+        r#"{"type":"Color","text":"Color(1, 1, 1, 1)"}"#,
+    );
+
+    let result = set_with_engine(
+        godot,
+        json!({"key": "application/boot_splash/bg_color", "value": "white",
+               "project_path": project.path()}),
+    )
+    .await;
+
+    assert!(!result.is_error, "{}", text(&result));
+    let asked: Value =
+        serde_json::from_str(&std::fs::read_to_string(&request).expect("request")).expect("json");
+    assert_eq!(asked["stored"], "Color(0, 0, 0, 1)", "{asked}");
+    assert_eq!(
+        std::fs::read_to_string(&project_file).expect("project.godot"),
+        "config_version=5\n\n[application]\n\nboot_splash/bg_color=Color(1, 1, 1, 1)\n"
+    );
+}
+
+#[tokio::test]
+async fn project_setting_without_an_editor_refuses_a_value_of_another_type() {
+    let project = project_dir();
+    let project_file = project.path().join("project.godot");
+    std::fs::write(&project_file, FROG_PROJECT).expect("project.godot");
+    let engine = tempfile::tempdir().expect("engine dir");
+    let set = |answer: &str, key: &str, value: Value| {
+        let (godot, _) = common::setting_godot(engine.path(), answer);
+        set_with_engine(
+            godot,
+            json!({"key": key, "value": value, "project_path": project.path()}),
+        )
+    };
+
+    let color = set(
+        r#"{"type":"Color"}"#,
+        "application/boot_splash/bg_color",
+        json!("not a colour"),
+    )
+    .await;
+    assert!(color.is_error, "{}", text(&color));
+    assert!(text(&color).contains("expects a Color"), "{}", text(&color));
+    let width = set(
+        r#"{"type":"int"}"#,
+        "display/window/size/viewport_width",
+        json!("1280"),
+    )
+    .await;
+    assert!(width.is_error, "{}", text(&width));
+    assert!(text(&width).contains("expects a int"), "{}", text(&width));
+    let fraction = set(
+        r#"{"type":"int"}"#,
+        "display/window/size/viewport_width",
+        json!(1280.5),
+    )
+    .await;
+    assert!(fraction.is_error, "{}", text(&fraction));
+    assert_eq!(
+        std::fs::read_to_string(&project_file).expect("project.godot"),
+        FROG_PROJECT,
+        "a refused value changed project.godot"
+    );
+
+    // An int stays an int, also when it comes as 1280.0.
+    let stored = set(
+        r#"{"type":"int"}"#,
+        "display/window/size/viewport_width",
+        json!(1280.0),
+    )
+    .await;
+    assert!(!stored.is_error, "{}", text(&stored));
+    let text_after = std::fs::read_to_string(&project_file).expect("project.godot");
+    assert!(
+        text_after.ends_with("window/stretch/mode=\"viewport\"\nwindow/size/viewport_width=1280\n"),
+        "{text_after}"
+    );
+}
+
+#[tokio::test]
+async fn project_setting_without_an_editor_or_engine_changes_nothing() {
+    let project = project_dir();
+    let project_file = project.path().join("project.godot");
+    std::fs::write(&project_file, FROG_PROJECT).expect("project.godot");
+
+    let result = call(
+        "godot_set_project_setting",
+        json!({"key": "application/boot_splash/bg_color", "value": "#102b38",
+               "project_path": project.path()}),
+    )
+    .await;
+
+    assert!(result.is_error, "{}", text(&result));
+    assert!(text(&result).contains("GODOT_PATH"), "{}", text(&result));
+    assert_eq!(
+        std::fs::read_to_string(&project_file).expect("project.godot"),
+        FROG_PROJECT
+    );
+}
+
+/// The real engine's answers for settings it defines, with the Godot build of the line.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn project_setting_without_an_editor_converts_with_the_real_engine() {
+    let godot = PathBuf::from(std::env::var("GODOT_PATH").expect("set GODOT_PATH"));
+    let project = project_dir();
+    let project_file = project.path().join("project.godot");
+    std::fs::write(&project_file, FROG_PROJECT).expect("project.godot");
+    for (key, value) in [
+        ("application/boot_splash/bg_color", json!("#102b38")),
+        ("display/window/size/viewport_width", json!(1280)),
+        ("display/window/size/viewport_height.mobile", json!(720.0)),
+        ("physics/2d/default_gravity_vector", json!("Vector2(0, 2)")),
+        ("custom/tuning/speed", json!(2.5)),
+    ] {
+        let result = set_with_engine(
+            godot.clone(),
+            json!({"key": key, "value": value, "project_path": project.path()}),
+        )
+        .await;
+        assert!(!result.is_error, "{key}: {}", text(&result));
+    }
+    for (key, value) in [
+        ("application/boot_splash/bg_color", json!("#zzzzzz")),
+        ("application/boot_splash/bg_color", json!(3)),
+        ("display/window/size/viewport_width", json!("wide")),
+        ("physics/2d/default_gravity_vector", json!("Object(Node)")),
+    ] {
+        let result = set_with_engine(
+            godot.clone(),
+            json!({"key": key, "value": value, "project_path": project.path()}),
+        )
+        .await;
+        assert!(result.is_error, "{key} = {value}: {}", text(&result));
+    }
+    let written = std::fs::read_to_string(&project_file).expect("project.godot");
+    for line in [
+        "\nboot_splash/bg_color=Color(0.0627451, 0.16862746, 0.21960784, 1)\n",
+        "\nwindow/size/viewport_width=1280\n",
+        "\nwindow/size/viewport_height.mobile=720\n",
+        "\n2d/default_gravity_vector=Vector2(0, 2)\n",
+        "\n[custom]\n\ntuning/speed=2.5\n",
+    ] {
+        assert!(written.contains(line), "{line:?} missing from:\n{written}");
+    }
+    assert!(
+        written.contains("run/main_scene=\"res://main.tscn\"\nboot_splash/bg_color=")
+            && written.contains("\n\n[display]\n"),
+        "{written}"
     );
 }
 

@@ -68,7 +68,8 @@ godot-mcp is built on a fixed set of technologies, and every change stays inside
 
 - Godot Engine and its own tools: the editor, GDScript, the language server, the remote debugger, the exporter and the importers.
 - Rust and the crates declared in `Cargo.toml`; the addon uses GDScript and the Godot API only.
-- GitHub and its CLI (`gh`) for issues, feedback and CI.
+- The Model Context Protocol and the MCP clients that connect to the server; the client configuration examples in the README show how to connect and are not an integration.
+- Git, GitHub and its CLI (`gh`) for the repository, issues, feedback and CI.
 - General-purpose open-source command-line utilities that the documentation already names (today `ffmpeg`, only for GIF and MP4 recordings).
 
 The project does not integrate any other third-party product, service, program or brand, whatever its license. That means no tool that starts or talks to one, no setting that names one, and no code, comment, test, documentation or example that describes using one (a factual comparison or a credit is not an integration). A pull request that does is declined. If you need such an integration, open an issue first: a maintainer decides, and the decision adds the technology to the list above before any code is written. A new crate or other dependency is an integration too: say in the pull request what it is for and under which license it is published.

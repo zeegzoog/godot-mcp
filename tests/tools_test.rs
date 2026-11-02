@@ -1000,6 +1000,12 @@ async fn project_setting_without_an_editor_converts_with_the_real_engine() {
         ("application/boot_splash/bg_color", json!(3)),
         ("display/window/size/viewport_width", json!("wide")),
         ("physics/2d/default_gravity_vector", json!("Object(Node)")),
+        (
+            "physics/2d/default_gravity_vector",
+            json!("Vector3(0, 2, 1)"),
+        ),
+        ("physics/2d/default_gravity_vector", json!(2)),
+        ("display/window/size/viewport_width", json!(1280.5)),
     ] {
         let result = set_with_engine(
             godot.clone(),

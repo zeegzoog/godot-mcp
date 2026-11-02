@@ -47,7 +47,7 @@ Choose the branch for your pull request:
 
 ## Development Setup
 
-1. Install Rust 1.85 or newer: `rustup update stable`.
+1. Install Rust 1.87 or newer: `rustup update stable`.
 2. Install the Godot build named in `.github/godot-version` of the branch you work on, from <https://github.com/godotengine/godot-builds/releases>. On Windows, also keep the `_console.exe` file that comes with it.
 3. Clone and build:
 

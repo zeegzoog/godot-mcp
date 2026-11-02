@@ -9,7 +9,7 @@
 //! after the magic.
 
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 const FORMAT_FLAG_UIDS: u32 = 2;
@@ -73,9 +73,10 @@ fn first_block(file: &mut File) -> Option<Vec<u8>> {
     if first_size == 0 || first_size > MAX_BLOCK {
         return None;
     }
-    // The other block sizes come before the data.
-    let mut skipped = vec![0_u8; 4 * (blocks as usize - 1)];
-    file.read_exact(&mut skipped).ok()?;
+    // The other block sizes come before the data. Skipped by seeking: a damaged header can promise
+    // billions of them, which must not become an allocation.
+    file.seek(SeekFrom::Current(4 * (i64::from(blocks) - 1)))
+        .ok()?;
     let mut compressed = vec![0_u8; first_size as usize];
     file.read_exact(&mut compressed).ok()?;
     let mut decoder = ruzstd::decoding::StreamingDecoder::new(compressed.as_slice()).ok()?;
@@ -235,5 +236,19 @@ pub(super) mod tests {
         }
         // The bytes ResourceSaver.set_uid wrote for this uid in Godot 4.8.
         assert_eq!(uid_text(id as u64), "uid://dap714cpjw8pd");
+    }
+
+    #[test]
+    fn a_damaged_compressed_header_is_unreadable_and_allocates_nothing() {
+        let dir = tempfile::tempdir().expect("dir");
+        // One-byte blocks and a size of 4 GiB: the table of block sizes it promises cannot exist.
+        let mut bytes = b"RSCC".to_vec();
+        for word in [MODE_ZSTD, 1, u32::MAX, 16] {
+            bytes.extend(word.to_le_bytes());
+        }
+        bytes.extend([0_u8; 32]);
+        let file = dir.path().join("damaged.scn");
+        std::fs::write(&file, bytes).expect("write");
+        assert_eq!(binary_uid(&file), BinaryUid::Unreadable);
     }
 }

@@ -239,6 +239,26 @@ func _typed(value: Variant, old: Variant) -> Variant:
 	return value
 "#;
 
+/// The script that writes uids back into binary resources. Fixed text: the pairs come from the
+/// JSON file named by its first user argument.
+const SET_BINARY_UIDS_SCRIPT: &str = r#"extends SceneTree
+
+
+func _init() -> void:
+	var args: PackedStringArray = OS.get_cmdline_user_args()
+	var request: Variant = JSON.parse_string(FileAccess.get_file_as_string(args[0] if args.size() > 0 else ""))
+	if typeof(request) == TYPE_ARRAY:
+		for item: Variant in request:
+			if typeof(item) != TYPE_DICTIONARY:
+				continue
+			var path: String = str(item.get("path", ""))
+			var id: int = ResourceUID.text_to_id(str(item.get("uid", "")))
+			if path.begins_with("res://") and id != ResourceUID.INVALID_ID:
+				print("GODOT_MCP_UID ", path, " ", error_string(ResourceSaver.set_uid(path, id)))
+	print("GODOT_MCP_UIDS_DONE")
+	quit()
+"#;
+
 /// The main script of an import parameter call. Fixed text: the request reaches it as
 /// `res://request.json`, and the work is done by the addon's `editor/import_ops.gd`, copied next
 /// to it as `res://import_ops.gd`.
@@ -952,6 +972,67 @@ impl CliRunner {
                     strip_banner(&String::from_utf8_lossy(&output.stderr))
                 ))
             })
+    }
+
+    /// Writes each `(res path, uid://)` pair into the header of that binary scene or resource of
+    /// `project` with `ResourceSaver.set_uid`, which rewrites a compressed file as well. The pairs
+    /// reach a fixed script outside the project as a JSON file, never on the command line. The
+    /// caller reads the headers back to see which ones took.
+    pub async fn set_binary_uids(&self, project: &Path, uids: &[(String, String)]) -> Result<()> {
+        let dir = create_scratch_dir("binary-uids")?;
+        let outcome = self.run_set_binary_uids(project, &dir, uids).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        outcome
+    }
+
+    async fn run_set_binary_uids(
+        &self,
+        project: &Path,
+        dir: &Path,
+        uids: &[(String, String)],
+    ) -> Result<()> {
+        let request: Vec<serde_json::Value> = uids
+            .iter()
+            .map(|(path, uid)| serde_json::json!({"path": path, "uid": uid}))
+            .collect();
+        let request_file = dir.join("request.json");
+        std::fs::write(&request_file, serde_json::Value::from(request).to_string())?;
+        let script = dir.join("set_binary_uids.gd");
+        std::fs::write(&script, SET_BINARY_UIDS_SCRIPT)?;
+        let mut command = Command::new(&self.godot_binary);
+        command
+            .arg("--headless")
+            .arg("--path")
+            .arg(project)
+            .arg("--script")
+            .arg(&script)
+            .arg("--")
+            .arg(&request_file)
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
+        let output = timeout(PRESETS_TIMEOUT, command.output())
+            .await
+            .map_err(|_| {
+                McpError::Process(format!(
+                    "Godot did not write the binary resource uids within {}s",
+                    PRESETS_TIMEOUT.as_secs()
+                ))
+            })?
+            .map_err(|e| {
+                McpError::Process(format!(
+                    "Failed to run the Godot executable at '{}' to write binary resource uids: {e}",
+                    self.godot_binary.display()
+                ))
+            })?;
+        if String::from_utf8_lossy(&output.stdout).contains("GODOT_MCP_UIDS_DONE") {
+            Ok(())
+        } else {
+            Err(McpError::Process(format!(
+                "Godot did not finish writing the binary resource uids (exit {}): {}",
+                output.status,
+                strip_banner(&String::from_utf8_lossy(&output.stderr))
+            )))
+        }
     }
 
     /// `godot --headless --path <project> --import`, bounded by `limit`, keeping the last output.

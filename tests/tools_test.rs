@@ -5106,3 +5106,225 @@ async fn an_importer_change_goes_to_the_editor_that_has_the_project() {
         .expect("import_params sent");
     assert_eq!(sent["params"]["importer"], "3d_texture");
 }
+
+/// A project holding the addon of an older server, and a fake editor of it that runs that addon:
+/// it knows `get_project_info` and answers every command in `unknown` as the old addon does.
+async fn editor_with_old_addon(
+    unknown: &'static [&'static str],
+) -> (tempfile::TempDir, common::MockBridge) {
+    use common::{MockBridge, Reply};
+    let project = project_dir();
+    let addon = project.path().join("addons/godot_mcp");
+    std::fs::create_dir_all(&addon).expect("addon dir");
+    std::fs::write(
+        addon.join("plugin.cfg"),
+        "[plugin]\n\nname=\"Godot MCP Bridge\"\nversion=\"0.11.1-dev+godot.4.8\"\nscript=\"plugin.gd\"\n",
+    )
+    .expect("old manifest");
+    let dir = project.path().to_string_lossy().replace('\\', "/");
+    let bridge = MockBridge::start(move |command| match command["type"].as_str() {
+        Some("get_project_info") => Reply::Ok(json!({"project_dir": dir})),
+        Some(other) if unknown.contains(&other) => {
+            Reply::Err(format!("Unknown command type: {other}"))
+        }
+        _ => Reply::Ok(json!({})),
+    })
+    .await;
+    (project, bridge)
+}
+
+fn editor_manager(bridge: &common::MockBridge) -> Arc<ToolManager> {
+    Arc::new(ToolManager::new(
+        BridgeClient::new(bridge.port),
+        CliRunner::new(PathBuf::from("unused-godot")),
+    ))
+}
+
+#[tokio::test]
+async fn a_command_the_editors_addon_lacks_names_both_versions_and_the_update() {
+    let (project, bridge) = editor_with_old_addon(&["get_scene_tree"]).await;
+    let result = editor_manager(&bridge)
+        .call_tool("godot_get_scene_tree", json!({}))
+        .await;
+    assert!(result.is_error);
+    let message = text(&result);
+    assert!(message.contains("0.11.1-dev+godot.4.8"), "{message}");
+    assert!(
+        message.contains(env!("CARGO_PKG_VERSION")),
+        "the server's version: {message}"
+    );
+    assert!(message.contains("get_scene_tree"), "{message}");
+    assert!(message.contains("godot_update_addon"), "{message}");
+    // The hint names the project as the editor reports it, with forward slashes on every OS.
+    assert!(
+        message.contains(&project.path().to_string_lossy().replace('\\', "/")),
+        "the project to update: {message}"
+    );
+    assert!(!message.contains("retry in a moment"), "{message}");
+}
+
+#[tokio::test]
+async fn shaders_are_read_and_edited_in_their_file_when_the_editors_addon_is_older() {
+    let (project, bridge) = editor_with_old_addon(&["read_shader", "edit_shader"]).await;
+    let shader = "shader_type spatial;\n\nuniform float sway = 1.0;\n";
+    std::fs::write(project.path().join("wind.gdshader"), shader).expect("shader");
+    let tools = editor_manager(&bridge);
+
+    let read = Arc::clone(&tools)
+        .call_tool(
+            "godot_read_shader",
+            json!({"shader_path": "res://wind.gdshader", "project_path": project.path()}),
+        )
+        .await;
+    assert!(!read.is_error, "{}", text(&read));
+    let answer: Value = serde_json::from_str(&text(&read)).expect("JSON answer");
+    assert!(
+        answer.to_string().contains("uniform float sway"),
+        "{answer}"
+    );
+    assert_eq!(answer["addon_version"], "0.11.1-dev+godot.4.8");
+    assert!(
+        answer["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("godot_update_addon"),
+        "{answer}"
+    );
+
+    let edit = tools
+        .call_tool(
+            "godot_edit_shader",
+            json!({"shader_path": "res://wind.gdshader", "project_path": project.path(),
+                   "old_text": "uniform float sway = 1.0;",
+                   "new_text": "uniform float sway = 1.0;\nuniform float gust = 0.5;"}),
+        )
+        .await;
+    assert!(!edit.is_error, "{}", text(&edit));
+    assert!(
+        text(&edit).contains("older than this server"),
+        "{}",
+        text(&edit)
+    );
+    assert!(
+        std::fs::read_to_string(project.path().join("wind.gdshader"))
+            .expect("shader")
+            .contains("uniform float gust = 0.5;")
+    );
+}
+
+#[tokio::test]
+async fn the_addon_is_installed_from_this_build_and_enabled() {
+    let project = project_dir();
+    let addon = project.path().join("addons/godot_mcp");
+    std::fs::create_dir_all(&addon).expect("addon dir");
+    std::fs::write(addon.join("plugin.cfg"), "version=\"0.11.1\"\n").expect("old manifest");
+    std::fs::write(addon.join("retired.gd"), "extends RefCounted\n").expect("old script");
+    std::fs::write(project.path().join("keep.txt"), "mine").expect("project file");
+
+    let result = call(
+        "godot_update_addon",
+        json!({"project_path": project.path()}),
+    )
+    .await;
+    assert!(!result.is_error, "{}", text(&result));
+    let report: Value = serde_json::from_str(&text(&result)).expect("JSON report");
+    assert_eq!(report["previous_version"], "0.11.1");
+    assert_eq!(report["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(report["installed"], true);
+    assert_eq!(report["removed"], json!(["retired.gd"]));
+    assert_eq!(report["enabled_now"], true);
+    let manifest = std::fs::read_to_string(addon.join("plugin.cfg")).expect("manifest");
+    assert!(manifest.contains(env!("CARGO_PKG_VERSION")), "{manifest}");
+    assert!(addon.join("bridge_server.gd").is_file());
+    assert!(!addon.join("retired.gd").exists());
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("keep.txt")).expect("kept"),
+        "mine"
+    );
+    let settings = std::fs::read_to_string(project.path().join("project.godot")).expect("project");
+    assert!(
+        settings.contains("enabled=PackedStringArray(\"res://addons/godot_mcp/plugin.cfg\")"),
+        "{settings}"
+    );
+
+    let again = call(
+        "godot_update_addon",
+        json!({"project_path": project.path()}),
+    )
+    .await;
+    let again: Value = serde_json::from_str(&text(&again)).expect("JSON report");
+    assert_eq!(again["installed"], false, "{again}");
+    assert_eq!(again["enabled_now"], false, "{again}");
+}
+
+#[tokio::test]
+async fn the_addon_is_not_replaced_under_a_connected_editor_without_restart_editor() {
+    let (project, bridge) = editor_with_old_addon(&[]).await;
+    let result = editor_manager(&bridge)
+        .call_tool(
+            "godot_update_addon",
+            json!({"project_path": project.path()}),
+        )
+        .await;
+    assert!(result.is_error, "{}", text(&result));
+    assert!(
+        text(&result).contains("restart_editor: true"),
+        "{}",
+        text(&result)
+    );
+    let manifest = std::fs::read_to_string(project.path().join("addons/godot_mcp/plugin.cfg"))
+        .expect("manifest");
+    assert!(manifest.contains("0.11.1"), "untouched: {manifest}");
+}
+
+#[tokio::test]
+async fn the_servers_own_source_tree_is_not_overwritten_by_the_update() {
+    let result = call(
+        "godot_update_addon",
+        json!({"project_path": env!("CARGO_MANIFEST_DIR")}),
+    )
+    .await;
+    assert!(result.is_error);
+    assert!(text(&result).contains("source tree"), "{}", text(&result));
+}
+
+#[tokio::test]
+async fn an_update_passes_discard_to_the_editor_it_closes() {
+    use common::{MockBridge, Reply};
+    let project = project_dir();
+    let dir = project.path().to_string_lossy().replace('\\', "/");
+    let bridge = MockBridge::start(move |command| match command["type"].as_str() {
+        Some("get_project_info") => {
+            Reply::Ok(json!({"project_dir": dir, "addon_version": "0.11.1"}))
+        }
+        Some("close_editor") => Reply::Ok(json!({
+            "closing": false, "unsaved_scenes": ["res://level.tscn"], "unsaved_scripts": []
+        })),
+        _ => Reply::Ok(json!({})),
+    })
+    .await;
+    let tools = editor_manager(&bridge);
+    for discard in [false, true] {
+        let result = Arc::clone(&tools)
+            .call_tool(
+                "godot_update_addon",
+                json!({"project_path": project.path(), "restart_editor": true, "discard": discard}),
+            )
+            .await;
+        assert!(result.is_error, "{}", text(&result));
+        let message = text(&result);
+        assert!(message.contains("res://level.tscn"), "{message}");
+        assert!(message.contains("discard: true"), "{message}");
+        let received = bridge.received.lock().expect("received").clone();
+        let close = received
+            .iter()
+            .rev()
+            .find(|command| command["type"] == "close_editor")
+            .expect("close_editor sent");
+        assert_eq!(close["params"]["discard"], discard, "{close}");
+    }
+    assert!(
+        !project.path().join("addons/godot_mcp").exists(),
+        "nothing installed"
+    );
+}

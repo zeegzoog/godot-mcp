@@ -5,6 +5,7 @@
 //! connected do the tools fall back to the file itself. The check compiles the saved file with
 //! the engine's shader compiler in a headless Godot.
 
+use super::addon_update::{file_fallback_note, unknown_command, with_fields};
 use super::scripts::{
     MAX_BYTES, TextFile, TextKind, edit_file, label, locate, locate_in, read_file, replace_file,
 };
@@ -110,7 +111,19 @@ async fn read(tools: &ToolManager, args: &Value) -> ToolResult {
             serde_json::to_string_pretty(&choice.name_project(value)).unwrap_or_default(),
         ),
         Err(McpError::BridgeUnavailable(_)) => read_file(tools, args, &SHADER).await,
-        Err(error) => bridge_error_result(&error),
+        Err(error) => match unknown_command(&error) {
+            // An addon older than the server: the saved file is what can be read.
+            Some(command) => {
+                let note = file_fallback_note(
+                    tools,
+                    &command,
+                    "the shader was read from its file: changes not saved in the editor are not in it",
+                )
+                .await;
+                with_fields(read_file(tools, args, &SHADER).await, &note)
+            }
+            None => bridge_error_result(&error),
+        },
     }
 }
 
@@ -127,7 +140,19 @@ async fn edit(tools: &ToolManager, args: &Value) -> ToolResult {
             serde_json::to_string_pretty(&choice.name_project(value)).unwrap_or_default(),
         ),
         Err(McpError::BridgeUnavailable(_)) => edit_file(tools, args, &SHADER).await,
-        Err(error) => bridge_error_result(&error),
+        Err(error) => match unknown_command(&error) {
+            // An addon older than the server: the file is edited, against the version read from it.
+            Some(command) => {
+                let note = file_fallback_note(
+                    tools,
+                    &command,
+                    "the shader file was edited on disk, checked against the version read from the file; this addon cannot tell whether the shader is open in the editor, and if it is, Godot asks there whether to reload it",
+                )
+                .await;
+                with_fields(edit_file(tools, args, &SHADER).await, &note)
+            }
+            None => bridge_error_result(&error),
+        },
     }
 }
 

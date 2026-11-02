@@ -34,6 +34,7 @@ thiserror = "2.0.21"
 anyhow = "1.0.104"
 uuid = { version = "1.29.0", features = ["v4"] }
 ruzstd = { version = "0.9.1", default-features = false, features = ["std"] }
+md-5 = "0.11"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.191"

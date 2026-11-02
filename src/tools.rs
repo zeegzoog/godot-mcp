@@ -23,6 +23,7 @@ mod feedback;
 mod files;
 mod game;
 mod headless;
+mod import_params;
 mod input_map;
 mod main_loop;
 mod model_chain;
@@ -146,6 +147,7 @@ impl ToolManager {
             name if game::handles(name) => game::call(&self, name, args).await,
             name if code::handles(name) => code::call(&self, name, args).await,
             name if export::handles(name) => export::call(&self, name, args).await,
+            name if import_params::handles(name) => import_params::call(&self, name, args).await,
             feedback::NOTE => self.handle_note_feedback(args).await,
             feedback::DRAFT => self.handle_draft_feedback(args).await,
             feedback::SUBMIT => self.handle_submit_feedback(args).await,
@@ -803,7 +805,8 @@ fn annotations(name: &str) -> Option<ToolAnnotations> {
         | "godot_code_symbols"
         | "godot_code_definition"
         | "godot_code_references"
-        | "godot_list_export_presets" => [true, false, true],
+        | "godot_list_export_presets"
+        | "godot_get_import_params" => [true, false, true],
         "godot_capture_viewport"
         | "godot_resave_resources"
         | "godot_create_project"
@@ -836,6 +839,7 @@ fn annotations(name: &str) -> Option<ToolAnnotations> {
         | "godot_set_project_setting"
         | "godot_edit_input_action"
         | "godot_set_export_preset"
+        | "godot_set_import_params"
         | "godot_delete_file"
         | "godot_game_set" => [false, true, true],
         "godot_run_script"
@@ -1193,6 +1197,7 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
     tools.extend(game::catalog());
     tools.extend(code::catalog());
     tools.extend(export::catalog());
+    tools.extend(import_params::catalog());
     tools.extend(feedback::catalog(feedback_mode));
     tools
 }

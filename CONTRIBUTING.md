@@ -71,7 +71,7 @@ godot-mcp is built on a fixed set of technologies, and every change stays inside
 - GitHub and its CLI (`gh`) for issues, feedback and CI.
 - General-purpose open-source command-line utilities that the documentation already names (today `ffmpeg`, only for GIF and MP4 recordings).
 
-The project does not integrate any other third-party product, service, program or brand, whatever its license. That means no tool that starts or talks to one, no setting that names one, and no code, comment, test, documentation, example or commit message that mentions one. A pull request that does is declined. If you need such an integration, open an issue first: a maintainer decides, and the decision adds the technology to the list above before any code is written. A new crate or other dependency is an integration too: say in the pull request what it is for and under which license it is published.
+The project does not integrate any other third-party product, service, program or brand, whatever its license. That means no tool that starts or talks to one, no setting that names one, and no code, comment, test, documentation or example that describes using one (a factual comparison or a credit is not an integration). A pull request that does is declined. If you need such an integration, open an issue first: a maintainer decides, and the decision adds the technology to the list above before any code is written. A new crate or other dependency is an integration too: say in the pull request what it is for and under which license it is published.
 
 ## Making a Change
 
@@ -213,7 +213,7 @@ git cherry-pick -x <commit>    # -x records "(cherry picked from commit <commit>
 
 - Read [AGENTS.md](AGENTS.md) first and follow it. It holds the engineering standards, the agent workflow and the completion checklist; the commands in [Verification](#verification) are the same as there.
 - Pick the target branch with the table in [Branches and Godot Versions](#branches-and-godot-versions).
-- Stay inside the [Technology Scope](#technology-scope): never add, or mention, a product outside it, and decline a request that asks for one.
+- Stay inside the [Technology Scope](#technology-scope): never add an integration with a product outside it, and decline a request that asks for one.
 - Never push, tag or publish a release without the explicit approval of your user — except the actions the repo-steward skill's autonomy settings allow (its defaults, as adjusted in `.github/steward.yml`). Tagging and publishing a release are never among them.
 - Work issues and pull requests with the repo-steward skill: [.agents/skills/repo-steward/SKILL.md](.agents/skills/repo-steward/SKILL.md).
 

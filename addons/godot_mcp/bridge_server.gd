@@ -639,12 +639,21 @@ func open_scene(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void
         send_error(peer, cmd_id, decision["error"])
         return
     var dialogs_before: Dictionary = _visible_dialog_texts()
-    if bool(decision.get("reload", false)):
+    var reloaded: bool = bool(decision.get("reload", false))
+    if reloaded:
         EditorInterface.reload_scene_from_path(scene_path)
-    else:
-        EditorInterface.open_scene_from_path(scene_path)
+    # A reload keeps whichever tab was active; opening a scene that is already open switches
+    # to its tab without loading it again.
+    EditorInterface.open_scene_from_path(scene_path)
     remember_scene_sync(scene_path)
-    var payload: Dictionary = {"opened": true, "reloaded": bool(decision.get("reload", false)), "scene_path": scene_path}
+    var active: String = _edited_scene_path()
+    if active != scene_path:
+        await get_tree().process_frame
+        active = _edited_scene_path()
+    if active != scene_path:
+        send_error(peer, cmd_id, "Opened %s but the editor's active scene is '%s', so edits without scene_path would go to that scene. Click the %s tab in the editor, or call godot_open_scene again, then check godot_get_scene_tree." % [scene_path, active, scene_path.get_file()])
+        return
+    var payload: Dictionary = {"opened": true, "reloaded": reloaded, "scene_path": scene_path, "active_scene": active}
     payload.merge(await _load_report(scene_path, dialogs_before))
     send_success(peer, cmd_id, payload)
 
@@ -1926,6 +1935,11 @@ func _has_unsaved_changes(scene_path: String) -> bool:
     if current < 0 or saved < 0:
         return false
     return current != saved
+
+## res:// path of the scene in the active editor tab, or "" when no scene is open.
+func _edited_scene_path() -> String:
+    var root: Node = EditorInterface.get_edited_scene_root()
+    return "" if root == null else String(root.scene_file_path)
 
 func _open_scene_root(scene_path: String) -> Node:
     var open: PackedStringArray = EditorInterface.get_open_scenes()

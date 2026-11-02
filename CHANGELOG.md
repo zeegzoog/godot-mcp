@@ -28,6 +28,10 @@ Each Godot version has its own release line and branch (`godot-v4.5`, `godot-v4.
 - `godot_set_project_setting` without an editor stores a setting with the type Godot gives it. A setting not yet in `project.godot` was written with the JSON type of the value, so `application/boot_splash/bg_color = "#102b38"` became the string `"#102b38"` instead of a `Color`, and Godot ignored it. The server now asks the Godot executable (headless, in a throw-away project) for the setting's type and converts the value: an HTML color or a color name for a Color, the `project.godot` text such as `"Vector2i(1152, 648)"` for other types, a whole number for an int. A value that does not convert is refused and nothing is written; when the engine cannot be run, a new setting is refused with a way out. A new entry now goes after the last entry of its section, keeping the blank line before the next section. Thanks to @theromis.
 - `godot_set_project_setting` with the editor accepts the same values as without it. The editor path refused a value for any setting that is not a string, number or boolean, so `"#102b38"` for `application/boot_splash/bg_color` worked only when no editor was connected. It now converts an HTML color or a color name for a Color and the `project.godot` text such as `"Vector2(0, 2)"` for other types, never creates an Object, refuses a string that does not convert with the setting named and nothing written, and gives a feature override such as `display/window/size/viewport_height.mobile` the type of its base setting, as the file path does.
 
+### Removed
+
+- `godot_check_voxel_model` and the executable setting it needed. The tool ran an external exporter program that is not part of the technology this project is built on, and the project no longer integrates products it does not build on (see "Technology Scope" in CONTRIBUTING.md). Model files are imported by the engine: put the `.glb` into the project and call `godot_resave_resources`; `godot_get_import_params` and `godot_set_import_params` read and set their import options. A call to the removed tool now fails as an unknown tool.
+
 ## [0.12.0] - 2026-11-01
 
 An agent can close the editors it opened, the bridge port follows the project path, and several edits that used to be reported as done although the scene would not keep them are now refused with the reason.
@@ -99,13 +103,13 @@ The AI can read and act in a game through the project's own adapter, delete file
 
 ## [0.9.0] - 2026-10-28
 
-The AI can now create a project, play a repeatable input scenario in a held game, check a voxel model, list and edit InputMap actions, and be told what an overwritten script tab, a saved scene and a loaded scene did to the editor. Several running-game calls stop failing quietly.
+The AI can now create a project, play a repeatable input scenario in a held game, list and edit InputMap actions, and be told what an overwritten script tab, a saved scene and a loaded scene did to the editor. Several running-game calls stop failing quietly.
 
 ### Added
 
 - `godot_create_project` creates a Godot project through MCP. Thanks to @theromis.
 - `godot_game_scenario` plays one input sequence in a held managed game: Input Map actions and pointers, a known number of physics ticks per step, and snapshots, optional screenshots and the call's logs in one answer. `godot_game_input` takes an `action` step for an Input Map action. Thanks to @theromis.
-- `godot_check_voxel_model` exports up to 16 `.vox` models through Froxel (`FROXEL_BIN`, or `froxel` on `PATH`), imports the `.glb` files into the project and checks the `.import` files. It needs a Froxel build with `export_models`. Thanks to @theromis.
+- `godot_check_voxel_model` exported `.vox` models through an external exporter program, imported the `.glb` files into the project and checked the `.import` files (removed in a later release). Thanks to @theromis.
 - `godot_get_input_map` and `godot_edit_input_action` (editor only) list the InputMap actions, add or remove key, mouse button and joypad events, set a deadzone, and create or delete an action. A change is one undo step and is saved through the editor; it is all or nothing. `godot_set_project_setting` refuses `input/` keys and points to these tools. Built-in `ui_` actions can be edited but not deleted. Thanks to @theromis.
 - `godot_game_input` and `godot_game_scenario` take `coordinate_space`: `viewport` (the default, unchanged) or `window`. Every input answer names the space and the mapping between the two, and a `click_node` step returns the point it clicked.
 - `godot_code_diagnostics` adds `warnings_hidden`, and `godot_validate_script` a line, for a script under `res://addons/` in a project that keeps Godot's default `debug/gdscript/warnings/exclude_addons=true`: the analyzer reports no warnings for such a script, so a clean answer did not mean the script was clean.

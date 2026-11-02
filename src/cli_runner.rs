@@ -257,6 +257,7 @@ func _init() -> void:
 				print("GODOT_MCP_UID ", path, " ", error_string(ResourceSaver.set_uid(path, id)))
 	print("GODOT_MCP_UIDS_DONE")
 	quit()
+"#;
 
 /// What the engine knows about a project setting, from [`CliRunner::setting_type`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

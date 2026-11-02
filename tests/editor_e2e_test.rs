@@ -4998,3 +4998,38 @@ async fn import_params_are_set_and_reimported_through_the_editor() {
     assert_eq!(again["changed"], json!([]));
     assert_eq!(again["reimported"], false, "{again}");
 }
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ editor executable"]
+async fn an_image_is_imported_as_a_texture_3d_through_the_editor() {
+    use godot_mcp::cli_runner::CliRunner;
+    use godot_mcp::tools::ToolManager;
+    use std::sync::Arc;
+
+    let strip = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"64\" height=\"16\"><rect width=\"64\" height=\"16\" fill=\"#3a3\"/></svg>\n";
+    let editor = start_editor_with(None, "", &[("strip.svg", strip)], "").await;
+    let project = editor.project.clone();
+    let (godot, _) = godot_binaries();
+    let tools = Arc::new(
+        ToolManager::new(BridgeClient::new(editor.port), CliRunner::new(godot))
+            .with_working_dir(project.clone()),
+    );
+    let result = tools
+        .call_tool(
+            "godot_set_import_params",
+            json!({"path": "res://strip.svg", "importer": "3d_texture",
+                   "params": {"slices/horizontal": 4}}),
+        )
+        .await;
+    let text = tool_text(&result);
+    assert!(!result.is_error, "{text}");
+    let set: Value = serde_json::from_str(&text).expect("JSON report");
+    assert_eq!(set["source"], "editor");
+    assert_eq!(set["reimported"], true, "{set}");
+    assert_eq!(set["previous_importer"], "texture");
+    assert_eq!(set["type"], "CompressedTexture3D", "{set}");
+    assert_eq!(set["after"]["params"]["slices/horizontal"], 4);
+    let sidecar = std::fs::read_to_string(project.join("strip.svg.import")).expect("sidecar");
+    assert!(sidecar.contains("importer=\"3d_texture\""), "{sidecar}");
+    assert!(sidecar.contains(".ctex3d"), "{sidecar}");
+}

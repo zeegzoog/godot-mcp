@@ -72,7 +72,7 @@ const PARAM_TYPES: Dictionary = {
     "delete_files": {"paths": TYPE_ARRAY, "force": TYPE_BOOL, "allow_empty_dir": TYPE_BOOL, "dry_run": TYPE_BOOL, "trash": TYPE_BOOL},
     "game_send": {"command": TYPE_STRING},
     "close_editor": {"discard": TYPE_BOOL},
-    "import_params": {"path": TYPE_STRING, "action": TYPE_STRING, "params": TYPE_DICTIONARY, "copy_from": TYPE_STRING, "reimport": TYPE_BOOL},
+    "import_params": {"path": TYPE_STRING, "action": TYPE_STRING, "params": TYPE_DICTIONARY, "copy_from": TYPE_STRING, "reimport": TYPE_BOOL, "importer": TYPE_STRING},
 }
 
 ## Fields accepted when a vector-like value is given as a JSON object.
@@ -2126,6 +2126,8 @@ func _script_ops() -> RefCounted:
 ## its .import file is edited (editor/import_ops.gd), then the file is reimported through the
 ## editor's file system, which rewrites the sidecar and reloads the imported resource. A refusal
 ## is a success answer with "error" (a code), the same codes as the server's headless runner.
+## A new importer (the dock's "Import As") makes another resource type, so a loaded copy of the
+## old one is replaced in the resource cache, as the dock does.
 func import_params(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
     var res_path: String = to_res_path(str(params.get("path", "")))
     if res_path.is_empty() or not FileAccess.file_exists(res_path):
@@ -2142,7 +2144,7 @@ func import_params(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> v
     if is_import_running(fs):
         send_error(peer, cmd_id, "A resource import is already in progress in the editor; retry once it finishes")
         return
-    var request: Dictionary = {"params": params.get("params", {})}
+    var request: Dictionary = {"params": params.get("params", {}), "importer": str(params.get("importer", ""))}
     var copy_from: String = str(params.get("copy_from", ""))
     if not copy_from.is_empty():
         var source: String = to_res_path(copy_from)
@@ -2156,7 +2158,8 @@ func import_params(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> v
         return
     var reimported: bool = false
     var changed: Array = result.get("changed", [])
-    if bool(params.get("reimport", true)) and not changed.is_empty():
+    var importer_changed: bool = bool(result.get("importer_changed", false))
+    if bool(params.get("reimport", true)) and (importer_changed or not changed.is_empty()):
         # reimport_files() skips a file the editor has never scanned, so it is scanned first.
         if not _filesystem_has(fs, res_path):
             fs.update_file(res_path)
@@ -2166,7 +2169,24 @@ func import_params(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> v
         reimported = true
     result["reimported"] = reimported
     result["after"] = ImportOps.describe(import_file)
+    if reimported and importer_changed:
+        result["replaced_loaded"] = _replace_cached_import(res_path, str(result["after"].get("type", "")))
     send_success(peer, cmd_id, result)
+
+## Puts the newly imported resource of res_path in the resource cache when the cached one is of
+## another class, so a later load gets the new type. Answers whether a loaded copy was replaced;
+## a scene still holding the old resource keeps it until it is reopened.
+func _replace_cached_import(res_path: String, imported_type: String) -> bool:
+    if imported_type.is_empty() or not ResourceLoader.has_cached(res_path):
+        return false
+    var cached: Resource = ResourceLoader.get_cached_ref(res_path)
+    if cached != null and cached.is_class(imported_type):
+        return false
+    var fresh: Resource = ResourceLoader.load(res_path, "", ResourceLoader.CACHE_MODE_IGNORE)
+    if fresh == null:
+        return false
+    fresh.take_over_path(res_path)
+    return true
 
 ## The shader commands keep their logic in editor/shader_ops.gd; these only check the parameters.
 func create_shader(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:

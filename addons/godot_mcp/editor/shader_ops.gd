@@ -41,6 +41,30 @@ func read(res_path: String) -> Dictionary:
     answer["version"] = label(str(answer["text"]))
     return answer
 
+## Writes the .uid file of a shader the editor's file system did not give one (ResourceSaver
+## writes none for a text shader and set_uid refuses it), registers the id and tells the file
+## system. Returns the id, or INVALID_ID when the file cannot be written.
+func _give_uid_file(res_path: String) -> int:
+    var sidecar_path: String = res_path + ".uid"
+    if FileAccess.file_exists(sidecar_path):
+        return ResourceLoader.get_resource_uid(res_path)
+    var id: int = ResourceUID.create_id()
+    var sidecar: FileAccess = FileAccess.open(sidecar_path, FileAccess.WRITE)
+    if sidecar == null:
+        return ResourceUID.INVALID_ID
+    sidecar.store_string(ResourceUID.id_to_text(id) + "\n")
+    sidecar.close()
+    if not ResourceUID.has_id(id):
+        ResourceUID.add_id(id, res_path)
+    EditorInterface.get_resource_filesystem().update_file(res_path)
+    var registered: int = ResourceLoader.get_resource_uid(res_path)
+    return registered if registered != ResourceUID.INVALID_ID else id
+
+
+## Frames an edit waits for the shader editor to open a tab for the shader.
+const TAB_OPEN_FRAMES: int = 30
+
+
 func create(res_path: String, code: String, overwrite: bool) -> Dictionary:
     if not EXTENSIONS.has(res_path.get_extension()):
         return {"error": "Only .gdshader and .gdshaderinc files are handled by the shader tools: " + res_path}
@@ -97,6 +121,8 @@ func create(res_path: String, code: String, overwrite: bool) -> Dictionary:
     # The file system scan gives a new file its .uid, as for a file the editor saved itself.
     EditorInterface.get_resource_filesystem().update_file(res_path)
     var uid: int = ResourceLoader.get_resource_uid(res_path)
+    if uid == ResourceUID.INVALID_ID:
+        uid = _give_uid_file(res_path)
     if uid != ResourceUID.INVALID_ID:
         answer["uid"] = ResourceUID.id_to_text(uid)
     return answer
@@ -129,8 +155,14 @@ func edit(res_path: String, old_text: String, new_text: String, version: String)
     if str(pair["state"]) == "none":
         EditorInterface.edit_resource(shader)
         pair = _pair_editor(res_path)
+        # An older editor connects the new tab to the shader on a later frame.
+        var frames: int = 0
+        while str(pair["state"]) == "none" and frames < TAB_OPEN_FRAMES:
+            await (Engine.get_main_loop() as SceneTree).process_frame
+            pair = _pair_editor(res_path)
+            frames += 1
         if str(pair["state"]) != "found":
-            return {"error": "The shader editor did not open %s. Open it in the shader editor and repeat the edit." % res_path}
+            return {"error": "The shader editor did not open %s (%s). Open it in the shader editor and repeat the edit." % [res_path, str(pair.get("reason", pair["state"]))]}
     var base: CodeEdit = _buffer(pair["editor"])
     if base.text != file_lf:
         return {"error": STALE_TAB % res_path}
@@ -202,7 +234,7 @@ func _pair_editor(res_path: String) -> Dictionary:
     var editors: Array[Object] = []
     for connection: Dictionary in shader.get_signal_connection_list("changed"):
         var target: Object = (connection["callable"] as Callable).get_object()
-        if target != null and target.is_class("ShaderTextEditor") and target.has_method("get_base_editor") and not editors.has(target):
+        if target != null and target is Node and target.is_class("ShaderTextEditor") and not editors.has(target):
             editors.append(target)
     if editors.is_empty():
         return {"state": "none"}
@@ -212,8 +244,13 @@ func _pair_editor(res_path: String) -> Dictionary:
         return {"state": "unknown", "reason": "the shader tab has no text editor"}
     return {"state": "found", "editor": editors[0]}
 
+## The text editor of a shader tab. ShaderTextEditor has get_base_editor only from Godot 4.8; the
+## older editors keep the CodeEdit as a child of the tab.
 func _buffer(editor: Object) -> CodeEdit:
-    return editor.call("get_base_editor") as CodeEdit
+    if editor.has_method("get_base_editor"):
+        return editor.call("get_base_editor") as CodeEdit
+    var found: Array[Node] = (editor as Node).find_children("*", "CodeEdit", true, false)
+    return null if found.is_empty() else found[0] as CodeEdit
 
 func _is_dirty(editor: Object) -> bool:
     var buffer: CodeEdit = _buffer(editor)

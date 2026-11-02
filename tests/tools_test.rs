@@ -3044,10 +3044,11 @@ async fn run_script_writes_back_the_uids_a_headless_save_dropped() {
             "path": "res://pond.tscn",
             "uid": "uid://cpond",
             "new_uid": false,
-            "ext_resource_uids": [{"path": "res://water.gdshader", "uid": "uid://dshader"}],
+            "ext_resource_uids_restored": 1,
             "removed_null_shader_parameters": ["tint"],
         }])
     );
+    assert_eq!(body["resource_repairs_total"], 1, "{saved_text}");
     assert_eq!(body["resource_damage"], json!([]), "{saved_text}");
     assert_eq!(
         body["editor_refresh"],
@@ -3055,9 +3056,8 @@ async fn run_script_writes_back_the_uids_a_headless_save_dropped() {
         "no editor is connected"
     );
     assert!(
-        body["summary"]
-            .as_str()
-            .is_some_and(|summary| summary.contains("repaired res://pond.tscn")),
+        body["summary"].as_str().is_some_and(|summary| summary
+            .contains("repaired 1 file, res://pond.tscn: 1 uid written back, 1 ext_resource uid restored, 1 null shader parameter removed; resource_repairs lists them.")),
         "{saved_text}"
     );
     assert_eq!(
@@ -3072,6 +3072,50 @@ async fn run_script_writes_back_the_uids_a_headless_save_dropped() {
                 "type=\"Shader\" uid=\"uid://dshader\" path"
             )
             .replace("shader_parameter/tint = null\n", "")
+    );
+}
+
+/// A script that saves many scenes gets a short answer: the summary counts the repairs and names
+/// a few, and resource_repairs lists the first ones with the total.
+#[tokio::test]
+async fn run_script_keeps_the_answer_short_when_it_repairs_many_files() {
+    let project = pond_project();
+    let root = project.path();
+    write_script(root, "many.gd", b"extends SceneTree\n");
+    let tools = manager_in(root, saving_godot(root));
+
+    let run = call_with(&tools, json!({"script": "many.gd", "project_path": root})).await;
+    let run_text = text(&run);
+    assert!(!run.is_error, "{run_text}");
+    let body = answer_body(&run_text);
+    assert_eq!(body["resource_repairs_total"], 25, "{run_text}");
+    let repairs = body["resource_repairs"].as_array().expect("repairs");
+    assert_eq!(repairs.len(), 20, "{run_text}");
+    let first = &repairs[0];
+    assert_eq!(first["path"], "res://many/pond_01.tscn", "{run_text}");
+    assert_eq!(first["new_uid"], true, "{run_text}");
+    assert!(
+        first["uid"]
+            .as_str()
+            .is_some_and(|uid| uid.starts_with("uid://")),
+        "{run_text}"
+    );
+    assert_eq!(first["ext_resource_uids_restored"], 1, "{run_text}");
+    assert_eq!(
+        first["removed_null_shader_parameters"],
+        json!(["tint"]),
+        "{run_text}"
+    );
+    let summary = body["summary"].as_str().unwrap_or_default();
+    assert!(
+        summary.contains("repaired 25 files, among them res://many/pond_01.tscn, res://many/pond_02.tscn, res://many/pond_03.tscn and 22 more: 25 uids written back (25 new), 25 ext_resource uids restored, 25 null shader parameters removed; resource_repairs lists the first 20 of 25 (resource_repairs_total)."),
+        "{summary}"
+    );
+    assert!(!summary.contains("pond_04"), "{summary}");
+    assert!(
+        run_text.len() < 8_000,
+        "{} bytes: {run_text}",
+        run_text.len()
     );
 }
 
@@ -3169,7 +3213,8 @@ async fn run_script_names_the_uids_and_null_shader_parameters_it_could_not_repai
 }
 
 /// A Godot stand-in that, for edit.gd and lock.gd, overwrites pond.tscn with headless.txt; lock.gd
-/// then makes it read-only. For shader.gd it overwrites water.gdshader with shader.txt.
+/// then makes it read-only. For shader.gd it overwrites water.gdshader with shader.txt, and for
+/// many.gd it writes headless.txt to many/pond_01.tscn .. many/pond_25.tscn.
 fn saving_godot(dir: &Path) -> PathBuf {
     #[cfg(unix)]
     {
@@ -3190,6 +3235,7 @@ case "$*" in
   *edit.gd*) cp "$proj/headless.txt" "$proj/pond.tscn" ;;
   *lock.gd*) cp "$proj/headless.txt" "$proj/pond.tscn"; chmod a-w "$proj/pond.tscn" ;;
   *shader.gd*) cp "$proj/shader.txt" "$proj/water.gdshader" ;;
+  *many.gd*) mkdir -p "$proj/many"; for i in $(seq -w 1 25); do cp "$proj/headless.txt" "$proj/many/pond_$i.tscn"; done ;;
 esac
 exit 0
 "#,
@@ -3203,7 +3249,7 @@ exit 0
         let path = dir.join("saving_godot.bat");
         std::fs::write(
             &path,
-            "@echo off\r\nsetlocal enabledelayedexpansion\r\nset PREV=\r\nset PROJ=\r\nfor %%A in (%*) do (\r\n  if \"!PREV!\"==\"--path\" set PROJ=%%~A\r\n  set PREV=%%A\r\n)\r\necho %* | findstr edit.gd >nul\r\nif %errorlevel%==0 copy /Y \"%PROJ%\\headless.txt\" \"%PROJ%\\pond.tscn\" >nul\r\necho %* | findstr lock.gd >nul\r\nif %errorlevel%==0 (\r\n  copy /Y \"%PROJ%\\headless.txt\" \"%PROJ%\\pond.tscn\" >nul\r\n  attrib +r \"%PROJ%\\pond.tscn\"\r\n)\r\necho %* | findstr shader.gd >nul\r\nif %errorlevel%==0 copy /Y \"%PROJ%\\shader.txt\" \"%PROJ%\\water.gdshader\" >nul\r\nexit /b 0\r\n",
+            "@echo off\r\nsetlocal enabledelayedexpansion\r\nset PREV=\r\nset PROJ=\r\nfor %%A in (%*) do (\r\n  if \"!PREV!\"==\"--path\" set PROJ=%%~A\r\n  set PREV=%%A\r\n)\r\necho %* | findstr edit.gd >nul\r\nif %errorlevel%==0 copy /Y \"%PROJ%\\headless.txt\" \"%PROJ%\\pond.tscn\" >nul\r\necho %* | findstr lock.gd >nul\r\nif %errorlevel%==0 (\r\n  copy /Y \"%PROJ%\\headless.txt\" \"%PROJ%\\pond.tscn\" >nul\r\n  attrib +r \"%PROJ%\\pond.tscn\"\r\n)\r\necho %* | findstr shader.gd >nul\r\nif %errorlevel%==0 copy /Y \"%PROJ%\\shader.txt\" \"%PROJ%\\water.gdshader\" >nul\r\necho %* | findstr many.gd >nul\r\nif %errorlevel%==0 (\r\n  mkdir \"%PROJ%\\many\" 2>nul\r\n  for /L %%I in (101,1,125) do (\r\n    set N=%%I\r\n    copy /Y \"%PROJ%\\headless.txt\" \"%PROJ%\\many\\pond_!N:~1!.tscn\" >nul\r\n  )\r\n)\r\nexit /b 0\r\n",
         )
         .expect("write saving godot");
         path

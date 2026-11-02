@@ -58,11 +58,7 @@ fn damage_report(damage: &[ResourceDamage]) -> (Vec<Value>, Option<String>) {
     if damage.is_empty() {
         return (entries, None);
     }
-    let paths = damage
-        .iter()
-        .map(|item| item.path.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
+    let paths = path_examples(damage.iter().map(|item| item.path.as_str()));
     let warning = format!(
         "WARNING: the script rewrote {paths} without the editor, and the server could not repair them: resource_damage lists the uid:// references still missing and the shader parameters still written as null. Restore the files from version control, or put the listed uid=\"...\" back (for a .scn or .res, with ResourceSaver.set_uid in a godot_run_script) and delete the null shader_parameter lines; make sure the files are writable."
     );
@@ -83,22 +79,43 @@ struct RepairReport {
 }
 
 impl RepairReport {
+    /// The first `REPAIR_LIST_LIMIT` repairs, each with counts instead of the restored references:
+    /// a script that saves a whole kit repairs hundreds of files, and the answer must stay readable.
     fn entries(&self) -> Vec<Value> {
         self.repairs
             .iter()
+            .take(REPAIR_LIST_LIMIT)
             .map(|item| {
                 json!({
                     "path": item.path,
                     "uid": item.uid,
                     "new_uid": item.new_uid,
-                    "ext_resource_uids": item.ext_resource_uids.iter().map(|(path, uid)| json!({
-                        "path": path,
-                        "uid": uid,
-                    })).collect::<Vec<_>>(),
+                    "ext_resource_uids_restored": item.ext_resource_uids.len(),
                     "removed_null_shader_parameters": item.removed_null_shader_parameters,
                 })
             })
             .collect()
+    }
+
+    /// The editor's refresh answer with each list cut to `REPAIR_LIST_LIMIT` paths and
+    /// `<list>_total` beside a cut one.
+    fn editor_refresh(&self) -> Option<Value> {
+        let mut answer = self.editor.clone()?;
+        if let Some(fields) = answer.as_object_mut() {
+            let mut totals = Vec::new();
+            for (key, value) in fields.iter_mut() {
+                if let Some(items) = value.as_array_mut()
+                    && items.len() > REPAIR_LIST_LIMIT
+                {
+                    totals.push((format!("{key}_total"), items.len()));
+                    items.truncate(REPAIR_LIST_LIMIT);
+                }
+            }
+            for (key, total) in totals {
+                fields.insert(key, json!(total));
+            }
+        }
+        Some(answer)
     }
 
     fn sentence(&self) -> Option<String> {
@@ -112,14 +129,58 @@ impl RepairReport {
             (None, None) => None,
         };
         let repaired = (!self.repairs.is_empty()).then(|| {
-            let paths = self
+            let total = self.repairs.len();
+            let files = if total == 1 {
+                format!("1 file, {}", self.repairs[0].path)
+            } else {
+                format!(
+                    "{total} files, among them {}",
+                    path_examples(self.repairs.iter().map(|item| item.path.as_str()))
+                )
+            };
+            let uids = self.repairs.iter().filter(|item| item.uid.is_some()).count();
+            let new_uids = self.repairs.iter().filter(|item| item.new_uid).count();
+            let ext_uids: usize = self
                 .repairs
                 .iter()
-                .map(|item| item.path.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
+                .map(|item| item.ext_resource_uids.len())
+                .sum();
+            let nulls: usize = self
+                .repairs
+                .iter()
+                .map(|item| item.removed_null_shader_parameters.len())
+                .sum();
+            let mut counts = Vec::new();
+            if uids > 0 {
+                let new = if new_uids > 0 {
+                    format!(" ({new_uids} new)")
+                } else {
+                    String::new()
+                };
+                counts.push(format!("{} written back{new}", plural(uids, "uid")));
+            }
+            if ext_uids > 0 {
+                counts.push(format!(
+                    "{} restored",
+                    plural(ext_uids, "ext_resource uid")
+                ));
+            }
+            if nulls > 0 {
+                counts.push(format!(
+                    "{} removed",
+                    plural(nulls, "null shader parameter")
+                ));
+            }
+            let counts = counts.join(", ");
+            let listed = if total > REPAIR_LIST_LIMIT {
+                format!(
+                    "resource_repairs lists the first {REPAIR_LIST_LIMIT} of {total} (resource_repairs_total)"
+                )
+            } else {
+                "resource_repairs lists them".to_string()
+            };
             format!(
-                "Headless Godot saves without uids and writes unset shader uniforms as null, so the server repaired {paths}: resource_repairs lists the uids it wrote back and the null shader_parameter lines it removed."
+                "Headless Godot saves without uids and writes unset shader uniforms as null, so the server repaired {files}: {counts}; {listed}."
             )
         });
         match (repaired, editor) {
@@ -128,6 +189,30 @@ impl RepairReport {
             (None, Some(editor)) => Some(editor.to_string()),
             (None, None) => None,
         }
+    }
+}
+
+/// How many repaired files the run's answer lists one by one.
+const REPAIR_LIST_LIMIT: usize = 20;
+/// How many paths a summary sentence names before it counts the rest.
+const EXAMPLE_PATHS: usize = 3;
+
+/// "a, b, c and 12 more" for a summary sentence.
+fn path_examples<'a>(paths: impl ExactSizeIterator<Item = &'a str>) -> String {
+    let total = paths.len();
+    let named = paths.take(EXAMPLE_PATHS).collect::<Vec<_>>().join(", ");
+    if total > EXAMPLE_PATHS {
+        format!("{named} and {} more", total - EXAMPLE_PATHS)
+    } else {
+        named
+    }
+}
+
+fn plural(count: usize, noun: &str) -> String {
+    if count == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{count} {noun}s")
     }
 }
 
@@ -204,7 +289,8 @@ fn script_run_result(
             "line": error.line,
         })).collect::<Vec<_>>(),
         "resource_repairs": repair.entries(),
-        "editor_refresh": repair.editor,
+        "resource_repairs_total": repair.repairs.len(),
+        "editor_refresh": repair.editor_refresh(),
         "editor_refresh_error": repair.editor_error,
         "binary_uid_error": repair.binary_error,
         "resource_damage": resource_damage,
@@ -725,5 +811,44 @@ impl ToolManager {
                 &["Verify GODOT_PATH points to a working Godot executable"],
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn editor_refresh_cuts_long_lists_and_names_their_totals() {
+        let paths: Vec<String> = (0..30)
+            .map(|index| format!("res://kit/{index}.tscn"))
+            .collect();
+        let report = RepairReport {
+            repairs: Vec::new(),
+            written: paths.clone(),
+            editor: Some(json!({
+                "mode": "refresh",
+                "refreshed": paths,
+                "not_scanned": ["res://kit/odd.bin"],
+            })),
+            editor_error: None,
+            binary_error: None,
+        };
+        let answer = report.editor_refresh().expect("answer");
+        assert_eq!(answer["mode"], "refresh");
+        assert_eq!(answer["refreshed"].as_array().map(Vec::len), Some(20));
+        assert_eq!(answer["refreshed"][0], "res://kit/0.tscn");
+        assert_eq!(answer["refreshed_total"], 30);
+        assert_eq!(answer["not_scanned"], json!(["res://kit/odd.bin"]));
+        assert!(answer.get("not_scanned_total").is_none(), "{answer}");
+    }
+
+    #[test]
+    fn path_examples_names_three_and_counts_the_rest() {
+        assert_eq!(path_examples(["res://a"].into_iter()), "res://a");
+        assert_eq!(
+            path_examples(["res://a", "res://b", "res://c", "res://d", "res://e"].into_iter()),
+            "res://a, res://b, res://c and 2 more"
+        );
     }
 }

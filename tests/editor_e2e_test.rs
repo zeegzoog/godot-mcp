@@ -492,10 +492,20 @@ async fn scene_and_property_tools_behave() {
         find(&unread["tree"], "Before").is_some(),
         "a read reloaded the scene: {unread}"
     );
+    // Reloading a background tab must also make it the edited scene: the reload used
+    // to leave the previous tab active, so the next edits went to the wrong scene.
+    call("open_scene", json!({"scene_path": "res://main.tscn"}))
+        .await
+        .expect("switch to main");
     let reloaded = call("open_scene", json!({"scene_path": "res://stale.tscn"}))
         .await
         .expect("reload stale");
     assert_eq!(reloaded["reloaded"], true, "{reloaded}");
+    assert_eq!(reloaded["active_scene"], "res://stale.tscn", "{reloaded}");
+    let active_tree = call("get_scene_tree", json!({}))
+        .await
+        .expect("active tree");
+    assert_eq!(active_tree["tree"]["name"], "Stale", "{active_tree}");
     let stale_tree = call("get_scene_tree", json!({"scene_path": "res://stale.tscn"}))
         .await
         .expect("stale tree");
@@ -4604,6 +4614,313 @@ async fn edits_inside_an_instance_need_editable_children() {
         "visible = false",
     ] {
         assert!(saved.contains(needle), "{needle} in {saved}");
+    }
+}
+
+/// Test-only commands that look at a shader's tab and type into it, through the same tab
+/// pairing the shader commands use.
+const SHADER_PROBE_HOOK: &str = r#"        "__shader_state":
+            var path: String = str(params.get("path", ""))
+            var pair: Dictionary = _shader_ops()._pair_editor(path)
+            var out: Dictionary = {"state": str(pair["state"]), "found": str(pair["state"]) == "found"}
+            if ResourceLoader.has_cached(path):
+                out["memory_code"] = str(load(path).get("code"))
+            if str(pair["state"]) == "found":
+                var base: CodeEdit = pair["editor"].call("get_base_editor")
+                out["text"] = base.text
+                out["dirty"] = base.get_version() != base.get_saved_version()
+            send_success(peer, cmd_id, out)
+        "__shader_type":
+            var pair: Dictionary = _shader_ops()._pair_editor(str(params.get("path", "")))
+            var base: CodeEdit = pair["editor"].call("get_base_editor")
+            base.insert_text(str(params.get("text", "")), 0, 0)
+            send_success(peer, cmd_id, {"text": base.text})
+        "__shader_undo":
+            var pair: Dictionary = _shader_ops()._pair_editor(str(params.get("path", "")))
+            var base: CodeEdit = pair["editor"].call("get_base_editor")
+            base.undo()
+            send_success(peer, cmd_id, {"text": base.text})
+        "ping":
+"#;
+
+/// The create, read and edit commands for shaders go through the editor's shader tab and the
+/// shader it holds in memory, keep the file's uid, and never overwrite unsaved typing.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn shader_commands_keep_the_shader_editor_in_step() {
+    let water = "shader_type spatial;\n\nuniform float depth = 1.0;\n\nvoid fragment() {\n\tALBEDO = vec3(0.1, 0.3, depth);\n}\n";
+    let clean = "shader_type canvas_item;\n\nvoid fragment() {\n\tCOLOR = vec4(1.0);\n}\n";
+    let editor = start_editor_with(
+        Some(SHADER_PROBE_HOOK),
+        "",
+        &[
+            ("water.gdshader", water),
+            ("clean.gdshader", clean),
+            ("typed.gdshader", clean),
+            ("notes.txt", "hello\n"),
+        ],
+        "",
+    )
+    .await;
+    let bridge = &editor.bridge;
+    let file = |name: &str| std::fs::read_to_string(editor.project.join(name)).expect("file");
+    let uid = |name: &str| std::fs::read_to_string(editor.project.join(format!("{name}.uid"))).ok();
+    let state = |path: &'static str| async move {
+        bridge
+            .send_command("__shader_state", json!({"path": path}))
+            .await
+            .expect("shader state")
+    };
+    let edit = |path: &'static str, old: &str, new: &str| {
+        let params = json!({"shader_path": path, "old_text": old, "new_text": new});
+        async move { bridge.send_command("edit_shader", params).await }
+    };
+
+    // A read of a closed shader answers with the file and the same label as the host.
+    let read = bridge
+        .send_command(
+            "read_shader",
+            json!({"shader_path": "res://water.gdshader"}),
+        )
+        .await
+        .expect("read water");
+    assert_eq!(read["text"], water);
+    assert_eq!(read["source"], "file");
+    assert_eq!(read["dirty"], false);
+    assert_eq!(read["version"], script_label(water));
+
+    // A new shader is written as given, tabs and all, and gets a .uid like any new file.
+    let code = "shader_type spatial;\n\nvoid vertex() {\n\tVERTEX.y += 0.1;\n}\n";
+    let created = bridge
+        .send_command(
+            "create_shader",
+            json!({"shader_path": "res://fx/ripple.gdshader", "code": code}),
+        )
+        .await
+        .expect("create ripple");
+    assert_eq!(created["created"], true);
+    assert_eq!(created["version"], script_label(code));
+    assert_eq!(file("fx/ripple.gdshader"), code);
+    let new_uid = uid("fx/ripple.gdshader").expect("the new shader has a .uid file");
+    assert_eq!(created["uid"], new_uid.trim());
+    expect_error(
+        bridge
+            .send_command(
+                "create_shader",
+                json!({"shader_path": "res://fx/ripple.gdshader", "code": "x"}),
+            )
+            .await,
+        "already exists",
+    );
+    assert_eq!(file("fx/ripple.gdshader"), code);
+    let include = bridge
+        .send_command(
+            "create_shader",
+            json!({"shader_path": "res://fx/common.gdshaderinc", "code": "float wave(float x) {\n\treturn sin(x);\n}\n"}),
+        )
+        .await
+        .expect("create include");
+    assert_eq!(include["created"], true);
+    assert!(uid("fx/common.gdshaderinc").is_some());
+
+    // An edit opens the closed shader in the shader editor, is one undo step in its tab, saves
+    // the file, gives the editor's shader the new code and keeps the uid.
+    let uid_before = uid("water.gdshader");
+    assert_eq!(state("res://water.gdshader").await["found"], false);
+    let edited = water.replace("depth = 1.0", "depth = 2.0");
+    let done = edit("res://water.gdshader", "depth = 1.0", "depth = 2.0")
+        .await
+        .expect("edit water");
+    assert_eq!(done["replaced"], 1);
+    assert_eq!(done["source"], "editor");
+    assert_eq!(done["version"], script_label(&edited));
+    assert_eq!(file("water.gdshader"), edited);
+    assert_eq!(
+        uid("water.gdshader"),
+        uid_before,
+        "the shader keeps its uid"
+    );
+    let shown = state("res://water.gdshader").await;
+    assert_eq!(shown["found"], true, "the edit opened the shader's tab");
+    assert_eq!(shown["text"], edited);
+    assert_eq!(shown["dirty"], false, "the edit is saved");
+    assert_eq!(shown["memory_code"], edited);
+    let undone = bridge
+        .send_command("__shader_undo", json!({"path": "res://water.gdshader"}))
+        .await
+        .expect("undo");
+    assert_eq!(undone["text"], water, "one undo step reverses the edit");
+
+    // Unsaved typing is read, and never overwritten by an edit or a create.
+    bridge
+        .send_command("edit_shader", json!({"shader_path": "res://typed.gdshader", "old_text": "vec4(1.0)", "new_text": "vec4(0.5)"}))
+        .await
+        .expect("open typed by editing it");
+    let saved_typed = file("typed.gdshader");
+    bridge
+        .send_command(
+            "__shader_type",
+            json!({"path": "res://typed.gdshader", "text": "// typed\n"}),
+        )
+        .await
+        .expect("type");
+    let dirty = bridge
+        .send_command(
+            "read_shader",
+            json!({"shader_path": "res://typed.gdshader"}),
+        )
+        .await
+        .expect("read typed");
+    assert_eq!(dirty["source"], "editor");
+    assert_eq!(dirty["dirty"], true);
+    assert!(
+        dirty["text"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("// typed\n")
+    );
+    expect_error(
+        edit("res://typed.gdshader", "vec4(0.5)", "vec4(0.25)").await,
+        "unsaved changes",
+    );
+    expect_error(
+        bridge
+            .send_command(
+                "create_shader",
+                json!({"shader_path": "res://typed.gdshader", "code": "x", "overwrite": true}),
+            )
+            .await,
+        "unsaved changes",
+    );
+    assert_eq!(file("typed.gdshader"), saved_typed, "the file is untouched");
+
+    // An overwrite reloads a clean open tab and the editor's shader, and keeps the uid.
+    edit("res://clean.gdshader", "vec4(1.0)", "vec4(0.9)")
+        .await
+        .expect("open clean by editing it");
+    let clean_uid = uid("clean.gdshader");
+    let replacement =
+        "shader_type canvas_item;\n\nvoid fragment() {\n\tCOLOR = vec4(0.0, 0.0, 1.0, 1.0);\n}\n";
+    let overwritten = bridge
+        .send_command(
+            "create_shader",
+            json!({"shader_path": "res://clean.gdshader", "code": replacement, "overwrite": true}),
+        )
+        .await
+        .expect("overwrite clean");
+    assert_eq!(overwritten["created"], false);
+    assert_eq!(overwritten["tab_reloaded"], true);
+    assert_eq!(file("clean.gdshader"), replacement);
+    assert_eq!(uid("clean.gdshader"), clean_uid);
+    let reloaded = state("res://clean.gdshader").await;
+    assert_eq!(reloaded["text"], replacement);
+    assert_eq!(reloaded["dirty"], false);
+    assert_eq!(reloaded["memory_code"], replacement);
+
+    // Refusals reply with a fix.
+    expect_error(
+        edit("res://ripple.gdshader", "a", "b").await,
+        "godot_create_shader",
+    );
+    expect_error(
+        edit("res://fx/ripple.gdshader", "nothing", "b").await,
+        "0 times",
+    );
+    expect_error(edit("res://notes.txt", "hello", "bye").await, ".gdshader");
+    expect_error(
+        edit("res://../x.gdshader", "a", "b").await,
+        "inside the project",
+    );
+    expect_error(
+        bridge
+            .send_command(
+                "create_shader",
+                json!({"shader_path": "res://x.gdshader", "code": 5}),
+            )
+            .await,
+        "must be of type",
+    );
+    assert_eq!(file("notes.txt"), "hello\n");
+}
+
+/// The shader check compiles a saved shader with the engine's compiler and names the file and
+/// line of each error, including one inside an include; a clean shader passes.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn validate_shader_compiles_the_file_with_godot() {
+    use godot_mcp::cli_runner::CliRunner;
+    use godot_mcp::tools::ToolManager;
+    use std::sync::Arc;
+
+    let (godot, _) = godot_binaries();
+    let project = common::project_dir();
+    let write = |name: &str, text: &str| {
+        let path = project.path().join(name);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        std::fs::write(path, text).expect("write shader");
+    };
+    write(
+        "good.gdshader",
+        "shader_type spatial;\n#include \"lib/ok.gdshaderinc\"\n\nvoid fragment() {\n\tALBEDO = vec3(helper());\n}\n",
+    );
+    write("lib/ok.gdshaderinc", "float helper() {\n\treturn 1.0;\n}\n");
+    write(
+        "bad.gdshader",
+        "shader_type canvas_item;\n\nvoid fragment() {\n\tCOLOR = vec4(foo);\n}\n",
+    );
+    write(
+        "bad_include.gdshader",
+        "shader_type spatial;\n#include \"lib/broken.gdshaderinc\"\nvoid fragment() {}\n",
+    );
+    write(
+        "lib/broken.gdshaderinc",
+        "float broken() {\n\treturn 1.0\n}\n",
+    );
+    write(
+        "missing_include.gdshader",
+        "shader_type spatial;\n#include \"lib/none.gdshaderinc\"\nvoid fragment() {}\n",
+    );
+    write("no_type.gdshader", "void fragment() {}\n");
+
+    let tools = Arc::new(ToolManager::new(
+        BridgeClient::new(common::free_port()),
+        CliRunner::new(godot),
+    ));
+    let validate = |path: &str| {
+        let tools = tools.clone();
+        let args = json!({"shader_path": path, "project_path": project.path()});
+        async move { tools.call_tool("godot_validate_shader", args).await }
+    };
+
+    let good = validate("res://good.gdshader").await;
+    assert!(!good.is_error, "{}", tool_text(&good));
+    let answer: Value = serde_json::from_str(&tool_text(&good)).expect("json answer");
+    assert_eq!(answer["valid"], true);
+
+    for (path, needles) in [
+        ("res://bad.gdshader", vec!["res://bad.gdshader:4:", "foo"]),
+        (
+            "res://bad_include.gdshader",
+            // Godot notices the missing ';' at the token after it, on the next line.
+            vec!["res://lib/broken.gdshaderinc:3:", "';'"],
+        ),
+        (
+            "res://missing_include.gdshader",
+            vec!["res://missing_include.gdshader:2:", "#include path"],
+        ),
+        ("res://no_type.gdshader", vec!["shader_type"]),
+        ("res://lib/ok.gdshaderinc", vec!["includes it"]),
+        ("res://absent.gdshader", vec!["godot_create_shader"]),
+    ] {
+        let result = validate(path).await;
+        let text = tool_text(&result);
+        assert!(result.is_error, "{path} should fail: {text}");
+        for needle in needles {
+            assert!(
+                text.contains(needle),
+                "{path}: {text:?} should mention {needle:?}"
+            );
+        }
     }
 }
 

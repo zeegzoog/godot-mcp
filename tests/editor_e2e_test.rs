@@ -5132,3 +5132,79 @@ async fn an_image_is_imported_as_a_texture_3d_through_the_editor() {
     assert!(sidecar.contains("importer=\"3d_texture\""), "{sidecar}");
     assert!(sidecar.contains(".ctex3d"), "{sidecar}");
 }
+
+/// An editor whose addon lacks the shader commands, as one older than the server does: the
+/// error names both versions, and the shader tools work on the file instead.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ editor executable"]
+async fn an_older_addon_is_named_and_shaders_fall_back_to_their_file() {
+    use godot_mcp::cli_runner::CliRunner;
+    use godot_mcp::tools::ToolManager;
+    use std::sync::Arc;
+
+    let hook = "        \"read_shader\", \"edit_shader\", \"get_scene_tree\":\n            send_error(peer, cmd_id, \"Unknown command type: \" + cmd_type)\n        \"ping\":\n";
+    let shader = "shader_type spatial;\n\nuniform float sway = 1.0;\n";
+    let editor = start_editor_with(Some(hook), "", &[("wind.gdshader", shader)], "").await;
+    let project = editor.project.clone();
+    let info = editor
+        .bridge
+        .send_command("get_project_info", json!({}))
+        .await
+        .expect("project info");
+    assert_eq!(info["addon_version"], env!("CARGO_PKG_VERSION"), "{info}");
+
+    let (godot, _) = godot_binaries();
+    let tools = Arc::new(
+        ToolManager::new(BridgeClient::new(editor.port), CliRunner::new(godot))
+            .with_working_dir(project.clone()),
+    );
+    let tree = Arc::clone(&tools)
+        .call_tool("godot_get_scene_tree", json!({}))
+        .await;
+    assert!(tree.is_error);
+    let message = tool_text(&tree);
+    assert!(message.contains("get_scene_tree"), "{message}");
+    assert!(message.contains("godot_update_addon"), "{message}");
+
+    let read = Arc::clone(&tools)
+        .call_tool(
+            "godot_read_shader",
+            json!({"shader_path": "res://wind.gdshader"}),
+        )
+        .await;
+    assert!(!read.is_error, "{}", tool_text(&read));
+    assert!(
+        tool_text(&read).contains("uniform float sway"),
+        "{}",
+        tool_text(&read)
+    );
+    assert!(
+        tool_text(&read).contains("addon_version"),
+        "{}",
+        tool_text(&read)
+    );
+
+    let edit = Arc::clone(&tools)
+        .call_tool(
+            "godot_edit_shader",
+            json!({"shader_path": "res://wind.gdshader",
+                   "old_text": "uniform float sway = 1.0;",
+                   "new_text": "uniform float sway = 1.0;\nuniform float gust = 0.5;"}),
+        )
+        .await;
+    assert!(!edit.is_error, "{}", tool_text(&edit));
+    let saved = std::fs::read_to_string(project.join("wind.gdshader")).expect("shader");
+    assert!(saved.contains("uniform float gust = 0.5;"), "{saved}");
+
+    let update = tools.call_tool("godot_update_addon", json!({})).await;
+    assert!(
+        update.is_error,
+        "the editor runs the addon: {}",
+        tool_text(&update)
+    );
+    assert!(
+        tool_text(&update).contains("restart_editor: true"),
+        "{}",
+        tool_text(&update)
+    );
+}

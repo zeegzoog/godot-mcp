@@ -2154,6 +2154,7 @@ func import_params(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> v
         reimported = true
     result["reimported"] = reimported
     result["after"] = ImportOps.describe(import_file)
+    send_success(peer, cmd_id, result)
 
 ## The shader commands keep their logic in editor/shader_ops.gd; these only check the parameters.
 func create_shader(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:

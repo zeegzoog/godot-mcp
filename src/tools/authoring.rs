@@ -4,7 +4,7 @@
 //! a scene, a resource or a project setting falls back to writing the file.
 
 use super::{EditorChoice, ToolManager, str_arg};
-use crate::cli_runner::ClassKind;
+use crate::cli_runner::{ClassKind, SettingType};
 use crate::error::McpError;
 use crate::paths::{res_display, resolve_in_project};
 use crate::protocol::{Tool, ToolResult};
@@ -72,7 +72,7 @@ pub fn catalog() -> Vec<Tool> {
         ),
         tool(
             "godot_set_project_setting",
-            "Sets one project setting and saves it. Uses the live editor when connected. The value must be a string, number or boolean, and of the type the setting already has. InputMap actions (input/...) are changed with godot_edit_input_action.",
+            "Sets one project setting and saves it. Uses the live editor when connected. The value must be a string, number or boolean, and of the type the setting already has. Without the editor, project.godot is written and the type comes from the file or the engine's definition of the setting; a setting of another type takes a string: an HTML color (\"#102b38\") for a Color, otherwise the text project.godot stores (\"Vector2i(1152, 648)\"). InputMap actions (input/...) are changed with godot_edit_input_action.",
             json!({"key": s("For example application/config/name."), "value": {"description": "String, number, or boolean."}, "project_path": s("")}),
             &["key", "value"],
         ),
@@ -426,24 +426,7 @@ async fn set_setting(tools: &ToolManager, args: &Value) -> ToolResult {
                 Ok(path) => path,
                 Err(result) => return result,
             };
-            match write_setting(&project.join("project.godot"), key, value) {
-                Ok(()) => ToolResult::text(format!(
-                    "Set {key} in {}. Reopen the project in the editor to pick it up.",
-                    project.join("project.godot").display()
-                )),
-                Err(error) => {
-                    let hint: &[&str] = if error.contains("expects a")
-                        || error.contains("value must be")
-                    {
-                        &[
-                            "Send a value of the type the setting already has, or change it in the editor's Project Settings",
-                        ]
-                    } else {
-                        &["Use a key like application/config/name"]
-                    };
-                    ToolResult::error(error, hint)
-                }
-            }
+            write_setting_on_disk(tools, &project.join("project.godot"), key, value).await
         }
         Err(error) => super::bridge_error_result(&error),
     }
@@ -610,48 +593,168 @@ fn render_setting(value: &Value, stored: Option<StoredKind>) -> Result<String, S
     }
 }
 
-fn write_setting(path: &Path, key: &str, value: &Value) -> Result<(), String> {
+/// Sets `key` in the `project.godot` at `path` without an editor. The value keeps the type the
+/// setting has: the one stored in the file, else the engine's own definition of the setting, which
+/// the Godot executable is asked for. A setting neither knows keeps the type of the value.
+async fn write_setting_on_disk(
+    tools: &ToolManager,
+    path: &Path,
+    key: &str,
+    value: &Value,
+) -> ToolResult {
+    let wrong_type = |problem: String| {
+        ToolResult::error(
+            problem,
+            &[
+                "Send a value of the type the setting already has, or change it in the editor's Project Settings",
+            ],
+        )
+    };
     if !is_setting_key(key) {
-        return Err(
-            "key must start with a section and use only letters, digits and _ / . -, like application/config/name"
-                .to_string(),
+        return ToolResult::error(
+            "key must start with a section and use only letters, digits and _ / . -, like application/config/name",
+            &["Use a key like application/config/name"],
         );
     }
-    let Some((section, name)) = key.split_once('/') else {
-        return Err(format!(
-            "'{key}' must contain a section, like application/config/name"
-        ));
-    };
+    if !matches!(value, Value::String(_) | Value::Bool(_) | Value::Number(_)) {
+        return wrong_type("value must be a string, number or boolean".to_string());
+    }
     let original = std::fs::read_to_string(path).unwrap_or_default();
-    let mut lines: Vec<String> = original.lines().map(str::to_string).collect();
-    let header = format!("[{section}]");
-    let prefix = format!("{name}=");
-    let range = lines
+    let stored = stored_setting(&original, key);
+    let rendered = match stored.as_deref().map(StoredKind::of) {
+        Some(kind) if kind != StoredKind::Structured => render_setting(value, Some(kind)),
+        _ => match tools.cli.setting_type(key, value, stored.as_deref()).await {
+            Ok(found) => render_typed(value, &found),
+            Err(McpError::Validation(problem)) => {
+                Err(format!("The type of {key} could not be checked: {problem}"))
+            }
+            Err(error) => {
+                return ToolResult::error(
+                    format!(
+                        "The type of {key} could not be checked with the engine, so project.godot was not changed: {error}"
+                    ),
+                    &[
+                        "Verify GODOT_PATH points to a working Godot executable",
+                        "Or open the project in the editor with the Godot MCP Bridge plugin, which checks the type itself",
+                    ],
+                );
+            }
+        },
+    };
+    let rendered = match rendered {
+        Ok(rendered) => rendered,
+        Err(problem) => return wrong_type(problem),
+    };
+    match std::fs::write(path, put_setting(&original, key, &rendered)) {
+        Ok(()) => ToolResult::text(format!(
+            "Set {key} = {rendered} in {}. Reopen the project in the editor to pick it up.",
+            path.display()
+        )),
+        Err(error) => ToolResult::error(
+            format!("Failed to write {}: {error}", path.display()),
+            &["Check that project.godot is writable"],
+        ),
+    }
+}
+
+/// The text to store for `value`, given what the engine answered about the setting.
+fn render_typed(value: &Value, found: &SettingType) -> Result<String, String> {
+    let Some(type_name) = found.type_name.as_deref() else {
+        return render_setting(value, None);
+    };
+    let plain = match type_name {
+        "String" => Some(StoredKind::Text),
+        "bool" => Some(StoredKind::Flag),
+        "int" => Some(StoredKind::Whole),
+        "float" => Some(StoredKind::Fraction),
+        _ => None,
+    };
+    if let Some(kind) = plain {
+        return render_setting(value, Some(kind));
+    }
+    match found.text.as_deref() {
+        Some(text) if !text.is_empty() && !text.contains(['\n', '\r']) => Ok(text.to_string()),
+        _ if type_name == "Color" => Err(
+            "This setting expects a Color: send an HTML color such as \"#102b38\" or \"#102b38ff\", or a color name such as \"white\"".to_string(),
+        ),
+        _ => Err(format!(
+            "This setting expects a {type_name}: send it as a string the way project.godot stores it, such as \"{type_name}(...)\". Change settings of other types in the editor's Project Settings."
+        )),
+    }
+}
+
+/// The section header and the line prefix of `key` in `project.godot`.
+fn setting_parts(key: &str) -> Option<(String, String)> {
+    key.split_once('/')
+        .map(|(section, name)| (format!("[{section}]"), format!("{name}=")))
+}
+
+/// The lines of `[section]` in `lines`: the header's index and the index of the next header (or
+/// the end).
+fn section_range(lines: &[&str], header: &str) -> Option<(usize, usize)> {
+    let start = lines.iter().position(|line| line.trim() == header)?;
+    let end = lines
         .iter()
-        .position(|line| line.trim() == header)
-        .map(|start| {
-            let end = lines
-                .iter()
-                .enumerate()
-                .skip(start + 1)
-                .find(|(_, line)| line.trim().starts_with('['))
-                .map_or(lines.len(), |(index, _)| index);
-            (start, end)
-        });
+        .enumerate()
+        .skip(start + 1)
+        .find(|(_, line)| line.trim().starts_with('['))
+        .map_or(lines.len(), |(index, _)| index);
+    Some((start, end))
+}
+
+/// The value text `project.godot` holds for `key`, if any.
+fn stored_setting(text: &str, key: &str) -> Option<String> {
+    let (header, prefix) = setting_parts(key)?;
+    let lines: Vec<&str> = text.lines().collect();
+    let (start, end) = section_range(&lines, &header)?;
+    lines[start + 1..end].iter().find_map(|line| {
+        line.trim_start()
+            .strip_prefix(&prefix)
+            .map(|stored| stored.trim().to_string())
+    })
+}
+
+/// `text` with `key` set to the stored text `rendered`: an existing entry is replaced in place, a
+/// new one goes after the last entry of its section, keeping the blank line before the next
+/// section, and a new section is added at the end the way Godot writes one.
+fn put_setting(text: &str, key: &str, rendered: &str) -> String {
+    let Some((header, prefix)) = setting_parts(key) else {
+        return text.to_string();
+    };
+    let assignment = format!("{prefix}{rendered}");
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let borrowed: Vec<&str> = lines.iter().map(String::as_str).collect();
+    let range = section_range(&borrowed, &header);
     let existing = range.and_then(|(start, end)| {
-        lines[start..end]
-            .iter()
-            .position(|line| line.trim_start().starts_with(&prefix))
-            .map(|offset| start + offset)
+        (start + 1..end).find(|&index| borrowed[index].trim_start().starts_with(&prefix))
     });
-    let stored =
-        existing.map(|index| StoredKind::of(lines[index].trim_start().trim_start_matches(&prefix)));
-    let assignment = format!("{prefix}{}", render_setting(value, stored)?);
     match (existing, range) {
         (Some(index), _) => lines[index] = assignment,
-        (None, Some((_, end))) => lines.insert(end, assignment),
+        (None, Some((start, end))) => {
+            let last = (start..end)
+                .rev()
+                .find(|&index| !lines[index].trim().is_empty())
+                .unwrap_or(start);
+            let mut at = last + 1;
+            if last == start {
+                // Only the header so far: Godot puts a blank line between it and the entries.
+                if lines.get(at).is_some_and(|line| line.trim().is_empty()) {
+                    at += 1;
+                } else {
+                    lines.insert(at, String::new());
+                    at += 1;
+                }
+            }
+            lines.insert(at, assignment);
+            if lines
+                .get(at + 1)
+                .is_some_and(|line| line.trim().starts_with('['))
+            {
+                lines.insert(at + 1, String::new());
+            }
+        }
         (None, None) => {
-            if !lines.is_empty() && !lines.last().is_some_and(|line| line.is_empty()) {
+            if !lines.is_empty() && !lines.last().is_some_and(|line| line.trim().is_empty()) {
                 lines.push(String::new());
             }
             lines.push(header);
@@ -659,7 +762,7 @@ fn write_setting(path: &Path, key: &str, value: &Value) -> Result<(), String> {
             lines.push(assignment);
         }
     }
-    std::fs::write(path, lines.join("\n") + "\n").map_err(|err| err.to_string())
+    lines.join("\n") + "\n"
 }
 
 /// A stored value as the editor reports it: a quoted string without its quotes and escapes, any
@@ -729,20 +832,95 @@ mod tests {
 
     #[test]
     fn project_setting_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("project.godot");
-        std::fs::write(
-            &path,
-            "config_version=5\n\n[application]\n\nconfig/name=\"Old\"\n",
-        )
-        .unwrap();
-        write_setting(&path, "application/config/name", &json!("New")).unwrap();
-        write_setting(&path, "display/window/size/viewport_width", &json!(640)).unwrap();
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("config/name=\"New\""), "{text}");
-        assert!(text.contains("[display]"), "{text}");
-        assert!(text.contains("window/size/viewport_width=640"), "{text}");
+        let text = "config_version=5\n\n[application]\n\nconfig/name=\"Old\"\n";
+        let text = put_setting(text, "application/config/name", "\"New\"");
+        let text = put_setting(&text, "display/window/size/viewport_width", "640");
+        assert_eq!(
+            text,
+            "config_version=5\n\n[application]\n\nconfig/name=\"New\"\n\n[display]\n\nwindow/size/viewport_width=640\n"
+        );
+        assert_eq!(
+            stored_setting(&text, "application/config/name").as_deref(),
+            Some("\"New\"")
+        );
+        assert_eq!(stored_setting(&text, "application/config/icon"), None);
         let settings = read_settings(&text, "application/");
         assert_eq!(settings["application/config/name"], "New");
+    }
+
+    #[test]
+    fn a_new_setting_keeps_the_blank_line_before_the_next_section() {
+        let text = "config_version=5\n\n[application]\n\nconfig/name=\"Frog\"\nrun/main_scene=\"res://main.tscn\"\n\n[display]\n\nwindow/stretch/mode=\"viewport\"\n";
+        assert_eq!(
+            put_setting(
+                text,
+                "application/boot_splash/bg_color",
+                "Color(0.0627451, 0.16862746, 0.21960784, 1)"
+            ),
+            "config_version=5\n\n[application]\n\nconfig/name=\"Frog\"\nrun/main_scene=\"res://main.tscn\"\nboot_splash/bg_color=Color(0.0627451, 0.16862746, 0.21960784, 1)\n\n[display]\n\nwindow/stretch/mode=\"viewport\"\n"
+        );
+        // A section with only its header gets the blank line Godot writes after a header.
+        assert_eq!(
+            put_setting("[a]\n\n[b]\n\nx=1\n", "a/k", "2"),
+            "[a]\n\nk=2\n\n[b]\n\nx=1\n"
+        );
+        assert_eq!(put_setting("[a]\n[b]\n", "a/k", "2"), "[a]\n\nk=2\n\n[b]\n");
+        assert_eq!(put_setting("[a]\n", "a/k", "2"), "[a]\n\nk=2\n");
+        // A section written without a blank line before the next one gets one.
+        assert_eq!(
+            put_setting("[a]\n\nx=1\n[b]\n", "a/k", "2"),
+            "[a]\n\nx=1\nk=2\n\n[b]\n"
+        );
+    }
+
+    #[test]
+    fn a_setting_of_another_type_takes_the_engine_text_or_is_refused() {
+        let typed = |type_name: &str, text: Option<&str>| SettingType {
+            type_name: Some(type_name.to_string()),
+            text: text.map(str::to_string),
+        };
+        assert_eq!(
+            render_typed(
+                &json!("#102b38"),
+                &typed("Color", Some("Color(0.1, 0.2, 0.3, 1)"))
+            ),
+            Ok("Color(0.1, 0.2, 0.3, 1)".to_string())
+        );
+        let refused = render_typed(&json!("teal-ish"), &typed("Color", None)).unwrap_err();
+        assert!(refused.contains("expects a Color"), "{refused}");
+        assert!(refused.contains("#102b38"), "{refused}");
+        let refused = render_typed(&json!(3), &typed("Vector2i", None)).unwrap_err();
+        assert!(refused.contains("Vector2i(...)"), "{refused}");
+        // An engine answer that would break the line is never written.
+        assert!(render_typed(&json!("x"), &typed("StringName", Some("&\"a\nb\""))).is_err());
+
+        // Plain types follow the same rules as a value already in project.godot.
+        assert_eq!(
+            render_typed(&json!(648), &typed("int", None)),
+            Ok("648".to_string())
+        );
+        assert_eq!(
+            render_typed(&json!(648.0), &typed("int", None)),
+            Ok("648".to_string())
+        );
+        assert!(render_typed(&json!(2.5), &typed("int", None)).is_err());
+        assert!(render_typed(&json!("60"), &typed("int", None)).is_err());
+        assert_eq!(
+            render_typed(&json!(1), &typed("float", None)),
+            Ok("1.0".to_string())
+        );
+        assert_eq!(
+            render_typed(&json!("Frog"), &typed("String", None)),
+            Ok("\"Frog\"".to_string())
+        );
+        assert!(render_typed(&json!("yes"), &typed("bool", None)).is_err());
+
+        // A setting the engine does not define keeps the value's own type.
+        let unknown = SettingType::default();
+        assert_eq!(render_typed(&json!(7), &unknown), Ok("7".to_string()));
+        assert_eq!(
+            render_typed(&json!("#fff"), &unknown),
+            Ok("\"#fff\"".to_string())
+        );
     }
 }

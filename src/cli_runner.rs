@@ -257,6 +257,94 @@ func _init() -> void:
 				print("GODOT_MCP_UID ", path, " ", error_string(ResourceSaver.set_uid(path, id)))
 	print("GODOT_MCP_UIDS_DONE")
 	quit()
+
+/// What the engine knows about a project setting, from [`CliRunner::setting_type`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SettingType {
+    /// The Variant type name, as `type_string` gives it (`Color`, `int`, `String`, ...); `None`
+    /// when the engine defines no such setting and `project.godot` holds none.
+    pub type_name: Option<String>,
+    /// The value converted to that type, as `project.godot` stores it. Only given for a type
+    /// that is not a string, number or boolean, and only when the value could be converted.
+    pub text: Option<String>,
+}
+
+/// The script the setting type check runs. Fixed text: the request reaches it as
+/// `res://request.json` of its throw-away project, never inside the source or on the command
+/// line. A string becomes a value of another type only as an HTML color for a Color, or as the
+/// text Godot writes for that type (`Vector2i(1152, 648)`); never as an Object.
+const SETTING_TYPE_SCRIPT: &str = r#"extends SceneTree
+
+const PLAIN_TYPES: Array[int] = [TYPE_STRING, TYPE_BOOL, TYPE_INT, TYPE_FLOAT]
+
+
+func _init() -> void:
+	print("GODOT_MCP_SETTING=", JSON.stringify(_answer()))
+	quit()
+
+
+func _answer() -> Dictionary:
+	var request: Variant = JSON.parse_string(FileAccess.get_file_as_string("res://request.json"))
+	if typeof(request) != TYPE_DICTIONARY:
+		return {"error": "the request could not be read"}
+	var key: String = str(request.get("key", ""))
+	var value: Variant = request.get("value")
+	var current: Variant = null
+	if request.has("stored"):
+		var stored: String = str(request["stored"]).strip_edges()
+		if stored.begins_with("Object("):
+			return {"type": "Object"}
+		current = str_to_var(stored)
+		if current == null:
+			return {"error": "the value stored in project.godot could not be read"}
+	else:
+		var defined: String = _defined_key(key)
+		if defined.is_empty():
+			return {}
+		current = ProjectSettings.get_setting(defined)
+	var type: int = typeof(current)
+	var answer: Dictionary = {"type": type_string(type)}
+	if type in PLAIN_TYPES:
+		return answer
+	var converted: Variant = _convert(value, type)
+	if converted != null:
+		answer["text"] = var_to_str(converted)
+	return answer
+
+
+## The setting the engine defines for key; a feature override (`name.mobile`) has the type of
+## its base setting.
+func _defined_key(key: String) -> String:
+	if ProjectSettings.has_setting(key):
+		return key
+	var last: String = key.get_slice("/", key.get_slice_count("/") - 1)
+	if last.contains("."):
+		var base: String = key.substr(0, key.rfind("."))
+		if ProjectSettings.has_setting(base):
+			return base
+	return ""
+
+
+func _convert(value: Variant, type: int) -> Variant:
+	if not value is String:
+		return null
+	var text: String = (value as String).strip_edges()
+	match type:
+		TYPE_COLOR:
+			var missing: Color = Color(-1, -1, -1, -1)
+			var color: Color = Color.from_string(text, missing)
+			if color != missing:
+				return color
+		TYPE_STRING_NAME:
+			return StringName(value)
+		TYPE_NODE_PATH:
+			return NodePath(value)
+	if type == TYPE_OBJECT or not text.begins_with(type_string(type) + "("):
+		return null
+	var parsed: Variant = str_to_var(text)
+	if typeof(parsed) == type:
+		return parsed
+	return null
 "#;
 
 const SHADER_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
@@ -423,6 +511,29 @@ impl CliRunner {
         }
     }
 
+    /// The type a project setting has, and `value` converted to it when it is not a string,
+    /// number or boolean (see [`SettingType`]).
+    ///
+    /// `stored` is the text `project.godot` already holds for the key; without it the engine's
+    /// own definition of the setting is used. One bounded call of the Godot executable in a
+    /// throw-away project of its own, so no project file is read and no project code runs; the
+    /// request travels as a JSON file, never on the command line.
+    pub async fn setting_type(
+        &self,
+        key: &str,
+        value: &serde_json::Value,
+        stored: Option<&str>,
+    ) -> Result<SettingType> {
+        let mut request = serde_json::json!({"key": key, "value": value});
+        if let Some(stored) = stored {
+            request["stored"] = serde_json::Value::String(stored.to_string());
+        }
+        let dir = create_scratch_dir("setting-type")?;
+        let outcome = self.run_setting_type(&dir, &request).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        outcome
+    }
+
     /// Compiles the shader at `res_path` with the engine's shader compiler in a headless Godot
     /// on the project, and returns what the check script printed after its marker: a JSON
     /// object `{loaded, errors: [{file, line, message}], other: [message]}`.
@@ -431,6 +542,65 @@ impl CliRunner {
         let outcome = self.run_shader_check(&dir, project_path, res_path).await;
         let _ = std::fs::remove_dir_all(&dir);
         outcome
+    }
+
+    async fn run_setting_type(
+        &self,
+        dir: &Path,
+        request: &serde_json::Value,
+    ) -> Result<SettingType> {
+        std::fs::write(dir.join("project.godot"), "config_version=5\n")?;
+        std::fs::write(dir.join("request.json"), request.to_string())?;
+        let script = dir.join("setting_type.gd");
+        std::fs::write(&script, SETTING_TYPE_SCRIPT)?;
+        let mut command = Command::new(&self.godot_binary);
+        command
+            .arg("--headless")
+            .arg("--path")
+            .arg(dir)
+            .arg("--script")
+            .arg(&script)
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
+        let output = timeout(CLASS_CHECK_TIMEOUT, command.output())
+            .await
+            .map_err(|_| {
+                McpError::Process(format!(
+                    "Godot did not answer the setting type check within {}s",
+                    CLASS_CHECK_TIMEOUT.as_secs()
+                ))
+            })?
+            .map_err(|e| {
+                McpError::Process(format!(
+                    "Failed to run the Godot executable at '{}' to check the setting type: {e}",
+                    self.godot_binary.display()
+                ))
+            })?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let answer: serde_json::Value = stdout
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("GODOT_MCP_SETTING="))
+            .and_then(|answer| serde_json::from_str(answer).ok())
+            .ok_or_else(|| {
+                McpError::Process(format!(
+                    "Godot gave no answer to the setting type check (exit {}): {}",
+                    output.status,
+                    strip_banner(&String::from_utf8_lossy(&output.stderr))
+                ))
+            })?;
+        if let Some(problem) = answer.get("error").and_then(|e| e.as_str()) {
+            return Err(McpError::Validation(problem.to_string()));
+        }
+        let field = |name: &str| {
+            answer
+                .get(name)
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        };
+        Ok(SettingType {
+            type_name: field("type"),
+            text: field("text"),
+        })
     }
 
     async fn run_shader_check(

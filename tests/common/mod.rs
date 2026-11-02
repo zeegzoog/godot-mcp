@@ -138,7 +138,8 @@ sleep 8
 
 /// A stand-in for the Godot executable that answers the class check of the authoring fallbacks:
 /// it reads the class name after `--` (the last argument) and prints `GODOT_MCP_CLASS=scene` for
-/// a few Node classes, `resource` for a few Resource classes and `no` for anything else.
+/// a few Node classes, `resource` for a few Resource classes and `no` for anything else. It
+/// answers the project setting type check as for a setting the engine does not define.
 pub fn classifying_godot(dir: &Path) -> PathBuf {
     #[cfg(windows)]
     {
@@ -146,6 +147,7 @@ pub fn classifying_godot(dir: &Path) -> PathBuf {
         std::fs::write(
             &path,
             "@echo off
+echo GODOT_MCP_SETTING={}
 for %%a in (%*) do set LAST=%%a
 for %%c in (Node Node2D Node3D Control) do if \"%LAST%\"==\"%%c\" (echo GODOT_MCP_CLASS=scene& exit /b 0)
 for %%c in (Resource Curve Gradient) do if \"%LAST%\"==\"%%c\" (echo GODOT_MCP_CLASS=resource& exit /b 0)
@@ -162,6 +164,7 @@ echo GODOT_MCP_CLASS=no
         std::fs::write(
             &path,
             "#!/bin/sh
+echo 'GODOT_MCP_SETTING={}'
 for last; do :; done
 case \"$last\" in
   Node|Node2D|Node3D|Control) echo GODOT_MCP_CLASS=scene ;;
@@ -174,6 +177,42 @@ esac
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
             .expect("chmod classifying godot");
         path
+    }
+}
+
+/// A stand-in for the Godot executable that answers the project setting type check with
+/// `answer` (the JSON after `GODOT_MCP_SETTING=`) and copies the request it was given to the
+/// returned file.
+pub fn setting_godot(dir: &Path, answer: &str) -> (PathBuf, PathBuf) {
+    let record = dir.join("setting_request.json");
+    #[cfg(windows)]
+    {
+        let path = dir.join("setting_godot.bat");
+        std::fs::write(
+            &path,
+            format!(
+                "@echo off\r\ncopy /y \"%~3\\request.json\" \"{}\" > nul\r\necho GODOT_MCP_SETTING={answer}\r\n",
+                record.display()
+            ),
+        )
+        .expect("write setting godot");
+        (path, record)
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("setting_godot.sh");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\ncp \"$3/request.json\" '{}'\necho 'GODOT_MCP_SETTING={answer}'\n",
+                record.display()
+            ),
+        )
+        .expect("write setting godot");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod setting godot");
+        (path, record)
     }
 }
 

@@ -19,7 +19,7 @@ use crate::paths::{res_display, resolve_in_project};
 use crate::protocol::{Tool, ToolResult};
 use serde_json::{Map, Value, json};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 pub const GET: &str = "godot_get_import_params";
 pub const SET: &str = "godot_set_import_params";
@@ -251,6 +251,7 @@ async fn set(tools: &ToolManager, args: &Value) -> ToolResult {
         if let Some(name) = &importer {
             request["importer"] = json!(name);
         }
+        let written_before = modified(&file.sidecar);
         let answer = match tools.cli.import_params(&request).await {
             Ok(answer) => answer,
             Err(error) => return godot_failed(&error),
@@ -265,6 +266,9 @@ async fn set(tools: &ToolManager, args: &Value) -> ToolResult {
                 .as_array()
                 .is_some_and(|changed| !changed.is_empty());
         if wants_reimport && changed {
+            if let Some(before) = written_before {
+                newer_than(&file.sidecar, before);
+            }
             let limit = Duration::from_secs(
                 args.get("timeout_seconds")
                     .and_then(Value::as_u64)
@@ -551,6 +555,40 @@ fn godot_failed(error: &crate::error::McpError) -> ToolResult {
         error.to_string(),
         &["Verify GODOT_PATH points to a working Godot editor executable"],
     )
+}
+
+fn modified(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+}
+
+/// Godot's file system cache keeps a `.import` file's modification time in whole seconds and
+/// reimports only when it differs, so an edit within the second of the last import would be
+/// missed. Such a file is dated one second after `before`.
+fn newer_than(path: &Path, before: SystemTime) {
+    let seconds = |time: SystemTime| {
+        time.duration_since(SystemTime::UNIX_EPOCH)
+            .map(|since| since.as_secs())
+            .unwrap_or_default()
+    };
+    let Some(now) = modified(path) else {
+        return;
+    };
+    if seconds(now) > seconds(before) {
+        return;
+    }
+    let later = before + Duration::from_secs(1);
+    let dated = std::fs::File::options()
+        .write(true)
+        .open(path)
+        .and_then(|file| file.set_modified(later));
+    if let Err(error) = dated {
+        tracing::warn!(
+            "could not date {} for the reimport: {error}",
+            path.display()
+        );
+    }
 }
 
 /// The path as Godot reads it on every platform.

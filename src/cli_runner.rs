@@ -239,6 +239,47 @@ func _typed(value: Variant, old: Variant) -> Variant:
 	return value
 "#;
 
+const SHADER_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+const SHADER_CHECK_MARKER: &str = "GODOT_MCP_SHADER=";
+
+/// The script the shader check runs. Fixed text: the shader path reaches it only as a user
+/// argument after `--`, never inside the source. Loading the shader runs the preprocessor
+/// (includes, defines); asking for its RID hands the result to the rendering server, whose
+/// headless (dummy) renderer compiles it with the engine's shader compiler. That compiler
+/// reports an error as a shader error with its file and line, which the logger collects.
+const SHADER_CHECK_SCRIPT: &str = "extends SceneTree
+
+class Collector extends Logger:
+	var errors: Array = []
+	var other: Array = []
+	var mutex: Mutex = Mutex.new()
+
+	func _log_error(_function: String, file: String, line: int, code: String, rationale: String, _editor_notify: bool, error_type: int, _script_backtraces: Array[ScriptBacktrace]) -> void:
+		mutex.lock()
+		if error_type == ERROR_TYPE_SHADER:
+			errors.append({\"file\": file, \"line\": line, \"message\": code})
+		elif error_type != ERROR_TYPE_WARNING and rationale != \"Shader compilation failed.\":
+			other.append(rationale if not rationale.is_empty() else code)
+		mutex.unlock()
+
+	func _log_message(_message: String, _error: bool) -> void:
+		pass
+
+func _init() -> void:
+	var args: PackedStringArray = OS.get_cmdline_user_args()
+	var path: String = args[0] if args.size() > 0 else \"\"
+	var collector: Collector = Collector.new()
+	OS.add_logger(collector)
+	var shader: Shader = null
+	if path.begins_with(\"res://\"):
+		shader = ResourceLoader.load(path, \"Shader\", ResourceLoader.CACHE_MODE_IGNORE) as Shader
+	if shader != null:
+		shader.get_rid()
+	OS.remove_logger(collector)
+	print(\"GODOT_MCP_SHADER=\", JSON.stringify({\"loaded\": shader != null, \"errors\": collector.errors, \"other\": collector.other}))
+	quit()
+";
+
 #[derive(Clone, Debug)]
 pub struct CliRunner {
     godot_binary: PathBuf,
@@ -360,6 +401,64 @@ impl CliRunner {
                 output.status
             ))),
         }
+    }
+
+    /// Compiles the shader at `res_path` with the engine's shader compiler in a headless Godot
+    /// on the project, and returns what the check script printed after its marker: a JSON
+    /// object `{loaded, errors: [{file, line, message}], other: [message]}`.
+    pub async fn check_shader(&self, project_path: &Path, res_path: &str) -> Result<String> {
+        let dir = create_scratch_dir("shader-check")?;
+        let outcome = self.run_shader_check(&dir, project_path, res_path).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        outcome
+    }
+
+    async fn run_shader_check(
+        &self,
+        dir: &Path,
+        project_path: &Path,
+        res_path: &str,
+    ) -> Result<String> {
+        let script = dir.join("shader_check.gd");
+        std::fs::write(&script, SHADER_CHECK_SCRIPT)?;
+        let run = self
+            .run_script(
+                project_path,
+                &script,
+                &[res_path.to_string()],
+                SHADER_CHECK_TIMEOUT.as_secs(),
+            )
+            .await?;
+        if let Some(answer) = run
+            .stdout
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(SHADER_CHECK_MARKER))
+        {
+            return Ok(answer.trim().to_string());
+        }
+        let mut detail = if run.timed_out {
+            format!(
+                "Godot did not finish the shader check within {}s",
+                SHADER_CHECK_TIMEOUT.as_secs()
+            )
+        } else {
+            format!(
+                "Godot gave no answer to the shader check (exit {})",
+                run.exit_code
+                    .map_or_else(|| "unknown".to_string(), |code| code.to_string())
+            )
+        };
+        let output = format!("{}\n{}", run.stdout.trim(), run.stderr.trim());
+        let output = output.trim();
+        if !output.is_empty() {
+            let start = output
+                .char_indices()
+                .rev()
+                .nth(1999)
+                .map_or(0, |(index, _)| index);
+            detail.push_str(&format!("; its output ends with:\n{}", &output[start..]));
+        }
+        Err(McpError::Process(detail))
     }
 
     /// Launch Godot Editor for a designated project directory.

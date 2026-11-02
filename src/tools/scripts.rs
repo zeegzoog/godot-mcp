@@ -13,8 +13,46 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 
-/// Scripts larger than this are not handled by the script tools.
+/// Files larger than this are not handled by the script and shader tools.
 pub(super) const MAX_BYTES: u64 = 1_048_576;
+
+/// The files a set of text tools works on, and the words their answers use for them.
+pub(super) struct TextKind {
+    /// The parameter that names the file.
+    pub(super) param: &'static str,
+    /// The extensions the tools accept, with the dot.
+    pub(super) extensions: &'static [&'static str],
+    /// The file in lower case ("script") and capitalized ("Script"), for messages.
+    pub(super) noun: &'static str,
+    pub(super) noun_title: &'static str,
+    /// What the path must name, for hints: "a .gd script".
+    pub(super) what: &'static str,
+    /// The refusal for another kind of file, before the path.
+    pub(super) wrong_kind: &'static str,
+    pub(super) wrong_kind_hint: &'static str,
+    pub(super) read_tool: &'static str,
+    pub(super) create_tool: &'static str,
+}
+
+impl TextKind {
+    pub(super) fn accepts(&self, res_path: &str) -> bool {
+        self.extensions
+            .iter()
+            .any(|extension| res_path.ends_with(extension))
+    }
+}
+
+const GDSCRIPT: TextKind = TextKind {
+    param: "script_path",
+    extensions: &[".gd"],
+    noun: "script",
+    noun_title: "Script",
+    what: "a .gd script",
+    wrong_kind: "Only .gd scripts can be read or edited",
+    wrong_kind_hint: "Pass the path of a GDScript file",
+    read_tool: "godot_read_script",
+    create_tool: "godot_create_script",
+};
 
 pub fn handles(name: &str) -> bool {
     matches!(name, "godot_read_script" | "godot_edit_script")
@@ -60,19 +98,20 @@ async fn read(tools: &ToolManager, args: &Value) -> ToolResult {
         Err(result) => return result,
     };
     if matches!(choice, EditorChoice::Host) {
-        return read_file(tools, args).await;
+        return read_file(tools, args, &GDSCRIPT).await;
     }
     match tools.bridge.send_command("read_script", args.clone()).await {
         Ok(value) => ToolResult::text(
             serde_json::to_string_pretty(&choice.name_project(value)).unwrap_or_default(),
         ),
-        Err(McpError::BridgeUnavailable(_)) => read_file(tools, args).await,
+        Err(McpError::BridgeUnavailable(_)) => read_file(tools, args, &GDSCRIPT).await,
         Err(error) => super::bridge_error_result(&error),
     }
 }
 
-async fn read_file(tools: &ToolManager, args: &Value) -> ToolResult {
-    let script = match load(tools, args).await {
+/// The read without an editor: the file's text and its label.
+pub(super) async fn read_file(tools: &ToolManager, args: &Value, kind: &TextKind) -> ToolResult {
+    let script = match load(tools, args, kind).await {
         Ok(script) => script,
         Err(result) => return result,
     };
@@ -96,20 +135,20 @@ async fn edit(tools: &ToolManager, args: &Value) -> ToolResult {
         Err(result) => return result,
     };
     if matches!(choice, EditorChoice::Host) {
-        return edit_file(tools, args).await;
+        return edit_file(tools, args, &GDSCRIPT).await;
     }
     match tools.bridge.send_command("edit_script", args.clone()).await {
         Ok(value) => ToolResult::text(
             serde_json::to_string_pretty(&choice.name_project(value)).unwrap_or_default(),
         ),
-        Err(McpError::BridgeUnavailable(_)) => edit_file(tools, args).await,
+        Err(McpError::BridgeUnavailable(_)) => edit_file(tools, args, &GDSCRIPT).await,
         Err(error) => super::bridge_error_result(&error),
     }
 }
 
 /// The edit without an editor: the same checks as the addon, then the whole file is replaced
-/// through a temporary file so no half-written script is ever seen.
-async fn edit_file(tools: &ToolManager, args: &Value) -> ToolResult {
+/// through a temporary file so no half-written file is ever seen.
+pub(super) async fn edit_file(tools: &ToolManager, args: &Value, kind: &TextKind) -> ToolResult {
     let (Some(old_text), Some(new_text)) = (str_arg(args, "old_text"), str_arg(args, "new_text"))
     else {
         return ToolResult::error(
@@ -131,7 +170,7 @@ async fn edit_file(tools: &ToolManager, args: &Value) -> ToolResult {
             &["Pass the text as it should read after the edit in new_text"],
         );
     }
-    let script = match load(tools, args).await {
+    let script = match load(tools, args, kind).await {
         Ok(script) => script,
         Err(result) => return result,
     };
@@ -139,8 +178,14 @@ async fn edit_file(tools: &ToolManager, args: &Value) -> ToolResult {
         let current = label(&script.text);
         if version != current {
             return ToolResult::error(
-                format!("The script changed since it was read (version {version}, now {current})"),
-                &["Read it again with godot_read_script and repeat the edit"],
+                format!(
+                    "The {} changed since it was read (version {version}, now {current})",
+                    kind.noun
+                ),
+                &[&format!(
+                    "Read it again with {} and repeat the edit",
+                    kind.read_tool
+                )],
             );
         }
     }
@@ -159,7 +204,7 @@ async fn edit_file(tools: &ToolManager, args: &Value) -> ToolResult {
         &script.text[..at],
         &script.text[at + old_lf.len()..]
     );
-    if let Err(result) = replace_file(&script, &edited).await {
+    if let Err(result) = replace_file(&script, &edited, kind.noun).await {
         return result;
     }
     ToolResult::text(
@@ -190,9 +235,13 @@ fn occurrences(text: &str, fragment: &str) -> (usize, Option<usize>) {
     (count, first)
 }
 
-/// Writes `edited` (with `\n` line endings) over the script, in the line ending and with the
+/// Writes `edited` (with `\n` line endings) over the file, in the line ending and with the
 /// byte order mark the file had, through a temporary file in the same directory.
-async fn replace_file(script: &Script, edited: &str) -> Result<(), ToolResult> {
+pub(super) async fn replace_file(
+    script: &TextFile,
+    edited: &str,
+    noun: &str,
+) -> Result<(), ToolResult> {
     // Replacing a symbolic link would swap the link for a regular file; the edit leaves it alone.
     if tokio::fs::symlink_metadata(&script.file)
         .await
@@ -203,7 +252,9 @@ async fn replace_file(script: &Script, edited: &str) -> Result<(), ToolResult> {
                 "{} is a symbolic link, so it is not replaced",
                 script.res_path
             ),
-            &["Edit the file the link points to, or replace the link with the script itself"],
+            &[&format!(
+                "Edit the file the link points to, or replace the link with the {noun} itself"
+            )],
         ));
     }
     let mut body = String::new();
@@ -223,7 +274,9 @@ async fn replace_file(script: &Script, edited: &str) -> Result<(), ToolResult> {
     let failure = |error: std::io::Error| {
         ToolResult::error(
             format!("Could not write {}: {error}", script.res_path),
-            &["Check that the file and its directory are writable; the script is unchanged"],
+            &[&format!(
+                "Check that the file and its directory are writable; the {noun} is unchanged"
+            )],
         )
     };
     let (temporary, mut file) = create_temporary(&script.file, &name)
@@ -276,15 +329,15 @@ async fn create_temporary(
     ))
 }
 
-/// A script read from disk: its text with `\n` line endings and the facts needed to write it
-/// back the way it was.
-struct Script {
-    res_path: String,
-    project: PathBuf,
-    file: PathBuf,
-    text: String,
-    crlf: bool,
-    bom: bool,
+/// A text file read from disk: its text with `\n` line endings and the facts needed to write
+/// it back the way it was.
+pub(super) struct TextFile {
+    pub(super) res_path: String,
+    pub(super) project: PathBuf,
+    pub(super) file: PathBuf,
+    pub(super) text: String,
+    pub(super) crlf: bool,
+    pub(super) bom: bool,
 }
 
 /// The version label of a text: the 64-bit FNV-1a hash of its UTF-8 bytes with `\r\n` read
@@ -298,35 +351,16 @@ pub fn label(text: &str) -> String {
     format!("{hash:016x}")
 }
 
-/// Finds the script named by `script_path` in the host project and reads it, or explains why
-/// it cannot be used.
-async fn load(tools: &ToolManager, args: &Value) -> Result<Script, ToolResult> {
-    let Some(requested) = str_arg(args, "script_path") else {
-        return Err(ToolResult::error(
-            "Missing script_path",
-            &["Pass a res:// path to a .gd script"],
-        ));
-    };
-    let project = tools.host_project(args)?;
-    let file = resolve_in_project(&project, requested).map_err(|problem| {
-        ToolResult::error(
-            problem,
-            &["Use a res:// path or a path relative to the project directory"],
-        )
-    })?;
-    let res_path = res_path_of(&project, &file, requested);
-    if !res_path.ends_with(".gd") {
-        return Err(ToolResult::error(
-            format!("Only .gd scripts can be read or edited: {res_path}"),
-            &["Pass the path of a GDScript file"],
-        ));
-    }
+/// Finds the file named by the kind's path parameter in the host project and reads it, or
+/// explains why it cannot be used.
+async fn load(tools: &ToolManager, args: &Value, kind: &TextKind) -> Result<TextFile, ToolResult> {
+    let (project, file, res_path) = locate(tools, args, kind)?;
     let size = match tokio::fs::metadata(&file).await {
         Ok(metadata) => metadata.len(),
         Err(error) if error.kind() == ErrorKind::NotFound => {
             return Err(ToolResult::error(
-                format!("Script file does not exist: {res_path}"),
-                &["Create it with godot_create_script"],
+                format!("{} file does not exist: {res_path}", kind.noun_title),
+                &[&format!("Create it with {}", kind.create_tool)],
             ));
         }
         Err(error) => {
@@ -338,7 +372,10 @@ async fn load(tools: &ToolManager, args: &Value) -> Result<Script, ToolResult> {
     };
     if size > MAX_BYTES {
         return Err(ToolResult::error(
-            format!("{res_path} is larger than 1 MiB, which the script tools do not handle"),
+            format!(
+                "{res_path} is larger than 1 MiB, which the {} tools do not handle",
+                kind.noun
+            ),
             &["Edit it with your own file tools"],
         ));
     }
@@ -356,7 +393,7 @@ async fn load(tools: &ToolManager, args: &Value) -> Result<Script, ToolResult> {
     };
     let bom = raw.starts_with('\u{feff}');
     let body = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
-    Ok(Script {
+    Ok(TextFile {
         res_path,
         project,
         file,
@@ -364,6 +401,47 @@ async fn load(tools: &ToolManager, args: &Value) -> Result<Script, ToolResult> {
         crlf: body.contains("\r\n"),
         bom,
     })
+}
+
+/// The host project, the file named by the kind's path parameter inside it and its `res://`
+/// spelling, refused when the path leaves the project or names another kind of file.
+pub(super) fn locate(
+    tools: &ToolManager,
+    args: &Value,
+    kind: &TextKind,
+) -> Result<(PathBuf, PathBuf, String), ToolResult> {
+    let project = tools.host_project(args)?;
+    let (file, res_path) = locate_in(&project, args, kind)?;
+    Ok((project, file, res_path))
+}
+
+/// The file named by the kind's path parameter inside `project` and its `res://` spelling,
+/// refused when the path leaves the project or names another kind of file.
+pub(super) fn locate_in(
+    project: &Path,
+    args: &Value,
+    kind: &TextKind,
+) -> Result<(PathBuf, String), ToolResult> {
+    let Some(requested) = str_arg(args, kind.param) else {
+        return Err(ToolResult::error(
+            format!("Missing {}", kind.param),
+            &[&format!("Pass a res:// path to {}", kind.what)],
+        ));
+    };
+    let file = resolve_in_project(project, requested).map_err(|problem| {
+        ToolResult::error(
+            problem,
+            &["Use a res:// path or a path relative to the project directory"],
+        )
+    })?;
+    let res_path = res_path_of(project, &file, requested);
+    if !kind.accepts(&res_path) {
+        return Err(ToolResult::error(
+            format!("{}: {res_path}", kind.wrong_kind),
+            &[kind.wrong_kind_hint],
+        ));
+    }
+    Ok((file, res_path))
 }
 
 /// The `res://` spelling of a path inside the project, for answers.

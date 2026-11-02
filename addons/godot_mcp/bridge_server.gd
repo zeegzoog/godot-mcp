@@ -30,6 +30,7 @@ const FILE_OPS_PATH: String = "res://addons/godot_mcp/editor/file_ops.gd"
 ## The running game's property ops. The editor reuses their ':' resource-step resolver, so a
 ## property path means the same in godot_set_node_properties as in godot_game_set.
 const RtLive: GDScript = preload("res://addons/godot_mcp/runtime/ops/rt_live.gd")
+const SHADER_OPS_PATH: String = "res://addons/godot_mcp/editor/shader_ops.gd"
 const MAX_CAPTURE_DIMENSION: int = 1568
 const MIN_CAPTURE_SIZE: int = 16
 
@@ -56,6 +57,9 @@ const PARAM_TYPES: Dictionary = {
     "read_script": {"script_path": TYPE_STRING},
     "script_tab": {"script_path": TYPE_STRING, "reload": TYPE_BOOL},
     "edit_script": {"script_path": TYPE_STRING, "old_text": TYPE_STRING, "new_text": TYPE_STRING, "version": TYPE_STRING},
+    "create_shader": {"shader_path": TYPE_STRING, "code": TYPE_STRING, "overwrite": TYPE_BOOL},
+    "read_shader": {"shader_path": TYPE_STRING},
+    "edit_shader": {"shader_path": TYPE_STRING, "old_text": TYPE_STRING, "new_text": TYPE_STRING, "version": TYPE_STRING},
     "connect_signal": {"node_path": TYPE_STRING, "signal_name": TYPE_STRING, "method": TYPE_STRING, "target_path": TYPE_STRING, "make_editable": TYPE_BOOL},
     "list_signals": {"node_path": TYPE_STRING},
     "create_resource": {"resource_path": TYPE_STRING, "class_name": TYPE_STRING},
@@ -92,6 +96,7 @@ var port_origin: String = ""
 var verbose: bool = false
 var _script_ops_instance: RefCounted = null
 var _file_ops_instance: RefCounted = null
+var _shader_ops_instance: RefCounted = null
 ## scene res:// path -> hash of the file bytes last loaded or saved by this bridge.
 ## Compared by content, not mtime, so an edit in the same second is still detected.
 var _scene_sync_hash: Dictionary = {}
@@ -338,6 +343,12 @@ func dispatch_command(peer: WebSocketPeer, cmd_id: String, cmd_type: String, par
             read_script(peer, cmd_id, params)
         "edit_script":
             edit_script(peer, cmd_id, params)
+        "create_shader":
+            create_shader(peer, cmd_id, params)
+        "read_shader":
+            read_shader(peer, cmd_id, params)
+        "edit_shader":
+            edit_shader(peer, cmd_id, params)
         "script_tab":
             script_tab(peer, cmd_id, params)
         "connect_signal":
@@ -2106,6 +2117,50 @@ func _script_ops() -> RefCounted:
         _script_ops_instance = (load(SCRIPT_OPS_PATH) as GDScript).new() as RefCounted
     return _script_ops_instance
 
+## The shader commands keep their logic in editor/shader_ops.gd; these only check the parameters.
+func create_shader(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
+    var res_path: String = _shader_command_path(peer, cmd_id, params)
+    if res_path.is_empty():
+        return
+    if not params.has("code"):
+        send_error(peer, cmd_id, "Missing code. Pass the whole shader source as code.")
+        return
+    _send_result(peer, cmd_id, _shader_ops().create(res_path, str(params["code"]), bool(params.get("overwrite", false))))
+
+func read_shader(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
+    var res_path: String = _shader_command_path(peer, cmd_id, params)
+    if res_path.is_empty():
+        return
+    _send_result(peer, cmd_id, _shader_ops().read(res_path))
+
+func edit_shader(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
+    var res_path: String = _shader_command_path(peer, cmd_id, params)
+    if res_path.is_empty():
+        return
+    for key: String in ["old_text", "new_text"]:
+        if not params.has(key):
+            send_error(peer, cmd_id, "Missing %s. Pass the fragment to replace as old_text and its replacement as new_text." % key)
+            return
+    _send_result(peer, cmd_id, _shader_ops().edit(res_path, str(params["old_text"]), str(params["new_text"]), str(params.get("version", ""))))
+
+## The res:// path of the shader_path parameter, or "" after an error reply was sent.
+func _shader_command_path(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> String:
+    var raw: String = str(params.get("shader_path", "")).strip_edges()
+    if raw.is_empty():
+        send_error(peer, cmd_id, "Missing shader_path. Pass a res:// path to a .gdshader or .gdshaderinc file.")
+        return ""
+    var res_path: String = to_res_path(raw)
+    if res_path.is_empty():
+        send_error(peer, cmd_id, "shader_path must be a path inside the project (res://...): " + raw)
+        return ""
+    return res_path
+
+func _send_result(peer: WebSocketPeer, cmd_id: String, result: Dictionary) -> void:
+    if result.has("error"):
+        send_error(peer, cmd_id, str(result["error"]))
+        return
+    send_success(peer, cmd_id, result)
+
 ## Deletes project files with their companions, closing their tabs; see editor/file_ops.gd.
 func delete_files(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
     if _file_ops_instance == null:
@@ -2115,6 +2170,11 @@ func delete_files(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> vo
         send_error(peer, cmd_id, str(result["error"]))
         return
     send_success(peer, cmd_id, result)
+
+func _shader_ops() -> RefCounted:
+    if _shader_ops_instance == null:
+        _shader_ops_instance = (load(SHADER_OPS_PATH) as GDScript).new() as RefCounted
+    return _shader_ops_instance
 
 func connect_signal(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
     var root: Node = scene_root_or_error(peer, cmd_id)

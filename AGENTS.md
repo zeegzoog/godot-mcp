@@ -92,6 +92,7 @@ Before submitting or committing changes, agents must execute and pass the comple
    godot --headless --check-only --path . --script addons/godot_mcp/editor/game_relay.gd
    godot --headless --check-only --path . --script addons/godot_mcp/editor/script_ops.gd
    godot --headless --check-only --path . --script addons/godot_mcp/editor/file_ops.gd
+   godot --headless --check-only --path . --script addons/godot_mcp/editor/import_ops.gd
    godot --headless --check-only --path . --script addons/godot_mcp/editor/shader_ops.gd
    godot --headless --check-only --path . --script addons/godot_mcp/core/runtime_override.gd
    godot --headless --check-only --path . --script addons/godot_mcp/core/bridge_port.gd

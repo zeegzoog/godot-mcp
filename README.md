@@ -183,7 +183,6 @@ Every tool takes only the parameters its schema lists (`additionalProperties: fa
 | `godot_get_import_params` | — | Reads a file's import parameters, the `[params]` of its `.import` sidecar that the Import dock shows: `importer`, the imported `type`, `params` and each option's Godot type under `types`. From the editor when it has the project open, else with the Godot binary. A file with no `.import` yet is refused; import it with `godot_resave_resources` first. |
 | `godot_set_import_params` | — | Changes import parameters the way the Import dock does and reimports the file: `params` (such as `{"compress/mode": 2, "compress/high_quality": true}`) are set after copying every parameter of `copy_from`'s `.import` (same importer only). An option keeps its type. With the editor the change goes through its file system, so the dock and the loaded resource follow; without it Godot's `ConfigFile` edits the file and `godot --headless --import` reimports. `new_options` lists names the file did not hold before and `ignored_options` the ones the importer dropped on reimport (a typo or another importer's option). Nothing changed means no reimport; `reimport: false` only edits the file. `importer` switches the importer as the dock's "Import As" does (`3d_texture` with `slices/horizontal` turns a PNG strip into a `Texture3D`): the new importer starts from its defaults, the name is checked against Godot's importers for the file type, and the answer gives `importer`, `previous_importer` and the imported `type`; an importer Godot does not have for the file is an error, not a silent fallback. |
 | `godot_export_project` | Godot editor binary | Exports with a preset, headless: `mode` `pack` (default, `--export-pack`, a `.pck` or `.zip`, no template needed), `release` (`--export-release`) or `debug` (`--export-debug`), after `godot --headless --import` (skipped with `import: false`, or while the editor has the project open). `output_path` defaults to the preset's `export_path` and must stay inside the project. Returns `ok`, `output_path`, `size_bytes`, `exit_code`, `duration_seconds`, the `ERROR`/`WARNING` lines and the end of the log. A missing preset, a missing export template, a failed import, no file written or a timeout (`timeout_seconds`, default 600) is an error with that log. See [Exporting](#exporting). |
-| `godot_check_voxel_model` | Froxel | Exports one `.vox`, or up to 16 `models`, through `froxel mcp`, writes each `.glb` into the project, imports it and checks the `.import` sidecar. `preview: true` adds a Froxel path-traced PNG. See [Checking voxel model exports](#checking-voxel-model-exports). |
 | `godot_run_output` | Running game | Logs, warnings and errors, with stack traces, from a managed process run or the editor's running game (`since`, `level`). |
 | `godot_game_tree` | Running game | Live nodes of the running game: path, class, position, visible text. Filter by `name`, `class`, `group` or `text`. |
 | `godot_game_get` | Running game | A live node's properties, groups and, optionally, signals and methods. `/` reads a Dictionary key or an Object property (get only; private names are refused). A missing segment is that property's entry in `property_errors` and names the segment; other properties are still returned. `null` is a value that really is null. `:` steps through a Resource (`material:shader_parameter/caustics`), including a name that starts with `_`. A requested `script` is omitted. A non-resource `:` step names the `/` form. |
@@ -301,45 +300,6 @@ A held game refuses what needs time to pass, and says to step instead: `godot_ga
 Steps are **exact** only for a game started with `godot_run_project` `{"mode": "process", "held": true}`. That start fixes the engine's frame rate to the project's tick rate (`physics/common/physics_ticks_per_second`, 60 when unset), so every tick is paired with one frame, and the answers say `"deterministic": true`. A hold entered later, or on the editor's Play, still stands still but is reported as `"deterministic": false` with a `deterministic_reason`: `not_started_held`, `fixed_rate_differs` (the game changed its tick rate) or `frames_did_not_follow_ticks` (a step saw frames fail to follow its ticks, which ends the claim for the rest of the run). A step runs its ticks as fast as the game can, so `max` bounds ticks, not seconds. Work on other threads and file loading takes real time, so after starting a game repeat short `until` steps instead of guessing a tick count. A held step that takes longer than 60 seconds is not cancelled: the call returns an error saying the game finishes it and holds again, and `status` shows where it is.
 
 Closing the game's window ends a hold. The server stopping the run does too. A server that disappears without stopping the run leaves its game held, with a window that can still be closed.
-
-## Checking voxel model exports
-
-`godot_check_voxel_model` exports one `.vox`, or a batch of up to 16 models,
-through Froxel MCP and imports the resulting GLBs into the selected Godot project.
-Set `FROXEL_BIN` to a Froxel executable supporting `export_models` (or put it on
-PATH). Both are trusted programs, like `GODOT_PATH`: the server starts `<bin> mcp`
-without the bridge token in its environment. Pass `vox` and `dest`, or
-`models: [{vox, dest}]`; source paths are absolute paths on this machine (a network
-share is refused, and the source is not confined to the project), and destinations are
-project-local `res://` GLB paths outside `.godot/`. Optional `preview: true`
-path-traces `<model>.preview.png` beside each successfully exported model, so a
-texture with the model's name is never overwritten. This is a Froxel preview, not a
-Godot viewport capture.
-
-All output paths are validated before writing. Output names must be unique,
-including previews, links and case-only aliases. Each Froxel process has a
-60-second deadline covering initialization, tool replies and process exit.
-A Froxel reply that leaves a model out, or that reports a model as exported without
-leaving its `.glb`, makes the check fail (`missing_exports`). The report preserves
-per-model export failures even when no model can be imported; a mixed batch imports
-and previews only successful exports. The import
-goes through the connected editor when it has the project open, and is headless
-otherwise. The Godot check verifies import sidecars and reports a changed `.glb`
-whose cache is older than the file under `stale_imports` (an export that left the
-bytes unchanged is not re-imported, so a cache that is older for another reason is
-not reported); it does not yet verify the instantiated model's meshes or animation
-behavior.
-
-```json
-{"vox": "/path/lily_pad.vox", "dest": "res://art/lily_pad.glb", "project_path": "/path/frog-world"}
-```
-
-The end-to-end test needs a Froxel build and the Godot build named in `.github/godot-version`:
-
-```bash
-FROXEL_BIN=/path/to/froxel GODOT_PATH=/path/to/godot \
-  cargo test --test model_chain_e2e_test -- --ignored --test-threads=1
-```
 
 ## The project adapter
 

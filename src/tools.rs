@@ -27,7 +27,6 @@ mod headless;
 mod import_params;
 mod input_map;
 mod main_loop;
-mod model_chain;
 mod project;
 mod run;
 mod scenario;
@@ -139,7 +138,6 @@ impl ToolManager {
             "godot_validate_script" => self.handle_validate_script(args).await,
             "godot_run_script" => self.handle_run_script(args).await,
             "godot_resave_resources" => self.handle_resave_resources(args).await,
-            "godot_check_voxel_model" => model_chain::call(&self, &args).await,
             name if authoring::handles(name) => authoring::call(&self, name, args).await,
             name if input_map::handles(name) => input_map::call(&self, name, args).await,
             name if files::handles(name) => files::call(&self, args).await,
@@ -837,7 +835,6 @@ fn annotations(name: &str) -> Option<ToolAnnotations> {
         | "godot_save_scene"
         | "godot_create_script"
         | "godot_create_shader"
-        | "godot_check_voxel_model"
         | "godot_attach_script"
         | "godot_set_project_setting"
         | "godot_edit_input_action"
@@ -1171,7 +1168,6 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
             }),
             &["script"],
         ),
-        model_chain::definition(),
         tool(
             "godot_resave_resources",
             "Refreshes assets and resources after they were changed externally. With the editor connected, importable files the editor already knows are re-imported synchronously and other files are re-scanned. An open script tab without unsaved changes whose text differs from its file is reloaded (listed under reloaded_tabs); one with unsaved changes is kept and listed under unsaved_tabs. A shader, shader include or resource the editor has loaded is reloaded from its file in place, and so is a loaded script without a tab, so whatever uses it sees the new contents (listed under reloaded_resources); scenes are left to the editor. A path the editor has never scanned is updated and, if needed, scanned first; it is listed under reimported only after a .import file exists, and otherwise under not_scanned (load() would fail with no loader). Without paths, rescans the whole project in the background. wait true holds the reply until scanning and importing finish (up to 60s) and reports how many files were imported; timed_out means they may not be loadable yet. Without the editor, runs `godot --headless --path <project> --import` and reports the sources whose .import sidecar appeared or changed.",

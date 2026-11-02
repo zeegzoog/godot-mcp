@@ -492,10 +492,20 @@ async fn scene_and_property_tools_behave() {
         find(&unread["tree"], "Before").is_some(),
         "a read reloaded the scene: {unread}"
     );
+    // Reloading a background tab must also make it the edited scene: the reload used
+    // to leave the previous tab active, so the next edits went to the wrong scene.
+    call("open_scene", json!({"scene_path": "res://main.tscn"}))
+        .await
+        .expect("switch to main");
     let reloaded = call("open_scene", json!({"scene_path": "res://stale.tscn"}))
         .await
         .expect("reload stale");
     assert_eq!(reloaded["reloaded"], true, "{reloaded}");
+    assert_eq!(reloaded["active_scene"], "res://stale.tscn", "{reloaded}");
+    let active_tree = call("get_scene_tree", json!({}))
+        .await
+        .expect("active tree");
+    assert_eq!(active_tree["tree"]["name"], "Stale", "{active_tree}");
     let stale_tree = call("get_scene_tree", json!({"scene_path": "res://stale.tscn"}))
         .await
         .expect("stale tree");

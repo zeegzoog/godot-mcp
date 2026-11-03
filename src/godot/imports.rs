@@ -3,10 +3,14 @@
 //! Godot 4 writes a `.import` sidecar next to each imported source. Its `path=` line names the
 //! cache file (`res://.godot/imported/...`). A process run loads that cache and does not import
 //! again, so a source saved while the editor was open stays stale until something reimports it.
+//! A source rewritten with the same bytes is not stale: Godot compares the `source_md5` it keeps
+//! in `.godot/imported/<name>-<hash>.md5` and skips the reimport, so this check does the same.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+
+use md5::{Digest, Md5};
 
 use crate::paths::skipped_by_godot;
 
@@ -71,17 +75,56 @@ fn stale_source(project: &Path, import_file: &Path) -> Option<String> {
     (!import_current(project, &source)?).then_some(res)
 }
 
-/// Whether the cache of an imported `source` is at least as new as the source: `false` when the
-/// cache is older or missing, `None` when the source has no readable `.import` sidecar.
+/// Whether the cache of an imported `source` is current: `false` when the cache is missing, or
+/// older than the source while the source's bytes differ from the `source_md5` Godot recorded for
+/// that cache. `None` when the source has no readable `.import` sidecar.
 pub fn import_current(project: &Path, source: &Path) -> Option<bool> {
     let name = source.file_name()?.to_str()?;
     let import_file = source.with_file_name(format!("{name}.import"));
     let text = read_sidecar(&import_file)?;
     let stale = match cache_path(project, &text) {
-        Some(cache) => newer_than(source, &cache),
+        Some(cache) => {
+            modified(&cache).is_none()
+                || (newer_than(source, &cache) && !same_recorded_md5(source, name, &cache))
+        }
         None => newer_than(source, &import_file),
     };
     Some(!stale)
+}
+
+/// True when Godot's `<name>-<hash>.md5` next to `cache` records the md5 of `source` as it is now,
+/// which is when Godot itself skips the reimport. False when the file is missing or differs.
+fn same_recorded_md5(source: &Path, name: &str, cache: &Path) -> bool {
+    let Some(cache_name) = cache.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(hash) = cache_name
+        .strip_prefix(name)
+        .and_then(|rest| rest.strip_prefix('-'))
+        .and_then(|rest| rest.split('.').next())
+    else {
+        return false;
+    };
+    if hash.is_empty() {
+        return false;
+    }
+    let md5_file = cache.with_file_name(format!("{name}-{hash}.md5"));
+    let Some(recorded) = read_sidecar(&md5_file)
+        .and_then(|text| text.lines().find_map(|line| assignment(line, "source_md5")))
+    else {
+        return false;
+    };
+    let Ok(bytes) = fs::read(source) else {
+        return false;
+    };
+    recorded.eq_ignore_ascii_case(&md5_hex(&bytes))
+}
+
+fn md5_hex(bytes: &[u8]) -> String {
+    Md5::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// Fingerprint of each `.import` sidecar: the `res://` source and a hash of the sidecar text.
@@ -331,6 +374,46 @@ mod tests {
         let unimported = fresh.path().join("shaders/other.glsl");
         fs::write(&unimported, "void main() {}\n").unwrap();
         assert_eq!(import_current(fresh.path(), &unimported), None);
+    }
+
+    #[test]
+    fn a_newer_source_with_the_md5_godot_recorded_is_left_alone() {
+        let project = project_with(true);
+        let root = project.path();
+        let md5_file = root.join(".godot/imported/flow.glsl-abc.md5");
+        // The md5 of the source's bytes, as Godot records it: Godot skips this reimport.
+        let actual = md5_hex(b"void main() {}\n");
+        fs::write(
+            &md5_file,
+            format!("source_md5=\"{actual}\"\ndest_md5=\"0\"\n"),
+        )
+        .unwrap();
+        assert!(stale_imports(root).is_empty());
+        let source = root.join("shaders/flow.glsl");
+        assert_eq!(import_current(root, &source), Some(true));
+        // Changed bytes are stale again, as they are for Godot.
+        fs::write(&source, "void main() { discard; }\n").unwrap();
+        assert_eq!(
+            stale_imports(root),
+            vec!["res://shaders/flow.glsl".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_missing_cache_is_stale_even_when_the_md5_matches() {
+        let project = project_with(false);
+        let root = project.path();
+        let actual = md5_hex(b"void main() {}\n");
+        fs::write(
+            root.join(".godot/imported/flow.glsl-abc.md5"),
+            format!("source_md5=\"{actual}\"\n"),
+        )
+        .unwrap();
+        fs::remove_file(root.join(".godot/imported/flow.glsl-abc.res")).unwrap();
+        assert_eq!(
+            stale_imports(root),
+            vec!["res://shaders/flow.glsl".to_string()]
+        );
     }
 
     #[test]

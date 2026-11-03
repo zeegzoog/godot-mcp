@@ -120,59 +120,168 @@ protected_hits() {
 }
 
 # The part of the protected set that a merge by the steward never reaches, whatever it decides:
-# its own rules, scripts and workflows, the agents' and tools' settings, the release and cleanup
-# automation (they run with the project's secrets and publish), the Cargo configuration, and any
-# workflow it does not know. The rest of the protected set (ci.yml, build.rs, the dependency
-# manifests, the other agent files) is merged after a read of every changed line and the content
-# scan below. Same name rules as protected_paths; prints each locked path (nothing when none).
+# its own rules, scripts and workflows, everything else under .agents/ and .github/, the tool
+# settings, the Cargo configuration, build scripts (they run code whenever the project is built)
+# and every workflow but ci.yml (the release, cleanup and steward workflows run with the project's
+# secrets and publish). What stays reachable is small and structured: ci.yml, the release skill's
+# SKILL.md, Cargo.toml and Cargo.lock. They are merged after a read of every changed line, and only
+# when danger_in_patch finds that every changed line has one of the plain shapes it knows. Same name
+# rules as protected_paths; prints each locked path (nothing when none).
 locked_hits() {
-	local path lower entry base
+	local path lower entry
 	for path in "$@"; do
 		lower=$(printf '%s' "$path" | tr '[:upper:]' '[:lower:]')
-		base=${lower##*/}
-		for entry in .agents/skills/repo-steward/ .agents/rules/ .agents/workflows/ .claude/ .cargo/ .github/steward.yml .github/codeowners; do
+		case "$lower" in .github/workflows/ci.yml | .agents/skills/release/skill.md) continue ;; esac
+		for entry in .agents/ .github/ .claude/ .cargo/ build.rs; do
 			case "$entry" in
 			*/) case "$lower" in "$entry"* | *"/$entry"*) printf '%s\n' "$path" && break ;; esac ;;
 			*) case "$lower" in "$entry" | *"/$entry") printf '%s\n' "$path" && break ;; esac ;;
 			esac
 		done
-		# Only ci.yml is a workflow a contributor's change may reach: the others publish, delete
-		# branches or run the steward itself.
-		case "$lower" in
-		.github/workflows/* | */.github/workflows/*)
-			if [ "$base" != ci.yml ]; then printf '%s\n' "$path"; fi
-			;;
-		esac
 	done | sort -u
 	return 0
 }
 
-# Reads the patch of one protected file on stdin and prints each added line that does what a
-# change to that file has no business doing: reaching for the project's secrets or the network,
-# widening a workflow's permissions or trigger, adding a dependency from outside the registry,
-# running a download, or talking to an agent instead of to a build. Status 1 when it prints any.
-# A line that GitHub did not show (a patch it left out) is not scanned: the caller fails closed
-# on an empty patch.
+# Succeeds when the line matches one of the extended regular expressions given after it.
+matches_a_shape() {
+	local line=$1 re
+	shift
+	for re in "$@"; do
+		if printf '%s' "$line" | grep -Eq "$re"; then return 0; fi
+	done
+	return 1
+}
+
+# A line of Cargo.toml that names one of the package's own settings, not a dependency: the
+# shape of `name = "1.0"` fits both, and only a release changes the package.
+cargo_package_key() {
+	local key
+	key=$(printf '%s' "$1" | sed -E 's/^[[:space:]]*([A-Za-z0-9_-]+)[[:space:]]*=.*/\1/')
+	case "$key" in version | edition | rust-version | name | license | readme | repository | description | authors | resolver | publish | build | links | homepage | documentation | include | exclude | default-run | categories | keywords) return 0 ;; esac
+	return 1
+}
+
+# Reads the added lines of a Cargo.lock patch ($1) and succeeds only when every package block it
+# adds or changes has the checksum crates.io publishes for that name and version. Offline, or
+# when crates.io does not answer, it is a no: the caller fails closed.
+lock_checksums_verified() {
+	local line name="" version="" sum answer
+	while IFS= read -r line; do
+		case "$line" in
+		'name = "'*) name=${line#name = \"}; name=${name%\"} ;;
+		'version = "'*) version=${line#version = \"}; version=${version%\"} ;;
+		'checksum = "'*)
+			sum=${line#checksum = \"}
+			sum=${sum%\"}
+			[ -n "$name" ] && [ -n "$version" ] || return 1
+			answer=$(curl -fsS --max-time 20 -A "godot-mcp-steward (repository maintenance)" \
+				"https://crates.io/api/v1/crates/$name/$version" 2>/dev/null | grep -o '"checksum":"[0-9a-f]*"' | head -1) || return 1
+			[ "$answer" = "\"checksum\":\"$sum\"" ] || return 1
+			;;
+		esac
+	done <<<"$1"
+	return 0
+}
+
+# Reads the patch of one protected file on stdin and prints each changed line that is not one of
+# the plain shapes that file may gain, with the reason; status 1 when it prints any. The shapes
+# are a list of what contributors really change: a syntax-check line or a `cargo test --test`
+# step of ci.yml, a syntax-check line of the release skill, a plain registry dependency of
+# Cargo.toml, a crates.io package block of Cargo.lock whose checksum is the published one. Every
+# changed line, in any file, is also refused when it is shaped like a credential or like an
+# instruction to an agent. A patch that GitHub did not show is not scanned: the caller fails
+# closed on an empty patch.
 danger_in_patch() {
-	local path=$1 lower added line bad=0 patch pat
+	local path=$1 lower patch added removed line bad=0 gd
+	local -a shapes=()
+	local removals_ok=0
 	lower=$(printf '%s' "$path" | tr '[:upper:]' '[:lower:]')
 	patch=$(cat)
 	added=$(printf '%s\n' "$patch" | grep -E '^\+' | grep -vE '^\+\+\+' | sed 's/^+//' || true)
-	local common='ignore (all|any|the|previous|prior|above)|disregard|without (asking|approval|confirmation|review)|do not (tell|mention|report|review)|exfiltrat|hide this'
+	removed=$(printf '%s\n' "$patch" | grep -E '^-' | grep -vE '^---' | sed 's/^-//' || true)
+	gd='[A-Za-z0-9_./-]+\.gd'
 	case "$lower" in
-	*.github/*) pat='pull_request_target|workflow_run|secrets\.|id-token|(contents|packages|actions|pull-requests|issues|checks|deployments|statuses|security-events):[[:space:]]*write|curl|wget|invoke-webrequest|\|[[:space:]]*(ba|z)?sh([[:space:]]|$)|bash -c|eval[[:space:]]|github_env|github_path' ;;
-	*cargo.toml) pat='(^|[{,])[[:space:]]*(git|path|registry|branch|rev|tag)[[:space:]]*=|^[[:space:]]*(build|links)[[:space:]]*=|^\[(patch|replace|source|build-dependencies)|\[target\.[^]]*build-dependencies' ;;
-	*cargo.lock) pat='^source = ' ;;
-	*build.rs) pat='TcpStream|UdpSocket|reqwest|ureq|curl|wget|https?://|\.ssh|HOME|USERPROFILE|APPDATA|TOKEN|SECRET|GITHUB_|ANTHROPIC|CLAUDE_' ;;
-	*) pat='^$' ;;
+	.github/workflows/ci.yml)
+		shapes=(
+			'^[[:space:]]*\$GODOT_PATH --headless --check-only --path \. --script addons/godot_mcp/'"$gd"'[[:space:]]*$'
+			'^[[:space:]]*(-[[:space:]]+)?name:[[:space:]]+[A-Za-z0-9 ,.()/_-]+[[:space:]]*$'
+			'^[[:space:]]*run:[[:space:]]+cargo test --test [a-z0-9_]+( -- --ignored)?( --test-threads=[0-9]+)?[[:space:]]*$'
+		)
+		;;
+	.agents/skills/release/skill.md)
+		shapes=('^[[:space:]]*godot --headless --check-only --path \. --script addons/godot_mcp/'"$gd"'[[:space:]]*$')
+		;;
+	*cargo.toml)
+		removals_ok=1
+		local ver='"[0-9][0-9A-Za-z.+*~^<>=, -]*"'
+		shapes=(
+			'^[[:space:]]*[A-Za-z0-9_-]+[[:space:]]*=[[:space:]]*'"$ver"'[[:space:]]*$'
+			'^[[:space:]]*[A-Za-z0-9_-]+[[:space:]]*=[[:space:]]*\{[[:space:]]*version[[:space:]]*=[[:space:]]*'"$ver"'([[:space:]]*,[[:space:]]*default-features[[:space:]]*=[[:space:]]*(true|false))?([[:space:]]*,[[:space:]]*features[[:space:]]*=[[:space:]]*\[("[A-Za-z0-9_/-]+"(,[[:space:]]*)?)*\])?[[:space:]]*\}[[:space:]]*$'
+			'^[[:space:]]*[A-Za-z0-9_-]+[[:space:]]*=[[:space:]]*\{[[:space:]]*version[[:space:]]*=[[:space:]]*'"$ver"'([[:space:]]*,[[:space:]]*default-features[[:space:]]*=[[:space:]]*(true|false))?[[:space:]]*,[[:space:]]*features[[:space:]]*=[[:space:]]*\[[[:space:]]*$'
+			'^[[:space:]]*"[A-Za-z0-9_/-]+",?[[:space:]]*$'
+			'^[[:space:]]*\][[:space:]]*\}?[[:space:]]*$'
+			"^\\[(target\\.'cfg\\([a-z_ =\"()]+\\)'\\.)?(dev-)?dependencies\\]\$"
+		)
+		;;
+	*cargo.lock)
+		removals_ok=1
+		shapes=(
+			'^\[\[package\]\]$'
+			'^name = "[A-Za-z0-9_-]+"$'
+			'^version = "[0-9][0-9A-Za-z.+-]*"$'
+			'^source = "registry\+https://github.com/rust-lang/crates.io-index"$'
+			'^checksum = "[0-9a-f]{64}"$'
+			'^dependencies = \[$'
+			'^ "[A-Za-z0-9_-]+( [0-9][0-9A-Za-z.+-]*)?",$'
+			'^\]$'
+		)
+		;;
 	esac
+	if [ ${#shapes[@]} -gt 0 ]; then
+		while IFS= read -r line; do
+			[ -n "$line" ] || continue
+			matches_a_shape "$line" "${shapes[@]}" ||
+				{ printf '%s: %s   (not one of the plain shapes this file may gain)\n' "$path" "$line"; bad=1; }
+			case "$lower" in
+			*cargo.toml)
+				if cargo_package_key "$line"; then
+					printf '%s: %s   (a setting of the package itself)\n' "$path" "$line"
+					bad=1
+				fi
+				;;
+			esac
+		done <<<"$added"
+		if [ "$removals_ok" = 1 ]; then
+			while IFS= read -r line; do
+				[ -n "$line" ] || continue
+				matches_a_shape "$line" "${shapes[@]}" ||
+					{ printf '%s: -%s   (a removed line of another kind)\n' "$path" "$line"; bad=1; }
+				case "$lower" in
+				*cargo.toml)
+					if cargo_package_key "$line"; then
+						printf '%s: -%s   (a setting of the package itself)\n' "$path" "$line"
+						bad=1
+					fi
+					;;
+				esac
+			done <<<"$removed"
+		elif printf '%s\n' "$removed" | grep -q .; then
+			printf '%s: %s\n' "$path" "(removes a line; this file may only gain lines here)"
+			bad=1
+		fi
+	fi
+	case "$lower" in
+	*cargo.lock)
+		if [ "${STEWARD_OFFLINE:-0}" != 1 ] && ! lock_checksums_verified "$added"; then
+			printf '%s: %s\n' "$path" "(a package whose checksum is not the one crates.io publishes, or crates.io did not answer)"
+			bad=1
+		fi
+		;;
+	esac
+	local common='ignore (all|any|the|previous|prior|above)|disregard|without (asking|approval|confirmation|review)|do not (tell|mention|report|review)|exfiltrat|hide this'
 	while IFS= read -r line; do
 		[ -n "$line" ] || continue
-		if printf '%s' "$line" | grep -Eiq "$common|$pat"; then
-			# The one source a lock file may add is the crates.io registry.
-			case "$lower" in
-			*cargo.lock) case "$line" in 'source = "registry+https://github.com/rust-lang/crates.io-index"') continue ;; esac ;;
-			esac
+		if printf '%s' "$line" | grep -Eiq "$common"; then
 			printf '%s: %s\n' "$path" "$line"
 			bad=1
 		elif credential_shaped "$line"; then
@@ -180,17 +289,6 @@ danger_in_patch() {
 			bad=1
 		fi
 	done <<<"$added"
-	# A workflow line that changes a `uses:` pin must be nothing but a version move.
-	case "$lower" in
-	*.github/*)
-		if printf '%s\n' "$added" | grep -Eq '^[[:space:]]*(-[[:space:]]+)?uses:'; then
-			if ! pins_only <<<"$patch" || { [ "${STEWARD_OFFLINE:-0}" != 1 ] && ! pins_match_tags "$patch"; }; then
-				printf '%s: %s\n' "$path" "a uses: line that is not a version pin of an action already used"
-				bad=1
-			fi
-		fi
-		;;
-	esac
 	return $bad
 }
 

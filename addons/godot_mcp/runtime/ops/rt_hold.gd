@@ -31,7 +31,7 @@ const TIMED_STEPS: Array[String] = ["wait", "text", "swipe", "path"]
 const SERVED: Array[String] = [
     "game.tree", "game.get", "game.set", "game.call", "game.signals", "game.snapshot",
     "game.body", "game.pause", "game.physics", "rt.output", "input.release_all",
-    "project.state", "project.command",
+    "project.state", "project.command", "game.probe",
 ]
 
 static var _armed := false
@@ -67,7 +67,9 @@ static func refusal(method: String, params: Dictionary) -> String:
         "game.screenshot":
             var frames: Variant = params.get("frames", 1)
             var sheet: bool = (frames is int or frames is float) and float(frames) > 1.0
-            if sheet or not str(params.get("camera", "")).strip_edges().is_empty():
+            # With aim, camera only names the camera to copy: nothing is switched.
+            var switch := not params.has("aim") and not str(params.get("camera", "")).strip_edges().is_empty()
+            if sheet or switch:
                 return _refused("a frame sheet or a camera switch needs frames to be drawn", "take one capture, step with godot_game_physics, then take the next")
             return ""
         "game.record":

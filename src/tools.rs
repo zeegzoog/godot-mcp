@@ -800,6 +800,7 @@ fn annotations(name: &str) -> Option<ToolAnnotations> {
         | "godot_game_snapshot"
         | "godot_game_state"
         | "godot_game_screenshot"
+        | "godot_game_probe"
         | "godot_debug_state"
         | "godot_code_diagnostics"
         | "godot_code_complete"

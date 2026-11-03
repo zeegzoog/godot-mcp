@@ -12,6 +12,7 @@ use super::{ToolManager, str_arg, string_list};
 mod catalog;
 mod debug;
 mod input;
+mod probe;
 mod project;
 mod record;
 mod screenshot;
@@ -23,6 +24,7 @@ pub use catalog::catalog;
 pub(in crate::tools) use debug::check_breakpoint;
 use debug::{breakpoints, debug_control, debug_state};
 use input::game_input;
+use probe::probe;
 use record::record;
 use screenshot::screenshot;
 use serde_json::{Value, json};
@@ -67,6 +69,7 @@ pub fn handles(name: &str) -> bool {
             | "godot_game_wait"
             | "godot_game_physics"
             | "godot_game_scenario"
+            | "godot_game_probe"
             | "godot_game_screenshot"
             | "godot_game_record"
             | "godot_debug_breakpoints"
@@ -92,6 +95,7 @@ pub async fn call(tools: &ToolManager, name: &str, args: Value) -> ToolResult {
         "godot_game_wait" => runtime(tools, &args, "input.wait").await,
         "godot_game_physics" => runtime(tools, &args, "game.physics").await,
         "godot_game_scenario" => crate::tools::scenario::call(tools, &args).await,
+        "godot_game_probe" => probe(tools, &args).await,
         "godot_game_screenshot" => screenshot(tools, &args).await,
         "godot_game_record" => record(tools, &args).await,
         "godot_debug_breakpoints" => breakpoints(tools, &args).await,

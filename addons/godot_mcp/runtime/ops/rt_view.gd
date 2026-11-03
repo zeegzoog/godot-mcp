@@ -37,7 +37,7 @@ static func screenshot(rt: Node, params: Dictionary) -> Dictionary:
         return request
     if DisplayServer.get_name() == "headless":
         return R.err(R.UNSUPPORTED, "This game is headless, so there is no image to capture. Start it without headless mode.")
-    var picked := _pick(rt, params)
+    var picked := _aim(rt, params) if params.has("aim") else _pick(rt, params)
     if R.is_err(picked):
         return picked
     var max_side := clampi(int(params.get("max_dimension", DEFAULT_MAX)), 16, MAX_MAX)
@@ -64,6 +64,8 @@ static func screenshot(rt: Node, params: Dictionary) -> Dictionary:
         "made_current": picked.get("made_current"),
         "made_current_2d": picked.get("made_current_2d"),
         "previous_2d": bool(picked.get("previous_2d", false)),
+        "aim_viewport": picked.get("aim_viewport"),
+        "aim": picked.get("aim", {}),
         "label": picked.get("label", "viewport"),
         "baseline": request,
         "drawn_mark": Engine.get_frames_drawn(),
@@ -76,15 +78,20 @@ static func screenshot(rt: Node, params: Dictionary) -> Dictionary:
 
 
 ## A held game draws nothing new, so its capture is the last frame it drew, taken at once.
+## An aimed capture has never been drawn, so it draws one frame of the rendering server here:
+## the scene does not advance.
 static func _capture_now(state: Dictionary) -> Dictionary:
+    if state.get("aim_viewport") != null:
+        RenderingServer.force_draw(false, 0.0)
     var grabbed = _grab(state)
-    if grabbed == null:
-        return R.err(R.GODOT_ERROR, "Nothing has been drawn yet. Take one tick with godot_game_physics first.")
-    if grabbed is Dictionary:
-        return grabbed
+    if grabbed == null or grabbed is Dictionary:
+        _restore_cameras(state)
+        return grabbed if grabbed is Dictionary else R.err(R.GODOT_ERROR, "Nothing has been drawn yet. Take one tick with godot_game_physics first.")
     state["got"] = [grabbed]
     state["held"] = true
-    return _compose(state)
+    var composed := _compose(state)
+    _restore_cameras(state)
+    return composed
 
 
 static func _tick_shot(rt: Node, state: Dictionary) -> bool:
@@ -125,8 +132,11 @@ static func _tick_shot(rt: Node, state: Dictionary) -> bool:
         state["pause"] = int(state["every"])
         state["phase"] = "pause"
         return true
+    # The picture is composed before the cameras are restored: an aimed capture frees its
+    # viewport there, and the answer still measures it.
+    var composed := _compose(state)
     _restore_cameras(state)
-    rt.finish_job(_compose(state))
+    rt.finish_job(composed)
     return false
 
 
@@ -215,6 +225,9 @@ static func _compose(state: Dictionary) -> Dictionary:
     var report: Dictionary = applied.get("report", {})
     if not report.is_empty():
         body["baseline"] = report
+    var aim: Dictionary = state.get("aim", {})
+    if not aim.is_empty():
+        body["aim"] = aim
     return R.ok(body)
 
 
@@ -437,6 +450,11 @@ static func _restore_cameras(state: Dictionary) -> void:
         restore_camera.current = true
     if made_current_2d != null and is_instance_valid(made_current_2d):
         made_current_2d.enabled = bool(state.get("previous_2d", false))
+    var aim_viewport: SubViewport = state.get("aim_viewport")
+    if aim_viewport != null and is_instance_valid(aim_viewport):
+        aim_viewport.get_parent().remove_child(aim_viewport)
+        aim_viewport.free()
+    state["aim_viewport"] = null
 
 
 static func _pick(rt: Node, params: Dictionary) -> Dictionary:
@@ -470,3 +488,164 @@ static func _pick(rt: Node, params: Dictionary) -> Dictionary:
                 return {"viewport": child, "label": rt.path_of(child)}
         return R.err(R.NOT_FOUND, "SubViewportContainer '%s' has no SubViewport." % path)
     return {"viewport": node.get_viewport(), "label": rt.path_of(node)}
+
+
+## A capture from a temporary camera in a temporary SubViewport that shares the game's 3D world.
+## The game's own cameras are not touched: its current camera stays current and keeps its
+## transform. The new camera copies the game camera's projection and environment and is either
+## moved so `at` is in the centre (same direction, same distance as the game camera) or placed at
+## `position` looking at `look_at`. Only the 3D world is drawn: the game's HUD and other 2D canvas
+## items are not in the picture. Both nodes are freed after the capture.
+static func _aim(rt: Node, params: Dictionary) -> Dictionary:
+    var raw: Variant = params.get("aim")
+    if not raw is Dictionary:
+        return R.err(R.BAD_PARAMS, "aim must be an object: {at: [x, y, z]} or {position: [x, y, z], look_at: [x, y, z]}.")
+    var aim: Dictionary = raw
+    for key: String in aim.keys():
+        if not key in ["at", "distance", "position", "look_at", "up"]:
+            return R.err(R.BAD_PARAMS, "aim has no '%s'. It takes at and distance, or position, look_at and up." % key)
+    if int(params.get("frames", 1)) != 1:
+        return R.err(R.BAD_PARAMS, "aim takes one picture: leave frames at 1.")
+    if not str(params.get("node", "")).strip_edges().is_empty():
+        return R.err(R.BAD_PARAMS, "aim and node do not go together: aim draws its own viewport.")
+    var at: Variant = _vector3(aim.get("at"))
+    var position: Variant = _vector3(aim.get("position"))
+    var look_at: Variant = _vector3(aim.get("look_at"))
+    var by_point := aim.has("at")
+    if by_point == (aim.has("position") or aim.has("look_at")):
+        return R.err(R.BAD_PARAMS, "aim takes at (a point to centre), or position and look_at, not both.")
+    if by_point and at == null:
+        return R.err(R.BAD_PARAMS, "aim.at must be [x, y, z].")
+    if not by_point and (position == null or look_at == null):
+        return R.err(R.BAD_PARAMS, "aim.position and aim.look_at must both be [x, y, z].")
+    if not by_point and (aim.has("distance")):
+        return R.err(R.BAD_PARAMS, "aim.distance goes with aim.at; with position and look_at the camera is where position says.")
+    if by_point and aim.has("up"):
+        return R.err(R.BAD_PARAMS, "aim.up goes with position and look_at; with at the camera keeps the game camera's angle.")
+    var distance: Variant = null
+    if aim.has("distance"):
+        var value: Variant = aim.get("distance")
+        if not (value is int or value is float) or float(value) <= 0.0 or not is_finite(float(value)):
+            return R.err(R.BAD_PARAMS, "aim.distance must be a number above 0.")
+        distance = float(value)
+    var up := Vector3.UP
+    if aim.has("up"):
+        var given_up: Variant = _vector3(aim.get("up"))
+        if given_up == null or (given_up as Vector3).is_zero_approx():
+            return R.err(R.BAD_PARAMS, "aim.up must be a non-zero [x, y, z].")
+        up = (given_up as Vector3).normalized()
+    var source: Camera3D = null
+    var camera_path := str(params.get("camera", "")).strip_edges()
+    if not camera_path.is_empty():
+        var named: Node = rt.find_node(camera_path)
+        if not named is Camera3D:
+            return R.err(R.NOT_FOUND, "aim copies a Camera3D, and '%s' is %s." % [camera_path, "missing" if named == null else "a " + named.get_class()])
+        source = named as Camera3D
+    else:
+        source = rt.get_tree().root.get_camera_3d()
+    if source == null and by_point:
+        return R.err(R.NOT_FOUND, "The game has no current Camera3D to copy, so aim.at has no direction to keep. Pass aim.position and aim.look_at, or name a Camera3D with camera.")
+    var source_viewport: Viewport = source.get_viewport() if source != null else rt.get_tree().root
+    var world: World3D = source_viewport.find_world_3d()
+    if world == null:
+        return R.err(R.UNSUPPORTED, "There is no 3D world to aim at.")
+    var report := {"copied_from": rt.path_of(source) if source != null else ""}
+    var transform := Transform3D.IDENTITY
+    if by_point:
+        var forward := -source.global_basis.z.normalized()
+        var point: Vector3 = at
+        if distance == null:
+            var measured := _camera_distance(source, world, point)
+            distance = measured["distance"]
+            report["distance_from"] = measured["from"]
+        else:
+            report["distance_from"] = "given"
+        transform = Transform3D(source.global_basis.orthonormalized(), point - forward * float(distance))
+        report["mode"] = "at"
+        report["at"] = _vec(point)
+        report["distance"] = snappedf(float(distance), 0.0001)
+    else:
+        var eye: Vector3 = position
+        var target: Vector3 = look_at
+        if eye.is_equal_approx(target):
+            return R.err(R.BAD_PARAMS, "aim.position and aim.look_at are the same point.")
+        var direction := (target - eye).normalized()
+        if absf(direction.dot(up)) > 0.999:
+            # Looking straight along up leaves the roll undefined: keep the picture's top to -Z.
+            up = Vector3.FORWARD if absf(direction.dot(Vector3.FORWARD)) < 0.999 else Vector3.RIGHT
+            report["up_replaced"] = _vec(up)
+        transform = Transform3D(Basis.looking_at(direction, up), eye)
+        report["mode"] = "look_at"
+        report["look_at"] = _vec(target)
+        report["distance"] = snappedf(eye.distance_to(target), 0.0001)
+    var size := Vector2i(source_viewport.get_visible_rect().size)
+    var texture := source_viewport.get_texture()
+    if texture != null and texture.get_width() > 0 and texture.get_height() > 0:
+        size = Vector2i(texture.get_width(), texture.get_height())
+    if size.x <= 0 or size.y <= 0:
+        return R.err(R.GODOT_ERROR, "The game's viewport has no size yet.")
+    var viewport := SubViewport.new()
+    viewport.name = "GodotMcpAimViewport"
+    viewport.size = size
+    viewport.world_3d = world
+    viewport.transparent_bg = false
+    viewport.render_target_update_mode = SubViewport.UPDATE_ALWAYS
+    for property: String in ["msaa_3d", "screen_space_aa", "use_taa", "use_debanding", "use_occlusion_culling", "mesh_lod_threshold", "scaling_3d_mode", "scaling_3d_scale", "fsr_sharpness", "texture_mipmap_bias", "positional_shadow_atlas_size", "positional_shadow_atlas_16_bits", "positional_shadow_atlas_quad_0", "positional_shadow_atlas_quad_1", "positional_shadow_atlas_quad_2", "positional_shadow_atlas_quad_3", "use_hdr_2d"]:
+        if property in source_viewport and property in viewport:
+            viewport.set(property, source_viewport.get(property))
+    var camera := Camera3D.new()
+    camera.name = "GodotMcpAimCamera"
+    if source != null:
+        for property: String in ["projection", "fov", "size", "near", "far", "keep_aspect", "frustum_offset", "cull_mask", "environment", "attributes", "compositor"]:
+            if property in source:
+                camera.set(property, source.get(property))
+        if not is_zero_approx(source.h_offset) or not is_zero_approx(source.v_offset):
+            report["offsets_dropped"] = [source.h_offset, source.v_offset]
+    viewport.add_child(camera)
+    rt.add_child(viewport)
+    camera.global_transform = transform
+    # A held game flushes no transform notifications, and the forced draw would otherwise use
+    # the camera's transform from before it was placed.
+    camera.force_update_transform()
+    camera.current = true
+    report["position"] = _vec(transform.origin)
+    report["forward"] = _vec(-transform.basis.z)
+    report["projection"] = ["perspective", "orthogonal", "frustum"][camera.projection]
+    if camera.projection == Camera3D.PROJECTION_ORTHOGONAL:
+        report["size"] = snappedf(camera.size, 0.0001)
+    else:
+        report["fov"] = snappedf(camera.fov, 0.0001)
+    report["image_centre"] = "the aimed point is the centre pixel of the returned image"
+    return {"viewport": viewport, "label": "aim camera", "aim_viewport": viewport, "aim": report}
+
+
+## How far the game camera is from what it looks at: the first hit straight ahead of it, else the
+## distance from it to the point along its view direction.
+static func _camera_distance(source: Camera3D, world: World3D, point: Vector3) -> Dictionary:
+    var origin := source.global_position
+    var forward := -source.global_basis.z.normalized()
+    var space := world.direct_space_state
+    if space != null:
+        var query := PhysicsRayQueryParameters3D.create(origin, origin + forward * source.far)
+        var hit := space.intersect_ray(query)
+        if not hit.is_empty():
+            var reach := origin.distance_to(hit["position"])
+            if reach > source.near:
+                return {"distance": reach, "from": "game_camera_centre_hit"}
+    var along := (point - origin).dot(forward)
+    if along > source.near:
+        return {"distance": along, "from": "game_camera_to_point"}
+    return {"distance": maxf(origin.distance_to(point), source.near * 2.0 + 0.1), "from": "game_camera_to_point"}
+
+
+static func _vector3(raw: Variant) -> Variant:
+    if not raw is Array or (raw as Array).size() != 3:
+        return null
+    for item: Variant in raw:
+        if not (item is int or item is float) or not is_finite(float(item)):
+            return null
+    return Vector3(float(raw[0]), float(raw[1]), float(raw[2]))
+
+
+static func _vec(value: Vector3) -> Array:
+    return [snappedf(value.x, 0.0001), snappedf(value.y, 0.0001), snappedf(value.z, 0.0001)]

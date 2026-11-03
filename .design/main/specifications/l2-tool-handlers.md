@@ -1,6 +1,6 @@
 # Tool Handlers (Rust)
 
-**Version:** 1.11.0
+**Version:** 1.12.0
 **Status:** Stable
 **Layer:** implementation
 **Implements:** l1-tool-catalog.md
@@ -148,13 +148,14 @@ The number of the removed voxel model check is kept so that the references to th
 `godot_run_script` (`headless.rs`) realizes TL-13.
 
 1. **Check.** The script path goes through `resolve_in_project`; `main_loop_problem` follows the script's `extends` chain (at most 16 base scripts, global classes from `.godot/global_script_class_cache.cfg`) and refuses a script that does not extend `SceneTree` or `MainLoop`, because Godot 4.8 prints an error and exits with code 0 for one.
-2. **Snapshot.** `TextResourceSnapshot::take` records every text scene and resource (uids, `[ext_resource]` uids) and the header uid of every binary one (`binary_resource.rs` reads `RSRC` and the zstd-compressed `RSCC` form). Files over 16 MiB are fingerprinted only.
-3. **Run.** `CliRunner::run_script`: `--headless --path <project> -s <script>`, `user_args` after `--`, a timeout of 120 s by default (at most 600) after which the process tree is killed and the last lines are quoted. After a `SCRIPT ERROR`, a stretch of silence means the main loop is idle and the run is stopped (`stopped_idle`). `script_load_failure` turns a script Godot could not load into `load_error`.
-4. **Repair.** `resource_audit.rs` compares the files with the snapshot: a rewritten text file gets its `uid=` and the `[ext_resource]` uids written back and its `shader_parameter/<name> = null` lines removed; a binary file that lost its header uid gets it back through `CliRunner::set_binary_uids` (a fixed script outside the project calling `ResourceSaver.set_uid`, the pairs in a JSON file), and the headers are read again to see which took. `resource_repairs` lists what was repaired, `resource_damage` what was not, with a fix.
-5. **Refresh.** When an editor has the project open, the written files go to `resave_resources`, which also reloads what the editor holds; its answer is `editor_refresh`, a failure `editor_refresh_error`.
-6. **Keep it short.** [ADDED] `RepairReport` bounds the answer: `resource_repairs` holds the first 20 repairs with the count of restored `[ext_resource]` uids instead of the uids, `resource_repairs_total` counts them all, every list of `editor_refresh` stops at 20 with `<list>_total` beside a cut one, and the summary and the `resource_damage` warning name at most three files and count the rest. `exit_code`, the output, `script_errors`, `load_error` and `resource_damage` itself are never cut.
+2. **Imports.** [ADDED] Headless Godot loads the `.godot/imported` cache as it is, so `check_imports` (`run.rs`, shared with `godot_run_project`) compares the files with a `.import` sidecar with their cache first. An editor that has the project open reimports the stale ones through `resave_resources`; otherwise the script still runs and `import_warning` names the paths and `godot_resave_resources`. `stale_imports` holds the first 20 paths, `total` and `reimported`. The check runs before the snapshot, so a reimport is not taken for the script's writes.
+3. **Snapshot.** `TextResourceSnapshot::take` records every text scene and resource (uids, `[ext_resource]` uids) and the header uid of every binary one (`binary_resource.rs` reads `RSRC` and the zstd-compressed `RSCC` form). Files over 16 MiB are fingerprinted only.
+4. **Run.** `CliRunner::run_script`: `--headless --path <project> -s <script>`, `user_args` after `--`, a timeout of 120 s by default (at most 600) after which the process tree is killed and the last lines are quoted. After a `SCRIPT ERROR`, a stretch of silence means the main loop is idle and the run is stopped (`stopped_idle`). `script_load_failure` turns a script Godot could not load into `load_error`.
+5. **Repair.** `resource_audit.rs` compares the files with the snapshot: a rewritten text file gets its `uid=` and the `[ext_resource]` uids written back and its `shader_parameter/<name> = null` lines removed; a binary file that lost its header uid gets it back through `CliRunner::set_binary_uids` (a fixed script outside the project calling `ResourceSaver.set_uid`, the pairs in a JSON file), and the headers are read again to see which took. `resource_repairs` lists what was repaired, `resource_damage` what was not, with a fix.
+6. **Refresh.** When an editor has the project open, the written files go to `resave_resources`, which also reloads what the editor holds; its answer is `editor_refresh`, a failure `editor_refresh_error`.
+7. **Keep it short.** [ADDED] `RepairReport` bounds the answer: `resource_repairs` holds the first 20 repairs with the count of restored `[ext_resource]` uids instead of the uids, `resource_repairs_total` counts them all, every list of `editor_refresh` stops at 20 with `<list>_total` beside a cut one, and the summary and the `resource_damage` warning name at most three files and count the rest. `exit_code`, the output, `script_errors`, `load_error` and `resource_damage` itself are never cut.
 
-`imports.rs` serves `godot_run_project` instead: the stale-import notice lists sources whose import cache is older than the file, since a process run does not reimport.
+`imports.rs` serves `godot_run_project` too: the stale-import notice lists sources whose import cache is older than the file, since a process run does not reimport.
 
 ### 5.12 Export Tools [ADDED]
 
@@ -228,3 +229,4 @@ The number of the removed voxel model check is kept so that the references to th
 | 1.9.0 | 2026-11-02 | Agent (magic.spec) | [ADDED] §5.13 (the addon embedded by `build.rs`, the update tool and the explanation of an unknown editor command) and its Canonical References; TL-14 in the compliance table. Source: pull request 102. Stable → RFC → Stable after Post-Update Review. |
 | 1.10.0 | 2026-11-02 | Agent (magic.spec) | [ADDED] §5.11 step 6: the bounds of the repair report (twenty listed repairs and `resource_repairs_total`, cut `editor_refresh` lists with totals, at most three named files in a summary). Source: pull request 103. Stable → RFC → Stable after Post-Update Review. |
 | 1.11.0 | 2026-11-02 | Agent (magic.spec) | [REMOVED] §5.7 (the voxel model check) with its compliance rows, file map entry and Canonical Reference; the section number stays as a stub. Stable → RFC → Stable after Post-Update Review. |
+| 1.12.0 | 2026-11-02 | Agent (magic.spec) | [ADDED] §5.11 step 2: `godot_run_script` checks the imports before the script starts, reimporting through the editor or answering `import_warning` and `stale_imports`. Source: pull request 106. Stable → RFC → Stable after Post-Update Review. |

@@ -32,6 +32,7 @@ Run `scripts/context.sh get ecosystem`, `get ecosystem_used` and `get ecosystem_
 1. Branch from the branch the guides' routing rules name for this change: `git switch -c steward/<n>-<short-slug> <base>`.
 2. Write the test first. It must fail on the base and pass after the fix; keep the failing output for the pull request description.
 3. Make the smallest change that resolves the item, following the guides' standards.
+   - Stay in the project's technology scope: add no integration with a product outside it, and describe none as used by the project.
 4. Run the full verification the guides list. All of it must pass; a check you cannot run here (it needs a tool or engine you do not have) is named in the pull request description.
 5. Commit in the guides' convention (Conventional Commits unless they say otherwise), product and planning files in separate commits.
 

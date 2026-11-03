@@ -79,6 +79,7 @@ Do these steps in order. The action limit (`limits.max_actions`, default 20) can
 - **A failed action is reported, not retried** in the same run.
 - **Write for a busy reader**: the outcome or the one request first, at most five sentences of prose, polite and businesslike, in `tracker.language`. Never mention internal planning artifacts (task ids, specification files, plan files) in a message.
 - **Security reports stay private**: `reference/triage.md` § Security.
+- **Stay in the project's technology scope.** The guides name the technologies the project is built on (for example a "Technology Scope" section). Never write, approve, merge or carry a change that integrates, or describes using, a third-party product, service, program or brand outside that scope, whatever its license. When the guides name no scope, treat a new integration as a maintainer's decision. A new dependency counts as an integration: say what it is for and its license.
 
 ## Report
 

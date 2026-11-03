@@ -1,6 +1,6 @@
 # MCP Server Core
 
-**Version:** 1.3.0
+**Version:** 1.4.0
 **Status:** Stable
 **Layer:** concept
 
@@ -87,7 +87,6 @@ sequenceDiagram
 | `GODOT_CONSOLE_PATH` | Windows console wrapper; reserved, read only by the editor end-to-end tests | unset |
 | `GODOT_MCP_FEEDBACK` | Agent feedback channel: `off`, `draft` (notes and drafts only) or `full` (adds submission after the human's approval) | `full` |
 | `GODOT_MCP_GH_PATH` | GitHub command-line client used for submission | `gh` on `PATH` |
-| `FROXEL_BIN` | Exporter program of `godot_check_voxel_model` (trusted like `GODOT_PATH`; see CA-13 of [l1-content-authoring.md](l1-content-authoring.md)) [ADDED] | `froxel` on `PATH` |
 
 ## 6. Implementation Notes
 
@@ -115,5 +114,6 @@ sequenceDiagram
 | 1.0.0 | 2026-10-16 | Agent (magic.analyze first-time) | Reverse-engineered from the code at 94e4540; rationale taken from the 2026-10-14 simulation QA report (findings on stdout corruption, head-of-line blocking, protocol conformance, configuration loading). |
 | 1.1.0 | 2026-10-16 | Agent (magic.spec) | [ADDED] Two configuration keys, the `initialize` guidance text and the link to the feedback concept; [MODIFIED] the tool list is fixed per process rather than static, because the feedback setting shapes it. |
 | 1.1.1 | 2026-10-20 | Agent (magic.spec) | [MODIFIED] The `GODOT_PATH` row: a set value is always used as given. |
-| 1.2.0 | 2026-10-26 | Agent (magic.spec) | [ADDED] The `FROXEL_BIN` configuration key. Stable → RFC → Stable after Post-Update Review. |
+| 1.2.0 | 2026-10-26 | Agent (magic.spec) | [ADDED] A configuration key for an external exporter program. Stable → RFC → Stable after Post-Update Review. |
 | 1.3.0 | 2026-11-02 | Agent (magic.spec) | [MODIFIED] The `GODOT_DEBUG_PORT` default: derived from the project path since pull request 75, `9333` only outside a project. Found by ventilation. Stable → RFC → Stable after Post-Update Review. |
+| 1.4.0 | 2026-11-02 | Agent (magic.spec) | [REMOVED] The configuration key for an external exporter program, with the tool that used it. Stable → RFC → Stable after Post-Update Review. |

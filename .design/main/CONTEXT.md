@@ -86,7 +86,6 @@
     ├── editor_e2e_test.rs
     ├── export_e2e_test.rs
     ├── feedback_test.rs
-    ├── model_chain_e2e_test.rs
     ├── runtime_e2e_test.rs
     ├── scenario_e2e_test.rs
     ├── server_test.rs

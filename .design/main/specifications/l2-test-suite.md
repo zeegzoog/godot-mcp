@@ -1,6 +1,6 @@
 # Test Suite
 
-**Version:** 1.6.0
+**Version:** 1.7.0
 **Status:** Stable
 **Layer:** implementation
 **Implements:** l1-quality-assurance.md
@@ -24,7 +24,7 @@ Tells a contributor where a new test belongs and which environment variables the
 - Opt-in tests are marked ignored and read `GODOT_PATH` (and, on Windows, `GODOT_CONSOLE_PATH`, whose console binary is used to start the editor so its log can be shown on failure). A `.env` file fills in only variables that were not exported, so testing a specific Godot version means exporting both.
 - A `.env` with double-quoted Windows paths does not load; export the variables instead.
 - Editor end-to-end tests run with `--test-threads=2` in CI. Locally every ignored suite runs with `--test-threads=1`: windowed and process-heavy tests interfere in parallel. [MODIFIED]
-- [ADDED] CI runs the editor, addon export and runtime suites; the export, scenario and voxel model suites run locally when their area changes.
+- [ADDED] CI runs the editor, addon export and runtime suites; the export and scenario suites run locally when their area changes.
 
 ## 4. Invariant Compliance
 
@@ -58,14 +58,13 @@ tests/
 ├── editor_e2e_test.rs         (ignored) real headless editor: security, scene/property tools, undo, resave, authoring tools, a game tool right after Play
 ├── runtime_e2e_test.rs        (ignored) real games and language server: process run, live tree, input and gestures, waits, breakpoints, windowed screenshot, diagnostics
 ├── scenario_e2e_test.rs       (ignored) real game: scenario steps, pause, input release, run pinning and the run lock
-├── model_chain_e2e_test.rs    (ignored) real exporter and engine: export, import, sidecar and stale checks (needs FROXEL_BIN and GODOT_PATH)
 ├── export_e2e_test.rs         (ignored) real headless engine: presets created and changed, a pack export, an unusable template, import parameters and "Import As" without the editor [ADDED]
 └── addon_export_test.rs       (ignored) export policy unit check + real pack export without the addon
 examples/
 └── fake_gh.rs                 stand-in for the GitHub client; not part of any release artifact
 ```
 
-Unit tests live next to the code in `src/paths.rs`, `src/validation.rs`, `src/cli_runner.rs`, `src/config.rs`, `src/feedback.rs` and `src/issues.rs`, and [MODIFIED] in `src/bridge_port.rs`, `src/journal.rs`, `src/lsp/`, every `src/godot/` module, and the tool modules `authoring.rs`, `code.rs`, `export.rs`, `files.rs`, `import_params.rs`, `input_map.rs`, `model_chain.rs`, `scenario.rs`, `shaders.rs`, `game.rs` and `game/`.
+Unit tests live next to the code in `src/paths.rs`, `src/validation.rs`, `src/cli_runner.rs`, `src/config.rs`, `src/feedback.rs` and `src/issues.rs`, and [MODIFIED] in `src/bridge_port.rs`, `src/journal.rs`, `src/lsp/`, every `src/godot/` module, and the tool modules `authoring.rs`, `code.rs`, `export.rs`, `files.rs`, `import_params.rs`, `input_map.rs`, `scenario.rs`, `shaders.rs`, `game.rs` and `game/`.
 
 ### 5.2 Where a New Test Goes
 
@@ -78,7 +77,6 @@ Unit tests live next to the code in `src/paths.rs`, `src/validation.rs`, `src/cl
 | Editor command behaviour | `tests/editor_e2e_test.rs` |
 | Running game, debugger, language server on a real Godot [ADDED] | `tests/runtime_e2e_test.rs` |
 | Scenario tool on a real Godot [ADDED] | `tests/scenario_e2e_test.rs` |
-| Voxel model chain with a real exporter and Godot [ADDED] | `tests/model_chain_e2e_test.rs` |
 | Export presets, headless exports and import parameters without the editor [ADDED] | `tests/export_e2e_test.rs` |
 | The same derived bridge port on both sides [ADDED] | a case in `tests/bridge-port-vectors.json` (both sides read it) |
 | Export exclusion | `tests/addon_export_test.rs` |
@@ -106,7 +104,6 @@ Unit tests live next to the code in `src/paths.rs`, `src/validation.rs`, `src/cl
 | `[E2E]` | `tests/editor_e2e_test.rs` | Real-editor tests |
 | `[RUNTIME]` | `tests/runtime_e2e_test.rs` | Real-game and language-server tests |
 | `[SCENARIO]` | `tests/scenario_e2e_test.rs` | Real-game scenario tests |
-| `[MODEL]` | `tests/model_chain_e2e_test.rs` | Real-exporter voxel model tests |
 | `[PROJECT-EXPORT]` | `tests/export_e2e_test.rs` | Real-engine export and import parameter tests |
 | `[ADAPTER]` | `tests/common/adapter.rs` | Project adapter fixture |
 | `[PORT-CASES]` | `tests/bridge-port-vectors.json` | Shared bridge port cases |
@@ -127,3 +124,4 @@ Unit tests live next to the code in `src/paths.rs`, `src/validation.rs`, `src/cl
 | 1.4.1 | 2026-10-21 | Agent (magic.spec) | Added the stand-in GitHub client to Canonical References. No requirement changed. |
 | 1.5.0 | 2026-10-26 | Agent (magic.spec) | [ADDED] The two end-to-end files of the scenario tool and the voxel model check to the layout, the routing table and the references. Stable → RFC → Stable after Post-Update Review. |
 | 1.6.0 | 2026-11-02 | Agent (magic.spec) | Reality sync after ventilation. [ADDED] The export end-to-end file (pull requests 89, 100, 101), the adapter fixture, the shared bridge port cases (75), their routing rows and references; which suites CI runs. [MODIFIED] QA-3 names the export suite; local runs use one test thread; unit-test locations. Stable → RFC → Stable after Post-Update Review. |
+| 1.7.0 | 2026-11-02 | Agent (magic.spec) | [REMOVED] The end-to-end file of the voxel model check from the layout, the routing table and the references. Stable → RFC → Stable after Post-Update Review. |

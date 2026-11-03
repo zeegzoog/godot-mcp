@@ -4758,7 +4758,7 @@ async fn run_script_writes_back_the_uids_and_shader_parameters_a_headless_save_d
     // description needs updating.
     assert!(
         answer.contains("\"uid\": \"uid://cpond1234abcd\"")
-            && answer.contains("\"uid\": \"uid://dlh0ah0opc20e\"")
+            && answer.contains("\"ext_resource_uids_restored\": 1")
             && answer.contains("\"removed_null_shader_parameters\": [\n        \"tint\"\n      ]"),
         "{answer}"
     );

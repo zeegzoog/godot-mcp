@@ -1,6 +1,6 @@
 # Godot Release Lines
 
-**Version:** 1.1.0
+**Version:** 1.1.1
 **Status:** Stable
 **Layer:** concept
 
@@ -20,7 +20,7 @@ godot-mcp is maintained as one release line per supported Godot minor version (4
 
 Every Godot minor version adds, changes and sometimes removes editor APIs (`EditorFileSystem.is_importing` exists only from 4.7). A single build for "4.5 and newer" has to reach every newer API through a runtime capability check, and a missed check fails silently: the handler raises a script error, sends no reply, and the caller waits for its timeout — the 4.8-only call that broke 4.5 in the first CI run. One line per Godot version lets each line use its own version's API directly, be proven against exactly that version, and get a fix or a release without waiting for, or risking, the users of other Godot versions. A fix that matters to every version must still reach every version, so routing changes between lines is part of the concept rather than left to memory.
 
-Maintaining a branch per Godot version is how engine-bound libraries are kept (godot-cpp has a branch and a tag per engine version), but the Godot add-ons that ship binaries (Godot Jolt, GodotSteam, Voxel Tools) publish one release per project version with the files for each engine version inside it and the engine version in the file name. The users here install a binary plus an addon, so the same fits: the branches are how the project is maintained, one release per number is how it is published.
+Maintaining a branch per Godot version is how engine-bound libraries are kept (godot-cpp has a branch and a tag per engine version), but the Godot add-ons that ship binaries (Godot Jolt, GodotSteam) publish one release per project version with the files for each engine version inside it and the engine version in the file name. The users here install a binary plus an addon, so the same fits: the branches are how the project is maintained, one release per number is how it is published.
 
 ## 2. Constraints & Assumptions
 
@@ -140,3 +140,4 @@ A Godot patch release (M.N.P) moves the affected line's verified engine build fo
 | --- | --- | --- | --- |
 | 1.0.0 | 2026-10-20 | Agent (magic.spec) | Created from the request to maintain one branch per Godot version (4.5 to the newest stable, with the default branch on the unstable version) and to carry shared fixes to every release branch. Promoted to Stable after Post-Update Review. |
 | 1.1.0 | 2026-10-20 | Agent (magic.spec) | [MODIFIED] RL-3, RL-7, RL-8, RL-9, RL-10, RL-11: one release per number containing the files of every supported line, the release named by its number alone; replaces one release per line after the first release showed three near-identical entries per version. Reviewed against the practice of Godot add-ons that ship binaries. |
+| 1.1.1 | 2026-11-02 | Agent (magic.spec) | The example of add-ons that publish one release per project version no longer names a third-party add-on the project has no use for. No requirement changed. |

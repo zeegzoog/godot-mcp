@@ -70,6 +70,7 @@ Apply exactly one `priority: Pn` label; replace a different one you set earlier,
 | Defect not yet reproduced | Backlog | `ack`, or `needs-info` when information is missing |
 | Feature that fits the project's documented scope and roadmap and is small | Backlog | `ack` |
 | Feature that is large, changes the project's direction, or touches a decision the guides leave to maintainers | Backlog, label `status: needs-maintainer` | `handover` |
+| Feature that asks for an integration with a product, service, program or brand outside the project's technology scope | Backlog, label `status: needs-maintainer` | `handover` recommending to decline, citing the guides' technology scope; the steward never plans or builds it |
 | Blocked by something outside the project (an upstream defect, a missing platform feature) | Backlog, Blocked field set, label `status: blocked` | `ack` naming the blocker |
 
 Add the issue to the board, set Status, Priority and Kind (`reference/board.md`), and post the message. One message per issue per run.

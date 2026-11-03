@@ -2,6 +2,7 @@
 //! resource resaving and the headless import.
 
 use super::main_loop::main_loop_problem;
+use super::run::StaleImports;
 use super::{ToolManager, bridge_error_result, code, missing_argument, str_arg, user_args_of};
 use crate::cli_runner::{ScriptErrorLoc, ScriptRun, script_load_failure};
 use crate::error::McpError;
@@ -192,7 +193,7 @@ impl RepairReport {
     }
 }
 
-/// How many repaired files the run's answer lists one by one.
+/// How many repaired files, or stale imports, the run's answer lists one by one.
 const REPAIR_LIST_LIMIT: usize = 20;
 /// How many paths a summary sentence names before it counts the rest.
 const EXAMPLE_PATHS: usize = 3;
@@ -222,6 +223,7 @@ fn script_run_result(
     timeout_seconds: u64,
     damage: &[ResourceDamage],
     repair: &RepairReport,
+    imports: Option<&StaleImports>,
 ) -> ToolResult {
     let exit = report
         .exit_code
@@ -275,6 +277,14 @@ fn script_run_result(
         Some(warning) => format!("{summary} {warning}"),
         None => summary,
     };
+    let import_sentence = imports.map(|stale| stale.sentence("script"));
+    let import_warning = imports
+        .filter(|stale| !stale.reimported())
+        .and(import_sentence.clone());
+    let summary = match &import_sentence {
+        Some(sentence) => format!("{summary} {sentence}"),
+        None => summary,
+    };
     let body = json!({
         "summary": summary,
         "exit_code": report.exit_code,
@@ -294,8 +304,17 @@ fn script_run_result(
         "editor_refresh_error": repair.editor_error,
         "binary_uid_error": repair.binary_error,
         "resource_damage": resource_damage,
+        "stale_imports": imports.map(|stale| json!({
+            "paths": stale.paths.iter().take(REPAIR_LIST_LIMIT).collect::<Vec<_>>(),
+            "total": stale.paths.len(),
+            "reimported": stale.reimported(),
+        })),
+        "import_warning": import_warning,
     });
     let mut text = serde_json::to_string_pretty(&body).unwrap_or(summary);
+    if let Some(warning) = import_warning {
+        text = format!("{warning}\n{text}");
+    }
     if let Some(warning) = warning {
         text = format!("{warning}\n{text}");
     }
@@ -795,6 +814,10 @@ impl ToolManager {
             Ok(seconds) => seconds,
             Err(result) => return result,
         };
+        // A headless script loads the .godot/imported cache as it is, so stale imports are
+        // reimported (or reported) before it starts, and before the snapshot, so a reimport is
+        // not taken for the script's own writes.
+        let imports = self.check_imports(&project.dir).await;
         let snapshot = TextResourceSnapshot::take(&project.dir);
         match self
             .cli
@@ -804,7 +827,14 @@ impl ToolManager {
             Ok(report) => {
                 let repair = self.repair_resources(&project.dir, &snapshot).await;
                 let damage = snapshot.damage_since(&project.dir);
-                script_run_result(&report, &script_res, timeout_seconds, &damage, &repair)
+                script_run_result(
+                    &report,
+                    &script_res,
+                    timeout_seconds,
+                    &damage,
+                    &repair,
+                    imports.as_ref(),
+                )
             }
             Err(error) => ToolResult::error(
                 format!("Failed to run the script: {error}"),

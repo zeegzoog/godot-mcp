@@ -68,7 +68,7 @@ Post one review with `scripts/act.sh review <n> approve|request-changes|comment 
 ## 7. Merge
 
 1. Checks green (§ 4), review passed, the autonomy level allows it or a maintainer approved.
-   `scripts/act.sh merge` also refuses, by itself, a pull request of someone without write permission that changes a protected path (`scripts/act.sh sensitive <path>...` shows which paths count). Do not look for a way around it: label the item `status: needs-maintainer`, say why in the report, and leave the merge to a maintainer.
+   A pull request of someone without write permission that changes a protected path (`scripts/act.sh sensitive <path>...` shows which paths count) is merged after you have read every changed line of the protected files: add `--protected-reviewed "<one line: what the protected changes do>"` to the merge. `scripts/act.sh merge` then scans those files and refuses on a hit; a path it calls locked (`scripts/act.sh locked <path>...`) is refused whatever you say. Do not look for a way around a refusal: label the item `status: needs-maintainer` and say why in the report.
 2. Re-read the pull request; stop if a maintainer acted since.
 3. `scripts/act.sh merge <n> <merge.method> "<Conventional Commit subject> (#<n>)"`. GitHub's default body is kept; for a squash it lists the commits and their co-authors.
 4. Post the `merged` message; for each issue it closed, post the `fixed` message (closing keywords close issues only when merging into the default branch; close others yourself with the `fixed` message).

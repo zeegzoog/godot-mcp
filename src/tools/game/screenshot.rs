@@ -96,7 +96,19 @@ fn screenshot_note(value: &Value, width: u32, height: u32, source: &str) -> Stri
     }
     append_baseline(&mut note, value);
     append_render(&mut note, value, frames);
+    append_aim(&mut note, value);
     note
+}
+
+/// Where the temporary camera of an aimed capture stood, as the runtime reported it, on a line
+/// of its own so it can be read as JSON.
+fn append_aim(note: &mut String, value: &Value) {
+    if let Some(aim) = value.get("aim").filter(|item| item.is_object()) {
+        note.push_str(
+            "\nAimed from a temporary copy of the game camera; the game's cameras were not moved. Aim: ",
+        );
+        note.push_str(&aim.to_string());
+    }
 }
 
 /// Which drawn frame the image is, and a warning when the window drew nothing new before the
@@ -320,6 +332,27 @@ fn json_number(value: Option<&Value>) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn an_aimed_screenshot_says_where_the_camera_stood_as_json() {
+        let note = screenshot_note(
+            &json!({
+                "frames": 1,
+                "diff": {"compared": false},
+                "aim": {"mode": "at", "at": [30, 0.5, 0], "position": [30, 6.5, 8], "distance": 10}
+            }),
+            32,
+            16,
+            "aim camera",
+        );
+        let (_, aim) = note.split_once("\n").expect("the aim is on its own line");
+        assert!(aim.contains("the game's cameras were not moved"), "{aim}");
+        let (_, raw) = aim.split_once("Aim: ").expect("Aim: label");
+        let parsed: Value = serde_json::from_str(raw).expect("aim is JSON");
+        assert_eq!(parsed["position"], json!([30, 6.5, 8]));
+        let plain = screenshot_note(&json!({"frames": 1}), 32, 16, "main window");
+        assert!(!plain.contains("Aim"), "{plain}");
+    }
 
     #[test]
     fn screenshot_note_names_a_sheet_and_the_changed_rect() {

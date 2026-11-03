@@ -92,9 +92,27 @@ pub fn catalog() -> Vec<Tool> {
         ),
         crate::tools::scenario::definition(),
         tool(
+            "godot_game_probe",
+            "Casts rays in the running game's 3D physics world and moves nothing: use it to measure a height, a gap or what lies under a point instead of teleporting a node there and reading its position. rays is a list of up to 1024 rays, each {from: [x, y, z], to: [x, y, z]} or {x, z} for a ray straight down from top to bottom. grid is an area of down rays, {min: [x, z], max: [x, z], step} or {min, max, count: [columns, rows]}, at most 4096 points, answered as heights[row][column] (row r is z = min.z + r * step.z, column c is x = min.x + c * step.x, null where nothing was hit) with the lowest and highest hit and the colliders hit with their counts; detail true adds every point's full hit. A hit carries position, normal, distance from the ray's start, the collider's node path and class, collider_id, the shape index and, for a body or an area, shape_node: the CollisionShape3D or other owner of that shape. mask is the collision mask (bit 0 is layer 1, default every layer); exclude lists bodies or areas to ignore, such as the player; areas true also hits Area3D (default false) and bodies false skips bodies. world names a node whose 3D world to probe (default the main window's). The rays read the physics server as it stands now: a node moved since the last physics tick may not be there yet. Works while the game is held.",
+            json!({
+                "run_id": s(""),
+                "rays": {"type": "array", "maxItems": 1024, "description": "Rays to cast, each {from, to} or {x, z} for straight down.", "items": {"type": "object", "properties": {"from": vec3("Start of the ray, [x, y, z]."), "to": vec3("End of the ray, [x, y, z]."), "x": n("Down ray: world x."), "z": n("Down ray: world z.")}}},
+                "grid": {"type": "object", "description": "An area of down rays. min and max are [x, z] corners, both included; step is the spacing in metres, or count is [columns, rows].", "properties": {"min": vec2("[x, z] corner with the smaller x and z."), "max": vec2("[x, z] corner with the larger x and z."), "step": n("Spacing in metres, above 0."), "count": {"type": "array", "items": {"type": "integer", "minimum": 1}, "minItems": 2, "maxItems": 2, "description": "[columns, rows], spread evenly from min to max."}}, "required": ["min", "max"]},
+                "top": n("Height a down ray starts at. Default 1000."),
+                "bottom": n("Height a down ray ends at. Default -1000."),
+                "mask": {"type": "integer", "minimum": 0, "maximum": 4294967295_u64, "description": "Collision mask; bit 0 is layer 1. Default every layer."},
+                "exclude": {"type": "array", "items": {"type": "string"}, "description": "Node paths of bodies or areas the rays pass through, such as the player."},
+                "areas": {"type": "boolean", "description": "Also hit Area3D. Default false."},
+                "bodies": {"type": "boolean", "description": "Hit physics bodies. Default true."},
+                "detail": {"type": "boolean", "description": "grid only: also return every point's full hit. Default false."},
+                "world": s("A node whose 3D world to probe, such as a SubViewport. Default the main window's world.")
+            }),
+            &[],
+        ),
+        tool(
             "godot_game_screenshot",
-            "Captures the running game window, a viewport, or a Camera2D/Camera3D as one PNG. frames (1 to 8) stitches shots taken every process frames into a single sheet. For a longer series saved as PNG files, use godot_game_record. The text names the godot_game_input coordinate space (the root viewport's visible width and height, after content scale) and the scale from returned image pixels to that space: multiply an image pixel by the scale. A sheet uses that scale per frame, after subtracting the cell origin. When a baseline is compared, roi is the comparison region in returned-image pixels (roi_space returned_image) and the same scale applies inside a frame; roi does not crop the image and is refused without a baseline. A camera capture uses the camera's viewport; when that viewport is not the root, the text also names the captured viewport and the scale to it. The text says how many pixels changed since the previous capture of this run, and where (a sheet compares its last frame, and only against a capture of the same size). It also names the engine's drawn-frame count and process frame, and says STALE when the window drew no new frame before the capture (a covered or minimized window on macOS stops drawing): that image is older than the game state, so bring the window forward and capture again. save_baseline stores the returned image under a name (at most 8, each at most 512×512 pixels). baseline compares the returned image with a saved one. roi is the comparison region (x, y, w, h in pixels of that returned image, including a sheet) and requires baseline; it does not crop the returned image. tolerance (0 to 255, only with baseline) is the allowed per-channel difference; a larger difference counts as changed. The text reports changed, sampled, ratio, bounds, tolerance, the baseline name, and whether the pixel count is exact or sampled. Fails instead of returning an empty image. Headless games have nothing to capture. While the game is held a single capture shows the last frame it drew (a sheet with frames above 1, or a camera switch, is refused: take one capture, step, take the next). A missing baseline, a bad name, or an roi outside the image is an error and does not replace a saved image.",
-            json!({"run_id": s(""), "node": s("Viewport or node whose viewport to capture."), "camera": s("Camera2D or Camera3D to make current for the shot."), "max_dimension": i("Longest side of the returned image in pixels. Default 768."), "frames": ir("How many frames to stitch. Default 1, max 8.", 1, Some(8)), "every": ir("Process frames between shots. Default 1, max 60.", 1, Some(60)), "baseline": s("Name of a saved image to compare."), "save_baseline": s("Store the returned image under this name. Letters, digits, underscore, hyphen. At most 8 names."), "roi": roi_schema(), "tolerance": ir("Per-channel difference that still counts as unchanged, only when comparing a baseline. 0 to 255. Default 0.", 0, Some(255))}),
+            "Captures the running game window, a viewport, or a Camera2D/Camera3D as one PNG. frames (1 to 8) stitches shots taken every process frames into a single sheet. For a longer series saved as PNG files, use godot_game_record. The text names the godot_game_input coordinate space (the root viewport's visible width and height, after content scale) and the scale from returned image pixels to that space: multiply an image pixel by the scale. A sheet uses that scale per frame, after subtracting the cell origin. When a baseline is compared, roi is the comparison region in returned-image pixels (roi_space returned_image) and the same scale applies inside a frame; roi does not crop the image and is refused without a baseline. A camera capture uses the camera's viewport; when that viewport is not the root, the text also names the captured viewport and the scale to it. The text says how many pixels changed since the previous capture of this run, and where (a sheet compares its last frame, and only against a capture of the same size). It also names the engine's drawn-frame count and process frame, and says STALE when the window drew no new frame before the capture (a covered or minimized window on macOS stops drawing): that image is older than the game state, so bring the window forward and capture again. save_baseline stores the returned image under a name (at most 8, each at most 512×512 pixels). baseline compares the returned image with a saved one. roi is the comparison region (x, y, w, h in pixels of that returned image, including a sheet) and requires baseline; it does not crop the returned image. tolerance (0 to 255, only with baseline) is the allowed per-channel difference; a larger difference counts as changed. The text reports changed, sampled, ratio, bounds, tolerance, the baseline name, and whether the pixel count is exact or sampled. Fails instead of returning an empty image. Headless games have nothing to capture. While the game is held a single capture shows the last frame it drew (a sheet with frames above 1, or a camera switch, is refused: take one capture, step, take the next). A missing baseline, a bad name, or an roi outside the image is an error and does not replace a saved image. aim looks at a point in the 3D world without moving the player or the game's camera rig: a temporary camera copies the game's current Camera3D (or the one named by camera) - projection, fov or size, near, far, cull mask, environment and attributes - in a temporary viewport that shares the game's world, captures once and is freed, and the game's own camera stays current and unmoved. aim.at [x, y, z] puts that point in the centre of the image, seen from the game camera's direction and distance (aim.distance overrides the distance; by default it is how far ahead of the game camera its centre ray hits something, else the distance to the point). aim.position and aim.look_at place the camera instead (aim.up, default [0, 1, 0]). The text and the answer's aim field say where the camera was. Only the 3D world is drawn: the HUD and other 2D canvas items are not in the picture. A VisibleOnScreenNotifier3D in view may report entering the screen. Works while the game is held: the rendering server draws one frame, the scene does not advance.",
+            json!({"run_id": s(""), "node": s("Viewport or node whose viewport to capture."), "camera": s("Camera2D or Camera3D to make current for the shot. With aim: the Camera3D to copy, which is not switched."), "aim": aim_schema(), "max_dimension": i("Longest side of the returned image in pixels. Default 768."), "frames": ir("How many frames to stitch. Default 1, max 8.", 1, Some(8)), "every": ir("Process frames between shots. Default 1, max 60.", 1, Some(60)), "baseline": s("Name of a saved image to compare."), "save_baseline": s("Store the returned image under this name. Letters, digits, underscore, hyphen. At most 8 names."), "roi": roi_schema(), "tolerance": ir("Per-channel difference that still counts as unchanged, only when comparing a baseline. 0 to 255. Default 0.", 0, Some(255))}),
             &[],
         ),
         tool(
@@ -211,6 +229,30 @@ fn roi_schema() -> Value {
             "w": {"type": "integer", "minimum": 1}, "h": {"type": "integer", "minimum": 1}
         }
     })
+}
+
+/// A screenshot from a temporary camera aimed at a point or placed with a look-at.
+fn aim_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Capture from a temporary copy of the game camera: {at: [x, y, z], distance?} centres that point at the game camera's angle, or {position, look_at, up?} places it. The game's cameras and nodes are not moved. Takes one frame; not with node.",
+        "properties": {
+            "at": vec3("World point to put in the centre of the image."),
+            "distance": n("With at: how far the camera stands from the point along the game camera's view direction. Default: the game camera's own distance to what it looks at."),
+            "position": vec3("Where the camera stands, [x, y, z]. Needs look_at."),
+            "look_at": vec3("The point it looks at, [x, y, z]. Needs position."),
+            "up": vec3("With position and look_at: the picture's up. Default [0, 1, 0].")
+        },
+        "additionalProperties": false
+    })
+}
+
+fn vec3(description: &str) -> Value {
+    json!({"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3, "description": description})
+}
+
+fn vec2(description: &str) -> Value {
+    json!({"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2, "description": description})
 }
 
 /// An integer parameter with the range the tool documents.

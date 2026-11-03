@@ -6145,3 +6145,386 @@ async fn run_script_writes_back_the_uid_of_a_rewritten_binary_scene() {
         "{read}"
     );
 }
+
+/// A small 3D level: a ground slab with its top at y = 0, a bank box on collision layer 2 with
+/// its top at y = 2 over x 4..6, z -1..1, a frog sphere standing at the origin, a camera at
+/// (0, 6, 8) looking at the origin, and a red marker at x = 30 that the camera cannot see.
+fn world_project() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("project");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("scenes")).unwrap();
+    std::fs::create_dir_all(root.join("scripts")).unwrap();
+    std::fs::write(
+        root.join("project.godot"),
+        "config_version=5\n\n[application]\n\nconfig/name=\"WorldProbe\"\nrun/main_scene=\"res://scenes/world.tscn\"\nconfig/features=PackedStringArray(\"4.5\")\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("scripts/world.gd"),
+        "extends Node3D\n\nfunc _ready() -> void:\n\t($Rig/Camera as Camera3D).look_at_from_position(Vector3(0, 6, 8), Vector3.ZERO)\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("scenes/world.tscn"),
+        r#"[gd_scene load_steps=7 format=3]
+
+[ext_resource type="Script" path="res://scripts/world.gd" id="1"]
+
+[sub_resource type="BoxShape3D" id="ground"]
+size = Vector3(40, 1, 40)
+
+[sub_resource type="BoxShape3D" id="bank"]
+size = Vector3(2, 2, 2)
+
+[sub_resource type="SphereShape3D" id="frog"]
+radius = 0.5
+
+[sub_resource type="BoxMesh" id="marker"]
+size = Vector3(6, 6, 6)
+
+[sub_resource type="StandardMaterial3D" id="red"]
+shading_mode = 0
+albedo_color = Color(1, 0, 0, 1)
+
+[node name="Level" type="Node3D"]
+script = ExtResource("1")
+
+[node name="Ground" type="StaticBody3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.5, 0)
+
+[node name="Shape" type="CollisionShape3D" parent="Ground"]
+shape = SubResource("ground")
+
+[node name="Bank" type="StaticBody3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 5, 1, 0)
+collision_layer = 2
+
+[node name="Shape" type="CollisionShape3D" parent="Bank"]
+shape = SubResource("bank")
+
+[node name="Frog" type="CharacterBody3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.5, 0)
+
+[node name="Shape" type="CollisionShape3D" parent="Frog"]
+shape = SubResource("frog")
+
+[node name="Rig" type="Node3D" parent="."]
+
+[node name="Camera" type="Camera3D" parent="Rig"]
+current = true
+
+[node name="Marker" type="MeshInstance3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 30, 2, 0)
+mesh = SubResource("marker")
+material_override = SubResource("red")
+"#,
+    )
+    .unwrap();
+    dir
+}
+
+async fn start_world(headless: bool) -> (tempfile::TempDir, Arc<ToolManager>, String) {
+    let project = world_project();
+    let tools = manager(project.path());
+    let started = call(
+        &tools,
+        "godot_run_project",
+        json!({
+            "project_path": project.path(),
+            "scene": "res://scenes/world.tscn",
+            "mode": "process",
+            "headless": headless
+        }),
+    )
+    .await;
+    assert!(!started.is_error, "{}", text_of(&started));
+    let run_id = run_id_of(&started);
+    // Let the bodies reach the physics server.
+    let waited = call(
+        &tools,
+        "godot_game_wait",
+        json!({"run_id": run_id, "frames": 5}),
+    )
+    .await;
+    assert!(!waited.is_error, "{}", text_of(&waited));
+    (project, tools, run_id)
+}
+
+async fn probe(tools: &Arc<ToolManager>, run_id: &str, extra: Value) -> Value {
+    let mut args = json!({"run_id": run_id});
+    if let (Some(base), Some(more)) = (args.as_object_mut(), extra.as_object()) {
+        for (key, value) in more {
+            base.insert(key.clone(), value.clone());
+        }
+    }
+    let reply = call(tools, "godot_game_probe", args).await;
+    assert!(!reply.is_error, "{}", text_of(&reply));
+    json_of(&reply)
+}
+
+fn close(value: &Value, expected: f64) -> bool {
+    (json_number(value) - expected).abs() < 0.01
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn probe_measures_the_world_without_moving_anything() {
+    let _ = IGNORE;
+    let (_project, tools, run_id) = start_world(true).await;
+
+    let down = probe(&tools, &run_id, json!({"rays": [{"x": 0, "z": 0}]})).await;
+    let frog = &down["rays"][0];
+    assert_eq!(frog["hit"], true, "{down}");
+    assert_eq!(frog["collider"], "Frog", "{down}");
+    assert_eq!(frog["class"], "CharacterBody3D", "{down}");
+    assert_eq!(frog["shape"], 0, "{down}");
+    assert_eq!(frog["shape_node"], "Frog/Shape", "{down}");
+    assert!(close(&frog["position"][1], 1.0), "{down}");
+
+    // The frog is skipped, the bank is on layer 2 and the mask can leave it out.
+    let rays = probe(
+        &tools,
+        &run_id,
+        json!({
+            "exclude": ["Frog"],
+            "rays": [
+                {"x": 0, "z": 0},
+                {"x": 5, "z": 0},
+                {"from": [-3, 1.5, 0], "to": [10, 1.5, 0]},
+                {"x": 50, "z": 0}
+            ]
+        }),
+    )
+    .await;
+    let hits = rays["rays"].as_array().expect("rays");
+    assert_eq!(hits[0]["collider"], "Ground", "{rays}");
+    assert!(close(&hits[0]["position"][1], 0.0), "{rays}");
+    assert!(close(&hits[0]["normal"][1], 1.0), "{rays}");
+    assert_eq!(hits[1]["collider"], "Bank", "{rays}");
+    assert!(close(&hits[1]["position"][1], 2.0), "{rays}");
+    assert_eq!(hits[2]["collider"], "Bank", "{rays}");
+    assert!(close(&hits[2]["position"][0], 4.0), "{rays}");
+    assert!(close(&hits[2]["normal"][0], -1.0), "{rays}");
+    assert!(close(&hits[2]["distance"], 7.0), "{rays}");
+    assert_eq!(hits[3]["hit"], false, "{rays}");
+    assert_eq!(rays["hits"], 3, "{rays}");
+    assert_eq!(rays["missed"], 1, "{rays}");
+
+    let masked = probe(
+        &tools,
+        &run_id,
+        json!({"mask": 1, "rays": [{"x": 5, "z": 0}]}),
+    )
+    .await;
+    assert_eq!(masked["rays"][0]["collider"], "Ground", "{masked}");
+
+    // A grid across the bank's edge: x 2.5 .. 7.5, z -0.5 and 0.5.
+    let grid = probe(
+        &tools,
+        &run_id,
+        json!({"exclude": ["Frog"], "grid": {"min": [2.5, -0.5], "max": [7.5, 0.5], "step": 1}}),
+    )
+    .await;
+    assert_eq!(grid["grid"]["columns"], 6, "{grid}");
+    assert_eq!(grid["grid"]["rows"], 2, "{grid}");
+    for row in grid["heights"].as_array().expect("heights") {
+        let heights: Vec<f64> = row
+            .as_array()
+            .expect("row")
+            .iter()
+            .map(json_number)
+            .collect();
+        let expected = [0.0, 0.0, 2.0, 2.0, 0.0, 0.0];
+        for (got, want) in heights.iter().zip(expected) {
+            assert!((got - want).abs() < 0.01, "{grid}");
+        }
+    }
+    assert!(close(&grid["lowest"], 0.0), "{grid}");
+    assert!(close(&grid["highest"], 2.0), "{grid}");
+    let bank = grid["colliders"]
+        .as_array()
+        .and_then(|list| list.iter().find(|item| item["path"] == "Bank"))
+        .unwrap_or_else(|| panic!("no Bank in {grid}"));
+    assert_eq!(bank["count"], 4, "{grid}");
+    assert!(grid.get("points").is_none(), "{grid}");
+    let detailed = probe(
+        &tools,
+        &run_id,
+        json!({"grid": {"min": [0, 0], "max": [1, 1], "count": [2, 2]}, "detail": true}),
+    )
+    .await;
+    assert_eq!(
+        detailed["points"].as_array().map(Vec::len),
+        Some(4),
+        "{detailed}"
+    );
+
+    let bad = call(
+        &tools,
+        "godot_game_probe",
+        json!({"run_id": run_id, "rays": [{"from": [0, 1, 0]}]}),
+    )
+    .await;
+    assert!(bad.is_error, "{}", text_of(&bad));
+    assert!(text_of(&bad).contains("from and to"), "{}", text_of(&bad));
+    let not_a_body = call(
+        &tools,
+        "godot_game_probe",
+        json!({"run_id": run_id, "exclude": ["Rig"], "rays": [{"x": 0, "z": 0}]}),
+    )
+    .await;
+    assert!(not_a_body.is_error, "{}", text_of(&not_a_body));
+    assert!(
+        text_of(&not_a_body).contains("CollisionObject3D"),
+        "{}",
+        text_of(&not_a_body)
+    );
+
+    // Nothing moved, and a held game is probed the same way.
+    let frog_now = json_of(
+        &call(
+            &tools,
+            "godot_game_get",
+            json!({"run_id": run_id, "path": "Frog", "properties": ["position"]}),
+        )
+        .await,
+    );
+    assert!(
+        close(&frog_now["properties"]["position"][1], 0.5),
+        "{frog_now}"
+    );
+    hold_now(&tools, &run_id).await;
+    let held = probe(&tools, &run_id, json!({"rays": [{"x": 5, "z": 0}]})).await;
+    assert_eq!(held["rays"][0]["collider"], "Bank", "{held}");
+
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+}
+
+fn aim_of(note: &str) -> Value {
+    let raw = note
+        .split_once("Aim: ")
+        .map(|(_, raw)| raw.lines().next().unwrap_or_default())
+        .unwrap_or_else(|| panic!("no aim in {note}"));
+    serde_json::from_str(raw).unwrap_or_else(|_| panic!("aim is not JSON: {note}"))
+}
+
+fn baseline_changed(note: &str) -> u64 {
+    note.split_once(", baseline plain changed ")
+        .and_then(|(_, rest)| rest.split(' ').next())
+        .and_then(|number| number.parse().ok())
+        .unwrap_or_else(|| panic!("no baseline comparison in {note}"))
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn an_aimed_screenshot_looks_at_a_point_and_leaves_the_game_camera_alone() {
+    let _ = IGNORE;
+    if !windowed_game_can_open() {
+        eprintln!("skipped: a windowed capture needs a display server");
+        return;
+    }
+    let (_project, tools, run_id) = start_world(false).await;
+    let shot = |extra: Value| {
+        let tools = Arc::clone(&tools);
+        let run_id = run_id.clone();
+        async move {
+            let mut args = json!({"run_id": run_id, "max_dimension": 128});
+            if let (Some(base), Some(more)) = (args.as_object_mut(), extra.as_object()) {
+                for (key, value) in more {
+                    base.insert(key.clone(), value.clone());
+                }
+            }
+            call(&tools, "godot_game_screenshot", args).await
+        }
+    };
+    let plain = shot(json!({"save_baseline": "plain"})).await;
+    assert!(!plain.is_error, "{}", text_of(&plain));
+
+    let aimed = shot(json!({"baseline": "plain", "aim": {"at": [30, 2, 0]}})).await;
+    assert!(!aimed.is_error, "{}", text_of(&aimed));
+    let note = text_of(&aimed);
+    assert!(
+        baseline_changed(&note) > 500,
+        "the marker is not in the picture: {note}"
+    );
+    let aim = aim_of(&note);
+    assert_eq!(aim["mode"], "at", "{aim}");
+    assert_eq!(aim["copied_from"], "Rig/Camera", "{aim}");
+    assert_eq!(aim["distance_from"], "game_camera_centre_hit", "{aim}");
+    // The camera's centre ray meets the frog's sphere 9.4 m away.
+    assert!(close(&aim["distance"], 9.4), "{aim}");
+    assert!(close(&aim["position"][0], 30.0), "{aim}");
+    assert!(close(&aim["position"][1], 2.0 + 0.6 * 9.4), "{aim}");
+    assert!(close(&aim["position"][2], 0.8 * 9.4), "{aim}");
+
+    let given = shot(json!({"aim": {"at": [30, 2, 0], "distance": 20}})).await;
+    assert!(!given.is_error, "{}", text_of(&given));
+    let given_aim = aim_of(&text_of(&given));
+    assert_eq!(given_aim["distance_from"], "given", "{given_aim}");
+    assert!(close(&given_aim["position"][2], 16.0), "{given_aim}");
+
+    let placed = shot(json!({"aim": {"position": [30, 2, 12], "look_at": [30, 2, 0]}})).await;
+    assert!(!placed.is_error, "{}", text_of(&placed));
+    let placed_aim = aim_of(&text_of(&placed));
+    assert_eq!(placed_aim["mode"], "look_at", "{placed_aim}");
+    assert!(close(&placed_aim["forward"][2], -1.0), "{placed_aim}");
+
+    let wrong = shot(json!({"aim": {"at": [1, 2]}})).await;
+    assert!(wrong.is_error, "{}", text_of(&wrong));
+    let both = shot(json!({"aim": {"at": [1, 2, 3], "look_at": [0, 0, 0]}})).await;
+    assert!(both.is_error, "{}", text_of(&both));
+
+    // The game camera is still current and where it was, and the temporary nodes are gone.
+    let camera = json_of(
+        &call(
+            &tools,
+            "godot_game_get",
+            json!({"run_id": run_id, "path": "Rig/Camera", "properties": ["current", "global_position"]}),
+        )
+        .await,
+    );
+    assert_eq!(camera["properties"]["current"], true, "{camera}");
+    assert!(
+        close(&camera["properties"]["global_position"][1], 6.0),
+        "{camera}"
+    );
+    assert!(
+        close(&camera["properties"]["global_position"][2], 8.0),
+        "{camera}"
+    );
+    let leftovers = json_of(
+        &call(
+            &tools,
+            "godot_game_tree",
+            json!({"run_id": run_id, "root": "/root", "name": "GodotMcpAim"}),
+        )
+        .await,
+    );
+    assert_eq!(leftovers["count"], 0, "{leftovers}");
+    let again = shot(json!({"baseline": "plain"})).await;
+    assert!(!again.is_error, "{}", text_of(&again));
+    assert!(
+        baseline_changed(&text_of(&again)) < 50,
+        "the game's own view changed: {}",
+        text_of(&again)
+    );
+
+    // A held game draws the aimed view without advancing.
+    hold_now(&tools, &run_id).await;
+    let held = shot(json!({"baseline": "plain", "aim": {"at": [30, 2, 0]}})).await;
+    assert!(!held.is_error, "{}", text_of(&held));
+    assert!(
+        baseline_changed(&text_of(&held)) > 500,
+        "{}",
+        text_of(&held)
+    );
+    let switch = shot(json!({"camera": "Rig/Camera"})).await;
+    assert!(
+        switch.is_error,
+        "a camera switch is still refused while held"
+    );
+
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+}

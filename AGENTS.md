@@ -104,6 +104,7 @@ Before submitting or committing changes, agents must execute and pass the comple
    godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_record.gd
    godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_registry.gd
    godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_project.gd
+   godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_probe.gd
    ```
 
 5. **Editor End-to-End Tests** (whenever `addons/godot_mcp/` changed; needs the Godot build named in `.github/godot-version`, ignored by default). Run the ignored end-to-end suites with `--test-threads=1`: windowed tests and process-heavy tests interfere when they run in parallel.
@@ -155,6 +156,7 @@ When interacting with a Godot project, agents must adhere to the following workf
    - Close an editor you opened (with `godot_launch_editor` or otherwise) with `godot_close_editor` when done. It refuses while the editor has unsaved scenes or scripts and lists them: save them or ask the person; pass `discard: true` only when losing them is intended.
    - When a tool says the editor's addon is older than the server, update it with `godot_update_addon` (`restart_editor: true` while the editor has the project open); never copy addon files by hand.
    - Read logs and errors with `godot_run_output`. Inspect the live tree with `godot_game_tree` before `godot_game_set` or `godot_game_call`.
+   - Measure the level with `godot_game_probe` (rays, or a grid of ground heights) and look at a point with `godot_game_screenshot` `aim`, instead of moving the player or the camera there.
    - Capture the game with `godot_game_screenshot`. A headless game returns an error and no image; do not treat that error as a picture. For a series of frames on disk, use `godot_game_record`.
    - Pass game flags with `godot_run_project` `user_args` and `mode: "process"`. They go after `--`. Do not put Godot engine options there.
    - `godot_game_call` runs only a method named in `permit`, and never one that quits, evaluates, calls another method by name, sets a property by name or frees or replaces a node.

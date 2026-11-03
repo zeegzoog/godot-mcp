@@ -1433,6 +1433,48 @@ async fn record_rejects_a_span_a_relative_directory_and_a_bad_format() {
 }
 
 #[tokio::test]
+async fn probe_is_listed_read_only_and_checks_its_size_before_reaching_a_game() {
+    let probe = ToolManager::list_tools()
+        .into_iter()
+        .find(|tool| tool.name == "godot_game_probe")
+        .expect("godot_game_probe is listed");
+    let schema = serde_json::to_value(&probe).expect("tool");
+    assert_eq!(schema["annotations"]["readOnlyHint"], true, "{schema}");
+    for key in ["rays", "grid", "mask", "exclude", "top", "bottom"] {
+        assert!(
+            schema["inputSchema"]["properties"].get(key).is_some(),
+            "{key}: {schema}"
+        );
+    }
+
+    let neither = call("godot_game_probe", json!({})).await;
+    assert!(neither.is_error, "{}", text(&neither));
+    assert!(
+        text(&neither).contains("rays or grid"),
+        "{}",
+        text(&neither)
+    );
+    let huge = call(
+        "godot_game_probe",
+        json!({"grid": {"min": [0, 0], "max": [100, 100], "step": 0.5}}),
+    )
+    .await;
+    assert!(huge.is_error, "{}", text(&huge));
+    assert!(text(&huge).contains("4096"), "{}", text(&huge));
+
+    let shot = ToolManager::list_tools()
+        .into_iter()
+        .find(|tool| tool.name == "godot_game_screenshot")
+        .expect("screenshot");
+    let shot = serde_json::to_value(&shot).expect("tool");
+    let aim = &shot["inputSchema"]["properties"]["aim"];
+    for key in ["at", "distance", "position", "look_at", "up"] {
+        assert!(aim["properties"].get(key).is_some(), "{key}: {aim}");
+    }
+    assert_eq!(aim["additionalProperties"], false, "{aim}");
+}
+
+#[tokio::test]
 async fn record_writes_only_below_the_system_temporary_directory() {
     let temp = std::env::temp_dir();
     let Some(outside) = temp

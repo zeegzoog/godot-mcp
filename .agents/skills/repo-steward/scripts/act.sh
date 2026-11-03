@@ -119,6 +119,81 @@ protected_hits() {
 	return $hit
 }
 
+# The part of the protected set that a merge by the steward never reaches, whatever it decides:
+# its own rules, scripts and workflows, the agents' and tools' settings, the release and cleanup
+# automation (they run with the project's secrets and publish), the Cargo configuration, and any
+# workflow it does not know. The rest of the protected set (ci.yml, build.rs, the dependency
+# manifests, the other agent files) is merged after a read of every changed line and the content
+# scan below. Same name rules as protected_paths; prints each locked path (nothing when none).
+locked_hits() {
+	local path lower entry base
+	for path in "$@"; do
+		lower=$(printf '%s' "$path" | tr '[:upper:]' '[:lower:]')
+		base=${lower##*/}
+		for entry in .agents/skills/repo-steward/ .agents/rules/ .agents/workflows/ .claude/ .cargo/ .github/steward.yml .github/codeowners; do
+			case "$entry" in
+			*/) case "$lower" in "$entry"* | *"/$entry"*) printf '%s\n' "$path" && break ;; esac ;;
+			*) case "$lower" in "$entry" | *"/$entry") printf '%s\n' "$path" && break ;; esac ;;
+			esac
+		done
+		# Only ci.yml is a workflow a contributor's change may reach: the others publish, delete
+		# branches or run the steward itself.
+		case "$lower" in
+		.github/workflows/* | */.github/workflows/*)
+			if [ "$base" != ci.yml ]; then printf '%s\n' "$path"; fi
+			;;
+		esac
+	done | sort -u
+	return 0
+}
+
+# Reads the patch of one protected file on stdin and prints each added line that does what a
+# change to that file has no business doing: reaching for the project's secrets or the network,
+# widening a workflow's permissions or trigger, adding a dependency from outside the registry,
+# running a download, or talking to an agent instead of to a build. Status 1 when it prints any.
+# A line that GitHub did not show (a patch it left out) is not scanned: the caller fails closed
+# on an empty patch.
+danger_in_patch() {
+	local path=$1 lower added line bad=0 patch pat
+	lower=$(printf '%s' "$path" | tr '[:upper:]' '[:lower:]')
+	patch=$(cat)
+	added=$(printf '%s\n' "$patch" | grep -E '^\+' | grep -vE '^\+\+\+' | sed 's/^+//' || true)
+	local common='ignore (all|any|the|previous|prior|above)|disregard|without (asking|approval|confirmation|review)|do not (tell|mention|report|review)|exfiltrat|hide this'
+	case "$lower" in
+	*.github/*) pat='pull_request_target|workflow_run|secrets\.|id-token|(contents|packages|actions|pull-requests|issues|checks|deployments|statuses|security-events):[[:space:]]*write|curl|wget|invoke-webrequest|\|[[:space:]]*(ba|z)?sh([[:space:]]|$)|bash -c|eval[[:space:]]|github_env|github_path' ;;
+	*cargo.toml) pat='(^|[{,])[[:space:]]*(git|path|registry|branch|rev|tag)[[:space:]]*=|^[[:space:]]*(build|links)[[:space:]]*=|^\[(patch|replace|source|build-dependencies)|\[target\.[^]]*build-dependencies' ;;
+	*cargo.lock) pat='^source = ' ;;
+	*build.rs) pat='TcpStream|UdpSocket|reqwest|ureq|curl|wget|https?://|\.ssh|HOME|USERPROFILE|APPDATA|TOKEN|SECRET|GITHUB_|ANTHROPIC|CLAUDE_' ;;
+	*) pat='^$' ;;
+	esac
+	while IFS= read -r line; do
+		[ -n "$line" ] || continue
+		if printf '%s' "$line" | grep -Eiq "$common|$pat"; then
+			# The one source a lock file may add is the crates.io registry.
+			case "$lower" in
+			*cargo.lock) case "$line" in 'source = "registry+https://github.com/rust-lang/crates.io-index"') continue ;; esac ;;
+			esac
+			printf '%s: %s\n' "$path" "$line"
+			bad=1
+		elif credential_shaped "$line"; then
+			printf '%s: %s\n' "$path" "(something shaped like a credential)"
+			bad=1
+		fi
+	done <<<"$added"
+	# A workflow line that changes a `uses:` pin must be nothing but a version move.
+	case "$lower" in
+	*.github/*)
+		if printf '%s\n' "$added" | grep -Eq '^[[:space:]]*(-[[:space:]]+)?uses:'; then
+			if ! pins_only <<<"$patch" || { [ "${STEWARD_OFFLINE:-0}" != 1 ] && ! pins_match_tags "$patch"; }; then
+				printf '%s: %s\n' "$path" "a uses: line that is not a version pin of an action already used"
+				bad=1
+			fi
+		fi
+		;;
+	esac
+	return $bad
+}
+
 # Reads a unified patch (the `patch` field GitHub gives for a file) on stdin and succeeds only
 # when it does nothing but move `uses:` lines of a workflow to another version of the same
 # actions: every changed line is a `uses: owner/name@ref` line, ref is a tag or a commit with the
@@ -176,6 +251,7 @@ pins_match_tags() {
 # the merge does not happen. It leaves the head commit it looked at in `head_sha`; the merge is
 # made for exactly that commit, so a push after the check turns the merge down.
 head_sha=""
+reviewed_statement=""
 guard_merge() {
 	[ "${STEWARD_OFFLINE:-0}" != 1 ] || return 0
 	local info author is_bot changed permission rows count files hits paths bot allowed named from_bot=0 path
@@ -233,7 +309,33 @@ guard_merge() {
 		mapfile -t paths <<<"$files"
 	fi
 	if hits=$(protected_hits "${paths[@]}"); then return 0; fi
-	fail "#$1 changes a protected path ($(printf '%s' "$hits" | head -3 | tr '\n' ' ')); the steward does not merge it. Label it 'status: needs-maintainer' and list it in the report"
+	# A protected path. Some are never the steward's to merge; the others are merged after it has
+	# read every changed line of them (--protected-reviewed names what they do) and the content
+	# scan finds nothing in the files themselves.
+	local locked scan_failed=0 hit_path patch danger
+	locked=$(locked_hits "${paths[@]}")
+	[ -z "$locked" ] ||
+		fail "#$1 changes a path the steward never merges ($(printf '%s' "$locked" | head -3 | tr '\n' ' ')): its own rules and automation, the agent and tool settings, the release workflows. Label it 'status: needs-maintainer' and list it in the report"
+	[ -n "$reviewed_statement" ] ||
+		fail "#$1 changes a protected path ($(printf '%s' "$hits" | head -3 | tr '\n' ' ')). Read every changed line of it, then merge with --protected-reviewed \"<one line: what the protected changes do>\""
+	while IFS= read -r hit_path; do
+		[ -n "$hit_path" ] || continue
+		patch=$(gh api "repos/$repo/pulls/$1/files" --paginate \
+			--jq ".[] | select(.filename == \"$hit_path\") | .patch // \"\"" | tr -d '\r') || patch=""
+		if [ -z "$patch" ]; then
+			printf 'act.sh: GitHub shows no patch of %s (renamed, binary or too large); a protected file that cannot be read line by line is not merged\n' "$hit_path" >&2
+			scan_failed=1
+			continue
+		fi
+		if ! danger=$(danger_in_patch "$hit_path" <<<"$patch"); then
+			printf '%s\n' "$danger" | head -5 >&2
+			scan_failed=1
+		fi
+	done <<<"$hits"
+	[ "$scan_failed" = 0 ] ||
+		fail "#$1: the content scan of its protected files found what a change there must not do (above); nothing was merged. Label it 'status: needs-maintainer' and list it in the report"
+	printf 'act.sh: protected-path merge of #%s after review: %s\n' "$1" "$reviewed_statement" >&2
+	return 0
 }
 
 repo=$(bash "$here/context.sh" get repo)
@@ -305,15 +407,25 @@ sensitive)
 	[ $# -ge 1 ] || fail "usage: sensitive <path>..."
 	if protected_hits "$@"; then exit 0; else exit 1; fi
 	;;
+locked)
+	[ $# -ge 1 ] || fail "usage: locked <path>..."
+	locked=$(locked_hits "$@")
+	[ -z "$locked" ] || { printf "%s\n" "$locked"; exit 1; }
+	;;
+patch-danger)
+	[ $# -eq 1 ] || fail "usage: patch-danger <path> < patch"
+	danger_in_patch "$1"
+	;;
 approve-run)
 	[ $# -eq 1 ] || fail "usage: approve-run <run-id>"
 	number "$1"
 	run gh api -X POST "repos/$repo/actions/runs/$1/approve" --silent
 	;;
 merge)
-	[ $# -eq 3 ] || fail "usage: merge <pr> squash|merge|rebase <subject>"
+	{ [ $# -eq 3 ] || { [ $# -eq 5 ] && [ "$4" = --protected-reviewed ]; }; } || fail "usage: merge <pr> squash|merge|rebase <subject> [--protected-reviewed <statement>]"
 	number "$1"
 	one_line "$3" subject
+	if [ $# -eq 5 ]; then one_line "$5" statement; reviewed_statement=$5; fi
 	case "$2" in squash | merge | rebase) guard_merge "$1" ;; esac
 	case "$2" in
 	squash | merge | rebase)

@@ -12,6 +12,36 @@ use crate::protocol::ToolResult;
 use serde_json::{Value, json};
 use std::path::Path;
 
+/// Imports found stale before a run, and how reimporting them through the editor went: `None`
+/// when no editor has the project open, so nothing was reimported.
+pub(super) struct StaleImports {
+    pub(super) paths: Vec<String>,
+    reimport: Option<Result<(), String>>,
+}
+
+impl StaleImports {
+    /// True when the editor reimported every stale file before the run.
+    pub(super) fn reimported(&self) -> bool {
+        matches!(self.reimport, Some(Ok(())))
+    }
+
+    /// One sentence for the answer; `loader` names what loads the import ("game", "script").
+    pub(super) fn sentence(&self, loader: &str) -> String {
+        let listed = list_paths(&self.paths);
+        match &self.reimport {
+            Some(Ok(())) => format!(
+                "Reimported stale resources before the run: {listed}. The {loader} loads the new import."
+            ),
+            Some(Err(error)) => format!(
+                "Warning: these imported resources are newer than the cache ({error}): {listed}. Call godot_resave_resources with those paths, then run again."
+            ),
+            None => format!(
+                "Warning: these imported resources are newer than the cache the {loader} will load: {listed}. Call godot_resave_resources with those paths, then run again."
+            ),
+        }
+    }
+}
+
 impl ToolManager {
     pub(super) async fn handle_run_project(&self, args: Value) -> ToolResult {
         let scene = str_arg(&args, "scene");
@@ -145,26 +175,26 @@ impl ToolManager {
     /// Reimports stale imports through the editor when it has this project open, and otherwise
     /// returns a warning that names `godot_resave_resources`. Empty when nothing is stale.
     async fn import_notice(&self, project: &Path) -> String {
+        match self.check_imports(project).await {
+            Some(stale) => format!("\n{}", stale.sentence("game")),
+            None => String::new(),
+        }
+    }
+
+    /// Compares the files with a `.import` sidecar with their `.godot/imported` cache and
+    /// reimports the stale ones when the editor has this project open. `None` when nothing is
+    /// stale.
+    pub(super) async fn check_imports(&self, project: &Path) -> Option<StaleImports> {
         let root = project.to_path_buf();
         // The walk reads every folder of the project, so it runs off the async workers.
-        let stale = tokio::task::spawn_blocking(move || stale_imports(&root))
+        let paths = tokio::task::spawn_blocking(move || stale_imports(&root))
             .await
             .unwrap_or_default();
-        if stale.is_empty() {
-            return String::new();
+        if paths.is_empty() {
+            return None;
         }
-        let listed = list_paths(&stale);
-        match self.reimport_stale(project, &stale).await {
-            Some(Ok(())) => format!(
-                "\nReimported stale resources before the run: {listed}. The game loads the new import."
-            ),
-            Some(Err(error)) => format!(
-                "\nWarning: these imported resources are newer than the cache ({error}): {listed}. Call godot_resave_resources with those paths, then run again."
-            ),
-            None => format!(
-                "\nWarning: these imported resources are newer than the cache the game will load: {listed}. Call godot_resave_resources with those paths, then run again."
-            ),
-        }
+        let reimport = self.reimport_stale(project, &paths).await;
+        Some(StaleImports { paths, reimport })
     }
 
     /// `Some` when the connected editor has this project open (`Ok` after a reimport). `None`

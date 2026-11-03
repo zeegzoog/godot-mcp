@@ -3180,6 +3180,104 @@ async fn run_script_has_the_editor_reload_a_shader_the_script_rewrote() {
     );
 }
 
+/// Gives `root` a res://art/east.glb whose import cache is an hour older than the source, the
+/// way a model regenerated outside Godot leaves it.
+fn stale_glb(root: &Path) {
+    std::fs::create_dir_all(root.join("art")).expect("art");
+    std::fs::create_dir_all(root.join(".godot/imported")).expect("cache dir");
+    let cache = root.join(".godot/imported/east.glb-abc.scn");
+    std::fs::write(root.join("art/east.glb"), "new model").expect("source");
+    std::fs::write(&cache, "old import").expect("cache");
+    std::fs::write(
+        root.join("art/east.glb.import"),
+        "path=\"res://.godot/imported/east.glb-abc.scn\"\n",
+    )
+    .expect("sidecar");
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    std::fs::File::options()
+        .write(true)
+        .open(&cache)
+        .and_then(|file| file.set_modified(old))
+        .expect("age the cache");
+}
+
+#[tokio::test]
+async fn run_script_warns_about_stale_imports_without_an_editor() {
+    let project = pond_project();
+    let root = project.path();
+    let tools = manager_in(root, saving_godot(root));
+
+    let current = call_with(&tools, json!({"script": "quiet.gd", "project_path": root})).await;
+    let current_text = text(&current);
+    assert!(!current.is_error, "{current_text}");
+    let body = answer_body(&current_text);
+    assert_eq!(body["stale_imports"], Value::Null, "{current_text}");
+    assert_eq!(body["import_warning"], Value::Null, "{current_text}");
+
+    stale_glb(root);
+    let run = call_with(&tools, json!({"script": "quiet.gd", "project_path": root})).await;
+    let run_text = text(&run);
+    assert!(!run.is_error, "the script still runs: {run_text}");
+    assert!(
+        run_text.starts_with("Warning: ") && run_text.contains("godot_resave_resources"),
+        "{run_text}"
+    );
+    let body = answer_body(&run_text);
+    assert_eq!(
+        body["stale_imports"],
+        json!({"paths": ["res://art/east.glb"], "total": 1, "reimported": false}),
+        "{run_text}"
+    );
+    let warning = body["import_warning"].as_str().expect("import_warning");
+    assert!(
+        warning.contains("res://art/east.glb") && warning.contains("godot_resave_resources"),
+        "{warning}"
+    );
+    assert!(
+        body["summary"]
+            .as_str()
+            .is_some_and(|summary| summary.contains(warning)),
+        "{run_text}"
+    );
+}
+
+#[tokio::test]
+async fn run_script_has_the_editor_reimport_stale_imports_before_the_script_starts() {
+    let project = pond_project();
+    let root = project.path();
+    stale_glb(root);
+    let (bridge, tools) =
+        manager_with_editor(root, &["resave_resources"], saving_godot(root)).await;
+
+    let run = call_with(&tools, json!({"script": "quiet.gd", "project_path": root})).await;
+    let run_text = text(&run);
+    assert!(!run.is_error, "{run_text}");
+    let body = answer_body(&run_text);
+    assert_eq!(
+        body["stale_imports"],
+        json!({"paths": ["res://art/east.glb"], "total": 1, "reimported": true}),
+        "{run_text}"
+    );
+    assert_eq!(body["import_warning"], Value::Null, "{run_text}");
+    assert!(
+        body["summary"].as_str().is_some_and(|summary| summary
+            .contains("Reimported stale resources before the run: res://art/east.glb")),
+        "{run_text}"
+    );
+    let resaves: Vec<Value> = bridge
+        .received()
+        .into_iter()
+        .filter(|command| command["type"] == "resave_resources")
+        .collect();
+    assert_eq!(resaves.len(), 1, "{:?}", bridge.received());
+    assert_eq!(
+        resaves[0]["params"]["paths"],
+        json!(["res://art/east.glb"]),
+        "{}",
+        resaves[0]
+    );
+}
+
 #[tokio::test]
 async fn run_script_names_the_uids_and_null_shader_parameters_it_could_not_repair() {
     let project = pond_project();

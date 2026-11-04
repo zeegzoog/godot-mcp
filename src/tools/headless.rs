@@ -9,7 +9,7 @@ use crate::cli_runner::{ScriptErrorLoc, ScriptRun, script_load_failure};
 use crate::error::McpError;
 use crate::godot::{
     IMPORTED_EXTENSIONS, ResourceDamage, ResourceRepair, TextResourceSnapshot, changed_imports,
-    import_fingerprints,
+    force_reimport, import_fingerprints, import_kind, stale_reason,
 };
 use crate::paths::{res_display, resolve_in_project, same_directory};
 use crate::protocol::ToolResult;
@@ -381,6 +381,47 @@ fn resave_paths(args: &Value) -> std::result::Result<Vec<String>, ToolResult> {
     Ok(paths)
 }
 
+/// Each imported `res://` path with its kind: the importer (`scene`, `texture`...) and the
+/// resource class it imports as, read from the sidecar.
+fn imported_with_kind(project: &Path, paths: &[String]) -> Vec<Value> {
+    paths
+        .iter()
+        .map(|path| {
+            let kind = resolve_in_project(project, path)
+                .ok()
+                .and_then(|file| import_kind(&file));
+            let (importer, class) = kind.unwrap_or_default();
+            json!({
+                "path": path,
+                "kind": (!importer.is_empty()).then_some(importer),
+                "type": class,
+            })
+        })
+        .collect()
+}
+
+/// The requested `res://` paths whose imported data still does not match their bytes, with why.
+fn still_stale(project: &Path, paths: &[String]) -> Vec<Value> {
+    paths
+        .iter()
+        .filter_map(|path| {
+            let file = resolve_in_project(project, path).ok()?;
+            let (reason, detail) = stale_reason(project, &file)?;
+            Some(json!({"path": path, "reason": reason, "detail": detail}))
+        })
+        .collect()
+}
+
+const STILL_STALE_HINTS: &[&str] = &[
+    "still_stale lists the requested paths whose .godot/imported data is older than the source, with the reason",
+    "Call godot_resave_resources again with those paths and force: true, which makes Godot reimport them whatever its cache says",
+];
+
+const STILL_STALE_FORCED_HINTS: &[&str] = &[
+    "still_stale lists the requested paths whose .godot/imported data is older than the source, with the reason",
+    "The import was forced and still did not match: read the import errors in the output, and check that nothing rewrote the source during the import",
+];
+
 fn last_output_lines(stdout: &str, stderr: &str, count: usize) -> String {
     let mut lines: Vec<&str> = stdout.lines().chain(stderr.lines()).collect();
     if lines.len() > count {
@@ -587,6 +628,14 @@ impl ToolManager {
                 );
             }
         }
+        if let Some(force) = args.get("force") {
+            if !force.is_null() && !force.is_boolean() {
+                return ToolResult::error(
+                    "force must be a boolean",
+                    &["Use force: true with paths to reimport them whatever Godot's cache says"],
+                );
+            }
+        }
         let named = str_arg(&args, "project_path");
         if let Some(named) = named {
             if !self.editor_may_serve(Path::new(named)).await {
@@ -606,10 +655,50 @@ impl ToolManager {
                         ],
                     );
                 }
-                ToolResult::text(text)
+                self.editor_resave_result(&args, result).await
             }
             Err(McpError::BridgeUnavailable(_)) => self.import_headless(&args).await,
             Err(error) => bridge_error_result(&error),
+        }
+    }
+
+    /// The editor's answer with the kind of each reimported file under imported, and the
+    /// requested files whose imported data still does not match under still_stale, when the
+    /// editor's project is on this machine. The editor's reimport_files always imports, so force
+    /// changes nothing there.
+    async fn editor_resave_result(&self, args: &Value, mut result: Value) -> ToolResult {
+        let project = self
+            .resolve_project(args)
+            .await
+            .ok()
+            .map(|project| project.dir)
+            .filter(|dir| dir.is_dir());
+        let mut stale = Vec::new();
+        if let (Some(project), Some(answer)) = (project, result.as_object_mut()) {
+            let reimported: Vec<String> = answer
+                .get("reimported")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if answer.contains_key("reimported") {
+                answer.insert(
+                    "imported".into(),
+                    Value::Array(imported_with_kind(&project, &reimported)),
+                );
+                stale = still_stale(&project, &reimported);
+                answer.insert("still_stale".into(), Value::Array(stale.clone()));
+            }
+        }
+        let text = serde_json::to_string_pretty(&result).unwrap_or_default();
+        if stale.is_empty() {
+            ToolResult::text(text)
+        } else {
+            ToolResult::error(text, STILL_STALE_FORCED_HINTS)
         }
     }
 
@@ -656,6 +745,28 @@ impl ToolManager {
                 &["Pass res:// paths of files that exist in the project"],
             );
         }
+        let force = args.get("force").and_then(Value::as_bool) == Some(true);
+        let mut forced = Vec::new();
+        if force {
+            for path in &wanted {
+                let Ok(file) = resolve_in_project(&project, path) else {
+                    continue;
+                };
+                match force_reimport(&project, &file) {
+                    Ok(true) => forced.push(path.clone()),
+                    Ok(false) => {}
+                    Err(error) => {
+                        return ToolResult::error(
+                            format!("Could not prepare {path} for a forced reimport: {error}"),
+                            &[
+                                "Check that the .import file and .godot/imported are writable",
+                                "Or open the project in the editor and reimport the file from the Import dock",
+                            ],
+                        );
+                    }
+                }
+            }
+        }
         let before = import_fingerprints(&project);
         let command = format!("godot --headless --path {} --import", project.display());
         let report = match self.cli.import_project(&project).await {
@@ -687,11 +798,14 @@ impl ToolManager {
                 not_scanned.push(path.clone());
             }
         }
+        let stale = still_stale(&project, &wanted);
         let body = json!({
             "mode": "headless_import",
             "command": command,
-            "imported": imported,
+            "imported": imported_with_kind(&project, &imported),
             "imported_count": imported.len(),
+            "still_stale": stale,
+            "forced": forced,
             "not_scanned": not_scanned,
             "skipped_missing": skipped_missing,
             "skipped_invalid": skipped_invalid,
@@ -708,6 +822,14 @@ impl ToolManager {
                     "A path in not_scanned has no .import file, so load() will not find a loader",
                 ],
             );
+        }
+        if !stale.is_empty() {
+            let hints = if force {
+                STILL_STALE_FORCED_HINTS
+            } else {
+                STILL_STALE_HINTS
+            };
+            return ToolResult::error(text, hints);
         }
         ToolResult::text(text)
     }

@@ -1,6 +1,7 @@
 //! Tools that run the Godot binary without the editor: script validation, one-off scripts,
 //! resource resaving and the headless import.
 
+use super::exit_leaks::{EXIT_LEAK_HINT, collapse_exit_leaks};
 use super::main_loop::main_loop_problem;
 use super::run::StaleImports;
 use super::{ToolManager, bridge_error_result, code, missing_argument, str_arg, user_args_of};
@@ -13,6 +14,7 @@ use crate::godot::{
 use crate::paths::{res_display, resolve_in_project, same_directory};
 use crate::protocol::ToolResult;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 const DEFAULT_SCRIPT_TIMEOUT: u64 = 120;
@@ -229,6 +231,10 @@ fn script_run_result(
         .exit_code
         .map(|code| code.to_string())
         .unwrap_or_else(|| "none".into());
+    // Godot repeats its shutdown leak reports hundreds of times, burying the errors that matter.
+    let mut exit_leaks = BTreeMap::new();
+    let stdout = collapse_exit_leaks(&report.stdout, &mut exit_leaks);
+    let stderr = collapse_exit_leaks(&report.stderr, &mut exit_leaks);
     let load_error = script_load_failure(&report.stderr, script_res)
         .or_else(|| script_load_failure(&report.stdout, script_res));
     let mut script_errors = report.script_errors.clone();
@@ -249,7 +255,7 @@ fn script_run_result(
     } else if report.timed_out {
         format!(
             "Timed out after {timeout_seconds}s and killed the process tree.\nLast output:\n{}",
-            last_output_lines(&report.stdout, &report.stderr, 20)
+            last_output_lines(&stdout, &stderr, 20)
         )
     } else if let Some(message) = &load_error {
         let detail = script_errors
@@ -291,8 +297,10 @@ fn script_run_result(
         "timed_out": report.timed_out,
         "stopped_idle": report.stopped_idle,
         "load_error": load_error,
-        "stdout": report.stdout,
-        "stderr": report.stderr,
+        "stdout": stdout,
+        "stderr": stderr,
+        "exit_leaks": (!exit_leaks.is_empty()).then_some(&exit_leaks),
+        "hint": (!exit_leaks.is_empty()).then_some(EXIT_LEAK_HINT),
         "script_errors": script_errors.iter().map(|error| json!({
             "message": error.message,
             "file": error.file,

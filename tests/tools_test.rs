@@ -3479,6 +3479,15 @@ async fn resave_without_an_editor_imports_headless_and_names_a_missing_sidecar()
     std::fs::create_dir_all(root.join("art/models")).unwrap();
     std::fs::write(root.join("art/models/x.glb"), b"glb").unwrap();
     std::fs::write(root.join("art/models/y.glb"), b"glb").unwrap();
+    // The imported data the stand-in's sidecar names, as an earlier import of x.glb left it.
+    std::fs::create_dir_all(root.join(".godot/imported")).unwrap();
+    std::fs::write(root.join(".godot/imported/x.glb-deadbeef.scn"), b"scene").unwrap();
+    std::fs::write(
+        root.join(".godot/imported/x.glb-deadbeef.md5"),
+        // The md5 of b"glb".
+        "source_md5=\"f9091f3defa83aede49cdf349390d0b3\"\n",
+    )
+    .unwrap();
     let tools = manager_in(root, importing_godot(root));
     let result = Arc::clone(&tools)
         .call_tool(
@@ -3502,11 +3511,15 @@ async fn resave_without_an_editor_imports_headless_and_names_a_missing_sidecar()
     );
     let imported = parsed["imported"].as_array().expect("imported");
     assert!(
-        imported.iter().any(|path| path == "res://art/models/x.glb"),
+        imported
+            .iter()
+            .any(|item| item["path"] == "res://art/models/x.glb"),
         "{body}"
     );
     assert!(
-        !imported.iter().any(|path| path == "res://art/models/y.glb"),
+        !imported
+            .iter()
+            .any(|item| item["path"] == "res://art/models/y.glb"),
         "{body}"
     );
     assert_eq!(parsed["imported_count"], 1, "{body}");
@@ -3517,6 +3530,122 @@ async fn resave_without_an_editor_imports_headless_and_names_a_missing_sidecar()
     );
     assert!(root.join("art/models/x.glb.import").is_file());
     assert!(!root.join("art/models/y.glb.import").exists());
+}
+
+/// A model rewritten with new bytes of the same size: the headless import lists it with its kind
+/// when Godot reimports it (the sidecar text stays the same), names it under still_stale when
+/// Godot's cache skips it, and force makes Godot import it again.
+#[cfg(unix)]
+#[tokio::test]
+async fn resave_lists_a_reimported_model_names_a_skipped_one_and_forces_it() {
+    let project = project_dir();
+    let root = project.path();
+    std::fs::create_dir_all(root.join("art")).unwrap();
+    std::fs::write(root.join("art/m.glb"), b"glb one").unwrap();
+    let tools = manager_in(root, cached_importing_godot(root));
+    let resave = |args: Value| {
+        let tools = Arc::clone(&tools);
+        async move {
+            let result = tools.call_tool("godot_resave_resources", args).await;
+            let body = text(&result);
+            // An error carries the same JSON between a prefix and its recovery hints.
+            let start = body.find('{').unwrap_or(0);
+            let end = body.rfind("\n}").map_or(body.len(), |end| end + 2);
+            let parsed: Value =
+                serde_json::from_str(&body[start..end]).unwrap_or_else(|_| panic!("json: {body}"));
+            (result.is_error, parsed, body)
+        }
+    };
+    let paths = json!(["res://art/m.glb"]);
+
+    let (failed, first, body) = resave(json!({"project_path": root, "paths": paths})).await;
+    assert!(!failed, "{body}");
+    assert_eq!(
+        first["imported"],
+        json!([{"path": "res://art/m.glb", "kind": "scene", "type": "PackedScene"}]),
+        "{body}"
+    );
+    assert_eq!(first["still_stale"], json!([]), "{body}");
+
+    // New bytes of the same size. This Godot stand-in trusts its cache, as Godot does for a
+    // source rewritten within the second its last scan saw.
+    std::fs::write(root.join("art/m.glb"), b"glb two").unwrap();
+    let (failed, skipped, body) = resave(json!({"project_path": root, "paths": paths})).await;
+    assert!(failed, "{body}");
+    assert_eq!(skipped["imported"], json!([]), "{body}");
+    assert_eq!(
+        skipped["still_stale"][0]["path"], "res://art/m.glb",
+        "{body}"
+    );
+    assert_eq!(
+        skipped["still_stale"][0]["reason"], "source_changed",
+        "{body}"
+    );
+    assert!(body.contains("force: true"), "{body}");
+
+    let (failed, forced, body) =
+        resave(json!({"project_path": root, "paths": paths, "force": true})).await;
+    assert!(!failed, "{body}");
+    assert_eq!(forced["forced"], json!(["res://art/m.glb"]), "{body}");
+    assert_eq!(forced["imported"][0]["path"], "res://art/m.glb", "{body}");
+    assert_eq!(forced["imported"][0]["kind"], "scene", "{body}");
+    assert_eq!(forced["still_stale"], json!([]), "{body}");
+    assert_eq!(
+        std::fs::read(root.join(".godot/imported/m.glb-abc.scn")).unwrap(),
+        b"glb two"
+    );
+
+    let wrong = Arc::clone(&tools)
+        .call_tool(
+            "godot_resave_resources",
+            json!({"project_path": root, "paths": paths, "force": 1}),
+        )
+        .await;
+    let body = text(&wrong);
+    assert!(wrong.is_error && body.contains("'force'"), "{body}");
+}
+
+/// A Godot stand-in that imports `art/m.glb` the way Godot does when its cache does not vouch for
+/// it: only while Godot's `.md5` record of it is missing. It writes the same sidecar text on every
+/// import, as Godot does for a model whose options did not change.
+#[cfg(unix)]
+fn cached_importing_godot(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("cached_importing_godot.sh");
+    std::fs::write(
+        &path,
+        r#"#!/bin/sh
+prev=
+proj=
+for arg in "$@"; do
+  if [ "$prev" = "--path" ]; then
+    proj=$arg
+  fi
+  prev=$arg
+done
+src="$proj/art/m.glb"
+md5="$proj/.godot/imported/m.glb-abc.md5"
+[ -f "$src" ] || exit 0
+[ -f "$md5" ] && exit 0
+mkdir -p "$proj/.godot/imported"
+cp "$src" "$proj/.godot/imported/m.glb-abc.scn"
+if command -v md5sum >/dev/null 2>&1; then
+  sum=$(md5sum "$src" | cut -d' ' -f1)
+else
+  sum=$(md5 -q "$src")
+fi
+printf 'source_md5="%s"
+dest_md5="0"
+' "$sum" > "$md5"
+printf '%s
+' '[remap]' '' 'importer="scene"' 'type="PackedScene"' 'uid="uid://b1"' \
+  'path="res://.godot/imported/m.glb-abc.scn"' > "$src.import"
+exit 0
+"#,
+    )
+    .expect("write cached importing godot");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    path
 }
 
 #[tokio::test]

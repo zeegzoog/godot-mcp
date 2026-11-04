@@ -1,0 +1,10 @@
+# What runs with the project's secrets, builds the project, or steers the agents that maintain
+# it is reviewed by the maintainer, whoever else has write access. The "Protect master" ruleset
+# turns this into a required review once "Require review from Code Owners" is on.
+/.github/ @teratron
+/.agents/ @teratron
+/.claude/ @teratron
+/.cargo/ @teratron
+build.rs @teratron
+/SECURITY.md @teratron
+/LICENSE @teratron

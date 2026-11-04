@@ -4774,6 +4774,58 @@ fn project_dir_with_scripts() -> tempfile::TempDir {
     dir
 }
 
+/// godot_run_script with real Godot: the leak reports it prints at exit stay in the output,
+/// are counted in exit_leaks with a hint on freeing nodes, and the script's own error stays.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn run_script_counts_the_leaks_godot_reports_at_exit() {
+    let _ = IGNORE;
+    let project = project_dir_with_scripts();
+    std::fs::write(
+        project.path().join("scripts/leak.gd"),
+        "extends SceneTree\n\nfunc _initialize() -> void:\n\tvar kept: Node = Node.new()\n\tkept.set_meta(\"mesh\", BoxMesh.new())\n\tpush_error(\"zone 7 has no shore\")\n\tprint(\"placed\")\n\tquit(0)\n",
+    )
+    .unwrap();
+    let tools = manager(project.path());
+    let result = call(
+        &tools,
+        "godot_run_script",
+        json!({
+            "script": "res://scripts/leak.gd",
+            "project_path": project.path(),
+            "timeout_seconds": 60
+        }),
+    )
+    .await;
+    let text = text_of(&result);
+    assert!(!result.is_error, "{text}");
+    let answer: Value = serde_json::from_str(&text).expect("json answer");
+    assert!(
+        answer["exit_leaks"]["objectdb_instances"].as_u64() >= Some(1),
+        "{answer}"
+    );
+    assert!(
+        answer["hint"]
+            .as_str()
+            .is_some_and(|hint| hint.contains("free()")),
+        "{answer}"
+    );
+    let output = format!("{}{}", answer["stdout"], answer["stderr"]);
+    assert!(output.contains("leaked at exit"), "{output}");
+    assert!(
+        answer["stderr"]
+            .as_str()
+            .is_some_and(|err| err.contains("ERROR: zone 7 has no shore")),
+        "{answer}"
+    );
+    assert!(
+        answer["stdout"]
+            .as_str()
+            .is_some_and(|out| out.contains("placed")),
+        "{answer}"
+    );
+}
+
 /// A result screen that pauses the tree, as a victory or pause menu does: the root ignores
 /// input while paused and the menu's button is the only thing that still reacts.
 fn paused_menu_project() -> tempfile::TempDir {

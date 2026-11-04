@@ -122,6 +122,7 @@ fn append_render(note: &mut String, value: &Value, frames: u64) {
     note.push_str(&format!(
         ", frames drawn {drawn} at process frame {process}"
     ));
+    append_path(note, render, frames);
     let stale = render
         .get("stale_frames")
         .and_then(Value::as_u64)
@@ -145,6 +146,38 @@ fn append_render(note: &mut String, value: &Value, frames: u64) {
     note.push_str(
         " Bring the game window to the front and keep it uncovered (macOS stops drawing a covered or minimized window), then capture again; read state with godot_game_get instead of trusting this image.",
     );
+}
+
+/// Which path produced the image: the window's own drawing, or frames the runtime drew itself
+/// because the window had stopped drawing. An older addon reports no path and says nothing here.
+fn append_path(note: &mut String, render: &Value, frames: u64) {
+    let Some(path) = render.get("path").and_then(Value::as_str) else {
+        return;
+    };
+    note.push_str(&format!(", path {path}"));
+    let forced = render
+        .get("forced_frames")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if forced == 0 {
+        return;
+    }
+    if render.get("held").and_then(Value::as_bool) == Some(true) {
+        note.push_str(
+            ": the window had not drawn the held state (it was covered or minimized, or a step ran several ticks in one frame), so the capture drew it itself without showing it in the window; the game did not advance",
+        );
+        return;
+    }
+    let waited = json_number(render.get("waited_frames"));
+    if forced < frames {
+        note.push_str(&format!(
+            ": {forced} of {frames} frames were drawn by the capture itself because the window drew no new frame in {waited} process frames (covered or minimized); every frame shows the game state of its moment"
+        ));
+    } else {
+        note.push_str(&format!(
+            ": the window drew no new frame in {waited} process frames (covered or minimized), so the capture drew the current game state itself without showing it in the window"
+        ));
+    }
 }
 
 /// How returned image pixels map onto the coordinate space `godot_game_input` uses.
@@ -579,6 +612,84 @@ mod tests {
         assert!(
             hidden.contains("The window reports that it cannot draw (minimized or hidden)"),
             "{hidden}"
+        );
+    }
+
+    #[test]
+    fn screenshot_note_names_a_frame_drawn_for_a_window_that_was_not_drawing() {
+        let note = screenshot_note(
+            &json!({
+                "frames": 1,
+                "diff": {"compared": false},
+                "render": {
+                    "frames_drawn": 3,
+                    "process_frame": 190,
+                    "stale_frames": 0,
+                    "forced_frames": 1,
+                    "path": "forced_draw",
+                    "waited_frames": 4,
+                    "window_can_draw": true
+                }
+            }),
+            8,
+            8,
+            "main window",
+        );
+        assert_eq!(
+            note,
+            "Game screenshot 8x8 (main window), no earlier capture to compare, frames drawn 3 at process frame 190, path forced_draw: the window drew no new frame in 4 process frames (covered or minimized), so the capture drew the current game state itself without showing it in the window"
+        );
+        assert!(!note.contains("STALE"), "{note}");
+
+        let sheet = screenshot_note(
+            &json!({
+                "frames": 4,
+                "columns": 2,
+                "render": {
+                    "frames_drawn": 9,
+                    "process_frame": 200,
+                    "stale_frames": 0,
+                    "forced_frames": 2,
+                    "path": "mixed",
+                    "waited_frames": 4,
+                    "window_can_draw": true
+                }
+            }),
+            16,
+            16,
+            "main window",
+        );
+        assert!(
+            sheet.contains("path mixed: 2 of 4 frames were drawn by the capture itself"),
+            "{sheet}"
+        );
+
+        let window = screenshot_note(
+            &json!({
+                "frames": 1,
+                "render": {"frames_drawn": 120, "process_frame": 124, "stale_frames": 0, "forced_frames": 0, "path": "window"}
+            }),
+            8,
+            8,
+            "main window",
+        );
+        assert!(
+            window.ends_with("frames drawn 120 at process frame 124, path window"),
+            "{window}"
+        );
+
+        let held = screenshot_note(
+            &json!({
+                "frames": 1,
+                "render": {"frames_drawn": 12, "process_frame": 13, "stale_frames": 0, "forced_frames": 1, "path": "forced_draw", "waited_frames": 0, "held": true}
+            }),
+            8,
+            8,
+            "main window",
+        );
+        assert!(
+            held.ends_with("path forced_draw: the window had not drawn the held state (it was covered or minimized, or a step ran several ticks in one frame), so the capture drew it itself without showing it in the window; the game did not advance"),
+            "{held}"
         );
     }
 

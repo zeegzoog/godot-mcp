@@ -191,6 +191,10 @@ func poke(value: int) -> int:
 func stop_drawing(stopped: bool) -> bool:
     RenderingServer.render_loop_enabled = not stopped
     return stopped
+
+func minimize(minimized: bool) -> bool:
+    DisplayServer.window_set_mode(DisplayServer.WINDOW_MODE_MINIMIZED if minimized else DisplayServer.WINDOW_MODE_WINDOWED)
+    return minimized
 "#,
     )
     .unwrap();
@@ -1991,10 +1995,11 @@ async fn windowed_screenshot_returns_a_sheet_and_a_diff() {
 }
 
 /// A window that stops drawing (covered on macOS, minimized) keeps the last drawn frame in its
-/// viewport texture. The capture must say so instead of returning that frame as current.
+/// viewport texture, and the engine skips drawing altogether. The capture must draw the current
+/// state itself, say so, and stay current: the probe moves its red square every process frame.
 #[tokio::test]
 #[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
-async fn windowed_screenshot_flags_a_window_that_stopped_drawing() {
+async fn windowed_screenshot_draws_a_window_that_stopped_drawing() {
     let _ = IGNORE;
     if !windowed_game_can_open() {
         eprintln!("skipped: a windowed screenshot needs a display server");
@@ -2024,28 +2029,48 @@ async fn windowed_screenshot_flags_a_window_that_stopped_drawing() {
     .await;
     assert!(!fresh.is_error, "{}", text_of(&fresh));
     let note = text_of(&fresh);
-    if covered_window(&tools, &run_id, &note).await {
-        return;
-    }
     assert!(
         note.contains("frames drawn") && !note.contains("STALE"),
+        "{note}"
+    );
+    // A window covered by something outside the test is drawn by the capture as well.
+    assert!(
+        note.contains("path window") || note.contains("path forced_draw"),
         "{note}"
     );
 
     let stop = |stopped: bool| json!({"run_id": run_id, "path": ".", "method": "stop_drawing", "permit": ["stop_drawing"], "args": [stopped]});
     let stopped = call(&tools, "godot_game_call", stop(true)).await;
     assert!(!stopped.is_error, "{}", text_of(&stopped));
-    let stale = call(
+    for _ in 0..2 {
+        let forced = call(
+            &tools,
+            "godot_game_screenshot",
+            json!({"run_id": run_id, "max_dimension": 64}),
+        )
+        .await;
+        assert!(!forced.is_error, "{}", text_of(&forced));
+        let note = text_of(&forced);
+        assert!(
+            note.contains("path forced_draw") && !note.contains("STALE"),
+            "{note}"
+        );
+        assert!(
+            !note.contains("changed 0 px"),
+            "a frame drawn on demand shows the moved square: {note}"
+        );
+    }
+    let sheet = call(
         &tools,
         "godot_game_screenshot",
-        json!({"run_id": run_id, "max_dimension": 64}),
+        json!({"run_id": run_id, "max_dimension": 64, "frames": 2}),
     )
     .await;
-    assert!(!stale.is_error, "{}", text_of(&stale));
-    let note = text_of(&stale);
+    assert!(!sheet.is_error, "{}", text_of(&sheet));
     assert!(
-        note.contains("STALE") && note.contains("Bring the game window to the front"),
-        "{note}"
+        text_of(&sheet).contains("path forced_draw") && !text_of(&sheet).contains("STALE"),
+        "{}",
+        text_of(&sheet)
     );
 
     let resumed = call(&tools, "godot_game_call", stop(false)).await;
@@ -2057,24 +2082,73 @@ async fn windowed_screenshot_flags_a_window_that_stopped_drawing() {
     )
     .await;
     assert!(!again.is_error, "{}", text_of(&again));
-    if covered_window(&tools, &run_id, &text_of(&again)).await {
-        return;
-    }
     assert!(!text_of(&again).contains("STALE"), "{}", text_of(&again));
 
     let ended = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
     assert!(!ended.is_error, "{}", text_of(&ended));
 }
 
-/// The system reports the game window cannot draw (covered or minimized by something outside
-/// the test), so a fresh frame cannot be expected. Stops the run and skips the rest.
-async fn covered_window(tools: &Arc<ToolManager>, run_id: &str, note: &str) -> bool {
-    if !note.contains("The window reports that it cannot draw") {
-        return false;
+/// A minimized window draws nothing (the system reports it cannot draw on macOS and Windows).
+/// The capture still returns the current state, drawn on demand.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn windowed_screenshot_captures_a_minimized_window() {
+    let _ = IGNORE;
+    if !windowed_game_can_open() {
+        eprintln!("skipped: a windowed screenshot needs a display server");
+        return;
     }
-    eprintln!("skipped: the game window cannot draw on this desktop: {note}");
-    let _ = call(tools, "godot_stop_project", json!({"run_id": run_id})).await;
-    true
+    let project = project();
+    let tools = manager(project.path());
+    let started = call(
+        &tools,
+        "godot_run_project",
+        json!({
+            "project_path": project.path(),
+            "scene": "res://scenes/main.tscn",
+            "mode": "process",
+            "headless": false
+        }),
+    )
+    .await;
+    assert!(!started.is_error, "{}", text_of(&started));
+    let run_id = run_id_of(&started);
+    let first = call(
+        &tools,
+        "godot_game_screenshot",
+        json!({"run_id": run_id, "max_dimension": 64}),
+    )
+    .await;
+    assert!(!first.is_error, "{}", text_of(&first));
+
+    let minimize = |minimized: bool| json!({"run_id": run_id, "path": ".", "method": "minimize", "permit": ["minimize"], "args": [minimized]});
+    let minimized = call(&tools, "godot_game_call", minimize(true)).await;
+    assert!(!minimized.is_error, "{}", text_of(&minimized));
+    // The window manager minimizes asynchronously; a few captures make sure one is taken while
+    // the window is down.
+    let mut forced = false;
+    for _ in 0..5 {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let shot = call(
+            &tools,
+            "godot_game_screenshot",
+            json!({"run_id": run_id, "max_dimension": 1152}),
+        )
+        .await;
+        assert!(!shot.is_error, "{}", text_of(&shot));
+        let note = text_of(&shot);
+        assert!(!note.contains("STALE"), "{note}");
+        // Full size, so the square's few pixels of movement between two captures show.
+        assert!(!note.contains("changed 0 px"), "{note}");
+        forced |= note.contains("path forced_draw");
+    }
+    let restored = call(&tools, "godot_game_call", minimize(false)).await;
+    assert!(!restored.is_error, "{}", text_of(&restored));
+    let ended = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!ended.is_error, "{}", text_of(&ended));
+    if !forced {
+        eprintln!("skipped: this window manager kept drawing the minimized window");
+    }
 }
 
 /// A window larger than the viewport, so content scale is not 1. Touch positions must arrive
@@ -2227,13 +2301,18 @@ func _process(_delta: float) -> void:
 
 func _physics_process(_delta: float) -> void:
     physics_ticks += 1
+    queue_redraw()
     trace.append([physics_ticks, Input.is_key_pressed(KEY_SPACE), Input.is_action_just_pressed("ui_accept")])
 
 func _draw() -> void:
-    draw_rect(Rect2(float(process_frames % 20) * 40.0, 8, 24, 24), Color(1, 0, 0))
+    draw_rect(Rect2(float((process_frames + physics_ticks) % 20) * 40.0, 8, 24, 24), Color(1, 0, 0))
 
 func set_tick_rate(rate: int) -> void:
     Engine.physics_ticks_per_second = rate
+
+func stop_drawing(stopped: bool) -> bool:
+    RenderingServer.render_loop_enabled = not stopped
+    return stopped
 
 func trace_log() -> Array:
     return trace
@@ -2897,6 +2976,38 @@ async fn held_windowed_game_captures_the_last_drawn_frame() {
         !text_of(&third).contains("changed 0 px"),
         "three held ticks changed nothing on screen: {}",
         text_of(&third)
+    );
+
+    // A window that stops drawing while the game is held: a step draws nothing, so the capture
+    // draws the held state itself.
+    let stop = json!({"run_id": run_id, "path": ".", "method": "stop_drawing", "permit": ["stop_drawing"], "args": [true]});
+    let no_draw = call(&tools, "godot_game_call", stop).await;
+    assert!(!no_draw.is_error, "{}", text_of(&no_draw));
+    let unchanged = call(
+        &tools,
+        "godot_game_screenshot",
+        json!({"run_id": run_id, "max_dimension": 128}),
+    )
+    .await;
+    assert!(!unchanged.is_error, "{}", text_of(&unchanged));
+    assert!(
+        text_of(&unchanged).contains("changed 0 px") && text_of(&unchanged).contains("path held"),
+        "no step, so the held frame is current: {}",
+        text_of(&unchanged)
+    );
+    let stepped = held_step(&tools, &run_id, json!({"ticks": 3})).await;
+    assert!(!stepped.is_error, "{}", text_of(&stepped));
+    let drawn = call(
+        &tools,
+        "godot_game_screenshot",
+        json!({"run_id": run_id, "max_dimension": 128}),
+    )
+    .await;
+    assert!(!drawn.is_error, "{}", text_of(&drawn));
+    assert!(
+        !text_of(&drawn).contains("changed 0 px") && text_of(&drawn).contains("path forced_draw"),
+        "three held ticks with the window not drawing: {}",
+        text_of(&drawn)
     );
 
     let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;

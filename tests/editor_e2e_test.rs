@@ -224,18 +224,7 @@ async fn start_editor_with_args(
         .expect("spawn godot editor");
 
     let bridge = BridgeClient::new(port);
-    let deadline = Instant::now() + Duration::from_secs(120);
-    loop {
-        if bridge.send_command("ping", json!({})).await.is_ok() {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "editor bridge did not come up; log:\n{}",
-            std::fs::read_to_string(&log).unwrap_or_default()
-        );
-        sleep(Duration::from_millis(500)).await;
-    }
+    wait_until_started(&bridge, &log, &format!("port {port}")).await;
 
     Editor {
         _dir: dir,
@@ -244,6 +233,26 @@ async fn start_editor_with_args(
         bridge,
         log,
         _child: child,
+    }
+}
+
+/// Waits until the editor's bridge answers and the editor has finished starting: the bridge
+/// listens during the first scan of the project's files, and the editor opens its scenes only
+/// when that scan ends, so a scene a test opened before would lose its tab to the main scene.
+async fn wait_until_started(bridge: &BridgeClient, log: &Path, port: &str) {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        if let Ok(pong) = bridge.send_command("ping", json!({})).await {
+            if pong["starting"] != true {
+                return;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "editor bridge on {port} did not come up or the editor did not finish starting; log:\n{}",
+            std::fs::read_to_string(log).unwrap_or_default()
+        );
+        sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -2802,6 +2811,81 @@ async fn input_actions_are_edited_saved_and_undone_through_the_editor() {
     );
 }
 
+/// Test-only command that makes the bridge act as if the editor were still starting, for
+/// `hold_ms` milliseconds.
+const STARTUP_HOLD_HOOK: &str = r#"        "__test_hold_startup":
+            var until: int = Time.get_ticks_msec() + int(params.get("hold_ms", 0))
+            _editor_started = false
+            _startup_probe = func() -> bool: return Time.get_ticks_msec() >= until
+            send_success(peer, cmd_id, {"holding": true})
+        "ping":
+"#;
+
+/// The editor opens the project's main scene only when the first scan of its files ends, while
+/// the bridge already listens during that scan. A scene opened before then lost its tab to the
+/// main scene, so the next edit went to the wrong scene. Until the editor has started, the bridge
+/// answers ping (with `starting`) and the facts the scan does not change, and refuses the rest.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn commands_wait_until_the_editor_has_opened_its_startup_scenes() {
+    let editor = start_editor_with(
+        Some(STARTUP_HOLD_HOOK),
+        "",
+        &[(
+            "pond.tscn",
+            "[gd_scene format=3]\n\n[node name=\"Pond\" type=\"Node3D\"]\n",
+        )],
+        "",
+    )
+    .await;
+    let bridge = &editor.bridge;
+    // The editor opened the main scene at the end of its start.
+    let open = bridge
+        .send_command("get_open_scenes", json!({}))
+        .await
+        .expect("open scenes");
+    assert_eq!(open["active_scene"], "res://main.tscn", "{open}");
+    let pong = bridge.send_command("ping", json!({})).await.expect("ping");
+    assert_eq!(pong["starting"], false, "{pong}");
+
+    bridge
+        .send_command("__test_hold_startup", json!({"hold_ms": 3000}))
+        .await
+        .expect("hold");
+    let pong = bridge.send_command("ping", json!({})).await.expect("ping");
+    assert_eq!(pong["starting"], true, "{pong}");
+    expect_error(
+        bridge
+            .send_command("open_scene", json!({"scene_path": "res://pond.tscn"}))
+            .await,
+        "still starting",
+    );
+    let info = bridge
+        .send_command("get_project_info", json!({}))
+        .await
+        .expect("project info while starting");
+    assert_eq!(info["main_scene"], "res://main.tscn", "{info}");
+    bridge
+        .send_command("get_version", json!({}))
+        .await
+        .expect("version while starting");
+    let open = bridge.send_command("get_open_scenes", json!({})).await;
+    expect_error(open, "still starting");
+
+    wait_until_started(bridge, &editor.log, "the held editor").await;
+    let opened = bridge
+        .send_command("open_scene", json!({"scene_path": "res://pond.tscn"}))
+        .await
+        .expect("open pond once started");
+    assert_eq!(opened["active_scene"], "res://pond.tscn", "{opened}");
+    sleep(Duration::from_millis(500)).await;
+    let open = bridge
+        .send_command("get_open_scenes", json!({}))
+        .await
+        .expect("open scenes");
+    assert_eq!(open["active_scene"], "res://pond.tscn", "{open}");
+}
+
 /// A scene whose own node `A` is added under an instance that already has a child `A`. Godot
 /// renames the incoming node while loading and reports it only in its "Load Errors" dialog.
 const CLASH_SUB: &str = "[gd_scene format=3]\n\n[node name=\"Sub\" type=\"Node2D\"]\n\n[node name=\"A\" type=\"Node\" parent=\".\"]\n";
@@ -3027,7 +3111,7 @@ const DELETE_PROBE_HOOK: &str = r#"        "__test_delete_probe":
 "#;
 
 /// godot_delete_file through the editor: a referenced script and a scene with unsaved changes are
-/// refused; a script with its .uid, an imported image with its .import and imported data, and an
+/// refused; a scene that a script only saves is deleted without force; a script with its .uid, an imported image with its .import and imported data, and an
 /// open scene are deleted, their tabs closed and the FileSystem dock updated. A reference from a
 /// nested project, which Godot does not scan, does not count.
 #[tokio::test]
@@ -3056,6 +3140,11 @@ async fn files_are_deleted_through_the_editor_with_companions_and_tabs() {
             ),
             ("old_scene.tscn", simple_scene),
             ("dirty.tscn", simple_scene),
+            ("generated.tscn", simple_scene),
+            (
+                "tools/generate.gd",
+                "extends RefCounted\n\nconst OUT := \"res://generated.tscn\"\n\nfunc run() -> void:\n\tResourceSaver.save(PackedScene.new(), OUT)\n",
+            ),
             (
                 "icon.svg",
                 "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"16\"><rect width=\"16\" height=\"16\" fill=\"#3a3\"/></svg>\n",
@@ -3110,6 +3199,22 @@ async fn files_are_deleted_through_the_editor_with_companions_and_tabs() {
         tool_text(&refused)
     );
     assert!(project.join("used.gd").is_file());
+
+    // A scene a script only saves is deleted without force, and the answer names the writer.
+    let generated = delete(json!({"paths": ["res://generated.tscn"], "trash": false})).await;
+    assert!(!generated.is_error, "{}", tool_text(&generated));
+    let report: Value = serde_json::from_str(&tool_text(&generated)).expect("JSON report");
+    assert_eq!(
+        report["references"][0]["referenced_by"][0]["kind"], "written",
+        "{report}"
+    );
+    assert!(
+        report["warnings"]
+            .to_string()
+            .contains("res://tools/generate.gd"),
+        "{report}"
+    );
+    assert!(!project.join("generated.tscn").exists());
 
     // A scene with unsaved changes is refused.
     editor
@@ -4337,6 +4442,66 @@ async fn the_addon_derives_the_same_bridge_port_as_the_server() {
     );
 }
 
+/// Runs `tests/script-reference-vectors.json` through the addon's reference classifier.
+const SCRIPT_REFERENCE_CHECK: &str = r#"extends SceneTree
+
+func _init() -> void:
+    var ops: RefCounted = (load("res://file_ops.gd") as GDScript).new() as RefCounted
+    var vectors: Dictionary = JSON.parse_string(FileAccess.get_file_as_string(OS.get_cmdline_user_args()[0]))
+    var failures: int = 0
+    var cases: int = 0
+    for case: Dictionary in vectors["cases"]:
+        cases += 1
+        var kind: String = str(ops.call("classify_script", str(case["script"]), str(case["path"])))
+        if kind != str(case["kind"]):
+            failures += 1
+            print("MISMATCH ", case["name"], ": ", kind, " != ", case["kind"])
+    print("CASES=", cases)
+    print("FAILURES=", failures)
+    quit()
+"#;
+
+/// The addon tells a script that only writes a file from one that uses it the same way as the
+/// server: the shared vectors hold for `classify_script` in `file_ops.gd`.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn the_addon_classifies_script_references_like_the_server() {
+    let (godot, _) = godot_binaries();
+    let dir = tempfile::tempdir().expect("project dir");
+    let project = dir.path();
+    std::fs::write(project.join("project.godot"), "config_version=5\n").expect("project.godot");
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("addons/godot_mcp/editor/file_ops.gd"),
+        project.join("file_ops.gd"),
+    )
+    .expect("copy file_ops.gd");
+    std::fs::write(project.join("check.gd"), SCRIPT_REFERENCE_CHECK).expect("check.gd");
+    let output = timeout(
+        Duration::from_secs(120),
+        Command::new(&godot)
+            .args(["--headless", "--path"])
+            .arg(project)
+            .args(["--script", "res://check.gd", "--"])
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/script-reference-vectors.json"))
+            .stdin(Stdio::null())
+            .output(),
+    )
+    .await
+    .expect("check timed out")
+    .expect("run godot");
+    let text = String::from_utf8_lossy(&output.stdout).to_string()
+        + &String::from_utf8_lossy(&output.stderr);
+    let line = |key: &str| {
+        text.lines()
+            .find_map(|line| line.strip_prefix(key))
+            .unwrap_or_else(|| panic!("no {key} line in:\n{text}"))
+            .trim()
+            .to_string()
+    };
+    assert_eq!(line("FAILURES="), "0", "{text}");
+    assert_ne!(line("CASES="), "0", "{text}");
+}
+
 /// With no port configured on either side, a server started in the project reaches the
 /// editor on the port derived from the project path.
 #[tokio::test]
@@ -4399,18 +4564,7 @@ async fn an_editor_without_a_port_setting_is_found_on_the_derived_port() {
         .expect("spawn godot editor");
 
     let bridge = BridgeClient::with_port_origin(port, config.bridge_port_origin());
-    let deadline = Instant::now() + Duration::from_secs(120);
-    loop {
-        if bridge.send_command("ping", json!({})).await.is_ok() {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "editor bridge did not come up on port {port}; log:\n{}",
-            std::fs::read_to_string(&log).unwrap_or_default()
-        );
-        sleep(Duration::from_millis(500)).await;
-    }
+    wait_until_started(&bridge, &log, &format!("port {port}")).await;
     let text = std::fs::read_to_string(&log).unwrap_or_default();
     assert!(
         text.contains(&format!(

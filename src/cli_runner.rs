@@ -42,6 +42,16 @@ pub struct ScriptRun {
     pub script_errors: Vec<ScriptErrorLoc>,
 }
 
+/// What the world map process left: its run, the answer JSON and the PNG, when they were written.
+#[derive(Debug)]
+pub struct WorldMapRun {
+    pub run: ScriptRun,
+    pub answer: Option<String>,
+    pub image: Option<Vec<u8>>,
+    /// The map as a JPEG at most 1024 pixels on a side, small enough to return inline.
+    pub preview: Option<Vec<u8>>,
+}
+
 /// What `godot --headless --path <project> --import` printed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImportRun {
@@ -714,8 +724,63 @@ impl CliRunner {
         user_args: &[String],
         timeout_seconds: u64,
     ) -> Result<ScriptRun> {
+        self.run_script_with(
+            &["--headless"],
+            project_path,
+            script_path,
+            user_args,
+            timeout_seconds,
+        )
+        .await
+    }
+
+    /// Runs the asset review script on the project in a small window, so the rendering server
+    /// draws (a headless Godot has no renderer), with the audio muted: `godot --path <project>
+    /// --resolution 64x64 --audio-driver Dummy -s <script> -- <request>`. The request JSON and the
+    /// script live in a scratch directory outside the project, removed afterwards; the PNG the
+    /// script saved there (`output` in the request) is returned with the run.
+    pub async fn review_assets(
+        &self,
+        project_path: &Path,
+        script: &str,
+        mut request: serde_json::Value,
+        timeout_seconds: u64,
+    ) -> Result<(ScriptRun, Option<Vec<u8>>)> {
+        let dir = create_scratch_dir("review")?;
+        let image = dir.join("review.png");
+        request["output"] = serde_json::json!(image.to_string_lossy());
+        let outcome = async {
+            let request_file = dir.join("request.json");
+            std::fs::write(&request_file, request.to_string())?;
+            let script_file = dir.join("review_assets.gd");
+            std::fs::write(&script_file, script)?;
+            let run = self
+                .run_script_with(
+                    &["--resolution", "64x64", "--audio-driver", "Dummy"],
+                    project_path,
+                    &script_file,
+                    &[request_file.to_string_lossy().into_owned()],
+                    timeout_seconds,
+                )
+                .await?;
+            Ok::<_, McpError>((run, std::fs::read(&image).ok()))
+        }
+        .await;
+        let _ = std::fs::remove_dir_all(&dir);
+        outcome
+    }
+
+    /// `godot <options> --path <project> -s <script> [-- args]`, as [`Self::run_script`] describes.
+    async fn run_script_with(
+        &self,
+        options: &[&str],
+        project_path: &Path,
+        script_path: &Path,
+        user_args: &[String],
+        timeout_seconds: u64,
+    ) -> Result<ScriptRun> {
         let mut cmd = Command::new(&self.godot_binary);
-        cmd.arg("--headless")
+        cmd.args(options)
             .arg("--path")
             .arg(project_path)
             .arg("-s")
@@ -836,6 +901,53 @@ impl CliRunner {
             stderr,
             script_errors,
         })
+    }
+
+    /// Runs the world map script on the project in a small window, so the rendering server draws
+    /// (a headless Godot has no renderer), with the audio muted: `godot --path <project>
+    /// --resolution 64x64 --audio-driver Dummy -s <script> -- <request>`. The request JSON, the
+    /// script, the PNG (`output` in the request), its JPEG preview (`preview`) and the answer JSON
+    /// (`answer`) live in a scratch
+    /// directory outside the project, removed afterwards. The answer is a file rather than a
+    /// stdout line because a summary of a few hundred scenes outgrows the captured output.
+    pub async fn world_map(
+        &self,
+        project_path: &Path,
+        script: &str,
+        mut request: serde_json::Value,
+        timeout_seconds: u64,
+    ) -> Result<WorldMapRun> {
+        let dir = create_scratch_dir("world-map")?;
+        let image = dir.join("map.png");
+        let answer = dir.join("answer.json");
+        let preview = dir.join("preview.jpg");
+        request["preview"] = serde_json::json!(preview.to_string_lossy());
+        request["output"] = serde_json::json!(image.to_string_lossy());
+        request["answer"] = serde_json::json!(answer.to_string_lossy());
+        let outcome = async {
+            let request_file = dir.join("request.json");
+            std::fs::write(&request_file, request.to_string())?;
+            let script_file = dir.join("world_map.gd");
+            std::fs::write(&script_file, script)?;
+            let run = self
+                .run_script_with(
+                    &["--resolution", "64x64", "--audio-driver", "Dummy"],
+                    project_path,
+                    &script_file,
+                    &[request_file.to_string_lossy().into_owned()],
+                    timeout_seconds,
+                )
+                .await?;
+            Ok::<_, McpError>(WorldMapRun {
+                run,
+                answer: std::fs::read_to_string(&answer).ok(),
+                image: std::fs::read(&image).ok(),
+                preview: std::fs::read(&preview).ok(),
+            })
+        }
+        .await;
+        let _ = std::fs::remove_dir_all(&dir);
+        outcome
     }
 
     /// Imports every new or changed resource: `godot --headless --path <project> --import`.

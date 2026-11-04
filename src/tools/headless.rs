@@ -8,8 +8,8 @@ use super::{ToolManager, bridge_error_result, code, missing_argument, str_arg, u
 use crate::cli_runner::{ScriptErrorLoc, ScriptRun, script_load_failure};
 use crate::error::McpError;
 use crate::godot::{
-    IMPORTED_EXTENSIONS, ResourceDamage, ResourceRepair, TextResourceSnapshot, changed_imports,
-    force_reimport, import_fingerprints, import_kind, stale_reason,
+    IMPORTED_EXTENSIONS, ResourceDamage, ResourceRepair, TextResourceSnapshot, UidCacheUpdate,
+    changed_imports, force_reimport, import_fingerprints, import_kind, record_uids, stale_reason,
 };
 use crate::paths::{res_display, resolve_in_project, same_directory};
 use crate::protocol::ToolResult;
@@ -79,6 +79,10 @@ struct RepairReport {
     editor_error: Option<String>,
     /// Why Godot could not write uids back into binary scenes and resources.
     binary_error: Option<String>,
+    /// How many repaired uids the server added to `.godot/uid_cache.bin`.
+    uid_cache_recorded: Option<usize>,
+    /// Why `.godot/uid_cache.bin` may still lack the repaired uids, with the remedy.
+    uid_cache_stale: Option<String>,
 }
 
 impl RepairReport {
@@ -186,12 +190,58 @@ impl RepairReport {
                 "Headless Godot saves without uids and writes unset shader uniforms as null, so the server repaired {files}: {counts}; {listed}."
             )
         });
-        match (repaired, editor) {
-            (Some(repaired), Some(editor)) => Some(format!("{repaired} {editor}")),
-            (Some(repaired), None) => Some(repaired),
-            (None, Some(editor)) => Some(editor.to_string()),
-            (None, None) => None,
-        }
+        let cache = match (self.uid_cache_recorded, &self.uid_cache_stale) {
+            (_, Some(stale)) => Some(stale.clone()),
+            (Some(recorded), None) if recorded > 0 => Some(format!(
+                "Recorded {} in .godot/uid_cache.bin (uid_cache), so the next run resolves them.",
+                plural(recorded, "uid")
+            )),
+            _ => None,
+        };
+        let sentences: Vec<String> = [repaired, editor.map(str::to_string), cache]
+            .into_iter()
+            .flatten()
+            .collect();
+        (!sentences.is_empty()).then(|| sentences.join(" "))
+    }
+
+    fn uid_cache(&self) -> Option<Value> {
+        self.uid_cache_recorded
+            .map(|recorded| json!({"file": ".godot/uid_cache.bin", "recorded": recorded}))
+    }
+}
+
+const UID_CACHE_REMEDY: &str = "Call godot_resave_resources with those paths, or open the project in the editor, so the uid cache learns them; until then a script or game that loads them prints \"ext_resource, invalid UID\" warnings and falls back to the text paths.";
+
+/// Puts the uids the server wrote back into the project's uid cache, which only the editor
+/// writes, so the next headless run or game resolves them without "invalid UID" warnings.
+/// Called only when no connected editor holds the project: that editor keeps its own copy of the
+/// cache, refreshes it from the files and would overwrite the file.
+fn record_repaired_uids(
+    project: &Path,
+    repairs: &[ResourceRepair],
+) -> (Option<usize>, Option<String>) {
+    let entries: Vec<(String, String)> = repairs
+        .iter()
+        .filter_map(|item| Some((item.path.clone(), item.uid.clone()?)))
+        .collect();
+    if entries.is_empty() {
+        return (None, None);
+    }
+    match record_uids(project, &entries) {
+        Ok(UidCacheUpdate::Recorded(recorded)) => (Some(recorded), None),
+        Ok(UidCacheUpdate::Missing) => (
+            None,
+            Some(format!(
+                "uid_cache_stale: the project has no .godot/uid_cache.bin yet, so the repaired uids are not in it. {UID_CACHE_REMEDY}"
+            )),
+        ),
+        Err(error) => (
+            None,
+            Some(format!(
+                "uid_cache_stale: the server could not record the repaired uids in .godot/uid_cache.bin ({error}). {UID_CACHE_REMEDY}"
+            )),
+        ),
     }
 }
 
@@ -311,6 +361,8 @@ fn script_run_result(
         "editor_refresh": repair.editor_refresh(),
         "editor_refresh_error": repair.editor_error,
         "binary_uid_error": repair.binary_error,
+        "uid_cache": repair.uid_cache(),
+        "uid_cache_stale": repair.uid_cache_stale,
         "resource_damage": resource_damage,
         "stale_imports": imports.map(|stale| json!({
             "paths": stale.paths.iter().take(REPAIR_LIST_LIMIT).collect::<Vec<_>>(),
@@ -865,6 +917,8 @@ impl ToolManager {
             editor: None,
             editor_error: None,
             binary_error,
+            uid_cache_recorded: None,
+            uid_cache_stale: None,
         };
         if report.written.is_empty() {
             return report;
@@ -881,6 +935,8 @@ impl ToolManager {
             Err(_) => false,
         };
         if !holds_project {
+            (report.uid_cache_recorded, report.uid_cache_stale) =
+                record_repaired_uids(project, &report.repairs);
             return report;
         }
         let bridge = self.bridge.clone().with_timeout(Self::RESAVE_BRIDGE_WAIT);
@@ -889,7 +945,14 @@ impl ToolManager {
             .await
         {
             Ok(answer) => report.editor = Some(answer),
-            Err(error) => report.editor_error = Some(error.to_string()),
+            Err(error) => {
+                report.editor_error = Some(error.to_string());
+                if report.repairs.iter().any(|item| item.uid.is_some()) {
+                    report.uid_cache_stale = Some(format!(
+                        "uid_cache_stale: the editor holding the project did not refresh the repaired files, so its uid cache may lack their uids. {UID_CACHE_REMEDY}"
+                    ));
+                }
+            }
         }
         report
     }
@@ -993,6 +1056,8 @@ mod tests {
             })),
             editor_error: None,
             binary_error: None,
+            uid_cache_recorded: None,
+            uid_cache_stale: None,
         };
         let answer = report.editor_refresh().expect("answer");
         assert_eq!(answer["mode"], "refresh");

@@ -950,6 +950,16 @@ fn the_steward_never_merges_what_controls_the_steward_and_the_releases() {
     ] {
         assert!(script.contains(needle), "act.sh lost {needle:?}");
     }
+    // Only an admin or a maintainer skips the protected-path check: a collaborator with write
+    // permission can push branches, but the steward reads their protected files like anyone's.
+    assert!(
+        script.contains("admin | maintain) return 0"),
+        "admin and maintain skip the check"
+    );
+    assert!(
+        !script.contains("admin | maintain | write"),
+        "write permission must not skip the protected-path check"
+    );
 }
 
 #[test]

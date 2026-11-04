@@ -344,7 +344,7 @@ pins_match_tags() {
 }
 
 # A merge the script itself refuses, whatever the agent decided: a pull request by someone
-# without write permission that changes a protected path (new and old names of every file). The
+# without admin or maintain permission that changes a protected path (new and old names of every file). The
 # check fails closed: when GitHub does not answer, or the list of files is not the whole list,
 # the merge does not happen. It leaves the head commit it looked at in `head_sha`; the merge is
 # made for exactly that commit, so a push after the check turns the merge down.
@@ -373,7 +373,7 @@ guard_merge() {
 	else
 		permission=$(bash "$here/api.sh" permission "$author") ||
 			fail "cannot read the permission of $author; nothing was merged"
-		case "$permission" in admin | maintain | write) return 0 ;; esac
+		case "$permission" in admin | maintain) return 0 ;; esac
 	fi
 	rows=$(gh api --paginate "repos/$repo/pulls/$1/files" --jq '.[] | [.filename, (.previous_filename // "")] | @tsv' | tr -d '\r') ||
 		fail "cannot list the files of #$1; nothing was merged"

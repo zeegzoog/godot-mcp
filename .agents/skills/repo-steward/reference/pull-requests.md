@@ -9,7 +9,7 @@ Handle every open pull request that is not a draft, not labelled `steward: skip`
 | Author | Class |
 | --- | --- |
 | Carries your marker in its description, from your own branch | steward |
-| `authorAssociation` OWNER, MEMBER or COLLABORATOR with write permission | maintainer |
+| `authorAssociation` OWNER or MEMBER with admin or maintain permission | maintainer |
 | An account in `limits.allowed_bots` | bot |
 | Anyone else | contributor |
 
@@ -68,7 +68,7 @@ Post one review with `scripts/act.sh review <n> approve|request-changes|comment 
 ## 7. Merge
 
 1. Checks green (§ 4), review passed, the autonomy level allows it or a maintainer approved.
-   A pull request of someone without write permission that changes a protected path (`scripts/act.sh sensitive <path>...` shows which paths count) is merged only when each protected file it changes is one that may be reached (`ci.yml`, the release skill's `SKILL.md`, `Cargo.toml`, `Cargo.lock`) and you have read every changed line of it: add `--protected-reviewed "<one line: what the protected changes do>"` to the merge. `scripts/act.sh merge` then checks that every changed line has one of the plain shapes that file may gain (a syntax-check line, a `cargo test --test` step, a registry dependency, a package block whose checksum crates.io confirms) and refuses otherwise; a path it calls locked (`scripts/act.sh locked <path>...`: build scripts, the steward's own files, the rest of `.agents/` and `.github/`, `.claude/`, `.cargo/`) is refused whatever you say. Do not look for a way around a refusal: label the item `status: needs-maintainer` and say why in the report.
+   A pull request of someone without admin or maintain permission (a collaborator with write permission included) that changes a protected path (`scripts/act.sh sensitive <path>...` shows which paths count) is merged only when each protected file it changes is one that may be reached (`ci.yml`, the release skill's `SKILL.md`, `Cargo.toml`, `Cargo.lock`) and you have read every changed line of it: add `--protected-reviewed "<one line: what the protected changes do>"` to the merge. `scripts/act.sh merge` then checks that every changed line has one of the plain shapes that file may gain (a syntax-check line, a `cargo test --test` step, a registry dependency, a package block whose checksum crates.io confirms) and refuses otherwise; a path it calls locked (`scripts/act.sh locked <path>...`: build scripts, the steward's own files, the rest of `.agents/` and `.github/`, `.claude/`, `.cargo/`) is refused whatever you say. Do not look for a way around a refusal: label the item `status: needs-maintainer` and say why in the report.
 2. Re-read the pull request; stop if a maintainer acted since.
 3. `scripts/act.sh merge <n> <merge.method> "<Conventional Commit subject> (#<n>)"`. GitHub's default body is kept; for a squash it lists the commits and their co-authors.
 4. Post the `merged` message; for each issue it closed, post the `fixed` message (closing keywords close issues only when merging into the default branch; close others yourself with the `fixed` message).

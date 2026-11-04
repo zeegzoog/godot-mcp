@@ -59,3 +59,6 @@ Desktop.ini
 /.design/*graph*.*
 /.design/*cache*/
 /.design/wiki/
+
+# Uid sidecars the dev project writes for the server's own GDScript templates
+src/tools/*.gd.uid

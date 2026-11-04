@@ -6012,3 +6012,65 @@ async fn review_assets_is_listed_and_checks_its_request_before_starting_godot() 
         "{names:?}"
     );
 }
+
+#[tokio::test]
+async fn world_map_is_listed_and_checks_its_request_before_starting_godot() {
+    let map = ToolManager::list_tools()
+        .into_iter()
+        .find(|tool| tool.name == "godot_world_map")
+        .expect("godot_world_map is listed");
+    let schema = serde_json::to_value(&map).expect("tool");
+    assert_eq!(schema["annotations"]["readOnlyHint"], false, "{schema}");
+    assert_eq!(schema["annotations"]["destructiveHint"], false, "{schema}");
+    for key in [
+        "dir",
+        "glob",
+        "recursive",
+        "scenes",
+        "rect",
+        "pixels_per_metre",
+        "view",
+        "labels",
+        "tile_metres",
+    ] {
+        assert!(
+            schema["inputSchema"]["properties"].get(key).is_some(),
+            "{key}: {schema}"
+        );
+    }
+
+    let project = project_dir();
+    std::fs::create_dir_all(project.path().join("zones")).expect("zones");
+    std::fs::write(project.path().join("zones/zone_0_0.tscn"), "").expect("scene");
+    let tools = manager_in(
+        project.path(),
+        PathBuf::from("godot-binary-that-does-not-exist"),
+    );
+    let outside = Arc::clone(&tools)
+        .call_tool("godot_world_map", json!({"dir": "res://../zones"}))
+        .await;
+    assert!(outside.is_error, "{}", text(&outside));
+    assert!(text(&outside).contains("dir:"), "{}", text(&outside));
+    let unmatched = Arc::clone(&tools)
+        .call_tool(
+            "godot_world_map",
+            json!({"dir": "res://zones", "glob": "tile_*.tscn"}),
+        )
+        .await;
+    assert!(unmatched.is_error, "{}", text(&unmatched));
+    assert!(
+        text(&unmatched).contains("matches tile_*.tscn"),
+        "{}",
+        text(&unmatched)
+    );
+    // A valid request reaches the engine, which is missing here.
+    let no_engine = Arc::clone(&tools)
+        .call_tool("godot_world_map", json!({"dir": "res://zones"}))
+        .await;
+    assert!(no_engine.is_error, "{}", text(&no_engine));
+    assert!(
+        text(&no_engine).contains("GODOT_PATH"),
+        "{}",
+        text(&no_engine)
+    );
+}

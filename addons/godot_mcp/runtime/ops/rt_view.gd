@@ -10,19 +10,34 @@ const MAX_MAX := 4096
 const MAX_FRAMES := 8
 const MAX_BASELINES := 8
 const MAX_BASELINE_PIXELS := 512 * 512
+## The lens an aimed copy may be given: orthographic size in metres, perspective fov in degrees.
+const AIM_SIZE_MIN := 0.001
+const AIM_SIZE_MAX := 10000.0
+const AIM_FOV_MIN := 1.0
+const AIM_FOV_MAX := 179.0
 ## Frames a capture waits for a window that has not drawn anything yet before it gives up.
 const EMPTY_RETRIES := 60
-## Process frames a capture waits for the window to draw a new frame. A window the system stops
-## drawing (covered on macOS, minimized) keeps its last frame in the viewport texture, so a
-## capture taken then is reported as stale instead of being passed off as current.
-const DRAW_WAIT := 30
+## Process frames a capture waits for the window to draw a new frame before it draws one itself.
+## A window the system stops drawing (covered on macOS, minimized) keeps its last frame in the
+## viewport texture, and the engine skips drawing while no window can draw, so the capture then
+## draws one frame of the rendering server into the viewports (without presenting it) and reads
+## that. A visible window draws every process frame, so a short wait is enough.
+const DRAW_WAIT := 4
 
 static var _previous = null
 static var _baselines: Dictionary = {}
+## The physics tick count when the rendering server last drew, -1 before the first frame.
+static var _drawn_physics := -1
 
 
 static func methods() -> Dictionary:
+    if not RenderingServer.frame_post_draw.is_connected(_note_drawn):
+        RenderingServer.frame_post_draw.connect(_note_drawn)
     return {"game.screenshot": {"fn": screenshot}}
+
+
+static func _note_drawn() -> void:
+    _drawn_physics = Engine.get_physics_frames()
 
 
 static func screenshot(rt: Node, params: Dictionary) -> Dictionary:
@@ -70,6 +85,7 @@ static func screenshot(rt: Node, params: Dictionary) -> Dictionary:
         "baseline": request,
         "drawn_mark": Engine.get_frames_drawn(),
         "stale": 0,
+        "forced": 0,
         "waited": 0,
     }
     if Hold.is_held() or state.get("aim_viewport") != null:
@@ -78,14 +94,20 @@ static func screenshot(rt: Node, params: Dictionary) -> Dictionary:
 
 
 ## A held game draws nothing new, so its capture is the last frame it drew, taken at once.
-## An aimed capture has never been drawn. Compatibility can omit instance-shaded meshes on
-## the fresh viewport's first draw, so prime that renderer once more before readback. These
-## are render-only passes: the scene does not advance.
+## An aimed capture has never been drawn, and the held state is not drawn when the window was
+## not drawing (covered or minimized) or a step ran several ticks in one frame, so either draws
+## one frame of the rendering server here: the scene does not advance. A held game waits at the
+## start of a tick, which the engine has already counted, so the tick before it is the held state.
+## Compatibility can omit instance-shaded meshes on a fresh aimed viewport's first draw, so an
+## aimed capture primes that renderer once more before readback.
 static func _capture_now(state: Dictionary) -> Dictionary:
-    if state.get("aim_viewport") != null:
+    var undrawn := _drawn_physics < Engine.get_physics_frames() - 1
+    if state.get("aim_viewport") != null or undrawn:
         RenderingServer.force_draw(false, 0.0)
-        if RenderingServer.get_current_rendering_method() == "gl_compatibility":
+        if state.get("aim_viewport") != null and RenderingServer.get_current_rendering_method() == "gl_compatibility":
             RenderingServer.force_draw(false, 0.0)
+        if undrawn and state.get("aim_viewport") == null:
+            state["forced"] = 1
     var grabbed = _grab(state)
     if grabbed == null or grabbed is Dictionary:
         _restore_cameras(state)
@@ -126,7 +148,15 @@ static func _tick_shot(rt: Node, state: Dictionary) -> bool:
         rt.finish_job(grabbed)
         return false
     if not _drew_since_mark(state):
-        state["stale"] = int(state["stale"]) + 1
+        # The engine drew nothing new: draw the current state now instead of returning the frame
+        # the window drew last.
+        RenderingServer.force_draw(false, rt.get_process_delta_time())
+        var redrawn = _grab(state)
+        if redrawn is Image:
+            grabbed = redrawn
+            state["forced"] = int(state["forced"]) + 1
+        else:
+            state["stale"] = int(state["stale"]) + 1
         state["waited"] = DRAW_WAIT
     state["draw_wait"] = 0
     state["drawn_mark"] = Engine.get_frames_drawn()
@@ -220,6 +250,8 @@ static func _compose(state: Dictionary) -> Dictionary:
             "frames_drawn": Engine.get_frames_drawn(),
             "process_frame": Engine.get_process_frames(),
             "stale_frames": 0 if bool(state.get("held", false)) else int(state.get("stale", 0)),
+            "forced_frames": int(state.get("forced", 0)),
+            "path": _render_path(state, count),
             "waited_frames": int(state.get("waited", 0)),
             "window_can_draw": DisplayServer.window_can_draw(),
             "held": bool(state.get("held", false)),
@@ -232,6 +264,17 @@ static func _compose(state: Dictionary) -> Dictionary:
     if not aim.is_empty():
         body["aim"] = aim
     return R.ok(body)
+
+
+## Which path produced the frames: the window's own drawing, a frame the capture drew itself
+## because the window was not drawing, both (a sheet), or the last frame of a held game.
+static func _render_path(state: Dictionary, count: int) -> String:
+    var forced := int(state.get("forced", 0))
+    if bool(state.get("held", false)):
+        return "forced_draw" if forced > 0 else "held"
+    if forced == 0:
+        return "window"
+    return "forced_draw" if forced >= count else "mixed"
 
 
 ## The coordinate space godot_game_input uses, and the viewport this image was taken from.
@@ -505,8 +548,8 @@ static func _aim(rt: Node, params: Dictionary) -> Dictionary:
         return R.err(R.BAD_PARAMS, "aim must be an object: {at: [x, y, z]} or {position: [x, y, z], look_at: [x, y, z]}.")
     var aim: Dictionary = raw
     for key: String in aim.keys():
-        if not key in ["at", "distance", "position", "look_at", "up"]:
-            return R.err(R.BAD_PARAMS, "aim has no '%s'. It takes at and distance, or position, look_at and up." % key)
+        if not key in ["at", "distance", "position", "look_at", "up", "size", "fov"]:
+            return R.err(R.BAD_PARAMS, "aim has no '%s'. It takes at and distance, or position, look_at and up, and size or fov for the lens." % key)
     if int(params.get("frames", 1)) != 1:
         return R.err(R.BAD_PARAMS, "aim takes one picture: leave frames at 1.")
     if not str(params.get("node", "")).strip_edges().is_empty():
@@ -531,6 +574,9 @@ static func _aim(rt: Node, params: Dictionary) -> Dictionary:
         if not (value is int or value is float) or float(value) <= 0.0 or not is_finite(float(value)):
             return R.err(R.BAD_PARAMS, "aim.distance must be a number above 0.")
         distance = float(value)
+    var lens: Variant = _lens(aim)
+    if lens is String:
+        return R.err(R.BAD_PARAMS, lens)
     var up := Vector3.UP
     if aim.has("up"):
         var given_up: Variant = _vector3(aim.get("up"))
@@ -604,6 +650,19 @@ static func _aim(rt: Node, params: Dictionary) -> Dictionary:
                 camera.set(property, source.get(property))
         if not is_zero_approx(source.h_offset) or not is_zero_approx(source.v_offset):
             report["offsets_dropped"] = [source.h_offset, source.v_offset]
+    report["lens_from"] = "game_camera" if source != null else "default"
+    var given_lens: Dictionary = lens
+    if not given_lens.is_empty():
+        # Only the copy changes lens: the game camera keeps its projection, fov and size.
+        var projection := int(given_lens["projection"]) as Camera3D.ProjectionType
+        if camera.projection != projection:
+            report["projection_replaced"] = ["perspective", "orthogonal", "frustum"][camera.projection]
+            camera.projection = projection
+        if given_lens.has("size"):
+            camera.size = float(given_lens["size"])
+        else:
+            camera.fov = float(given_lens["fov"])
+        report["lens_from"] = "given"
     viewport.add_child(camera)
     rt.add_child(viewport)
     camera.global_transform = transform
@@ -618,8 +677,27 @@ static func _aim(rt: Node, params: Dictionary) -> Dictionary:
         report["size"] = snappedf(camera.size, 0.0001)
     else:
         report["fov"] = snappedf(camera.fov, 0.0001)
+    report["aspect_axis"] = "height" if camera.keep_aspect == Camera3D.KEEP_HEIGHT else "width"
     report["image_centre"] = "the aimed point is the centre pixel of the returned image"
     return {"viewport": viewport, "label": "aim camera", "aim_viewport": viewport, "aim": report}
+
+
+## The lens override of an aim: {} when neither size nor fov is given, {projection, size} or
+## {projection, fov} when one is, or the error text when a value is out of range.
+static func _lens(aim: Dictionary) -> Variant:
+    if aim.has("size") and aim.has("fov"):
+        return "aim takes size (an orthographic copy) or fov (a perspective copy), not both."
+    if aim.has("size"):
+        var size: Variant = aim.get("size")
+        if not (size is int or size is float) or not is_finite(float(size)) or float(size) < AIM_SIZE_MIN or float(size) > AIM_SIZE_MAX:
+            return "aim.size must be a number from %s to %s metres: the height of the orthographic view (its width when the copied camera keeps width)." % [AIM_SIZE_MIN, int(AIM_SIZE_MAX)]
+        return {"projection": Camera3D.PROJECTION_ORTHOGONAL, "size": float(size)}
+    if aim.has("fov"):
+        var fov: Variant = aim.get("fov")
+        if not (fov is int or fov is float) or not is_finite(float(fov)) or float(fov) < AIM_FOV_MIN or float(fov) > AIM_FOV_MAX:
+            return "aim.fov must be a number from %d to %d degrees: the vertical view angle (horizontal when the copied camera keeps width)." % [int(AIM_FOV_MIN), int(AIM_FOV_MAX)]
+        return {"projection": Camera3D.PROJECTION_PERSPECTIVE, "fov": float(fov)}
+    return {}
 
 
 ## How far the game camera is from what it looks at: the first hit straight ahead of it, else the

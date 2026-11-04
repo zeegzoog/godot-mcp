@@ -9,6 +9,7 @@ mod debug_session;
 mod imports;
 mod resource_audit;
 mod runs;
+mod uid_cache;
 mod variant;
 
 pub use binary_resource::{BinaryUid, binary_uid};
@@ -20,4 +21,5 @@ pub use imports::{
 };
 pub use resource_audit::{BinaryUidFix, ResourceDamage, ResourceRepair, TextResourceSnapshot};
 pub use runs::{GameHub, ProcessStart, Run, RunInfo, json_id_eq};
+pub use uid_cache::{UidCacheUpdate, record as record_uids, uid_cache_file};
 pub use variant::{PacketReader, decode_variant, encode_variant, frame_packet};

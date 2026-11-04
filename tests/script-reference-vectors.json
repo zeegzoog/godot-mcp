@@ -1,0 +1,149 @@
+{
+  "_comment": "How a GDScript file names a path it mentions: written (only writes it, so it can recreate it) or used. Checked by src/tools/reference_kind.rs (cargo test) and the_addon_classifies_script_references_like_the_server (editor_e2e_test).",
+  "cases": [
+    {
+      "name": "a generator saves to a constant and prints it",
+      "path": "res://previews/bed_relief_preview.tscn",
+      "kind": "written",
+      "script": "@tool\nextends EditorScript\n\nconst OUT := \"res://previews/bed_relief_preview.tscn\"\n\nfunc _run() -> void:\n\tvar packed := PackedScene.new()\n\tpacked.pack(Node3D.new())\n\tDirAccess.make_dir_recursive_absolute(OUT.get_base_dir())\n\tvar err := ResourceSaver.save(packed, OUT)\n\tif err != OK:\n\t\tpush_error(\"could not save %s\" % OUT)\n\tprint(\"Saved \", OUT)\n"
+    },
+    {
+      "name": "a literal path saved directly",
+      "path": "res://previews/bed_relief_preview.tscn",
+      "kind": "written",
+      "script": "extends SceneTree\n\nfunc _init() -> void:\n\tResourceSaver.save(PackedScene.new(), \"res://previews/bed_relief_preview.tscn\")\n\tquit()\n"
+    },
+    {
+      "name": "a typed constant carried through a variable",
+      "path": "res://previews/bed_relief_preview.tscn",
+      "kind": "written",
+      "script": "const OUT: String = \"res://previews/bed_relief_preview.tscn\"\n\nfunc run(scene: PackedScene) -> void:\n\tvar target: String = OUT\n\tResourceSaver.save(scene, target)\n"
+    },
+    {
+      "name": "a call spread over lines with a comment",
+      "path": "res://previews/bed_relief_preview.tscn",
+      "kind": "written",
+      "script": "# Writes res://previews/bed_relief_preview.tscn\nconst OUT := \"res://previews/bed_relief_preview.tscn\"\n\nfunc run(scene: PackedScene) -> void:\n\tResourceSaver.save(\n\t\tscene,\n\t\tOUT,\n\t)\n"
+    },
+    {
+      "name": "a file opened for writing",
+      "path": "res://previews/bed_relief_preview.tscn",
+      "kind": "written",
+      "script": "const OUT := \"res://previews/bed_relief_preview.tscn\"\n\nfunc run() -> void:\n\tvar file := FileAccess.open(OUT, FileAccess.WRITE)\n\tfile.store_string(\"x\")\n"
+    },
+    {
+      "name": "a removal through globalize_path",
+      "path": "res://previews/bed_relief_preview.tscn",
+      "kind": "written",
+      "script": "func clean() -> void:\n\tDirAccess.remove_absolute(ProjectSettings.globalize_path(\"res://previews/bed_relief_preview.tscn\"))\n"
+    },
+    {
+      "name": "an image saved as png",
+      "path": "res://previews/bed_relief_preview.tscn",
+      "kind": "written",
+      "script": "const OUT = \"res://previews/bed_relief_preview.tscn\"\n\nfunc run(image: Image) -> void:\n\timage.save_png(OUT)\n"
+    },
+    {
+      "name": "a preload",
+      "path": "res://previews/bed_relief_preview.tscn",
+      "kind": "used",
+      "script": "const Preview := preload(\"res://previews/bed_relief_preview.tscn\")\n"
+    },
+    {
+      "name": "a load through a constant",
+      "path": "res://previews/bed_relief_preview.tscn",
+      "kind": "used",
+      "script": "const OUT := \"res://previews/bed_relief_preview.tscn\"\n\nfunc run() -> void:\n\tvar scene: PackedScene = load(OUT)\n"
+    },
+    {
+      "name": "a script that saves and loads it",
+      "path": "res://previews/bed_relief_preview.tscn",
+      "kind": "used",
+      "script": "const OUT := \"res://previews/bed_relief_preview.tscn\"\n\nfunc run(scene: PackedScene) -> void:\n\tResourceSaver.save(scene, OUT)\n\tvar again := ResourceLoader.load(OUT)\n"
+    },
+    {
+      "name": "a file opened for reading",
+      "path": "res://previews/bed_relief_preview.tscn",
+      "kind": "used",
+      "script": "const OUT := \"res://previews/bed_relief_preview.tscn\"\n\nfunc run() -> void:\n\tvar file := FileAccess.open(OUT, FileAccess.READ)\n"
+    },
+    {
+      "name": "a file opened for reading and writing",
+      "path": "res://previews/bed_relief_preview.tscn",
+      "kind": "used",
+      "script": "const OUT := \"res://previews/bed_relief_preview.tscn\"\n\nfunc run() -> void:\n\tvar file := FileAccess.open(OUT, FileAccess.READ_WRITE)\n"
+    },
+    {
+      "name": "a path that is only printed",
+      "path": "res://previews/bed_relief_preview.tscn",
+      "kind": "used",
+      "script": "const OUT := \"res://previews/bed_relief_preview.tscn\"\n\nfunc run() -> void:\n\tprint(OUT)\n"
+    },
+    {
+      "name": "a constant nobody reads",
+      "path": "res://previews/bed_relief_preview.tscn",
+      "kind": "used",
+      "script": "const OUT := \"res://previews/bed_relief_preview.tscn\"\n"
+    },
+    {
+      "name": "a path handed to the script's own function",
+      "path": "res://previews/bed_relief_preview.tscn",
+      "kind": "used",
+      "script": "const OUT := \"res://previews/bed_relief_preview.tscn\"\n\nfunc run(scene: PackedScene) -> void:\n\t_store(scene, OUT)\n\nfunc _store(scene: PackedScene, path: String) -> void:\n\tResourceSaver.save(scene, path)\n"
+    },
+    {
+      "name": "a path built on",
+      "path": "res://previews/bed_relief_preview.tscn",
+      "kind": "used",
+      "script": "const OUT := \"res://previews/bed_relief_preview.tscn\"\n\nfunc run(scene: PackedScene) -> void:\n\tResourceSaver.save(scene, OUT + \".bak\")\n"
+    },
+    {
+      "name": "a constant that is reassigned",
+      "path": "res://previews/bed_relief_preview.tscn",
+      "kind": "used",
+      "script": "var out := \"res://previews/bed_relief_preview.tscn\"\n\nfunc run(scene: PackedScene) -> void:\n\tResourceSaver.save(scene, out)\n\tout = \"res://other.tscn\"\n"
+    },
+    {
+      "name": "a mention only in a comment",
+      "path": "res://previews/bed_relief_preview.tscn",
+      "kind": "used",
+      "script": "extends Node\n# The preview lives at res://previews/bed_relief_preview.tscn\n"
+    },
+    {
+      "name": "a string with more than the path",
+      "path": "res://previews/bed_relief_preview.tscn",
+      "kind": "used",
+      "script": "func run() -> void:\n\tvar scene := load(\"res://previews/bed_relief_preview.tscn::1\")\n"
+    },
+    {
+      "name": "the arguments of Godot 3's save",
+      "path": "res://previews/bed_relief_preview.tscn",
+      "kind": "used",
+      "script": "func run(scene: PackedScene) -> void:\n\tResourceSaver.save(\"res://previews/bed_relief_preview.tscn\", scene)\n"
+    },
+    {
+      "name": "a path inside an array",
+      "path": "res://previews/bed_relief_preview.tscn",
+      "kind": "used",
+      "script": "const OUTS := [\"res://previews/bed_relief_preview.tscn\"]\n\nfunc run(scene: PackedScene) -> void:\n\tResourceSaver.save(scene, OUTS[0])\n"
+    },
+    {
+      "name": "a folder made with globalize_path",
+      "path": "res://previews/bed_relief_preview.tscn",
+      "kind": "written",
+      "script": "const OUT := \"res://previews/bed_relief_preview.tscn\"\n\nfunc run(scene: PackedScene) -> void:\n\tDirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(OUT.get_base_dir()))\n\tResourceSaver.save(scene, OUT)\n"
+    },
+    {
+      "name": "a folder used for something else",
+      "path": "res://previews/bed_relief_preview.tscn",
+      "kind": "used",
+      "script": "const OUT := \"res://previews/bed_relief_preview.tscn\"\n\nfunc run(scene: PackedScene) -> void:\n\tvar files := DirAccess.get_files_at(OUT.get_base_dir())\n\tResourceSaver.save(scene, OUT)\n"
+    },
+    {
+      "name": "a uid that is loaded",
+      "path": "uid://b8xpreview",
+      "kind": "used",
+      "script": "func run() -> void:\n\tvar scene := load(\"uid://b8xpreview\")\n"
+    }
+  ]
+}

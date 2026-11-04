@@ -7,7 +7,8 @@ extends RefCounted
 ##
 ## Nothing is deleted while any requested path is refused, so a call either deletes everything it
 ## names or nothing. A file that another project file still names by path or UID is refused unless
-## the caller passes force.
+## the caller passes force. A script that only writes the file (a generator saving its output)
+## does not count: it can create the file again (classify_script).
 
 ## Text files whose content is searched for a path or UID of a file being deleted.
 const TEXT_EXTENSIONS: PackedStringArray = [
@@ -23,6 +24,51 @@ const BRIDGE_ADDON: String = "res://addons/godot_mcp/"
 const IMPORTED_PREFIX: String = "res://.godot/imported/"
 ## Characters that continue a path or UID, so "res://a.gd" is not found inside "res://a.gdshader".
 const PATH_CHARS: String = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-./~"
+
+## How a .gd file names a path: "written" when every place the path reaches in its code writes
+## the file (so the script can create it again), "used" otherwise. The server classifies the same
+## way (src/tools/reference_kind.rs); tests/script-reference-vectors.json holds the shared cases.
+const KIND_WRITTEN: String = "written"
+const KIND_USED: String = "used"
+## How far a path is followed through constants and variables that hold it.
+const MAX_CARRIERS: int = 4
+## Calls that write the file named by an argument: [receiver ("" for any), method, argument].
+const WRITES: Array = [
+    ["ResourceSaver", "save", 1],
+    ["DirAccess", "remove_absolute", 0],
+    ["DirAccess", "copy_absolute", 1],
+    ["DirAccess", "rename_absolute", 1],
+    ["OS", "move_to_trash", 0],
+    ["ProjectSettings", "save_custom", 0],
+    ["", "save_png", 0],
+    ["", "save_jpg", 0],
+    ["", "save_webp", 0],
+    ["", "save_exr", 0],
+]
+## FileAccess openers; they write when their second argument is one of WRITE_MODES.
+const OPENERS: PackedStringArray = ["open", "open_compressed", "open_encrypted", "open_encrypted_with_pass"]
+const WRITE_MODES: PackedStringArray = ["FileAccess.WRITE", "FileAccess.WRITE_READ"]
+## Calls that only look at the path: [receiver ("" for any), method].
+const LOOKS: Array = [
+    ["FileAccess", "file_exists"], ["ResourceLoader", "exists"], ["", "print"], ["", "prints"],
+    ["", "printt"], ["", "printerr"], ["", "print_rich"], ["", "print_verbose"],
+    ["", "push_warning"], ["", "push_error"],
+]
+## Calls that only look at the folder of the path (path.get_base_dir()).
+const FOLDER_LOOKS: Array = [
+    ["DirAccess", "make_dir_recursive_absolute"], ["DirAccess", "make_dir_absolute"],
+    ["DirAccess", "dir_exists_absolute"],
+]
+## Calls that hand back the same path in another form.
+const SAME_PATH: Array = [["ProjectSettings", "globalize_path"], ["ProjectSettings", "localize_path"]]
+const TOKEN_WORD: int = 0
+const TOKEN_TEXT: int = 1
+const TOKEN_MARK: int = 2
+const TOKEN_NEWLINE: int = 3
+const ROLE_WRITE: int = 0
+const ROLE_LOOK: int = 1
+const ROLE_USE: int = 2
+const WORD_CHARS: String = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
 
 ## params: paths (Array), force, allow_empty_dir, dry_run, trash (bools). bridge is the bridge
 ## node, for its path, scene and script helpers. Returns the report; "refused" is non-empty when nothing
@@ -83,13 +129,18 @@ func delete(bridge: Object, params: Dictionary) -> Dictionary:
         var users: Array = target.get("referenced_by", [])
         if users.is_empty():
             continue
-        report["references"].append({"path": target["path"], "uid": target.get("uid", ""), "count": users.size(), "referenced_by": users.slice(0, MAX_LISTED_REFERENCES)})
-        if not force:
-            var names: PackedStringArray = PackedStringArray()
-            for user: Dictionary in users.slice(0, 5):
-                names.append(str(user["file"]))
-            var more: String = "" if users.size() <= 5 else " and %d more" % (users.size() - 5)
-            _refuse(report, str(target["path"]), "is still referenced by %d file(s): %s%s. Remove the references first, or pass force: true to delete it anyway and leave them broken" % [users.size(), ", ".join(names), more])
+        var used: PackedStringArray = PackedStringArray()
+        var writers: PackedStringArray = PackedStringArray()
+        for user: Dictionary in users:
+            if str(user["kind"]) == KIND_USED:
+                used.append(str(user["file"]))
+            else:
+                writers.append(str(user["file"]))
+        report["references"].append({"path": target["path"], "uid": target.get("uid", ""), "count": users.size(), "used": used.size(), "written": writers.size(), "referenced_by": users.slice(0, MAX_LISTED_REFERENCES)})
+        if used.is_empty():
+            report["warnings"].append("%s is named only as a file that %d script(s) write: %s%s. They can create it again, so this does not stop the deletion; run the generator to rebuild it." % [target["path"], writers.size(), ", ".join(writers.slice(0, 5)), _more(writers.size())])
+        elif not force:
+            _refuse(report, str(target["path"]), "is still used by %d file(s): %s%s. Remove the references first, or pass force: true to delete it anyway and leave them broken" % [used.size(), ", ".join(used.slice(0, 5)), _more(used.size())])
 
     var scene_tabs: Array[String] = []
     var script_tabs: Array[String] = []
@@ -174,6 +225,9 @@ func delete(bridge: Object, params: Dictionary) -> Dictionary:
         fs.scan()
     report["rescanned"] = true
     return report
+
+func _more(count: int) -> String:
+    return "" if count <= 5 else " and %d more" % (count - 5)
 
 func _refuse(report: Dictionary, res_path: String, reason: String) -> void:
     report["refused"].append({"path": res_path, "reason": reason})
@@ -280,7 +334,7 @@ func _find_references(targets: Array[Dictionary], report: Dictionary) -> void:
                 if not str(target["uid"]).is_empty() and parts.has(target["uid"]):
                     by.append("uid")
                 if not by.is_empty():
-                    target["referenced_by"].append({"file": candidate, "by": by})
+                    target["referenced_by"].append({"file": candidate, "by": by, "kind": KIND_USED})
             continue
         if not extension in TEXT_EXTENSIONS:
             continue
@@ -298,9 +352,237 @@ func _find_references(targets: Array[Dictionary], report: Dictionary) -> void:
             if not str(target["uid"]).is_empty() and mentions(text, str(target["uid"])):
                 by.append("uid")
             if not by.is_empty():
-                target["referenced_by"].append({"file": candidate, "by": by})
+                target["referenced_by"].append({"file": candidate, "by": by, "kind": _reference_kind(extension, text, target, by)})
     if skipped_large > 0:
         report["warnings"].append("%d text file(s) larger than %d bytes were not searched for references." % [skipped_large, MAX_SCAN_BYTES])
+
+## How a file of the given extension names target: a script that only writes it can create it
+## again; every other file uses it.
+func _reference_kind(extension: String, text: String, target: Dictionary, by: Array[String]) -> String:
+    if extension != "gd":
+        return KIND_USED
+    var needles: Array[String] = []
+    if by.has("path"):
+        needles.append(str(target["path"]))
+    if by.has("uid"):
+        needles.append(str(target["uid"]))
+    for needle: String in needles:
+        if classify_script(text, needle) != KIND_WRITTEN:
+            return KIND_USED
+    return KIND_WRITTEN
+
+## How a GDScript source names needle (a res:// path or uid://), which its text mentions:
+## KIND_WRITTEN or KIND_USED.
+func classify_script(source: String, needle: String) -> String:
+    var kinds: PackedInt32Array = PackedInt32Array()
+    var texts: PackedStringArray = PackedStringArray()
+    _lex(source, kinds, texts)
+    var roles: Array[int] = []
+    for at: int in kinds.size():
+        if kinds[at] != TOKEN_TEXT or not mentions(texts[at], needle):
+            continue
+        if texts[at] != needle:
+            return KIND_USED
+        roles.append(_role(kinds, texts, at, at + 1, 0, false))
+    # A mention outside the code's strings (in a comment, say) is no place the analysis follows.
+    if roles.is_empty():
+        return KIND_USED
+    return KIND_WRITTEN if _combine(roles) == ROLE_WRITE else KIND_USED
+
+func _combine(roles: Array[int]) -> int:
+    var result: int = ROLE_LOOK
+    for role: int in roles:
+        if role == ROLE_USE:
+            return ROLE_USE
+        if role == ROLE_WRITE:
+            result = ROLE_WRITE
+    return result
+
+## Splits GDScript into words, string contents, marks and line ends; comments are dropped, and so
+## are line ends inside brackets, as GDScript ignores them there.
+func _lex(source: String, kinds: PackedInt32Array, texts: PackedStringArray) -> void:
+    var length: int = source.length()
+    var brackets: int = 0
+    var at: int = 0
+    while at < length:
+        var c: String = source[at]
+        if c == "\n":
+            if brackets == 0:
+                kinds.append(TOKEN_NEWLINE)
+                texts.append("")
+            at += 1
+        elif c == " " or c == "\t" or c == "\r":
+            at += 1
+        elif c == "\\" and at + 1 < length and source[at + 1] == "\n":
+            at += 2
+        elif c == "#":
+            while at < length and source[at] != "\n":
+                at += 1
+        elif c == "\"" or c == "'":
+            var triple: bool = source.substr(at, 3) == c + c + c
+            var open: int = 3 if triple else 1
+            var start: int = at + open
+            var end: int = start
+            while end < length:
+                if source[end] == "\\":
+                    end += 2
+                    continue
+                if triple:
+                    if source.substr(end, 3) == c + c + c:
+                        break
+                elif source[end] == c or source[end] == "\n":
+                    break
+                end += 1
+            end = mini(end, length)
+            kinds.append(TOKEN_TEXT)
+            texts.append(source.substr(start, end - start))
+            at = end + open if end < length and source[end] == c else end
+        elif WORD_CHARS.contains(c):
+            var start: int = at
+            while at < length and WORD_CHARS.contains(source[at]):
+                at += 1
+            kinds.append(TOKEN_WORD)
+            texts.append(source.substr(start, at - start))
+        else:
+            var pair: String = source.substr(at, 2)
+            var mark: String = pair if pair in [":=", "==", "!=", "<=", ">=", "->"] else c
+            if c in ["(", "[", "{"]:
+                brackets += 1
+            elif c in [")", "]", "}"]:
+                brackets = maxi(brackets - 1, 0)
+            kinds.append(TOKEN_MARK)
+            texts.append(mark)
+            at += mark.length()
+
+func _is_mark(kinds: PackedInt32Array, texts: PackedStringArray, at: int, mark: String) -> bool:
+    return at >= 0 and at < kinds.size() and kinds[at] == TOKEN_MARK and texts[at] == mark
+
+func _word(kinds: PackedInt32Array, texts: PackedStringArray, at: int) -> String:
+    return texts[at] if at >= 0 and at < kinds.size() and kinds[at] == TOKEN_WORD else ""
+
+func _listed(list: Array, receiver: String, method: String) -> bool:
+    for entry: Array in list:
+        if str(entry[1]) == method and (str(entry[0]).is_empty() or str(entry[0]) == receiver):
+            return true
+    return false
+
+## The call whose argument list holds token at: {receiver, method, open, argument}, or {}.
+func _enclosing_call(kinds: PackedInt32Array, texts: PackedStringArray, at: int) -> Dictionary:
+    var nested: int = 0
+    var argument: int = 0
+    var index: int = at
+    while index > 0:
+        index -= 1
+        if kinds[index] != TOKEN_MARK:
+            continue
+        var mark: String = texts[index]
+        if mark in [")", "]", "}"]:
+            nested += 1
+        elif mark == "(" and nested == 0:
+            var method: String = _word(kinds, texts, index - 1)
+            if method.is_empty():
+                return {}
+            var receiver: String = _word(kinds, texts, index - 3) if _is_mark(kinds, texts, index - 2, ".") else ""
+            return {"receiver": receiver, "method": method, "open": index, "argument": argument}
+        elif (mark == "[" or mark == "{") and nested == 0:
+            return {}
+        elif mark in ["(", "[", "{"]:
+            nested -= 1
+        elif mark == "," and nested == 0:
+            argument += 1
+    return {}
+
+## The index of the ")" that closes the call opened at open, or -1.
+func _call_end(kinds: PackedInt32Array, texts: PackedStringArray, open: int) -> int:
+    var nested: int = 0
+    for index: int in range(open + 1, kinds.size()):
+        if kinds[index] != TOKEN_MARK:
+            continue
+        if texts[index] in ["(", "[", "{"]:
+            nested += 1
+        elif texts[index] in [")", "]", "}"]:
+            if nested == 0:
+                return index
+            nested -= 1
+    return -1
+
+## The tokens of argument wanted of the call opened at open, joined.
+func _argument_text(kinds: PackedInt32Array, texts: PackedStringArray, open: int, wanted: int) -> String:
+    var nested: int = 0
+    var argument: int = 0
+    var text: String = ""
+    for index: int in range(open + 1, kinds.size()):
+        var kind: int = kinds[index]
+        if kind == TOKEN_MARK:
+            if texts[index] in ["(", "[", "{"]:
+                nested += 1
+            elif texts[index] in [")", "]", "}"]:
+                if nested == 0:
+                    break
+                nested -= 1
+            elif texts[index] == "," and nested == 0:
+                argument += 1
+                continue
+        if argument == wanted:
+            if kind == TOKEN_TEXT:
+                text += "\""
+            elif kind != TOKEN_NEWLINE:
+                text += texts[index]
+    return text
+
+## What the expression in tokens [start, end) does with the path, or with its folder when folder.
+func _role(kinds: PackedInt32Array, texts: PackedStringArray, start: int, end: int, carriers: int, folder: bool) -> int:
+    # path.get_base_dir() is the folder: making it or checking it changes nothing.
+    if not folder and _is_mark(kinds, texts, end, ".") and _word(kinds, texts, end + 1) == "get_base_dir" and _is_mark(kinds, texts, end + 2, "(") and _is_mark(kinds, texts, end + 3, ")"):
+        return _role(kinds, texts, start, end + 4, carriers, true)
+    var whole: bool = (_is_mark(kinds, texts, start - 1, "(") or _is_mark(kinds, texts, start - 1, ",")) and (_is_mark(kinds, texts, end, ")") or _is_mark(kinds, texts, end, ","))
+
+    var enclosing: Dictionary = _enclosing_call(kinds, texts, start)
+    if not enclosing.is_empty():
+        var receiver: String = str(enclosing["receiver"])
+        var method: String = str(enclosing["method"])
+        var open: int = int(enclosing["open"])
+        var argument: int = int(enclosing["argument"])
+        if _listed(LOOKS, receiver, method):
+            return ROLE_LOOK
+        if not whole:
+            return ROLE_USE
+        if _listed(SAME_PATH, receiver, method) and argument == 0:
+            var close: int = _call_end(kinds, texts, open)
+            if close == -1:
+                return ROLE_USE
+            return _role(kinds, texts, open - 1 if receiver.is_empty() else open - 3, close + 1, carriers, folder)
+        if folder:
+            return ROLE_LOOK if _listed(FOLDER_LOOKS, receiver, method) and argument == 0 else ROLE_USE
+        for entry: Array in WRITES:
+            if str(entry[1]) == method and int(entry[2]) == argument and (str(entry[0]).is_empty() or str(entry[0]) == receiver):
+                return ROLE_WRITE
+        if receiver == "FileAccess" and OPENERS.has(method) and argument == 0 and WRITE_MODES.has(_argument_text(kinds, texts, open, 1)):
+            return ROLE_WRITE
+        return ROLE_USE
+
+    # const NAME := <path> or var NAME: Type = <path>: follow NAME.
+    var ends_statement: bool = end >= kinds.size() or kinds[end] == TOKEN_NEWLINE or _is_mark(kinds, texts, end, ";")
+    if not ends_statement or not (_is_mark(kinds, texts, start - 1, "=") or _is_mark(kinds, texts, start - 1, ":=")):
+        return ROLE_USE
+    var assign: int = start - 1
+    var keyword: int = -1
+    for candidate: int in [assign - 2, assign - 4]:
+        if candidate < 0 or not _word(kinds, texts, candidate) in ["var", "const"] or _word(kinds, texts, candidate + 1).is_empty():
+            continue
+        if candidate + 2 == assign or (_is_mark(kinds, texts, candidate + 2, ":") and not _word(kinds, texts, candidate + 3).is_empty() and candidate + 4 == assign):
+            keyword = candidate
+            break
+    if keyword == -1 or carriers >= MAX_CARRIERS:
+        return ROLE_USE
+    var name: String = texts[keyword + 1]
+    var roles: Array[int] = []
+    for at: int in kinds.size():
+        if at != keyword + 1 and kinds[at] == TOKEN_WORD and texts[at] == name and not _is_mark(kinds, texts, at - 1, "."):
+            roles.append(_role(kinds, texts, at, at + 1, carriers + 1, folder))
+    if roles.is_empty():
+        return ROLE_USE
+    return _combine(roles)
 
 func _collect(folder: String, into: Array[String]) -> void:
     var dir: DirAccess = DirAccess.open(folder)

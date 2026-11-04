@@ -1468,9 +1468,13 @@ async fn probe_is_listed_read_only_and_checks_its_size_before_reaching_a_game() 
         .expect("screenshot");
     let shot = serde_json::to_value(&shot).expect("tool");
     let aim = &shot["inputSchema"]["properties"]["aim"];
-    for key in ["at", "distance", "position", "look_at", "up"] {
+    for key in ["at", "distance", "position", "look_at", "up", "size", "fov"] {
         assert!(aim["properties"].get(key).is_some(), "{key}: {aim}");
     }
+    assert_eq!(aim["properties"]["size"]["minimum"], 0.001, "{aim}");
+    assert_eq!(aim["properties"]["size"]["maximum"], 10000, "{aim}");
+    assert_eq!(aim["properties"]["fov"]["minimum"], 1, "{aim}");
+    assert_eq!(aim["properties"]["fov"]["maximum"], 179, "{aim}");
     assert_eq!(aim["additionalProperties"], false, "{aim}");
 }
 
@@ -3161,6 +3165,157 @@ async fn run_script_keeps_the_answer_short_when_it_repairs_many_files() {
     );
 }
 
+/// `.godot/uid_cache.bin` as Godot's `ResourceUID::save_to_cache` writes it.
+fn uid_cache_bytes(entries: &[(u64, &str)]) -> Vec<u8> {
+    let mut bytes = (entries.len() as u32).to_le_bytes().to_vec();
+    for (id, path) in entries {
+        bytes.extend_from_slice(&id.to_le_bytes());
+        bytes.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(path.as_bytes());
+    }
+    bytes
+}
+
+/// The `(id, path)` entries of a uid cache file.
+fn uid_cache_entries(bytes: &[u8]) -> Vec<(u64, String)> {
+    let count = u32::from_le_bytes(bytes[0..4].try_into().expect("count"));
+    let mut at = 4;
+    let mut entries = Vec::new();
+    for _ in 0..count {
+        let id = u64::from_le_bytes(bytes[at..at + 8].try_into().expect("id"));
+        let length =
+            u32::from_le_bytes(bytes[at + 8..at + 12].try_into().expect("length")) as usize;
+        let path = String::from_utf8(bytes[at + 12..at + 12 + length].to_vec()).expect("path");
+        at += 12 + length;
+        entries.push((id, path));
+    }
+    assert_eq!(at, bytes.len(), "no bytes after the entries");
+    entries
+}
+
+/// Godot's `ResourceUID::text_to_id`.
+fn uid_text_to_id(text: &str) -> u64 {
+    text.trim_start_matches("uid://")
+        .bytes()
+        .fold(0u64, |id, byte| {
+            let digit = if byte.is_ascii_lowercase() {
+                byte - b'a'
+            } else {
+                byte - b'0' + 25
+            };
+            id * 34 + u64::from(digit)
+        })
+        & 0x7FFF_FFFF_FFFF_FFFF
+}
+
+/// New files get new uids, and only the editor writes the uid cache: without them in it, the next
+/// script that loads the files prints an "invalid UID" warning per reference. With no editor
+/// holding the project, the server records them in the cache itself.
+#[tokio::test]
+async fn run_script_records_the_new_uids_in_the_uid_cache() {
+    let project = pond_project();
+    let root = project.path();
+    write_script(root, "many.gd", b"extends SceneTree\n");
+    std::fs::create_dir_all(root.join(".godot")).expect(".godot");
+    let shader_id = uid_text_to_id("uid://dshader");
+    std::fs::write(
+        root.join(".godot/uid_cache.bin"),
+        uid_cache_bytes(&[(shader_id, "res://water.gdshader")]),
+    )
+    .expect("uid cache");
+    let tools = manager_in(root, saving_godot(root));
+
+    let run = call_with(&tools, json!({"script": "many.gd", "project_path": root})).await;
+    let run_text = text(&run);
+    assert!(!run.is_error, "{run_text}");
+    let body = answer_body(&run_text);
+    assert_eq!(
+        body["uid_cache"],
+        json!({"file": ".godot/uid_cache.bin", "recorded": 25}),
+        "{run_text}"
+    );
+    assert_eq!(body["uid_cache_stale"], Value::Null, "{run_text}");
+    assert!(
+        body["summary"]
+            .as_str()
+            .is_some_and(|summary| summary.contains("Recorded 25 uids in .godot/uid_cache.bin")),
+        "{run_text}"
+    );
+    let cache =
+        uid_cache_entries(&std::fs::read(root.join(".godot/uid_cache.bin")).expect("cache"));
+    assert_eq!(cache.len(), 26, "{cache:?}");
+    assert_eq!(cache[0], (shader_id, "res://water.gdshader".to_string()));
+    for index in 1..=25 {
+        let path = format!("res://many/pond_{index:02}.tscn");
+        let scene = std::fs::read_to_string(root.join(format!("many/pond_{index:02}.tscn")))
+            .expect("scene");
+        let uid = scene
+            .split("uid=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("header uid");
+        assert!(
+            cache.contains(&(uid_text_to_id(uid), path.clone())),
+            "{path} {uid} in {cache:?}"
+        );
+    }
+
+    // A second run that rewrites the same files records nothing new.
+    let again = call_with(&tools, json!({"script": "edit.gd", "project_path": root})).await;
+    let body = answer_body(&text(&again));
+    assert_eq!(
+        body["uid_cache"]["recorded"], 1,
+        "pond.tscn was not in the cache yet"
+    );
+    let again = call_with(&tools, json!({"script": "edit.gd", "project_path": root})).await;
+    let body = answer_body(&text(&again));
+    assert_eq!(body["uid_cache"]["recorded"], 0, "{body}");
+}
+
+/// A project the editor never scanned has no uid cache; the server does not make one up, and the
+/// answer says the uids are not cached and how to fix it.
+#[tokio::test]
+async fn run_script_reports_a_missing_uid_cache_as_stale() {
+    let project = pond_project();
+    let root = project.path();
+    let tools = manager_in(root, saving_godot(root));
+
+    let run = call_with(&tools, json!({"script": "edit.gd", "project_path": root})).await;
+    let run_text = text(&run);
+    assert!(!run.is_error, "{run_text}");
+    let body = answer_body(&run_text);
+    assert_eq!(body["uid_cache"], Value::Null, "{run_text}");
+    let stale = body["uid_cache_stale"].as_str().expect("uid_cache_stale");
+    assert!(stale.contains("no .godot/uid_cache.bin"), "{stale}");
+    assert!(stale.contains("godot_resave_resources"), "{stale}");
+    assert!(!root.join(".godot/uid_cache.bin").exists());
+}
+
+/// An editor that holds the project keeps its own uid cache and refreshes it from the repaired
+/// files; the server leaves the file to it.
+#[tokio::test]
+async fn run_script_leaves_the_uid_cache_to_a_connected_editor() {
+    let project = pond_project();
+    let root = project.path();
+    std::fs::create_dir_all(root.join(".godot")).expect(".godot");
+    let cache = uid_cache_bytes(&[(uid_text_to_id("uid://dshader"), "res://water.gdshader")]);
+    std::fs::write(root.join(".godot/uid_cache.bin"), &cache).expect("uid cache");
+    let (_bridge, tools) =
+        manager_with_editor(root, &["resave_resources"], saving_godot(root)).await;
+
+    let run = call_with(&tools, json!({"script": "edit.gd", "project_path": root})).await;
+    let run_text = text(&run);
+    assert!(!run.is_error, "{run_text}");
+    let body = answer_body(&run_text);
+    assert_eq!(body["resource_repairs_total"], 1, "{run_text}");
+    assert_eq!(body["uid_cache"], Value::Null, "{run_text}");
+    assert_eq!(body["uid_cache_stale"], Value::Null, "{run_text}");
+    assert_eq!(
+        std::fs::read(root.join(".godot/uid_cache.bin")).expect("cache"),
+        cache
+    );
+}
+
 /// A script that rewrites a shader with FileAccess leaves no scene to repair, yet the editor still
 /// holds the old Shader: saving a scene then pins its old uniform defaults. The server has the
 /// connected editor refresh and reload the shader.
@@ -4128,6 +4283,67 @@ async fn files_are_deleted_on_disk_with_their_companions_unless_still_referenced
             tool.description
         );
     }
+}
+
+/// A tool script that only saves a generated file names its path without using it: deleting
+/// the file is not refused, and the answer says which script writes it. A script that loads the
+/// file still refuses it without force, and every reference reports its kind.
+#[tokio::test]
+async fn a_file_only_written_by_a_generator_script_is_deleted_without_force() {
+    let project = project_dir();
+    let root = project.path();
+    let write = |name: &str, text: &str| {
+        let path = root.join(name);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("folder");
+        std::fs::write(path, text).expect("fixture file");
+    };
+    let scene = "[gd_scene format=3]\n\n[node name=\"Preview\" type=\"Node3D\"]\n";
+    write("previews/bed_relief_preview.tscn", scene);
+    write("previews/loaded_preview.tscn", scene);
+    write(
+        "scripts/tools/preview_bed_relief.gd",
+        "@tool\nextends EditorScript\n\nconst OUT := \"res://previews/bed_relief_preview.tscn\"\n\nfunc _run() -> void:\n\tvar packed := PackedScene.new()\n\tpacked.pack(Node3D.new())\n\tDirAccess.make_dir_recursive_absolute(OUT.get_base_dir())\n\tResourceSaver.save(packed, OUT)\n\tprint(\"Saved \", OUT)\n",
+    );
+    write(
+        "scripts/tools/preview_loaded.gd",
+        "@tool\nextends EditorScript\n\nconst OUT := \"res://previews/loaded_preview.tscn\"\n\nfunc _run() -> void:\n\tResourceSaver.save(PackedScene.new(), OUT)\n\tvar again: PackedScene = load(OUT)\n",
+    );
+    let delete = |args: Value| async move {
+        let mut args = args;
+        args["project_path"] = json!(root);
+        call("godot_delete_file", args).await
+    };
+
+    let used = delete(json!({"paths": ["res://previews/loaded_preview.tscn"]})).await;
+    assert!(used.is_error, "{}", text(&used));
+    let message = text(&used);
+    assert!(message.contains("still used by 1 file(s)"), "{message}");
+    assert!(message.contains("\"kind\": \"used\""), "{message}");
+    assert!(root.join("previews/loaded_preview.tscn").exists());
+
+    let dry =
+        delete(json!({"paths": ["res://previews/bed_relief_preview.tscn"], "dry_run": true})).await;
+    assert!(!dry.is_error, "{}", text(&dry));
+    let report: Value = serde_json::from_str(&text(&dry)).expect("JSON report");
+    assert_eq!(report["refused"], json!([]), "{report}");
+    assert_eq!(report["references"][0]["written"], 1, "{report}");
+    assert_eq!(report["references"][0]["used"], 0, "{report}");
+    assert_eq!(
+        report["references"][0]["referenced_by"][0],
+        json!({"file": "res://scripts/tools/preview_bed_relief.gd", "by": ["path"], "kind": "written"}),
+        "{report}"
+    );
+    assert!(
+        report["warnings"].to_string().contains(
+            "named only as a file that 1 script(s) write: res://scripts/tools/preview_bed_relief.gd"
+        ),
+        "{report}"
+    );
+
+    let deleted = delete(json!({"paths": ["res://previews/bed_relief_preview.tscn"]})).await;
+    assert!(!deleted.is_error, "{}", text(&deleted));
+    assert!(!root.join("previews/bed_relief_preview.tscn").exists());
+    assert!(root.join("scripts/tools/preview_bed_relief.gd").exists());
 }
 
 #[test]
@@ -5711,5 +5927,150 @@ async fn run_script_without_exit_time_leaks_answers_exit_leaks_null() {
             .as_str()
             .is_some_and(|out| out.contains("NOISE_ON_STDOUT")),
         "{answer}"
+    );
+}
+
+#[tokio::test]
+async fn review_assets_is_listed_and_checks_its_request_before_starting_godot() {
+    let review = ToolManager::list_tools()
+        .into_iter()
+        .find(|tool| tool.name == "godot_review_assets")
+        .expect("godot_review_assets is listed");
+    let schema = serde_json::to_value(&review).expect("tool");
+    assert_eq!(schema["annotations"]["readOnlyHint"], false, "{schema}");
+    assert_eq!(schema["annotations"]["destructiveHint"], false, "{schema}");
+    for key in [
+        "assets",
+        "environment",
+        "camera",
+        "planes",
+        "width",
+        "height",
+    ] {
+        assert!(
+            schema["inputSchema"]["properties"].get(key).is_some(),
+            "{key}: {schema}"
+        );
+    }
+    assert_eq!(schema["inputSchema"]["required"], json!(["assets"]));
+
+    let project = project_dir();
+    std::fs::write(project.path().join("rock.tscn"), "").expect("scene");
+    let tools = manager_in(
+        project.path(),
+        PathBuf::from("godot-binary-that-does-not-exist"),
+    );
+    let outside = Arc::clone(&tools)
+        .call_tool(
+            "godot_review_assets",
+            json!({"assets": [{"scene": "res://../rock.tscn"}]}),
+        )
+        .await;
+    assert!(outside.is_error, "{}", text(&outside));
+    assert!(
+        text(&outside).contains("assets[0].scene"),
+        "{}",
+        text(&outside)
+    );
+    let bad_camera = Arc::clone(&tools)
+        .call_tool(
+            "godot_review_assets",
+            json!({"assets": [{"scene": "res://rock.tscn"}], "camera": {"yaw": "left"}}),
+        )
+        .await;
+    assert!(bad_camera.is_error, "{}", text(&bad_camera));
+    assert!(
+        text(&bad_camera).contains("camera.yaw"),
+        "{}",
+        text(&bad_camera)
+    );
+    // A valid request reaches the engine, which is missing here.
+    let no_engine = Arc::clone(&tools)
+        .call_tool(
+            "godot_review_assets",
+            json!({"assets": [{"scene": "res://rock.tscn"}]}),
+        )
+        .await;
+    assert!(no_engine.is_error, "{}", text(&no_engine));
+    assert!(
+        text(&no_engine).contains("GODOT_PATH"),
+        "{}",
+        text(&no_engine)
+    );
+    let names: Vec<String> = std::fs::read_dir(project.path())
+        .expect("project")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert!(
+        !names.iter().any(|name| name.contains("review")),
+        "{names:?}"
+    );
+}
+
+#[tokio::test]
+async fn world_map_is_listed_and_checks_its_request_before_starting_godot() {
+    let map = ToolManager::list_tools()
+        .into_iter()
+        .find(|tool| tool.name == "godot_world_map")
+        .expect("godot_world_map is listed");
+    let schema = serde_json::to_value(&map).expect("tool");
+    assert_eq!(schema["annotations"]["readOnlyHint"], false, "{schema}");
+    assert_eq!(schema["annotations"]["destructiveHint"], false, "{schema}");
+    for key in [
+        "dir",
+        "glob",
+        "recursive",
+        "scenes",
+        "rect",
+        "pixels_per_metre",
+        "view",
+        "labels",
+        "tile_metres",
+    ] {
+        assert!(
+            schema["inputSchema"]["properties"].get(key).is_some(),
+            "{key}: {schema}"
+        );
+    }
+
+    let project = project_dir();
+    std::fs::create_dir_all(project.path().join("zones")).expect("zones");
+    std::fs::write(project.path().join("zones/zone_0_0.tscn"), "").expect("scene");
+    let tools = manager_in(
+        project.path(),
+        PathBuf::from("godot-binary-that-does-not-exist"),
+    );
+    let outside = Arc::clone(&tools)
+        .call_tool("godot_world_map", json!({"dir": "res://../zones"}))
+        .await;
+    assert!(outside.is_error, "{}", text(&outside));
+    assert!(text(&outside).contains("dir:"), "{}", text(&outside));
+    let unmatched = Arc::clone(&tools)
+        .call_tool(
+            "godot_world_map",
+            json!({"dir": "res://zones", "glob": "tile_*.tscn"}),
+        )
+        .await;
+    assert!(unmatched.is_error, "{}", text(&unmatched));
+    assert!(
+        text(&unmatched).contains("matches tile_*.tscn"),
+        "{}",
+        text(&unmatched)
+    );
+    // A valid request reaches the engine, which is missing here.
+    let no_engine = Arc::clone(&tools)
+        .call_tool("godot_world_map", json!({"dir": "res://zones"}))
+        .await;
+    assert!(no_engine.is_error, "{}", text(&no_engine));
+    assert!(
+        text(&no_engine).contains("GODOT_PATH"),
+        "{}",
+        text(&no_engine)
     );
 }

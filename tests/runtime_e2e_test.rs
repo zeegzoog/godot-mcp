@@ -191,6 +191,10 @@ func poke(value: int) -> int:
 func stop_drawing(stopped: bool) -> bool:
     RenderingServer.render_loop_enabled = not stopped
     return stopped
+
+func minimize(minimized: bool) -> bool:
+    DisplayServer.window_set_mode(DisplayServer.WINDOW_MODE_MINIMIZED if minimized else DisplayServer.WINDOW_MODE_WINDOWED)
+    return minimized
 "#,
     )
     .unwrap();
@@ -1991,10 +1995,11 @@ async fn windowed_screenshot_returns_a_sheet_and_a_diff() {
 }
 
 /// A window that stops drawing (covered on macOS, minimized) keeps the last drawn frame in its
-/// viewport texture. The capture must say so instead of returning that frame as current.
+/// viewport texture, and the engine skips drawing altogether. The capture must draw the current
+/// state itself, say so, and stay current: the probe moves its red square every process frame.
 #[tokio::test]
 #[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
-async fn windowed_screenshot_flags_a_window_that_stopped_drawing() {
+async fn windowed_screenshot_draws_a_window_that_stopped_drawing() {
     let _ = IGNORE;
     if !windowed_game_can_open() {
         eprintln!("skipped: a windowed screenshot needs a display server");
@@ -2024,28 +2029,48 @@ async fn windowed_screenshot_flags_a_window_that_stopped_drawing() {
     .await;
     assert!(!fresh.is_error, "{}", text_of(&fresh));
     let note = text_of(&fresh);
-    if covered_window(&tools, &run_id, &note).await {
-        return;
-    }
     assert!(
         note.contains("frames drawn") && !note.contains("STALE"),
+        "{note}"
+    );
+    // A window covered by something outside the test is drawn by the capture as well.
+    assert!(
+        note.contains("path window") || note.contains("path forced_draw"),
         "{note}"
     );
 
     let stop = |stopped: bool| json!({"run_id": run_id, "path": ".", "method": "stop_drawing", "permit": ["stop_drawing"], "args": [stopped]});
     let stopped = call(&tools, "godot_game_call", stop(true)).await;
     assert!(!stopped.is_error, "{}", text_of(&stopped));
-    let stale = call(
+    for _ in 0..2 {
+        let forced = call(
+            &tools,
+            "godot_game_screenshot",
+            json!({"run_id": run_id, "max_dimension": 64}),
+        )
+        .await;
+        assert!(!forced.is_error, "{}", text_of(&forced));
+        let note = text_of(&forced);
+        assert!(
+            note.contains("path forced_draw") && !note.contains("STALE"),
+            "{note}"
+        );
+        assert!(
+            !note.contains("changed 0 px"),
+            "a frame drawn on demand shows the moved square: {note}"
+        );
+    }
+    let sheet = call(
         &tools,
         "godot_game_screenshot",
-        json!({"run_id": run_id, "max_dimension": 64}),
+        json!({"run_id": run_id, "max_dimension": 64, "frames": 2}),
     )
     .await;
-    assert!(!stale.is_error, "{}", text_of(&stale));
-    let note = text_of(&stale);
+    assert!(!sheet.is_error, "{}", text_of(&sheet));
     assert!(
-        note.contains("STALE") && note.contains("Bring the game window to the front"),
-        "{note}"
+        text_of(&sheet).contains("path forced_draw") && !text_of(&sheet).contains("STALE"),
+        "{}",
+        text_of(&sheet)
     );
 
     let resumed = call(&tools, "godot_game_call", stop(false)).await;
@@ -2057,24 +2082,73 @@ async fn windowed_screenshot_flags_a_window_that_stopped_drawing() {
     )
     .await;
     assert!(!again.is_error, "{}", text_of(&again));
-    if covered_window(&tools, &run_id, &text_of(&again)).await {
-        return;
-    }
     assert!(!text_of(&again).contains("STALE"), "{}", text_of(&again));
 
     let ended = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
     assert!(!ended.is_error, "{}", text_of(&ended));
 }
 
-/// The system reports the game window cannot draw (covered or minimized by something outside
-/// the test), so a fresh frame cannot be expected. Stops the run and skips the rest.
-async fn covered_window(tools: &Arc<ToolManager>, run_id: &str, note: &str) -> bool {
-    if !note.contains("The window reports that it cannot draw") {
-        return false;
+/// A minimized window draws nothing (the system reports it cannot draw on macOS and Windows).
+/// The capture still returns the current state, drawn on demand.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn windowed_screenshot_captures_a_minimized_window() {
+    let _ = IGNORE;
+    if !windowed_game_can_open() {
+        eprintln!("skipped: a windowed screenshot needs a display server");
+        return;
     }
-    eprintln!("skipped: the game window cannot draw on this desktop: {note}");
-    let _ = call(tools, "godot_stop_project", json!({"run_id": run_id})).await;
-    true
+    let project = project();
+    let tools = manager(project.path());
+    let started = call(
+        &tools,
+        "godot_run_project",
+        json!({
+            "project_path": project.path(),
+            "scene": "res://scenes/main.tscn",
+            "mode": "process",
+            "headless": false
+        }),
+    )
+    .await;
+    assert!(!started.is_error, "{}", text_of(&started));
+    let run_id = run_id_of(&started);
+    let first = call(
+        &tools,
+        "godot_game_screenshot",
+        json!({"run_id": run_id, "max_dimension": 64}),
+    )
+    .await;
+    assert!(!first.is_error, "{}", text_of(&first));
+
+    let minimize = |minimized: bool| json!({"run_id": run_id, "path": ".", "method": "minimize", "permit": ["minimize"], "args": [minimized]});
+    let minimized = call(&tools, "godot_game_call", minimize(true)).await;
+    assert!(!minimized.is_error, "{}", text_of(&minimized));
+    // The window manager minimizes asynchronously; a few captures make sure one is taken while
+    // the window is down.
+    let mut forced = false;
+    for _ in 0..5 {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let shot = call(
+            &tools,
+            "godot_game_screenshot",
+            json!({"run_id": run_id, "max_dimension": 1152}),
+        )
+        .await;
+        assert!(!shot.is_error, "{}", text_of(&shot));
+        let note = text_of(&shot);
+        assert!(!note.contains("STALE"), "{note}");
+        // Full size, so the square's few pixels of movement between two captures show.
+        assert!(!note.contains("changed 0 px"), "{note}");
+        forced |= note.contains("path forced_draw");
+    }
+    let restored = call(&tools, "godot_game_call", minimize(false)).await;
+    assert!(!restored.is_error, "{}", text_of(&restored));
+    let ended = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!ended.is_error, "{}", text_of(&ended));
+    if !forced {
+        eprintln!("skipped: this window manager kept drawing the minimized window");
+    }
 }
 
 /// A window larger than the viewport, so content scale is not 1. Touch positions must arrive
@@ -2227,13 +2301,18 @@ func _process(_delta: float) -> void:
 
 func _physics_process(_delta: float) -> void:
     physics_ticks += 1
+    queue_redraw()
     trace.append([physics_ticks, Input.is_key_pressed(KEY_SPACE), Input.is_action_just_pressed("ui_accept")])
 
 func _draw() -> void:
-    draw_rect(Rect2(float(process_frames % 20) * 40.0, 8, 24, 24), Color(1, 0, 0))
+    draw_rect(Rect2(float((process_frames + physics_ticks) % 20) * 40.0, 8, 24, 24), Color(1, 0, 0))
 
 func set_tick_rate(rate: int) -> void:
     Engine.physics_ticks_per_second = rate
+
+func stop_drawing(stopped: bool) -> bool:
+    RenderingServer.render_loop_enabled = not stopped
+    return stopped
 
 func trace_log() -> Array:
     return trace
@@ -2897,6 +2976,38 @@ async fn held_windowed_game_captures_the_last_drawn_frame() {
         !text_of(&third).contains("changed 0 px"),
         "three held ticks changed nothing on screen: {}",
         text_of(&third)
+    );
+
+    // A window that stops drawing while the game is held: a step draws nothing, so the capture
+    // draws the held state itself.
+    let stop = json!({"run_id": run_id, "path": ".", "method": "stop_drawing", "permit": ["stop_drawing"], "args": [true]});
+    let no_draw = call(&tools, "godot_game_call", stop).await;
+    assert!(!no_draw.is_error, "{}", text_of(&no_draw));
+    let unchanged = call(
+        &tools,
+        "godot_game_screenshot",
+        json!({"run_id": run_id, "max_dimension": 128}),
+    )
+    .await;
+    assert!(!unchanged.is_error, "{}", text_of(&unchanged));
+    assert!(
+        text_of(&unchanged).contains("changed 0 px") && text_of(&unchanged).contains("path held"),
+        "no step, so the held frame is current: {}",
+        text_of(&unchanged)
+    );
+    let stepped = held_step(&tools, &run_id, json!({"ticks": 3})).await;
+    assert!(!stepped.is_error, "{}", text_of(&stepped));
+    let drawn = call(
+        &tools,
+        "godot_game_screenshot",
+        json!({"run_id": run_id, "max_dimension": 128}),
+    )
+    .await;
+    assert!(!drawn.is_error, "{}", text_of(&drawn));
+    assert!(
+        !text_of(&drawn).contains("changed 0 px") && text_of(&drawn).contains("path forced_draw"),
+        "three held ticks with the window not drawing: {}",
+        text_of(&drawn)
     );
 
     let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
@@ -6198,6 +6309,87 @@ async fn run_script_writes_back_the_uid_of_a_rewritten_binary_scene() {
     );
 }
 
+/// A tool script that builds new scenes and resources headless leaves them without uids; the
+/// server writes new ones back. The project's uid cache must learn them too, or the next script
+/// that loads the scenes prints an "invalid UID" warning for every ext_resource.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn run_script_records_new_uids_in_the_uid_cache() {
+    let dir = tempfile::tempdir().expect("project dir");
+    let root = dir.path();
+    std::fs::write(
+        root.join("project.godot"),
+        "config_version=5\n\n[application]\n\nconfig/name=\"Uid cache\"\n",
+    )
+    .expect("project.godot");
+    std::fs::create_dir_all(root.join("tools")).expect("tools dir");
+    std::fs::create_dir_all(root.join("zones")).expect("zones dir");
+    std::fs::write(
+        root.join("zones/seed.tres"),
+        "[gd_resource type=\"BoxMesh\" format=3 uid=\"uid://bseedmesh01\"]\n\n[resource]\n",
+    )
+    .expect("seed.tres");
+    // The editor's first scan writes .godot/uid_cache.bin, as in any project opened once.
+    let imported = std::process::Command::new(godot_path())
+        .args(["--headless", "--path"])
+        .arg(root)
+        .arg("--import")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("godot --import");
+    assert!(imported.status.success(), "{imported:?}");
+    assert!(root.join(".godot/uid_cache.bin").is_file(), "uid cache");
+    let save = |name: &str, source: &str| {
+        std::fs::write(root.join("tools").join(name), source).expect("script");
+    };
+    save(
+        "build.gd",
+        "extends SceneTree\n\nfunc _init() -> void:\n\tfor index in 3:\n\t\tvar mesh := BoxMesh.new()\n\t\tvar mesh_path := \"res://zones/mesh_%d.res\" % index\n\t\tResourceSaver.save(mesh, mesh_path)\n\t\tvar material := StandardMaterial3D.new()\n\t\tvar material_path := \"res://zones/material_%d.tres\" % index\n\t\tResourceSaver.save(material, material_path)\n\t\tvar root := Node3D.new()\n\t\troot.name = \"Zone\"\n\t\tvar body := MeshInstance3D.new()\n\t\tbody.mesh = load(mesh_path)\n\t\tbody.material_override = load(material_path)\n\t\troot.add_child(body)\n\t\tbody.owner = root\n\t\tvar scene := PackedScene.new()\n\t\tscene.pack(root)\n\t\tResourceSaver.save(scene, \"res://zones/zone_%d.tscn\" % index)\n\t\troot.free()\n\tquit()\n",
+    );
+    save(
+        "load.gd",
+        "extends SceneTree\n\nfunc _init() -> void:\n\tfor index in 3:\n\t\tvar zone: Node = (load(\"res://zones/zone_%d.tscn\" % index) as PackedScene).instantiate()\n\t\tprint(\"ZONE_CHILDREN=\", zone.get_child_count())\n\t\tzone.free()\n\tquit()\n",
+    );
+    let tools = manager(root);
+    let run = |script: &'static str| {
+        let tools = Arc::clone(&tools);
+        let root = root.to_path_buf();
+        async move {
+            let result = call(
+                &tools,
+                "godot_run_script",
+                json!({"script": script, "project_path": root, "timeout_seconds": 60}),
+            )
+            .await;
+            let text = text_of(&result);
+            assert!(!result.is_error, "{text}");
+            serde_json::from_str::<Value>(&text[text.find('{').expect("json")..]).expect("JSON")
+        }
+    };
+    let built = run("res://tools/build.gd").await;
+    let new_uids = built["resource_repairs"]
+        .as_array()
+        .expect("repairs")
+        .iter()
+        .filter(|item| item["new_uid"] == true)
+        .count();
+    assert_eq!(new_uids, 9, "{built}");
+
+    let loaded = run("res://tools/load.gd").await;
+    let output = format!(
+        "{}{}",
+        loaded["stdout"].as_str().unwrap_or_default(),
+        loaded["stderr"].as_str().unwrap_or_default()
+    );
+    assert_eq!(output.matches("ZONE_CHILDREN=1").count(), 3, "{loaded}");
+    assert!(!output.contains("invalid UID"), "{output}");
+    assert_eq!(built["uid_cache"]["recorded"], 9, "{built}");
+    assert!(
+        built.get("uid_cache_stale").is_none_or(Value::is_null),
+        "{built}"
+    );
+}
+
 /// A small 3D level: a ground slab with its top at y = 0, a bank box on collision layer 2 with
 /// its top at y = 2 over x 4..6, z -1..1, a frog sphere standing at the origin, a camera at
 /// (0, 6, 8) looking at the origin, and a red marker at x = 30 that the camera cannot see.
@@ -6462,7 +6654,9 @@ fn aim_of(note: &str) -> Value {
 }
 
 fn baseline_changed(note: &str) -> u64 {
-    note.split_once(", baseline plain changed ")
+    // Any baseline name: "..., baseline <name> changed <n> px, ...".
+    note.split_once(", baseline ")
+        .and_then(|(_, rest)| rest.split_once(" changed "))
         .and_then(|(_, rest)| rest.split(' ').next())
         .and_then(|number| number.parse().ok())
         .unwrap_or_else(|| panic!("no baseline comparison in {note}"))
@@ -6493,7 +6687,9 @@ async fn an_aimed_screenshot_looks_at_a_point_and_leaves_the_game_camera_alone()
     let plain = shot(json!({"save_baseline": "plain"})).await;
     assert!(!plain.is_error, "{}", text_of(&plain));
 
-    let aimed = shot(json!({"baseline": "plain", "aim": {"at": [30, 2, 0]}})).await;
+    let aimed =
+        shot(json!({"baseline": "plain", "save_baseline": "aimed", "aim": {"at": [30, 2, 0]}}))
+            .await;
     assert!(!aimed.is_error, "{}", text_of(&aimed));
     let note = text_of(&aimed);
     assert!(
@@ -6509,6 +6705,9 @@ async fn an_aimed_screenshot_looks_at_a_point_and_leaves_the_game_camera_alone()
     assert!(close(&aim["position"][0], 30.0), "{aim}");
     assert!(close(&aim["position"][1], 2.0 + 0.6 * 9.4), "{aim}");
     assert!(close(&aim["position"][2], 0.8 * 9.4), "{aim}");
+    assert_eq!(aim["projection"], "perspective", "{aim}");
+    assert_eq!(aim["lens_from"], "game_camera", "{aim}");
+    assert!(close(&aim["fov"], 75.0), "{aim}");
 
     let given = shot(json!({"aim": {"at": [30, 2, 0], "distance": 20}})).await;
     assert!(!given.is_error, "{}", text_of(&given));
@@ -6522,6 +6721,59 @@ async fn an_aimed_screenshot_looks_at_a_point_and_leaves_the_game_camera_alone()
     assert_eq!(placed_aim["mode"], "look_at", "{placed_aim}");
     assert!(close(&placed_aim["forward"][2], -1.0), "{placed_aim}");
 
+    // A wide orthographic overview from the same copy, without touching the game camera.
+    let wide = shot(json!({"baseline": "aimed", "aim": {"at": [30, 2, 0], "size": 60}})).await;
+    assert!(!wide.is_error, "{}", text_of(&wide));
+    let wide_aim = aim_of(&text_of(&wide));
+    assert_eq!(wide_aim["projection"], "orthogonal", "{wide_aim}");
+    assert_eq!(wide_aim["projection_replaced"], "perspective", "{wide_aim}");
+    assert_eq!(wide_aim["lens_from"], "given", "{wide_aim}");
+    assert_eq!(wide_aim["aspect_axis"], "height", "{wide_aim}");
+    assert!(close(&wide_aim["size"], 60.0), "{wide_aim}");
+    assert!(wide_aim.get("fov").is_none(), "{wide_aim}");
+    assert!(
+        baseline_changed(&text_of(&wide)) > 500,
+        "the overview looks like the plain aimed shot: {}",
+        text_of(&wide)
+    );
+    let narrow = shot(json!({"baseline": "aimed", "aim": {"at": [30, 2, 0], "fov": 20}})).await;
+    assert!(!narrow.is_error, "{}", text_of(&narrow));
+    let narrow_aim = aim_of(&text_of(&narrow));
+    assert_eq!(narrow_aim["projection"], "perspective", "{narrow_aim}");
+    assert_eq!(narrow_aim["lens_from"], "given", "{narrow_aim}");
+    assert!(
+        narrow_aim.get("projection_replaced").is_none(),
+        "{narrow_aim}"
+    );
+    assert!(close(&narrow_aim["fov"], 20.0), "{narrow_aim}");
+    assert!(
+        baseline_changed(&text_of(&narrow)) > 500,
+        "a 20 degree view looks like the 75 degree one: {}",
+        text_of(&narrow)
+    );
+    for (lens, expected) in [
+        (json!({"size": 0}), "aim.size"),
+        (json!({"size": 20000}), "10000"),
+        (json!({"size": "wide"}), "aim.size"),
+        (json!({"fov": 0.5}), "aim.fov"),
+        (json!({"fov": 180}), "179"),
+        (json!({"size": 10, "fov": 30}), "not both"),
+    ] {
+        let mut aim = json!({"at": [30, 2, 0]});
+        if let (Some(base), Some(more)) = (aim.as_object_mut(), lens.as_object()) {
+            for (key, value) in more {
+                base.insert(key.clone(), value.clone());
+            }
+        }
+        let refused = shot(json!({"aim": aim})).await;
+        assert!(refused.is_error, "{lens}: {}", text_of(&refused));
+        assert!(
+            text_of(&refused).contains(expected),
+            "{lens}: {}",
+            text_of(&refused)
+        );
+    }
+
     let wrong = shot(json!({"aim": {"at": [1, 2]}})).await;
     assert!(wrong.is_error, "{}", text_of(&wrong));
     let both = shot(json!({"aim": {"at": [1, 2, 3], "look_at": [0, 0, 0]}})).await;
@@ -6532,11 +6784,13 @@ async fn an_aimed_screenshot_looks_at_a_point_and_leaves_the_game_camera_alone()
         &call(
             &tools,
             "godot_game_get",
-            json!({"run_id": run_id, "path": "Rig/Camera", "properties": ["current", "global_position"]}),
+            json!({"run_id": run_id, "path": "Rig/Camera", "properties": ["current", "global_position", "projection", "fov"]}),
         )
         .await,
     );
     assert_eq!(camera["properties"]["current"], true, "{camera}");
+    assert_eq!(camera["properties"]["projection"], 0, "{camera}");
+    assert!(close(&camera["properties"]["fov"], 75.0), "{camera}");
     assert!(
         close(&camera["properties"]["global_position"][1], 6.0),
         "{camera}"
@@ -6705,5 +6959,663 @@ void fragment() { ALBEDO = vec3(1.0, 0.0, 0.0); ALPHA = opacity; }
         baseline_changed(&text_of(&aimed)) < 50,
         "the aimed image lost instance-shaded geometry: {}",
         text_of(&aimed)
+    );
+}
+
+/// Two box scenes, a sphere, and a level with an environment, a sun and an orthogonal camera.
+fn review_project() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("project");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("kit")).unwrap();
+    std::fs::write(
+        root.join("project.godot"),
+        "config_version=5\n\n[application]\n\nconfig/name=\"ReviewProbe\"\nconfig/features=PackedStringArray(\"4.5\")\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("kit/box.tscn"),
+        "[gd_scene load_steps=2 format=3]\n\n[sub_resource type=\"BoxMesh\" id=\"1\"]\nsize = Vector3(2, 3, 1)\n\n[node name=\"Box\" type=\"Node3D\"]\n\n[node name=\"Mesh\" type=\"MeshInstance3D\" parent=\".\"]\ntransform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1.5, 0)\nmesh = SubResource(\"1\")\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("kit/ball.tscn"),
+        "[gd_scene load_steps=2 format=3]\n\n[sub_resource type=\"SphereMesh\" id=\"1\"]\n\n[node name=\"Ball\" type=\"MeshInstance3D\"]\ntransform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.5, 0)\nmesh = SubResource(\"1\")\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("level.tscn"),
+        "[gd_scene load_steps=2 format=3]\n\n[sub_resource type=\"Environment\" id=\"1\"]\nbackground_mode = 1\nbackground_color = Color(0.2, 0.3, 0.5, 1)\n\n[node name=\"Level\" type=\"Node3D\"]\n\n[node name=\"WorldEnvironment\" type=\"WorldEnvironment\" parent=\".\"]\nenvironment = SubResource(\"1\")\n\n[node name=\"Sun\" type=\"DirectionalLight3D\" parent=\".\"]\ntransform = Transform3D(1, 0, 0, 0, 0.5, 0.866, 0, -0.866, 0.5, 0, 10, 0)\nshadow_enabled = true\n\n[node name=\"Player\" type=\"Node3D\" parent=\".\"]\n\n[node name=\"Camera\" type=\"Camera3D\" parent=\"Player\"]\ntransform = Transform3D(1, 0, 0, 0, 0.7071, 0.7071, 0, -0.7071, 0.7071, 0, 10, 10)\nprojection = 1\nsize = 12.0\ncurrent = true\n",
+    )
+    .unwrap();
+    dir
+}
+
+/// Every file under `root` except the engine's `.godot` cache, as sorted relative paths.
+fn project_files(root: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).expect("dir").flatten() {
+            let path = entry.path();
+            if path.file_name().is_some_and(|name| name == ".godot") {
+                continue;
+            }
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                found.push(path.strip_prefix(root).unwrap().display().to_string());
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Width and height of the PNG image in a tool answer, read from its IHDR chunk.
+fn answer_png_size(result: &ToolResult) -> Option<(u32, u32)> {
+    let data = result.content.iter().find_map(|item| match item {
+        godot_mcp::protocol::ToolContent::Image { data, mime_type } if mime_type == "image/png" => {
+            Some(data.as_str())
+        }
+        _ => None,
+    })?;
+    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut bytes = Vec::new();
+    for chunk in data.as_bytes()[..32].chunks(4) {
+        let mut triple = 0u32;
+        for &symbol in chunk {
+            triple = (triple << 6) | alphabet.iter().position(|&c| c == symbol)? as u32;
+        }
+        bytes.extend_from_slice(&triple.to_be_bytes()[1..]);
+    }
+    png_size(&bytes)
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn review_assets_renders_a_row_with_counts_and_bounds_and_leaves_the_project_alone() {
+    if !windowed_game_can_open() {
+        eprintln!("skipped: the asset review renders in a window and needs a display server");
+        return;
+    }
+    let project = review_project();
+    let before = project_files(project.path());
+    let tools = manager(project.path());
+
+    let row = call(
+        &tools,
+        "godot_review_assets",
+        json!({
+            "assets": [
+                {"scene": "res://kit/box.tscn"},
+                {"scene": "res://kit/ball.tscn"},
+                {"scene": "res://kit/box.tscn", "rotation": [0, 90, 0]}
+            ],
+            "gap": 1,
+            "environment": {"scene": "res://level.tscn"},
+            "planes": [{"kind": "water", "height": 0.2}],
+            "width": 320,
+            "height": 180
+        }),
+    )
+    .await;
+    assert!(!row.is_error, "{}", text_of(&row));
+    assert_eq!(answer_png_size(&row), Some((320, 180)));
+    let answer = json_of(&row);
+    let assets = answer["assets"].as_array().expect("assets");
+    assert_eq!(assets.len(), 3, "{answer}");
+    assert_eq!(assets[0]["triangles"], 12, "{answer}");
+    assert_eq!(assets[0]["mesh_instances"], 1, "{answer}");
+    assert!(json_number(&assets[1]["triangles"]) > 100.0, "{answer}");
+    for asset in assets {
+        assert!(
+            json_number(&asset["rendered"]["draw_calls"]) >= 1.0,
+            "{asset}"
+        );
+        assert!(
+            json_number(&asset["rendered"]["primitives"]) >= 12.0,
+            "{asset}"
+        );
+    }
+    // A row along X, 1 m apart, centred: box 2 wide, ball 1, the turned box 1.
+    let min_x = |index: usize| json_number(&assets[index]["bounds"]["min"][0]);
+    let max_x = |index: usize| json_number(&assets[index]["bounds"]["max"][0]);
+    assert!((min_x(1) - max_x(0) - 1.0).abs() < 0.01, "{answer}");
+    assert!((min_x(2) - max_x(1) - 1.0).abs() < 0.01, "{answer}");
+    assert!((min_x(0) + max_x(2)).abs() < 0.01, "{answer}");
+    assert!(
+        (json_number(&assets[0]["bounds"]["min"][1])).abs() < 0.01,
+        "{answer}"
+    );
+    assert!(
+        (json_number(&assets[0]["bounds"]["max"][1]) - 3.0).abs() < 0.01,
+        "{answer}"
+    );
+    assert_eq!(
+        answer["totals"]["triangles"],
+        json_number(&assets[1]["triangles"]) as i64 + 24
+    );
+    assert!(
+        json_number(&answer["totals"]["rendered"]["draw_calls"]) >= 4.0,
+        "the frame has three assets and the water: {answer}"
+    );
+    assert_eq!(answer["camera"]["projection"], "orthogonal", "{answer}");
+    assert_eq!(answer["warnings"], json!([]), "{answer}");
+
+    let copied = call(
+        &tools,
+        "godot_review_assets",
+        json!({
+            "assets": [{"scene": "res://kit/box.tscn", "position": [5, 0, 5]}],
+            "camera": {"scene": "res://level.tscn", "node": "Player/Camera"},
+            "width": 200,
+            "height": 100
+        }),
+    )
+    .await;
+    assert!(!copied.is_error, "{}", text_of(&copied));
+    let answer = json_of(&copied);
+    assert_eq!(
+        answer["camera"]["size"], 12.0,
+        "the copied size is kept: {answer}"
+    );
+    assert!(
+        (json_number(&answer["camera"]["pitch"]) + 45.0).abs() < 0.1,
+        "{answer}"
+    );
+    assert_eq!(answer["assets"][0]["position"], json!([5.0, 0.0, 5.0]));
+
+    let perspective = call(
+        &tools,
+        "godot_review_assets",
+        json!({
+            "assets": [{"scene": "res://kit/ball.tscn"}],
+            "camera": {"projection": "perspective", "fov": 40, "yaw": 0, "pitch": 0},
+            "width": 64,
+            "height": 64
+        }),
+    )
+    .await;
+    assert!(!perspective.is_error, "{}", text_of(&perspective));
+    let answer = json_of(&perspective);
+    assert_eq!(answer["camera"]["projection"], "perspective", "{answer}");
+    let distance = json_number(&answer["camera"]["position"][2]);
+    assert!(
+        distance > 1.0 && distance < 4.0,
+        "fitted to a 1 m ball: {answer}"
+    );
+
+    let missing = call(
+        &tools,
+        "godot_review_assets",
+        json!({"assets": [{"scene": "res://kit/box.tscn"}], "camera": {"scene": "res://level.tscn", "node": "Nowhere"}}),
+    )
+    .await;
+    assert!(missing.is_error, "{}", text_of(&missing));
+    assert!(
+        text_of(&missing).contains("no Camera3D at Nowhere"),
+        "{}",
+        text_of(&missing)
+    );
+
+    assert_eq!(
+        project_files(project.path()),
+        before,
+        "the review wrote into the project"
+    );
+}
+
+/// A 2 x 2 grid of 20 m zones: two with ground (a box body and its mesh, one with a nested rock
+/// scene), one with lake dressing only, one with nothing to draw, and a file that does not load.
+fn world_map_project() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("project");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("zones")).unwrap();
+    std::fs::create_dir_all(root.join("props")).unwrap();
+    std::fs::write(
+        root.join("project.godot"),
+        // Compatibility, as the project the blank-PNG report came from: it leaves alpha 0 in a
+        // viewport's target.
+        "config_version=5\n\n[application]\n\nconfig/name=\"WorldMapProbe\"\nconfig/features=PackedStringArray(\"4.5\")\n\n[rendering]\n\nrenderer/rendering_method=\"gl_compatibility\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("props/rock.tscn"),
+        "[gd_scene load_steps=2 format=3]\n\n[sub_resource type=\"SphereMesh\" id=\"1\"]\n\n[node name=\"Rock\" type=\"MeshInstance3D\"]\nmesh = SubResource(\"1\")\n",
+    )
+    .unwrap();
+    let ground = |name: &str, x: i32, z: i32, rock: bool, color: &str| {
+        let (steps, external, nested) = if rock {
+            (
+                5,
+                "[ext_resource type=\"PackedScene\" path=\"res://props/rock.tscn\" id=\"rock\"]\n\n",
+                "\n[node name=\"Rock\" parent=\".\" instance=ExtResource(\"rock\")]\ntransform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 2, 1, 2)\n",
+            )
+        } else {
+            (4, "", "")
+        };
+        format!(
+            "[gd_scene load_steps={steps} format=3]\n\n{external}[sub_resource type=\"BoxShape3D\" id=\"1\"]\nsize = Vector3(20, 1, 20)\n\n[sub_resource type=\"StandardMaterial3D\" id=\"3\"]\nalbedo_color = Color({color}, 1)\n\n[sub_resource type=\"BoxMesh\" id=\"2\"]\nmaterial = SubResource(\"3\")\nsize = Vector3(20, 1, 20)\n\n[node name=\"{name}\" type=\"Node3D\"]\ntransform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, {x}, 0, {z})\n\n[node name=\"Ground\" type=\"StaticBody3D\" parent=\".\"]\n\n[node name=\"Shape\" type=\"CollisionShape3D\" parent=\"Ground\"]\nshape = SubResource(\"1\")\n\n[node name=\"Mesh\" type=\"MeshInstance3D\" parent=\"Ground\"]\nmesh = SubResource(\"2\")\n{nested}"
+        )
+    };
+    std::fs::write(
+        root.join("zones/zone_0_0.tscn"),
+        ground("Zone00", 0, 0, true, "0.8, 0.15, 0.1"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("zones/zone_1_0.tscn"),
+        ground("Zone10", 20, 0, false, "0.1, 0.25, 0.85"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("zones/zone_0_1.tscn"),
+        "[gd_scene load_steps=2 format=3]\n\n[sub_resource type=\"PlaneMesh\" id=\"1\"]\nsize = Vector2(20, 20)\n\n[node name=\"Zone01\" type=\"Node3D\"]\ntransform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 20)\n\n[node name=\"Water\" type=\"MeshInstance3D\" parent=\".\"]\nmesh = SubResource(\"1\")\n\n[node name=\"Reeds\" type=\"Node3D\" parent=\".\"]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("zones/zone_1_1.tscn"),
+        "[gd_scene format=3]\n\n[node name=\"Zone11\" type=\"Node3D\"]\ntransform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 20, 0, 20)\n\n[node name=\"Marker\" type=\"Node3D\" parent=\".\"]\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("zones/zone_9_9.tscn"), "not a scene\n").unwrap();
+    dir
+}
+
+/// Every file under `root` except the engine's `.godot` cache and the `.maps` folder the
+/// test asks the map to be written to, as sorted relative paths.
+fn world_map_project_files(root: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).expect("dir").flatten() {
+            let path = entry.path();
+            if path
+                .file_name()
+                .is_some_and(|name| name == ".godot" || name == ".maps")
+            {
+                continue;
+            }
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                found.push(path.strip_prefix(root).unwrap().display().to_string());
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Compares a saved map PNG with an inline preview in a headless Godot: the PNG's colour type
+/// (2 is RGB, so opaque), the mean difference per channel once the PNG is scaled to the preview's
+/// size, and the PNG's spread of brightness, which a blank picture lacks.
+fn compare_map_with_preview(png: &Path, preview: &[u8]) -> Value {
+    let dir = tempfile::tempdir().expect("scratch");
+    let preview_file = dir.path().join("preview.jpg");
+    std::fs::write(&preview_file, preview).expect("preview");
+    let script = dir.path().join("compare.gd");
+    std::fs::write(
+        &script,
+        "extends SceneTree\n\nfunc _initialize() -> void:\n\tvar args: PackedStringArray = OS.get_cmdline_user_args()\n\tvar map: Image = Image.load_from_file(args[0])\n\tvar preview: Image = Image.load_from_file(args[1])\n\tmap.convert(Image.FORMAT_RGBA8)\n\tpreview.convert(Image.FORMAT_RGBA8)\n\tvar min_alpha: float = 1.0\n\tfor y: int in range(0, map.get_height(), 7):\n\t\tfor x: int in range(0, map.get_width(), 7):\n\t\t\tmin_alpha = minf(min_alpha, map.get_pixel(x, y).a)\n\tmap.resize(preview.get_width(), preview.get_height(), Image.INTERPOLATE_CUBIC)\n\tvar diff: float = 0.0\n\tvar low: float = 1.0\n\tvar high: float = 0.0\n\tvar count: int = 0\n\tfor y: int in preview.get_height():\n\t\tfor x: int in preview.get_width():\n\t\t\tvar a: Color = map.get_pixel(x, y)\n\t\t\tvar b: Color = preview.get_pixel(x, y)\n\t\t\tdiff += (absf(a.r - b.r) + absf(a.g - b.g) + absf(a.b - b.b)) / 3.0\n\t\t\tlow = minf(low, a.get_luminance())\n\t\t\thigh = maxf(high, a.get_luminance())\n\t\t\tcount += 1\n\tprint(\"WORLD_MAP_COMPARE=\", JSON.stringify({\"min_alpha\": min_alpha, \"mean_diff\": diff / count, \"spread\": high - low}))\n\tquit()\n",
+    )
+    .expect("script");
+    let output = std::process::Command::new(godot_path())
+        .arg("--headless")
+        .arg("-s")
+        .arg(&script)
+        .arg("--")
+        .arg(png)
+        .arg(&preview_file)
+        .output()
+        .expect("run Godot");
+    let text = String::from_utf8_lossy(&output.stdout);
+    let line = text
+        .lines()
+        .find_map(|line| line.strip_prefix("WORLD_MAP_COMPARE="))
+        .unwrap_or_else(|| panic!("no comparison: {text}"));
+    let mut answer: Value = serde_json::from_str(line).expect("comparison JSON");
+    let bytes = std::fs::read(png).expect("png");
+    answer["colour_type"] = json!(bytes.get(25).copied());
+    answer
+}
+
+/// The mean colour of each tile of a PNG cut into side x side equal squares, read in a headless
+/// Godot, row by row from the top left.
+fn tile_means(png: &Path, side: u32) -> Vec<[f64; 3]> {
+    let dir = tempfile::tempdir().expect("scratch");
+    let script = dir.path().join("tiles.gd");
+    std::fs::write(
+        &script,
+        "extends SceneTree\n\nfunc _initialize() -> void:\n\tvar args: PackedStringArray = OS.get_cmdline_user_args()\n\tvar map: Image = Image.load_from_file(args[0])\n\tvar side: int = int(args[1])\n\tvar size: Vector2i = map.get_size() / side\n\tvar means: Array = []\n\tfor row: int in side:\n\t\tfor column: int in side:\n\t\t\tvar sum: Color = Color(0, 0, 0, 0)\n\t\t\tfor y: int in size.y:\n\t\t\t\tfor x: int in size.x:\n\t\t\t\t\tsum += map.get_pixel(column * size.x + x, row * size.y + y)\n\t\t\tvar count: float = float(size.x * size.y)\n\t\t\tmeans.append([sum.r / count, sum.g / count, sum.b / count])\n\tprint(\"WORLD_MAP_TILES=\", JSON.stringify(means))\n\tquit()\n",
+    )
+    .expect("script");
+    let output = std::process::Command::new(godot_path())
+        .arg("--headless")
+        .arg("-s")
+        .arg(&script)
+        .arg("--")
+        .arg(png)
+        .arg(side.to_string())
+        .output()
+        .expect("run Godot");
+    let text = String::from_utf8_lossy(&output.stdout);
+    let line = text
+        .lines()
+        .find_map(|line| line.strip_prefix("WORLD_MAP_TILES="))
+        .unwrap_or_else(|| panic!("no tile means: {text}"));
+    serde_json::from_str(line).expect("tile means JSON")
+}
+
+/// The inline image of a tool answer, decoded from base64, with its media type.
+fn world_map_image(result: &ToolResult) -> (Vec<u8>, String) {
+    let data = result
+        .content
+        .iter()
+        .find_map(|item| match item {
+            godot_mcp::protocol::ToolContent::Image { data, mime_type } => {
+                Some((data.as_str(), mime_type.clone()))
+            }
+            _ => None,
+        })
+        .expect("an image in the answer");
+    let (data, mime_type) = data;
+    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut bytes = Vec::new();
+    for chunk in data.trim_end_matches('=').as_bytes().chunks(4) {
+        let mut bits = 0u32;
+        for &symbol in chunk {
+            bits = (bits << 6) | alphabet.iter().position(|&c| c == symbol).expect("base64") as u32;
+        }
+        bits <<= 6 * (4 - chunk.len() as u32);
+        bytes.extend_from_slice(&bits.to_be_bytes()[1..chunk.len()]);
+    }
+    (bytes, mime_type)
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn world_map_draws_zones_and_names_the_ones_without_ground() {
+    if !windowed_game_can_open() {
+        eprintln!("skipped: the world map renders in a window and needs a display server");
+        return;
+    }
+    let project = world_map_project();
+    let tools = manager(project.path());
+    // The first run imports the scenes' sidecars; compare the project after it.
+    let map = call(
+        &tools,
+        "godot_world_map",
+        json!({
+            "dir": "res://zones",
+            "glob": "zone_*.tscn",
+            "pixels_per_metre": 8,
+            "detail": "scenes",
+            "output_path": "res://.maps/zones.png"
+        }),
+    )
+    .await;
+    assert!(!map.is_error, "{}", text_of(&map));
+    assert!(
+        map.content
+            .iter()
+            .all(|item| matches!(item, godot_mcp::protocol::ToolContent::Text { .. })),
+        "with output_path the reply carries paths, not a picture"
+    );
+    let reply = text_of(&map);
+    assert!(
+        reply.trim_start().starts_with("{\n  \"totals\""),
+        "totals come first: {reply}"
+    );
+    let png = std::fs::read(project.path().join(".maps/zones.png")).expect("the map PNG");
+    let written: Value = serde_json::from_str(
+        &std::fs::read_to_string(project.path().join(".maps/zones.json")).expect("the map JSON"),
+    )
+    .expect("the written JSON parses");
+    assert_eq!(written["scenes"].as_array().map(Vec::len), Some(5));
+    // The same map inline: the saved PNG must be opaque and show what the preview shows.
+    let inline = call(
+        &tools,
+        "godot_world_map",
+        json!({"dir": "res://zones", "glob": "zone_*.tscn", "pixels_per_metre": 8}),
+    )
+    .await;
+    assert!(!inline.is_error, "{}", text_of(&inline));
+    let (preview, _) = world_map_image(&inline);
+    let compared = compare_map_with_preview(&project.path().join(".maps/zones.png"), &preview);
+    assert_eq!(compared["colour_type"], 2, "an RGB PNG: {compared}");
+    assert_eq!(compared["min_alpha"], 1.0, "{compared}");
+    assert!(
+        json_number(&compared["spread"]) > 0.2,
+        "the map is not one colour: {compared}"
+    );
+    assert!(
+        json_number(&compared["mean_diff"]) < 0.06,
+        "the PNG matches the preview: {compared}"
+    );
+    if let Ok(out) = std::env::var("WORLD_MAP_PNG_OUT") {
+        std::fs::write(out, &png).expect("save the map");
+    }
+    let answer = json_of(&map);
+    // Geometry spans x and z from -10 to 30, plus a 1 m margin on each side, at 8 px/m.
+    assert_eq!(png_size(&png), Some((336, 336)), "{answer}");
+    assert_eq!(answer["image"]["width"], 336, "{answer}");
+    assert_eq!(answer["image"]["rect"], json!([-11.0, -11.0, 31.0, 31.0]));
+    assert_eq!(answer["image"]["up"], "-Z");
+    assert_eq!(answer["image"]["preview"], json!([336, 336]));
+    assert_eq!(answer["files"]["png"], "res://.maps/zones.png", "{answer}");
+    assert_eq!(
+        answer["totals"],
+        json!({"scenes": 5, "no_collision": 2, "no_geometry": 1, "failed": 1}),
+        "{answer}"
+    );
+    let scenes = answer["scenes"].as_array().expect("scenes");
+    let scene = |name: &str| {
+        scenes
+            .iter()
+            .find(|scene| scene["scene"] == format!("res://zones/{name}.tscn"))
+            .unwrap_or_else(|| panic!("{name}: {answer}"))
+    };
+    let first = scene("zone_0_0");
+    assert_eq!(first["root"]["name"], "Zone00", "{first}");
+    assert_eq!(first["top_level"], json!(["Ground", "Rock"]), "{first}");
+    assert_eq!(first["mesh_instances"], 2, "{first}");
+    assert_eq!(first["collision_objects"], 1, "{first}");
+    assert_eq!(first["collision_shapes"], 1, "{first}");
+    assert_eq!(first["collision_layers"], json!([1]), "{first}");
+    assert_eq!(first["instanced_scenes"], 1, "{first}");
+    assert_eq!(first["has_collision"], true, "{first}");
+    assert_eq!(
+        first["collision_bounds"]["min"],
+        json!([-10.0, -0.5, -10.0]),
+        "{first}"
+    );
+    let second = scene("zone_1_0");
+    assert_eq!(second["root"]["position"], json!([20.0, 0.0, 0.0]));
+    assert_eq!(second["bounds"]["min"][0], 10.0, "{second}");
+    let lake = scene("zone_0_1");
+    assert_eq!(lake["has_geometry"], true, "{lake}");
+    assert_eq!(lake["has_collision"], false, "{lake}");
+    assert_eq!(lake["collision_bounds"], Value::Null, "{lake}");
+    let empty = scene("zone_1_1");
+    assert_eq!(empty["has_geometry"], false, "{empty}");
+    assert_eq!(empty["bounds"], Value::Null, "{empty}");
+    assert!(scene("zone_9_9")["error"].as_str().is_some(), "{answer}");
+    let problems = answer["problems"].to_string();
+    for expected in [
+        "zone_0_1.tscn: no collision (visible geometry only)",
+        "zone_1_1.tscn: no collision and no visible geometry",
+        "zone_9_9.tscn:",
+    ] {
+        assert!(problems.contains(expected), "{expected}: {problems}");
+    }
+    assert!(!problems.contains("zone_0_0"), "{problems}");
+    let before = world_map_project_files(project.path());
+
+    // Small tiles: the map is the same size, built from 16 tiles of at most four zones each.
+    let collision = call(
+        &tools,
+        "godot_world_map",
+        json!({
+            "scenes": ["res://zones/zone_0_0.tscn", "res://zones/zone_1_0.tscn", "res://zones/zone_0_1.tscn"],
+            "rect": [-10, -10, 30, 30],
+            "pixels_per_metre": 4,
+            "tile_metres": 10,
+            "view": "collision",
+            "labels": false
+        }),
+    )
+    .await;
+    assert!(!collision.is_error, "{}", text_of(&collision));
+    let (preview, mime_type) = world_map_image(&collision);
+    assert_eq!(mime_type, "image/jpeg");
+    assert!(preview.starts_with(&[0xff, 0xd8]), "a JPEG preview");
+    if let Ok(out) = std::env::var("WORLD_MAP_COLLISION_PNG_OUT") {
+        std::fs::write(out, &preview).expect("save the preview");
+    }
+    let answer = json_of(&collision);
+    assert!(
+        answer.get("scenes").is_none(),
+        "the default reply lists no scenes: {answer}"
+    );
+    assert_eq!(answer["image"]["preview"], json!([160, 160]));
+    assert_eq!(answer["image"]["view"], "collision", "{answer}");
+    assert_eq!(answer["image"]["tiles"], 16, "{answer}");
+    assert!(
+        json_number(&answer["image"]["max_scenes_per_tile"]) <= 3.0,
+        "{answer}"
+    );
+    assert_eq!(answer["totals"]["no_collision"], 1, "{answer}");
+
+    // One tile per zone, each zone a different colour (red ground, blue ground, the lake's white
+    // plane, the empty background): every tile must show its own area, not a neighbour's.
+    let tiled = call(
+        &tools,
+        "godot_world_map",
+        json!({
+            "dir": "res://zones",
+            "glob": "zone_?_?.tscn",
+            "rect": [-10, -10, 30, 30],
+            "pixels_per_metre": 4,
+            "tile_metres": 20,
+            "labels": false,
+            "output_path": "res://.maps/tiles.png"
+        }),
+    )
+    .await;
+    assert!(!tiled.is_error, "{}", text_of(&tiled));
+    assert_eq!(json_of(&tiled)["image"]["tiles"], 4, "{}", text_of(&tiled));
+    let means = tile_means(&project.path().join(".maps/tiles.png"), 2);
+    assert_eq!(means.len(), 4, "{means:?}");
+    for first in 0..means.len() {
+        for second in first + 1..means.len() {
+            let distance: f64 = (0..3)
+                .map(|channel| (means[first][channel] - means[second][channel]).abs())
+                .sum();
+            assert!(
+                distance > 0.15,
+                "tiles {first} and {second} look alike: {means:?}"
+            );
+        }
+    }
+    assert!(
+        means[0][0] > means[0][2] && means[1][2] > means[1][0],
+        "the red zone is top left, the blue one top right: {means:?}"
+    );
+
+    let nothing = call(
+        &tools,
+        "godot_world_map",
+        json!({"scenes": ["res://zones/zone_1_1.tscn"]}),
+    )
+    .await;
+    assert!(nothing.is_error, "{}", text_of(&nothing));
+    assert!(
+        text_of(&nothing).contains("pass rect"),
+        "{}",
+        text_of(&nothing)
+    );
+
+    assert_eq!(
+        world_map_project_files(project.path()),
+        before,
+        "the map wrote into the project"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn world_map_refuses_a_map_godot_did_not_draw() {
+    if !windowed_game_can_open() {
+        eprintln!("skipped: the world map renders in a window and needs a display server");
+        return;
+    }
+    let project = world_map_project();
+    // The script runs directly so its test hook can make tiles read back black, as a window
+    // does that cannot draw (the display asleep): the tool itself never sets the hook.
+    let request = |undrawn: &str| {
+        json!({
+            "scenes": [
+                "res://zones/zone_0_0.tscn",
+                "res://zones/zone_0_1.tscn",
+                "res://zones/zone_1_0.tscn",
+                "res://zones/zone_1_1.tscn"
+            ],
+            "rect": [-10, -10, 30, 30],
+            "pixels_per_metre": 4,
+            "tile_metres": 20,
+            "view": "geometry",
+            "labels": true,
+            "default_side": 2048,
+            "test_undrawn": undrawn
+        })
+    };
+    let runner = CliRunner::new(godot_path());
+    let script = include_str!("../src/tools/world_map.gd");
+
+    let none = runner
+        .world_map(project.path(), script, request("all"), 120)
+        .await
+        .expect("run");
+    let answer: Value =
+        serde_json::from_str(none.answer.as_deref().expect("an answer")).expect("JSON");
+    let error = answer["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("drew none of the 4 tiles"),
+        "a black map is refused, not returned: {answer}"
+    );
+    assert!(none.image.is_none(), "no picture is saved for it");
+
+    let partial = runner
+        .world_map(project.path(), script, request("first"), 120)
+        .await
+        .expect("run");
+    let answer: Value =
+        serde_json::from_str(partial.answer.as_deref().expect("an answer")).expect("JSON");
+    assert!(answer.get("error").is_none(), "{answer}");
+    for key in ["warnings", "problems"] {
+        assert!(
+            answer[key]
+                .to_string()
+                .contains("tiles 1 of 4 were not drawn"),
+            "{key}: {answer}"
+        );
+    }
+
+    let drawn = runner
+        .world_map(project.path(), script, request(""), 120)
+        .await
+        .expect("run");
+    let answer: Value =
+        serde_json::from_str(drawn.answer.as_deref().expect("an answer")).expect("JSON");
+    assert!(answer.get("error").is_none(), "{answer}");
+    assert_eq!(
+        answer["problems"].as_array().map(Vec::len),
+        Some(2),
+        "{answer}"
+    );
+    assert!(
+        !answer["warnings"].to_string().contains("not drawn"),
+        "{answer}"
     );
 }

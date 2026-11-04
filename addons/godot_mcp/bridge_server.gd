@@ -119,6 +119,17 @@ var _token: String = ""
 ## shows only after the plugin is enabled again, so the server compares this one with its own.
 var _addon_version: String = ""
 var _token_files: PackedStringArray = []
+## The bridge listens while the editor is still starting: plugins are enabled during the first
+## scan of the project's files, and only when that scan ends does the editor open its scenes (the
+## main scene, or the ones of the last session) and switch to them. A scene opened before that
+## would lose its tab to them, so until then only STARTUP_COMMANDS are answered. Set once
+## _startup_probe returns true, and never cleared.
+var _editor_started: bool = false
+## Whether the editor has finished starting. is_scanning() stays true for the whole first scan,
+## and the editor opens its scenes in the same call that ends it.
+var _startup_probe: Callable = func() -> bool: return not EditorInterface.get_resource_filesystem().is_scanning()
+## Commands that only read facts the first scan does not change, answered while the editor starts.
+const STARTUP_COMMANDS: PackedStringArray = ["ping", "get_version", "get_project_info"]
 
 func _ready() -> void:
     var manifest: ConfigFile = ConfigFile.new()
@@ -223,6 +234,8 @@ func _accept_connections(listener: TCPServer) -> void:
                 printerr("[Godot MCP] Failed to accept WebSocket connection: ", error_string(err))
 
 func _process(_delta: float) -> void:
+    if not _editor_started and _startup_probe.call():
+        _editor_started = true
     _track_open_scenes()
     if not server.is_listening():
         return
@@ -313,9 +326,12 @@ func validate_params(cmd_type: String, params: Dictionary) -> String:
     return ""
 
 func dispatch_command(peer: WebSocketPeer, cmd_id: String, cmd_type: String, params: Dictionary) -> void:
+    if not _editor_started and not STARTUP_COMMANDS.has(cmd_type):
+        send_error(peer, cmd_id, "The editor is still starting: it opens its scenes when the first scan of the project's files ends, and a scene opened before that would not stay the active one. Wait a few seconds and call the tool again; ping answers \"starting\": false once the editor is ready.")
+        return
     match cmd_type:
         "ping":
-            send_success(peer, cmd_id, {"pong": true, "timestamp": Time.get_unix_time_from_system()})
+            send_success(peer, cmd_id, {"pong": true, "timestamp": Time.get_unix_time_from_system(), "starting": not _editor_started})
         "get_version":
             get_version(peer, cmd_id)
         "get_project_info":

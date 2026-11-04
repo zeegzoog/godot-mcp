@@ -5,7 +5,10 @@
 //! system trash unless `trash` is false. Without an editor the files are deleted on disk and the
 //! answer says a rescan is needed. Either way a file that another project file still names by
 //! path or UID is refused unless `force` is set, and nothing is deleted while any path is refused.
+//! A script that only writes the file (a generator saving its output) does not count: it can
+//! create the file again (`reference_kind`).
 
+use super::reference_kind::{Kind, classify_script};
 use super::{EditorChoice, ToolManager};
 use crate::error::McpError;
 use crate::paths::{res_display, resolve_in_project};
@@ -46,14 +49,14 @@ pub fn handles(name: &str) -> bool {
 pub fn catalog() -> Vec<Tool> {
     vec![super::tool(
         DELETE,
-        "Deletes files of a Godot project (scripts, scenes, resources, imported assets, any project file) together with their companions: the .uid file, the .import file and the imported data in .godot/imported. Before deleting it searches the project's text files (.tscn, .tres, .gd, shaders, project.godot, .cfg, .import, .cs, .json; with the editor also binary .scn/.res) for the file's res:// path and uid:// and refuses a file that is still referenced unless force is true. Refuses project.godot, anything in .godot/, the Godot MCP addon itself, a .uid or .import file whose own file exists, and directories (an empty one only with allow_empty_dir). All or nothing: while any path is refused nothing is deleted, and the answer lists each refusal with its reason. With the editor connected the files are deleted through it: open scene and script tabs of them are closed (one with unsaved changes is refused), the FileSystem dock is updated, and the files go to the system trash unless trash is false. Without an editor they are deleted permanently on disk and the answer says the editor needs a rescan (godot_resave_resources). dry_run reports what would be deleted and the references without deleting. Mentions by class_name or a path built at run time are not found.",
+        "Deletes files of a Godot project (scripts, scenes, resources, imported assets, any project file) together with their companions: the .uid file, the .import file and the imported data in .godot/imported. Before deleting it searches the project's text files (.tscn, .tres, .gd, shaders, project.godot, .cfg, .import, .cs, .json; with the editor also binary .scn/.res) for the file's res:// path and uid:// and refuses a file that is still used unless force is true. Each reference has a kind: \"written\" when a .gd script only writes the file (ResourceSaver.save, FileAccess.open for writing, DirAccess removal, Image.save_png; directly or through a constant or variable), so the script can create it again and the reference does not refuse the deletion; \"used\" for every other reference, and for any the analysis cannot follow. Refuses project.godot, anything in .godot/, the Godot MCP addon itself, a .uid or .import file whose own file exists, and directories (an empty one only with allow_empty_dir). All or nothing: while any path is refused nothing is deleted, and the answer lists each refusal with its reason. With the editor connected the files are deleted through it: open scene and script tabs of them are closed (one with unsaved changes is refused), the FileSystem dock is updated, and the files go to the system trash unless trash is false. Without an editor they are deleted permanently on disk and the answer says the editor needs a rescan (godot_resave_resources). dry_run reports what would be deleted and the references without deleting. Mentions by class_name or a path built at run time are not found.",
         json!({
             "paths": {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": "res:// paths of the files to delete, at most 64."
             },
-            "force": {"type": "boolean", "description": "Delete files that are still referenced, leaving those references broken. Default false."},
+            "force": {"type": "boolean", "description": "Delete files that are still used, leaving those references broken. Default false."},
             "allow_empty_dir": {"type": "boolean", "description": "Allow deleting a directory that is empty. Default false."},
             "dry_run": {"type": "boolean", "description": "Only report what would be deleted, the references and the refusals. Default false."},
             "trash": {"type": "boolean", "description": "With the editor connected, move the files to the system trash (default true); false deletes them permanently. Without an editor files are always deleted permanently."},
@@ -262,28 +265,24 @@ fn delete_on_disk(project: &Path, requested: &[String], options: Options) -> Val
             continue;
         }
         let count = target.referenced_by.len();
+        let users: Vec<&str> = target
+            .referenced_by
+            .iter()
+            .filter(|user| user["kind"] == Kind::Used.as_str())
+            .filter_map(|user| user["file"].as_str())
+            .collect();
         references.push(json!({
             "path": target.res_path,
             "uid": target.uid.clone().unwrap_or_default(),
             "count": count,
+            "used": users.len(),
+            "written": count - users.len(),
             "referenced_by": target.referenced_by.iter().take(MAX_LISTED_REFERENCES).collect::<Vec<_>>(),
         }));
-        if !options.force {
-            let names: Vec<&str> = target
-                .referenced_by
-                .iter()
-                .take(5)
-                .filter_map(|user| user["file"].as_str())
-                .collect();
-            let more = if count > 5 {
-                format!(" and {} more", count - 5)
-            } else {
-                String::new()
-            };
-            refused.push(json!({"path": target.res_path, "reason": format!(
-                "is still referenced by {count} file(s): {}{more}. Remove the references first, or pass force: true to delete it anyway and leave them broken",
-                names.join(", ")
-            )}));
+        if users.is_empty() {
+            warnings.push(written_only(target));
+        } else if !options.force {
+            refused.push(json!({"path": target.res_path, "reason": still_used(&users)}));
         }
     }
 
@@ -343,6 +342,41 @@ fn delete_on_disk(project: &Path, requested: &[String], options: Options) -> Val
     report["refused"] = json!(refused);
     report["warnings"] = json!(warnings);
     report
+}
+
+/// The note for a file that scripts only write: they can recreate it, so it is not kept.
+fn written_only(target: &Target) -> String {
+    let writers: Vec<&str> = target
+        .referenced_by
+        .iter()
+        .take(5)
+        .filter_map(|user| user["file"].as_str())
+        .collect();
+    let count = target.referenced_by.len();
+    let more = if count > 5 {
+        format!(" and {} more", count - 5)
+    } else {
+        String::new()
+    };
+    format!(
+        "{} is named only as a file that {count} script(s) write: {}{more}. They can create it again, so this does not stop the deletion; run the generator to rebuild it.",
+        target.res_path,
+        writers.join(", ")
+    )
+}
+
+/// The refusal for a file that other files still use.
+fn still_used(users: &[&str]) -> String {
+    let more = if users.len() > 5 {
+        format!(" and {} more", users.len() - 5)
+    } else {
+        String::new()
+    };
+    format!(
+        "is still used by {} file(s): {}{more}. Remove the references first, or pass force: true to delete it anyway and leave them broken",
+        users.len(),
+        users.iter().take(5).copied().collect::<Vec<_>>().join(", ")
+    )
 }
 
 fn listing(project: &Path, target: &Target) -> Value {
@@ -545,13 +579,39 @@ fn find_references(project: &Path, targets: &mut [Target]) -> Unchecked {
                 by.push("uid");
             }
             if !by.is_empty() {
-                target
-                    .referenced_by
-                    .push(json!({"file": res_display(project, &candidate), "by": by}));
+                let kind = reference_kind(&kind, &text, target, &by);
+                target.referenced_by.push(json!({
+                    "file": res_display(project, &candidate),
+                    "by": by,
+                    "kind": kind.as_str(),
+                }));
             }
         }
     }
     unchecked
+}
+
+/// How a file of extension `extension` names `target`: a script that only writes it can
+/// recreate it; every other file uses it.
+fn reference_kind(extension: &str, text: &str, target: &Target, by: &[&str]) -> Kind {
+    if extension != "gd" {
+        return Kind::Used;
+    }
+    let mut needles = Vec::new();
+    if by.contains(&"path") {
+        needles.push(target.res_path.as_str());
+    }
+    if let Some(uid) = target.uid.as_deref().filter(|_| by.contains(&"uid")) {
+        needles.push(uid);
+    }
+    if needles
+        .iter()
+        .all(|needle| classify_script(text, needle) == Kind::Written)
+    {
+        Kind::Written
+    } else {
+        Kind::Used
+    }
 }
 
 fn collect(folder: &Path, into: &mut Vec<PathBuf>) {
@@ -578,7 +638,7 @@ fn collect(folder: &Path, into: &mut Vec<PathBuf>) {
 
 /// Whether `text` holds `needle` not followed by a character that would continue it, so
 /// `res://a.gd` is not found inside `res://a.gdshader`. The addon matches the same way.
-fn mentions(text: &str, needle: &str) -> bool {
+pub(super) fn mentions(text: &str, needle: &str) -> bool {
     text.match_indices(needle).any(|(at, _)| {
         text[at + needle.len()..]
             .chars()

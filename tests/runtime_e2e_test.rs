@@ -6219,6 +6219,87 @@ async fn run_script_writes_back_the_uid_of_a_rewritten_binary_scene() {
     );
 }
 
+/// A tool script that builds new scenes and resources headless leaves them without uids; the
+/// server writes new ones back. The project's uid cache must learn them too, or the next script
+/// that loads the scenes prints an "invalid UID" warning for every ext_resource.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn run_script_records_new_uids_in_the_uid_cache() {
+    let dir = tempfile::tempdir().expect("project dir");
+    let root = dir.path();
+    std::fs::write(
+        root.join("project.godot"),
+        "config_version=5\n\n[application]\n\nconfig/name=\"Uid cache\"\n",
+    )
+    .expect("project.godot");
+    std::fs::create_dir_all(root.join("tools")).expect("tools dir");
+    std::fs::create_dir_all(root.join("zones")).expect("zones dir");
+    std::fs::write(
+        root.join("zones/seed.tres"),
+        "[gd_resource type=\"BoxMesh\" format=3 uid=\"uid://bseedmesh01\"]\n\n[resource]\n",
+    )
+    .expect("seed.tres");
+    // The editor's first scan writes .godot/uid_cache.bin, as in any project opened once.
+    let imported = std::process::Command::new(godot_path())
+        .args(["--headless", "--path"])
+        .arg(root)
+        .arg("--import")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("godot --import");
+    assert!(imported.status.success(), "{imported:?}");
+    assert!(root.join(".godot/uid_cache.bin").is_file(), "uid cache");
+    let save = |name: &str, source: &str| {
+        std::fs::write(root.join("tools").join(name), source).expect("script");
+    };
+    save(
+        "build.gd",
+        "extends SceneTree\n\nfunc _init() -> void:\n\tfor index in 3:\n\t\tvar mesh := BoxMesh.new()\n\t\tvar mesh_path := \"res://zones/mesh_%d.res\" % index\n\t\tResourceSaver.save(mesh, mesh_path)\n\t\tvar material := StandardMaterial3D.new()\n\t\tvar material_path := \"res://zones/material_%d.tres\" % index\n\t\tResourceSaver.save(material, material_path)\n\t\tvar root := Node3D.new()\n\t\troot.name = \"Zone\"\n\t\tvar body := MeshInstance3D.new()\n\t\tbody.mesh = load(mesh_path)\n\t\tbody.material_override = load(material_path)\n\t\troot.add_child(body)\n\t\tbody.owner = root\n\t\tvar scene := PackedScene.new()\n\t\tscene.pack(root)\n\t\tResourceSaver.save(scene, \"res://zones/zone_%d.tscn\" % index)\n\t\troot.free()\n\tquit()\n",
+    );
+    save(
+        "load.gd",
+        "extends SceneTree\n\nfunc _init() -> void:\n\tfor index in 3:\n\t\tvar zone: Node = (load(\"res://zones/zone_%d.tscn\" % index) as PackedScene).instantiate()\n\t\tprint(\"ZONE_CHILDREN=\", zone.get_child_count())\n\t\tzone.free()\n\tquit()\n",
+    );
+    let tools = manager(root);
+    let run = |script: &'static str| {
+        let tools = Arc::clone(&tools);
+        let root = root.to_path_buf();
+        async move {
+            let result = call(
+                &tools,
+                "godot_run_script",
+                json!({"script": script, "project_path": root, "timeout_seconds": 60}),
+            )
+            .await;
+            let text = text_of(&result);
+            assert!(!result.is_error, "{text}");
+            serde_json::from_str::<Value>(&text[text.find('{').expect("json")..]).expect("JSON")
+        }
+    };
+    let built = run("res://tools/build.gd").await;
+    let new_uids = built["resource_repairs"]
+        .as_array()
+        .expect("repairs")
+        .iter()
+        .filter(|item| item["new_uid"] == true)
+        .count();
+    assert_eq!(new_uids, 9, "{built}");
+
+    let loaded = run("res://tools/load.gd").await;
+    let output = format!(
+        "{}{}",
+        loaded["stdout"].as_str().unwrap_or_default(),
+        loaded["stderr"].as_str().unwrap_or_default()
+    );
+    assert_eq!(output.matches("ZONE_CHILDREN=1").count(), 3, "{loaded}");
+    assert!(!output.contains("invalid UID"), "{output}");
+    assert_eq!(built["uid_cache"]["recorded"], 9, "{built}");
+    assert!(
+        built.get("uid_cache_stale").is_none_or(Value::is_null),
+        "{built}"
+    );
+}
+
 /// A small 3D level: a ground slab with its top at y = 0, a bank box on collision layer 2 with
 /// its top at y = 2 over x 4..6, z -1..1, a frog sphere standing at the origin, a camera at
 /// (0, 6, 8) looking at the origin, and a red marker at x = 30 that the camera cannot see.

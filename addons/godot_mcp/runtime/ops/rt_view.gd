@@ -72,23 +72,26 @@ static func screenshot(rt: Node, params: Dictionary) -> Dictionary:
         "stale": 0,
         "waited": 0,
     }
-    if Hold.is_held():
+    if Hold.is_held() or state.get("aim_viewport") != null:
         return _capture_now(state)
     return {"_pending": true, "_tick": func() -> bool: return _tick_shot(rt, state)}
 
 
 ## A held game draws nothing new, so its capture is the last frame it drew, taken at once.
-## An aimed capture has never been drawn, so it draws one frame of the rendering server here:
-## the scene does not advance.
+## An aimed capture has never been drawn. Compatibility can omit instance-shaded meshes on
+## the fresh viewport's first draw, so prime that renderer once more before readback. These
+## are render-only passes: the scene does not advance.
 static func _capture_now(state: Dictionary) -> Dictionary:
     if state.get("aim_viewport") != null:
         RenderingServer.force_draw(false, 0.0)
+        if RenderingServer.get_current_rendering_method() == "gl_compatibility":
+            RenderingServer.force_draw(false, 0.0)
     var grabbed = _grab(state)
     if grabbed == null or grabbed is Dictionary:
         _restore_cameras(state)
         return grabbed if grabbed is Dictionary else R.err(R.GODOT_ERROR, "Nothing has been drawn yet. Take one tick with godot_game_physics first.")
     state["got"] = [grabbed]
-    state["held"] = true
+    state["held"] = Hold.is_held()
     var composed := _compose(state)
     _restore_cameras(state)
     return composed

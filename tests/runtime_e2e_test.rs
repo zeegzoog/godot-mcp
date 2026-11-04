@@ -6580,3 +6580,130 @@ async fn an_aimed_screenshot_looks_at_a_point_and_leaves_the_game_camera_alone()
     let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
     assert!(!stopped.is_error, "{}", text_of(&stopped));
 }
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn aimed_capture_preserves_instance_shader_geometry_without_advancing_a_hold() {
+    if !windowed_game_can_open() {
+        eprintln!("skipped: a windowed capture needs a display server");
+        return;
+    }
+    let project = world_project();
+    let settings_path = project.path().join("project.godot");
+    let settings = std::fs::read_to_string(&settings_path).unwrap();
+    std::fs::write(settings_path, format!("{settings}\n[rendering]\nrenderer/rendering_method=\"gl_compatibility\"\nanti_aliasing/quality/msaa_3d=2\n")).unwrap();
+    std::fs::write(
+        project.path().join("marker.gdshader"),
+        r#"shader_type spatial;
+render_mode unshaded;
+instance uniform float extent = 0.0;
+instance uniform float opacity = 0.0;
+void vertex() { VERTEX *= extent; }
+void fragment() { ALBEDO = vec3(1.0, 0.0, 0.0); ALPHA = opacity; }
+"#,
+    )
+    .unwrap();
+    let scene_path = project.path().join("scenes/world.tscn");
+    let scene = std::fs::read_to_string(&scene_path).unwrap()
+        .replace("[sub_resource type=\"StandardMaterial3D\" id=\"red\"]\nshading_mode = 0\nalbedo_color = Color(1, 0, 0, 1)",
+            "[sub_resource type=\"ShaderMaterial\" id=\"red\"]\nshader = ExtResource(\"2\")")
+        .replace("[ext_resource type=\"Script\" path=\"res://scripts/world.gd\" id=\"1\"]", "[ext_resource type=\"Script\" path=\"res://scripts/world.gd\" id=\"1\"]\n[ext_resource type=\"Shader\" path=\"res://marker.gdshader\" id=\"2\"]")
+        .replace("1, 30, 2, 0)", "1, 0, 0, 0)")
+        .replace("current = true", "current = true\nprojection = 1\nsize = 19.0");
+    std::fs::write(scene_path, scene).unwrap();
+    std::fs::write(project.path().join("scripts/world.gd"), "extends Node3D\nvar ticks := 0\nvar aim_started_frame := -1\nvar aim_drawn_frame := -1\nvar _aim_viewport: SubViewport\nfunc _ready() -> void:\n\tget_tree().node_added.connect(_node_added)\n\tRenderingServer.frame_post_draw.connect(_after_draw)\n\t$Rig/Camera.look_at_from_position(Vector3(0, 6, 8), Vector3.ZERO)\n\t$Marker.set_instance_shader_parameter(\"extent\", 1.0)\n\t$Marker.set_instance_shader_parameter(\"opacity\", 0.8)\nfunc _process(_delta: float) -> void:\n\tticks += 1\nfunc _node_added(node: Node) -> void:\n\tif node is SubViewport:\n\t\taim_started_frame = Engine.get_process_frames()\n\t\t_aim_viewport = node\nfunc _after_draw() -> void:\n\tif is_instance_valid(_aim_viewport):\n\t\taim_drawn_frame = Engine.get_process_frames()\n").unwrap();
+    let tools = manager(project.path());
+    let started = call(&tools, "godot_run_project", json!({"project_path": project.path(), "scene": "res://scenes/world.tscn", "mode": "process"})).await;
+    assert!(!started.is_error, "{}", text_of(&started));
+    let run_id = run_id_of(&started);
+    let _ = call(
+        &tools,
+        "godot_game_wait",
+        json!({"run_id": run_id, "frames": 20}),
+    )
+    .await;
+    let plain = call(
+        &tools,
+        "godot_game_screenshot",
+        json!({"run_id":run_id,"max_dimension":128,"save_baseline":"plain"}),
+    )
+    .await;
+    assert!(!plain.is_error, "{}", text_of(&plain));
+    let _ = call(
+        &tools,
+        "godot_game_set",
+        json!({"run_id":run_id,"path":"Marker","properties":{"visible":false}}),
+    )
+    .await;
+    let hidden = call(
+        &tools,
+        "godot_game_screenshot",
+        json!({"run_id":run_id,"max_dimension":128,"baseline":"plain"}),
+    )
+    .await;
+    assert!(!hidden.is_error, "{}", text_of(&hidden));
+    assert!(
+        baseline_changed(&text_of(&hidden)) > 500,
+        "fixture shader is not visible in the game window: {}",
+        text_of(&hidden)
+    );
+    let _ = call(
+        &tools,
+        "godot_game_set",
+        json!({"run_id":run_id,"path":"Marker","properties":{"visible":true}}),
+    )
+    .await;
+    let immediate = call(
+        &tools,
+        "godot_game_screenshot",
+        json!({"run_id":run_id,"max_dimension":128,"aim":{"position":[0,6,8],"look_at":[0,0,0]}}),
+    )
+    .await;
+    assert!(!immediate.is_error, "{}", text_of(&immediate));
+    let timing = json_of(
+        &call(
+            &tools,
+            "godot_game_get",
+            json!({"run_id":run_id,"properties":["aim_started_frame","aim_drawn_frame"]}),
+        )
+        .await,
+    );
+    assert!(
+        json_number(&timing["properties"]["aim_started_frame"]) >= 0.0,
+        "{timing}"
+    );
+    assert_eq!(
+        timing["properties"]["aim_started_frame"], timing["properties"]["aim_drawn_frame"],
+        "the game advanced between creating the aim viewport and rendering it: {timing}"
+    );
+    hold_now(&tools, &run_id).await;
+    let before = json_of(
+        &call(
+            &tools,
+            "godot_game_get",
+            json!({"run_id":run_id,"properties":["ticks"]}),
+        )
+        .await,
+    );
+    let aimed = call(&tools, "godot_game_screenshot", json!({"run_id":run_id,"max_dimension":128,"baseline":"plain","aim":{"position":[0,6,8],"look_at":[0,0,0]}})).await;
+    let after = json_of(
+        &call(
+            &tools,
+            "godot_game_get",
+            json!({"run_id":run_id,"properties":["ticks"]}),
+        )
+        .await,
+    );
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id":run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+    assert!(!aimed.is_error, "{}", text_of(&aimed));
+    assert_eq!(
+        before["properties"]["ticks"], after["properties"]["ticks"],
+        "render initialization advanced game time"
+    );
+    assert!(
+        baseline_changed(&text_of(&aimed)) < 50,
+        "the aimed image lost instance-shaded geometry: {}",
+        text_of(&aimed)
+    );
+}

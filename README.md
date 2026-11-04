@@ -289,7 +289,7 @@ A named baseline is the returned image, so `roi` uses that image's pixels (`roi_
 {"grid": {"min": [-5, -5], "max": [5, 5], "step": 0.5}, "mask": 1}
 ```
 
-A grid answers `heights[row][column]` (row `r` is `z = min.z + r * step`, column `c` is `x = min.x + c * step`, `null` where nothing was hit), the lowest and highest hit and the colliders it met. `godot_game_screenshot` with `aim` looks at a point the same way: `{"aim": {"at": [12, 1.5, -3]}}` draws the world from a temporary camera that copies the game camera's angle, distance, projection and environment and puts that point in the centre; `{"aim": {"position": [...], "look_at": [...]}}` places it. The game's camera stays current and unmoved, and the temporary nodes are freed after the capture.
+A grid answers `heights[row][column]` (row `r` is `z = min.z + r * step`, column `c` is `x = min.x + c * step`, `null` where nothing was hit), the lowest and highest hit and the colliders it met. `godot_game_screenshot` with `aim` looks at a point the same way: `{"aim": {"at": [12, 1.5, -3]}}` draws the world from a temporary camera that copies the game camera's angle, distance, projection and environment and puts that point in the centre; `{"aim": {"position": [...], "look_at": [...]}}` places it. The game's camera stays current and unmoved, and the temporary nodes are freed after the capture. The fresh viewport is initialized before readback, with a second render-only pass in Compatibility so per-instance shader effects are included; the scene does not advance for those passes.
 
 ## Holding a game
 

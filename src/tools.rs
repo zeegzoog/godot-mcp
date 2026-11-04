@@ -30,6 +30,7 @@ mod input_map;
 mod main_loop;
 mod project;
 mod reference_kind;
+mod review;
 mod run;
 mod scenario;
 mod scripts;
@@ -150,6 +151,7 @@ impl ToolManager {
             name if export::handles(name) => export::call(&self, name, args).await,
             name if addon_update::handles(name) => addon_update::call(&self, args).await,
             name if import_params::handles(name) => import_params::call(&self, name, args).await,
+            name if review::handles(name) => review::call(&self, args).await,
             feedback::NOTE => self.handle_note_feedback(args).await,
             feedback::DRAFT => self.handle_draft_feedback(args).await,
             feedback::SUBMIT => self.handle_submit_feedback(args).await,
@@ -812,6 +814,7 @@ fn annotations(name: &str) -> Option<ToolAnnotations> {
         | "godot_list_export_presets"
         | "godot_get_import_params" => [true, false, true],
         "godot_capture_viewport"
+        | "godot_review_assets"
         | "godot_resave_resources"
         | "godot_create_project"
         | "godot_create_scene"
@@ -1206,6 +1209,7 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
     tools.extend(code::catalog());
     tools.extend(export::catalog());
     tools.extend(import_params::catalog());
+    tools.extend(review::catalog());
     tools.extend(feedback::catalog(feedback_mode));
     tools
 }

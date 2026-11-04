@@ -714,8 +714,63 @@ impl CliRunner {
         user_args: &[String],
         timeout_seconds: u64,
     ) -> Result<ScriptRun> {
+        self.run_script_with(
+            &["--headless"],
+            project_path,
+            script_path,
+            user_args,
+            timeout_seconds,
+        )
+        .await
+    }
+
+    /// Runs the asset review script on the project in a small window, so the rendering server
+    /// draws (a headless Godot has no renderer), with the audio muted: `godot --path <project>
+    /// --resolution 64x64 --audio-driver Dummy -s <script> -- <request>`. The request JSON and the
+    /// script live in a scratch directory outside the project, removed afterwards; the PNG the
+    /// script saved there (`output` in the request) is returned with the run.
+    pub async fn review_assets(
+        &self,
+        project_path: &Path,
+        script: &str,
+        mut request: serde_json::Value,
+        timeout_seconds: u64,
+    ) -> Result<(ScriptRun, Option<Vec<u8>>)> {
+        let dir = create_scratch_dir("review")?;
+        let image = dir.join("review.png");
+        request["output"] = serde_json::json!(image.to_string_lossy());
+        let outcome = async {
+            let request_file = dir.join("request.json");
+            std::fs::write(&request_file, request.to_string())?;
+            let script_file = dir.join("review_assets.gd");
+            std::fs::write(&script_file, script)?;
+            let run = self
+                .run_script_with(
+                    &["--resolution", "64x64", "--audio-driver", "Dummy"],
+                    project_path,
+                    &script_file,
+                    &[request_file.to_string_lossy().into_owned()],
+                    timeout_seconds,
+                )
+                .await?;
+            Ok::<_, McpError>((run, std::fs::read(&image).ok()))
+        }
+        .await;
+        let _ = std::fs::remove_dir_all(&dir);
+        outcome
+    }
+
+    /// `godot <options> --path <project> -s <script> [-- args]`, as [`Self::run_script`] describes.
+    async fn run_script_with(
+        &self,
+        options: &[&str],
+        project_path: &Path,
+        script_path: &Path,
+        user_args: &[String],
+        timeout_seconds: u64,
+    ) -> Result<ScriptRun> {
         let mut cmd = Command::new(&self.godot_binary);
-        cmd.arg("--headless")
+        cmd.args(options)
             .arg("--path")
             .arg(project_path)
             .arg("-s")

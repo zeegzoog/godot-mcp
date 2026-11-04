@@ -6982,3 +6982,206 @@ void fragment() { ALBEDO = vec3(1.0, 0.0, 0.0); ALPHA = opacity; }
         text_of(&aimed)
     );
 }
+
+/// Two box scenes, a sphere, and a level with an environment, a sun and an orthogonal camera.
+fn review_project() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("project");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("kit")).unwrap();
+    std::fs::write(
+        root.join("project.godot"),
+        "config_version=5\n\n[application]\n\nconfig/name=\"ReviewProbe\"\nconfig/features=PackedStringArray(\"4.5\")\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("kit/box.tscn"),
+        "[gd_scene load_steps=2 format=3]\n\n[sub_resource type=\"BoxMesh\" id=\"1\"]\nsize = Vector3(2, 3, 1)\n\n[node name=\"Box\" type=\"Node3D\"]\n\n[node name=\"Mesh\" type=\"MeshInstance3D\" parent=\".\"]\ntransform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1.5, 0)\nmesh = SubResource(\"1\")\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("kit/ball.tscn"),
+        "[gd_scene load_steps=2 format=3]\n\n[sub_resource type=\"SphereMesh\" id=\"1\"]\n\n[node name=\"Ball\" type=\"MeshInstance3D\"]\ntransform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.5, 0)\nmesh = SubResource(\"1\")\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("level.tscn"),
+        "[gd_scene load_steps=2 format=3]\n\n[sub_resource type=\"Environment\" id=\"1\"]\nbackground_mode = 1\nbackground_color = Color(0.2, 0.3, 0.5, 1)\n\n[node name=\"Level\" type=\"Node3D\"]\n\n[node name=\"WorldEnvironment\" type=\"WorldEnvironment\" parent=\".\"]\nenvironment = SubResource(\"1\")\n\n[node name=\"Sun\" type=\"DirectionalLight3D\" parent=\".\"]\ntransform = Transform3D(1, 0, 0, 0, 0.5, 0.866, 0, -0.866, 0.5, 0, 10, 0)\nshadow_enabled = true\n\n[node name=\"Player\" type=\"Node3D\" parent=\".\"]\n\n[node name=\"Camera\" type=\"Camera3D\" parent=\"Player\"]\ntransform = Transform3D(1, 0, 0, 0, 0.7071, 0.7071, 0, -0.7071, 0.7071, 0, 10, 10)\nprojection = 1\nsize = 12.0\ncurrent = true\n",
+    )
+    .unwrap();
+    dir
+}
+
+/// Every file under `root` except the engine's `.godot` cache, as sorted relative paths.
+fn project_files(root: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).expect("dir").flatten() {
+            let path = entry.path();
+            if path.file_name().is_some_and(|name| name == ".godot") {
+                continue;
+            }
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                found.push(path.strip_prefix(root).unwrap().display().to_string());
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Width and height of the PNG image in a tool answer, read from its IHDR chunk.
+fn answer_png_size(result: &ToolResult) -> Option<(u32, u32)> {
+    let data = result.content.iter().find_map(|item| match item {
+        godot_mcp::protocol::ToolContent::Image { data, mime_type } if mime_type == "image/png" => {
+            Some(data.as_str())
+        }
+        _ => None,
+    })?;
+    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut bytes = Vec::new();
+    for chunk in data.as_bytes()[..32].chunks(4) {
+        let mut triple = 0u32;
+        for &symbol in chunk {
+            triple = (triple << 6) | alphabet.iter().position(|&c| c == symbol)? as u32;
+        }
+        bytes.extend_from_slice(&triple.to_be_bytes()[1..]);
+    }
+    png_size(&bytes)
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn review_assets_renders_a_row_with_counts_and_bounds_and_leaves_the_project_alone() {
+    if !windowed_game_can_open() {
+        eprintln!("skipped: the asset review renders in a window and needs a display server");
+        return;
+    }
+    let project = review_project();
+    let before = project_files(project.path());
+    let tools = manager(project.path());
+
+    let row = call(
+        &tools,
+        "godot_review_assets",
+        json!({
+            "assets": [
+                {"scene": "res://kit/box.tscn"},
+                {"scene": "res://kit/ball.tscn"},
+                {"scene": "res://kit/box.tscn", "rotation": [0, 90, 0]}
+            ],
+            "gap": 1,
+            "environment": {"scene": "res://level.tscn"},
+            "planes": [{"kind": "water", "height": 0.2}],
+            "width": 320,
+            "height": 180
+        }),
+    )
+    .await;
+    assert!(!row.is_error, "{}", text_of(&row));
+    assert_eq!(answer_png_size(&row), Some((320, 180)));
+    let answer = json_of(&row);
+    let assets = answer["assets"].as_array().expect("assets");
+    assert_eq!(assets.len(), 3, "{answer}");
+    assert_eq!(assets[0]["triangles"], 12, "{answer}");
+    assert_eq!(assets[0]["mesh_instances"], 1, "{answer}");
+    assert!(json_number(&assets[1]["triangles"]) > 100.0, "{answer}");
+    for asset in assets {
+        assert!(
+            json_number(&asset["rendered"]["draw_calls"]) >= 1.0,
+            "{asset}"
+        );
+        assert!(
+            json_number(&asset["rendered"]["primitives"]) >= 12.0,
+            "{asset}"
+        );
+    }
+    // A row along X, 1 m apart, centred: box 2 wide, ball 1, the turned box 1.
+    let min_x = |index: usize| json_number(&assets[index]["bounds"]["min"][0]);
+    let max_x = |index: usize| json_number(&assets[index]["bounds"]["max"][0]);
+    assert!((min_x(1) - max_x(0) - 1.0).abs() < 0.01, "{answer}");
+    assert!((min_x(2) - max_x(1) - 1.0).abs() < 0.01, "{answer}");
+    assert!((min_x(0) + max_x(2)).abs() < 0.01, "{answer}");
+    assert!(
+        (json_number(&assets[0]["bounds"]["min"][1])).abs() < 0.01,
+        "{answer}"
+    );
+    assert!(
+        (json_number(&assets[0]["bounds"]["max"][1]) - 3.0).abs() < 0.01,
+        "{answer}"
+    );
+    assert_eq!(
+        answer["totals"]["triangles"],
+        json_number(&assets[1]["triangles"]) as i64 + 24
+    );
+    assert!(
+        json_number(&answer["totals"]["rendered"]["draw_calls"]) >= 4.0,
+        "the frame has three assets and the water: {answer}"
+    );
+    assert_eq!(answer["camera"]["projection"], "orthogonal", "{answer}");
+    assert_eq!(answer["warnings"], json!([]), "{answer}");
+
+    let copied = call(
+        &tools,
+        "godot_review_assets",
+        json!({
+            "assets": [{"scene": "res://kit/box.tscn", "position": [5, 0, 5]}],
+            "camera": {"scene": "res://level.tscn", "node": "Player/Camera"},
+            "width": 200,
+            "height": 100
+        }),
+    )
+    .await;
+    assert!(!copied.is_error, "{}", text_of(&copied));
+    let answer = json_of(&copied);
+    assert_eq!(
+        answer["camera"]["size"], 12.0,
+        "the copied size is kept: {answer}"
+    );
+    assert!(
+        (json_number(&answer["camera"]["pitch"]) + 45.0).abs() < 0.1,
+        "{answer}"
+    );
+    assert_eq!(answer["assets"][0]["position"], json!([5.0, 0.0, 5.0]));
+
+    let perspective = call(
+        &tools,
+        "godot_review_assets",
+        json!({
+            "assets": [{"scene": "res://kit/ball.tscn"}],
+            "camera": {"projection": "perspective", "fov": 40, "yaw": 0, "pitch": 0},
+            "width": 64,
+            "height": 64
+        }),
+    )
+    .await;
+    assert!(!perspective.is_error, "{}", text_of(&perspective));
+    let answer = json_of(&perspective);
+    assert_eq!(answer["camera"]["projection"], "perspective", "{answer}");
+    let distance = json_number(&answer["camera"]["position"][2]);
+    assert!(
+        distance > 1.0 && distance < 4.0,
+        "fitted to a 1 m ball: {answer}"
+    );
+
+    let missing = call(
+        &tools,
+        "godot_review_assets",
+        json!({"assets": [{"scene": "res://kit/box.tscn"}], "camera": {"scene": "res://level.tscn", "node": "Nowhere"}}),
+    )
+    .await;
+    assert!(missing.is_error, "{}", text_of(&missing));
+    assert!(
+        text_of(&missing).contains("no Camera3D at Nowhere"),
+        "{}",
+        text_of(&missing)
+    );
+
+    assert_eq!(
+        project_files(project.path()),
+        before,
+        "the review wrote into the project"
+    );
+}

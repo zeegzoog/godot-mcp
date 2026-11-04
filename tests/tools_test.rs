@@ -5929,3 +5929,86 @@ async fn run_script_without_exit_time_leaks_answers_exit_leaks_null() {
         "{answer}"
     );
 }
+
+#[tokio::test]
+async fn review_assets_is_listed_and_checks_its_request_before_starting_godot() {
+    let review = ToolManager::list_tools()
+        .into_iter()
+        .find(|tool| tool.name == "godot_review_assets")
+        .expect("godot_review_assets is listed");
+    let schema = serde_json::to_value(&review).expect("tool");
+    assert_eq!(schema["annotations"]["readOnlyHint"], false, "{schema}");
+    assert_eq!(schema["annotations"]["destructiveHint"], false, "{schema}");
+    for key in [
+        "assets",
+        "environment",
+        "camera",
+        "planes",
+        "width",
+        "height",
+    ] {
+        assert!(
+            schema["inputSchema"]["properties"].get(key).is_some(),
+            "{key}: {schema}"
+        );
+    }
+    assert_eq!(schema["inputSchema"]["required"], json!(["assets"]));
+
+    let project = project_dir();
+    std::fs::write(project.path().join("rock.tscn"), "").expect("scene");
+    let tools = manager_in(
+        project.path(),
+        PathBuf::from("godot-binary-that-does-not-exist"),
+    );
+    let outside = Arc::clone(&tools)
+        .call_tool(
+            "godot_review_assets",
+            json!({"assets": [{"scene": "res://../rock.tscn"}]}),
+        )
+        .await;
+    assert!(outside.is_error, "{}", text(&outside));
+    assert!(
+        text(&outside).contains("assets[0].scene"),
+        "{}",
+        text(&outside)
+    );
+    let bad_camera = Arc::clone(&tools)
+        .call_tool(
+            "godot_review_assets",
+            json!({"assets": [{"scene": "res://rock.tscn"}], "camera": {"yaw": "left"}}),
+        )
+        .await;
+    assert!(bad_camera.is_error, "{}", text(&bad_camera));
+    assert!(
+        text(&bad_camera).contains("camera.yaw"),
+        "{}",
+        text(&bad_camera)
+    );
+    // A valid request reaches the engine, which is missing here.
+    let no_engine = Arc::clone(&tools)
+        .call_tool(
+            "godot_review_assets",
+            json!({"assets": [{"scene": "res://rock.tscn"}]}),
+        )
+        .await;
+    assert!(no_engine.is_error, "{}", text(&no_engine));
+    assert!(
+        text(&no_engine).contains("GODOT_PATH"),
+        "{}",
+        text(&no_engine)
+    );
+    let names: Vec<String> = std::fs::read_dir(project.path())
+        .expect("project")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert!(
+        !names.iter().any(|name| name.contains("review")),
+        "{names:?}"
+    );
+}

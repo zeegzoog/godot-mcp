@@ -224,18 +224,7 @@ async fn start_editor_with_args(
         .expect("spawn godot editor");
 
     let bridge = BridgeClient::new(port);
-    let deadline = Instant::now() + Duration::from_secs(120);
-    loop {
-        if bridge.send_command("ping", json!({})).await.is_ok() {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "editor bridge did not come up; log:\n{}",
-            std::fs::read_to_string(&log).unwrap_or_default()
-        );
-        sleep(Duration::from_millis(500)).await;
-    }
+    wait_until_started(&bridge, &log, &format!("port {port}")).await;
 
     Editor {
         _dir: dir,
@@ -244,6 +233,26 @@ async fn start_editor_with_args(
         bridge,
         log,
         _child: child,
+    }
+}
+
+/// Waits until the editor's bridge answers and the editor has finished starting: the bridge
+/// listens during the first scan of the project's files, and the editor opens its scenes only
+/// when that scan ends, so a scene a test opened before would lose its tab to the main scene.
+async fn wait_until_started(bridge: &BridgeClient, log: &Path, port: &str) {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        if let Ok(pong) = bridge.send_command("ping", json!({})).await {
+            if pong["starting"] != true {
+                return;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "editor bridge on {port} did not come up or the editor did not finish starting; log:\n{}",
+            std::fs::read_to_string(log).unwrap_or_default()
+        );
+        sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -2802,6 +2811,81 @@ async fn input_actions_are_edited_saved_and_undone_through_the_editor() {
     );
 }
 
+/// Test-only command that makes the bridge act as if the editor were still starting, for
+/// `hold_ms` milliseconds.
+const STARTUP_HOLD_HOOK: &str = r#"        "__test_hold_startup":
+            var until: int = Time.get_ticks_msec() + int(params.get("hold_ms", 0))
+            _editor_started = false
+            _startup_probe = func() -> bool: return Time.get_ticks_msec() >= until
+            send_success(peer, cmd_id, {"holding": true})
+        "ping":
+"#;
+
+/// The editor opens the project's main scene only when the first scan of its files ends, while
+/// the bridge already listens during that scan. A scene opened before then lost its tab to the
+/// main scene, so the next edit went to the wrong scene. Until the editor has started, the bridge
+/// answers ping (with `starting`) and the facts the scan does not change, and refuses the rest.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn commands_wait_until_the_editor_has_opened_its_startup_scenes() {
+    let editor = start_editor_with(
+        Some(STARTUP_HOLD_HOOK),
+        "",
+        &[(
+            "pond.tscn",
+            "[gd_scene format=3]\n\n[node name=\"Pond\" type=\"Node3D\"]\n",
+        )],
+        "",
+    )
+    .await;
+    let bridge = &editor.bridge;
+    // The editor opened the main scene at the end of its start.
+    let open = bridge
+        .send_command("get_open_scenes", json!({}))
+        .await
+        .expect("open scenes");
+    assert_eq!(open["active_scene"], "res://main.tscn", "{open}");
+    let pong = bridge.send_command("ping", json!({})).await.expect("ping");
+    assert_eq!(pong["starting"], false, "{pong}");
+
+    bridge
+        .send_command("__test_hold_startup", json!({"hold_ms": 3000}))
+        .await
+        .expect("hold");
+    let pong = bridge.send_command("ping", json!({})).await.expect("ping");
+    assert_eq!(pong["starting"], true, "{pong}");
+    expect_error(
+        bridge
+            .send_command("open_scene", json!({"scene_path": "res://pond.tscn"}))
+            .await,
+        "still starting",
+    );
+    let info = bridge
+        .send_command("get_project_info", json!({}))
+        .await
+        .expect("project info while starting");
+    assert_eq!(info["main_scene"], "res://main.tscn", "{info}");
+    bridge
+        .send_command("get_version", json!({}))
+        .await
+        .expect("version while starting");
+    let open = bridge.send_command("get_open_scenes", json!({})).await;
+    expect_error(open, "still starting");
+
+    wait_until_started(bridge, &editor.log, "the held editor").await;
+    let opened = bridge
+        .send_command("open_scene", json!({"scene_path": "res://pond.tscn"}))
+        .await
+        .expect("open pond once started");
+    assert_eq!(opened["active_scene"], "res://pond.tscn", "{opened}");
+    sleep(Duration::from_millis(500)).await;
+    let open = bridge
+        .send_command("get_open_scenes", json!({}))
+        .await
+        .expect("open scenes");
+    assert_eq!(open["active_scene"], "res://pond.tscn", "{open}");
+}
+
 /// A scene whose own node `A` is added under an instance that already has a child `A`. Godot
 /// renames the incoming node while loading and reports it only in its "Load Errors" dialog.
 const CLASH_SUB: &str = "[gd_scene format=3]\n\n[node name=\"Sub\" type=\"Node2D\"]\n\n[node name=\"A\" type=\"Node\" parent=\".\"]\n";
@@ -4389,18 +4473,7 @@ async fn an_editor_without_a_port_setting_is_found_on_the_derived_port() {
         .expect("spawn godot editor");
 
     let bridge = BridgeClient::with_port_origin(port, config.bridge_port_origin());
-    let deadline = Instant::now() + Duration::from_secs(120);
-    loop {
-        if bridge.send_command("ping", json!({})).await.is_ok() {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "editor bridge did not come up on port {port}; log:\n{}",
-            std::fs::read_to_string(&log).unwrap_or_default()
-        );
-        sleep(Duration::from_millis(500)).await;
-    }
+    wait_until_started(&bridge, &log, &format!("port {port}")).await;
     let text = std::fs::read_to_string(&log).unwrap_or_default();
     assert!(
         text.contains(&format!(

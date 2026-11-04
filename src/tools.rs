@@ -29,6 +29,7 @@ mod import_params;
 mod input_map;
 mod main_loop;
 mod project;
+mod reference_kind;
 mod run;
 mod scenario;
 mod scripts;

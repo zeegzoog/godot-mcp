@@ -3101,7 +3101,7 @@ const DELETE_PROBE_HOOK: &str = r#"        "__test_delete_probe":
 "#;
 
 /// godot_delete_file through the editor: a referenced script and a scene with unsaved changes are
-/// refused; a script with its .uid, an imported image with its .import and imported data, and an
+/// refused; a scene that a script only saves is deleted without force; a script with its .uid, an imported image with its .import and imported data, and an
 /// open scene are deleted, their tabs closed and the FileSystem dock updated. A reference from a
 /// nested project, which Godot does not scan, does not count.
 #[tokio::test]
@@ -3130,6 +3130,11 @@ async fn files_are_deleted_through_the_editor_with_companions_and_tabs() {
             ),
             ("old_scene.tscn", simple_scene),
             ("dirty.tscn", simple_scene),
+            ("generated.tscn", simple_scene),
+            (
+                "tools/generate.gd",
+                "extends RefCounted\n\nconst OUT := \"res://generated.tscn\"\n\nfunc run() -> void:\n\tResourceSaver.save(PackedScene.new(), OUT)\n",
+            ),
             (
                 "icon.svg",
                 "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"16\"><rect width=\"16\" height=\"16\" fill=\"#3a3\"/></svg>\n",
@@ -3184,6 +3189,22 @@ async fn files_are_deleted_through_the_editor_with_companions_and_tabs() {
         tool_text(&refused)
     );
     assert!(project.join("used.gd").is_file());
+
+    // A scene a script only saves is deleted without force, and the answer names the writer.
+    let generated = delete(json!({"paths": ["res://generated.tscn"], "trash": false})).await;
+    assert!(!generated.is_error, "{}", tool_text(&generated));
+    let report: Value = serde_json::from_str(&tool_text(&generated)).expect("JSON report");
+    assert_eq!(
+        report["references"][0]["referenced_by"][0]["kind"], "written",
+        "{report}"
+    );
+    assert!(
+        report["warnings"]
+            .to_string()
+            .contains("res://tools/generate.gd"),
+        "{report}"
+    );
+    assert!(!project.join("generated.tscn").exists());
 
     // A scene with unsaved changes is refused.
     editor
@@ -4409,6 +4430,66 @@ async fn the_addon_derives_the_same_bridge_port_as_the_server() {
         godot_mcp::bridge_port::port_for(&canonical).to_string(),
         "{text}"
     );
+}
+
+/// Runs `tests/script-reference-vectors.json` through the addon's reference classifier.
+const SCRIPT_REFERENCE_CHECK: &str = r#"extends SceneTree
+
+func _init() -> void:
+    var ops: RefCounted = (load("res://file_ops.gd") as GDScript).new() as RefCounted
+    var vectors: Dictionary = JSON.parse_string(FileAccess.get_file_as_string(OS.get_cmdline_user_args()[0]))
+    var failures: int = 0
+    var cases: int = 0
+    for case: Dictionary in vectors["cases"]:
+        cases += 1
+        var kind: String = str(ops.call("classify_script", str(case["script"]), str(case["path"])))
+        if kind != str(case["kind"]):
+            failures += 1
+            print("MISMATCH ", case["name"], ": ", kind, " != ", case["kind"])
+    print("CASES=", cases)
+    print("FAILURES=", failures)
+    quit()
+"#;
+
+/// The addon tells a script that only writes a file from one that uses it the same way as the
+/// server: the shared vectors hold for `classify_script` in `file_ops.gd`.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn the_addon_classifies_script_references_like_the_server() {
+    let (godot, _) = godot_binaries();
+    let dir = tempfile::tempdir().expect("project dir");
+    let project = dir.path();
+    std::fs::write(project.join("project.godot"), "config_version=5\n").expect("project.godot");
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("addons/godot_mcp/editor/file_ops.gd"),
+        project.join("file_ops.gd"),
+    )
+    .expect("copy file_ops.gd");
+    std::fs::write(project.join("check.gd"), SCRIPT_REFERENCE_CHECK).expect("check.gd");
+    let output = timeout(
+        Duration::from_secs(120),
+        Command::new(&godot)
+            .args(["--headless", "--path"])
+            .arg(project)
+            .args(["--script", "res://check.gd", "--"])
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/script-reference-vectors.json"))
+            .stdin(Stdio::null())
+            .output(),
+    )
+    .await
+    .expect("check timed out")
+    .expect("run godot");
+    let text = String::from_utf8_lossy(&output.stdout).to_string()
+        + &String::from_utf8_lossy(&output.stderr);
+    let line = |key: &str| {
+        text.lines()
+            .find_map(|line| line.strip_prefix(key))
+            .unwrap_or_else(|| panic!("no {key} line in:\n{text}"))
+            .trim()
+            .to_string()
+    };
+    assert_eq!(line("FAILURES="), "0", "{text}");
+    assert_ne!(line("CASES="), "0", "{text}");
 }
 
 /// With no port configured on either side, a server started in the project reaches the

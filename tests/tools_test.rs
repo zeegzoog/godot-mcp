@@ -4281,6 +4281,67 @@ async fn files_are_deleted_on_disk_with_their_companions_unless_still_referenced
     }
 }
 
+/// A tool script that only saves a generated file names its path without using it: deleting
+/// the file is not refused, and the answer says which script writes it. A script that loads the
+/// file still refuses it without force, and every reference reports its kind.
+#[tokio::test]
+async fn a_file_only_written_by_a_generator_script_is_deleted_without_force() {
+    let project = project_dir();
+    let root = project.path();
+    let write = |name: &str, text: &str| {
+        let path = root.join(name);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("folder");
+        std::fs::write(path, text).expect("fixture file");
+    };
+    let scene = "[gd_scene format=3]\n\n[node name=\"Preview\" type=\"Node3D\"]\n";
+    write("previews/bed_relief_preview.tscn", scene);
+    write("previews/loaded_preview.tscn", scene);
+    write(
+        "scripts/tools/preview_bed_relief.gd",
+        "@tool\nextends EditorScript\n\nconst OUT := \"res://previews/bed_relief_preview.tscn\"\n\nfunc _run() -> void:\n\tvar packed := PackedScene.new()\n\tpacked.pack(Node3D.new())\n\tDirAccess.make_dir_recursive_absolute(OUT.get_base_dir())\n\tResourceSaver.save(packed, OUT)\n\tprint(\"Saved \", OUT)\n",
+    );
+    write(
+        "scripts/tools/preview_loaded.gd",
+        "@tool\nextends EditorScript\n\nconst OUT := \"res://previews/loaded_preview.tscn\"\n\nfunc _run() -> void:\n\tResourceSaver.save(PackedScene.new(), OUT)\n\tvar again: PackedScene = load(OUT)\n",
+    );
+    let delete = |args: Value| async move {
+        let mut args = args;
+        args["project_path"] = json!(root);
+        call("godot_delete_file", args).await
+    };
+
+    let used = delete(json!({"paths": ["res://previews/loaded_preview.tscn"]})).await;
+    assert!(used.is_error, "{}", text(&used));
+    let message = text(&used);
+    assert!(message.contains("still used by 1 file(s)"), "{message}");
+    assert!(message.contains("\"kind\": \"used\""), "{message}");
+    assert!(root.join("previews/loaded_preview.tscn").exists());
+
+    let dry =
+        delete(json!({"paths": ["res://previews/bed_relief_preview.tscn"], "dry_run": true})).await;
+    assert!(!dry.is_error, "{}", text(&dry));
+    let report: Value = serde_json::from_str(&text(&dry)).expect("JSON report");
+    assert_eq!(report["refused"], json!([]), "{report}");
+    assert_eq!(report["references"][0]["written"], 1, "{report}");
+    assert_eq!(report["references"][0]["used"], 0, "{report}");
+    assert_eq!(
+        report["references"][0]["referenced_by"][0],
+        json!({"file": "res://scripts/tools/preview_bed_relief.gd", "by": ["path"], "kind": "written"}),
+        "{report}"
+    );
+    assert!(
+        report["warnings"].to_string().contains(
+            "named only as a file that 1 script(s) write: res://scripts/tools/preview_bed_relief.gd"
+        ),
+        "{report}"
+    );
+
+    let deleted = delete(json!({"paths": ["res://previews/bed_relief_preview.tscn"]})).await;
+    assert!(!deleted.is_error, "{}", text(&deleted));
+    assert!(!root.join("previews/bed_relief_preview.tscn").exists());
+    assert!(root.join("scripts/tools/preview_bed_relief.gd").exists());
+}
+
 #[test]
 fn every_tool_declares_all_four_hints() {
     let listed = serde_json::to_value(ToolManager::list_tools()).expect("tools serialize");

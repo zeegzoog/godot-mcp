@@ -4800,8 +4800,12 @@ async fn run_script_counts_the_leaks_godot_reports_at_exit() {
     let text = text_of(&result);
     assert!(!result.is_error, "{text}");
     let answer: Value = serde_json::from_str(&text).expect("json answer");
+    // The kinds of exit-time report depend on the engine: 4.7 and later count the ObjectDB
+    // instances left at exit, older lines print only the RID allocations.
     assert!(
-        answer["exit_leaks"]["objectdb_instances"].as_u64() >= Some(1),
+        answer["exit_leaks"]
+            .as_object()
+            .is_some_and(|kinds| kinds.values().any(|count| count.as_u64() >= Some(1))),
         "{answer}"
     );
     assert!(

@@ -1468,9 +1468,13 @@ async fn probe_is_listed_read_only_and_checks_its_size_before_reaching_a_game() 
         .expect("screenshot");
     let shot = serde_json::to_value(&shot).expect("tool");
     let aim = &shot["inputSchema"]["properties"]["aim"];
-    for key in ["at", "distance", "position", "look_at", "up"] {
+    for key in ["at", "distance", "position", "look_at", "up", "size", "fov"] {
         assert!(aim["properties"].get(key).is_some(), "{key}: {aim}");
     }
+    assert_eq!(aim["properties"]["size"]["minimum"], 0.001, "{aim}");
+    assert_eq!(aim["properties"]["size"]["maximum"], 10000, "{aim}");
+    assert_eq!(aim["properties"]["fov"]["minimum"], 1, "{aim}");
+    assert_eq!(aim["properties"]["fov"]["maximum"], 179, "{aim}");
     assert_eq!(aim["additionalProperties"], false, "{aim}");
 }
 

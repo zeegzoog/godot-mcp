@@ -10,6 +10,11 @@ const MAX_MAX := 4096
 const MAX_FRAMES := 8
 const MAX_BASELINES := 8
 const MAX_BASELINE_PIXELS := 512 * 512
+## The lens an aimed copy may be given: orthographic size in metres, perspective fov in degrees.
+const AIM_SIZE_MIN := 0.001
+const AIM_SIZE_MAX := 10000.0
+const AIM_FOV_MIN := 1.0
+const AIM_FOV_MAX := 179.0
 ## Frames a capture waits for a window that has not drawn anything yet before it gives up.
 const EMPTY_RETRIES := 60
 ## Process frames a capture waits for the window to draw a new frame before it draws one itself.
@@ -543,8 +548,8 @@ static func _aim(rt: Node, params: Dictionary) -> Dictionary:
         return R.err(R.BAD_PARAMS, "aim must be an object: {at: [x, y, z]} or {position: [x, y, z], look_at: [x, y, z]}.")
     var aim: Dictionary = raw
     for key: String in aim.keys():
-        if not key in ["at", "distance", "position", "look_at", "up"]:
-            return R.err(R.BAD_PARAMS, "aim has no '%s'. It takes at and distance, or position, look_at and up." % key)
+        if not key in ["at", "distance", "position", "look_at", "up", "size", "fov"]:
+            return R.err(R.BAD_PARAMS, "aim has no '%s'. It takes at and distance, or position, look_at and up, and size or fov for the lens." % key)
     if int(params.get("frames", 1)) != 1:
         return R.err(R.BAD_PARAMS, "aim takes one picture: leave frames at 1.")
     if not str(params.get("node", "")).strip_edges().is_empty():
@@ -569,6 +574,9 @@ static func _aim(rt: Node, params: Dictionary) -> Dictionary:
         if not (value is int or value is float) or float(value) <= 0.0 or not is_finite(float(value)):
             return R.err(R.BAD_PARAMS, "aim.distance must be a number above 0.")
         distance = float(value)
+    var lens: Variant = _lens(aim)
+    if lens is String:
+        return R.err(R.BAD_PARAMS, lens)
     var up := Vector3.UP
     if aim.has("up"):
         var given_up: Variant = _vector3(aim.get("up"))
@@ -642,6 +650,19 @@ static func _aim(rt: Node, params: Dictionary) -> Dictionary:
                 camera.set(property, source.get(property))
         if not is_zero_approx(source.h_offset) or not is_zero_approx(source.v_offset):
             report["offsets_dropped"] = [source.h_offset, source.v_offset]
+    report["lens_from"] = "game_camera" if source != null else "default"
+    var given_lens: Dictionary = lens
+    if not given_lens.is_empty():
+        # Only the copy changes lens: the game camera keeps its projection, fov and size.
+        var projection := int(given_lens["projection"]) as Camera3D.ProjectionType
+        if camera.projection != projection:
+            report["projection_replaced"] = ["perspective", "orthogonal", "frustum"][camera.projection]
+            camera.projection = projection
+        if given_lens.has("size"):
+            camera.size = float(given_lens["size"])
+        else:
+            camera.fov = float(given_lens["fov"])
+        report["lens_from"] = "given"
     viewport.add_child(camera)
     rt.add_child(viewport)
     camera.global_transform = transform
@@ -656,8 +677,27 @@ static func _aim(rt: Node, params: Dictionary) -> Dictionary:
         report["size"] = snappedf(camera.size, 0.0001)
     else:
         report["fov"] = snappedf(camera.fov, 0.0001)
+    report["aspect_axis"] = "height" if camera.keep_aspect == Camera3D.KEEP_HEIGHT else "width"
     report["image_centre"] = "the aimed point is the centre pixel of the returned image"
     return {"viewport": viewport, "label": "aim camera", "aim_viewport": viewport, "aim": report}
+
+
+## The lens override of an aim: {} when neither size nor fov is given, {projection, size} or
+## {projection, fov} when one is, or the error text when a value is out of range.
+static func _lens(aim: Dictionary) -> Variant:
+    if aim.has("size") and aim.has("fov"):
+        return "aim takes size (an orthographic copy) or fov (a perspective copy), not both."
+    if aim.has("size"):
+        var size: Variant = aim.get("size")
+        if not (size is int or size is float) or not is_finite(float(size)) or float(size) < AIM_SIZE_MIN or float(size) > AIM_SIZE_MAX:
+            return "aim.size must be a number from %s to %s metres: the height of the orthographic view (its width when the copied camera keeps width)." % [AIM_SIZE_MIN, int(AIM_SIZE_MAX)]
+        return {"projection": Camera3D.PROJECTION_ORTHOGONAL, "size": float(size)}
+    if aim.has("fov"):
+        var fov: Variant = aim.get("fov")
+        if not (fov is int or fov is float) or not is_finite(float(fov)) or float(fov) < AIM_FOV_MIN or float(fov) > AIM_FOV_MAX:
+            return "aim.fov must be a number from %d to %d degrees: the vertical view angle (horizontal when the copied camera keeps width)." % [int(AIM_FOV_MIN), int(AIM_FOV_MAX)]
+        return {"projection": Camera3D.PROJECTION_PERSPECTIVE, "fov": float(fov)}
+    return {}
 
 
 ## How far the game camera is from what it looks at: the first hit straight ahead of it, else the

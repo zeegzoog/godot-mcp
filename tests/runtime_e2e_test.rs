@@ -6675,7 +6675,9 @@ fn aim_of(note: &str) -> Value {
 }
 
 fn baseline_changed(note: &str) -> u64 {
-    note.split_once(", baseline plain changed ")
+    // Any baseline name: "..., baseline <name> changed <n> px, ...".
+    note.split_once(", baseline ")
+        .and_then(|(_, rest)| rest.split_once(" changed "))
         .and_then(|(_, rest)| rest.split(' ').next())
         .and_then(|number| number.parse().ok())
         .unwrap_or_else(|| panic!("no baseline comparison in {note}"))
@@ -6706,7 +6708,9 @@ async fn an_aimed_screenshot_looks_at_a_point_and_leaves_the_game_camera_alone()
     let plain = shot(json!({"save_baseline": "plain"})).await;
     assert!(!plain.is_error, "{}", text_of(&plain));
 
-    let aimed = shot(json!({"baseline": "plain", "aim": {"at": [30, 2, 0]}})).await;
+    let aimed =
+        shot(json!({"baseline": "plain", "save_baseline": "aimed", "aim": {"at": [30, 2, 0]}}))
+            .await;
     assert!(!aimed.is_error, "{}", text_of(&aimed));
     let note = text_of(&aimed);
     assert!(
@@ -6722,6 +6726,9 @@ async fn an_aimed_screenshot_looks_at_a_point_and_leaves_the_game_camera_alone()
     assert!(close(&aim["position"][0], 30.0), "{aim}");
     assert!(close(&aim["position"][1], 2.0 + 0.6 * 9.4), "{aim}");
     assert!(close(&aim["position"][2], 0.8 * 9.4), "{aim}");
+    assert_eq!(aim["projection"], "perspective", "{aim}");
+    assert_eq!(aim["lens_from"], "game_camera", "{aim}");
+    assert!(close(&aim["fov"], 75.0), "{aim}");
 
     let given = shot(json!({"aim": {"at": [30, 2, 0], "distance": 20}})).await;
     assert!(!given.is_error, "{}", text_of(&given));
@@ -6735,6 +6742,59 @@ async fn an_aimed_screenshot_looks_at_a_point_and_leaves_the_game_camera_alone()
     assert_eq!(placed_aim["mode"], "look_at", "{placed_aim}");
     assert!(close(&placed_aim["forward"][2], -1.0), "{placed_aim}");
 
+    // A wide orthographic overview from the same copy, without touching the game camera.
+    let wide = shot(json!({"baseline": "aimed", "aim": {"at": [30, 2, 0], "size": 60}})).await;
+    assert!(!wide.is_error, "{}", text_of(&wide));
+    let wide_aim = aim_of(&text_of(&wide));
+    assert_eq!(wide_aim["projection"], "orthogonal", "{wide_aim}");
+    assert_eq!(wide_aim["projection_replaced"], "perspective", "{wide_aim}");
+    assert_eq!(wide_aim["lens_from"], "given", "{wide_aim}");
+    assert_eq!(wide_aim["aspect_axis"], "height", "{wide_aim}");
+    assert!(close(&wide_aim["size"], 60.0), "{wide_aim}");
+    assert!(wide_aim.get("fov").is_none(), "{wide_aim}");
+    assert!(
+        baseline_changed(&text_of(&wide)) > 500,
+        "the overview looks like the plain aimed shot: {}",
+        text_of(&wide)
+    );
+    let narrow = shot(json!({"baseline": "aimed", "aim": {"at": [30, 2, 0], "fov": 20}})).await;
+    assert!(!narrow.is_error, "{}", text_of(&narrow));
+    let narrow_aim = aim_of(&text_of(&narrow));
+    assert_eq!(narrow_aim["projection"], "perspective", "{narrow_aim}");
+    assert_eq!(narrow_aim["lens_from"], "given", "{narrow_aim}");
+    assert!(
+        narrow_aim.get("projection_replaced").is_none(),
+        "{narrow_aim}"
+    );
+    assert!(close(&narrow_aim["fov"], 20.0), "{narrow_aim}");
+    assert!(
+        baseline_changed(&text_of(&narrow)) > 500,
+        "a 20 degree view looks like the 75 degree one: {}",
+        text_of(&narrow)
+    );
+    for (lens, expected) in [
+        (json!({"size": 0}), "aim.size"),
+        (json!({"size": 20000}), "10000"),
+        (json!({"size": "wide"}), "aim.size"),
+        (json!({"fov": 0.5}), "aim.fov"),
+        (json!({"fov": 180}), "179"),
+        (json!({"size": 10, "fov": 30}), "not both"),
+    ] {
+        let mut aim = json!({"at": [30, 2, 0]});
+        if let (Some(base), Some(more)) = (aim.as_object_mut(), lens.as_object()) {
+            for (key, value) in more {
+                base.insert(key.clone(), value.clone());
+            }
+        }
+        let refused = shot(json!({"aim": aim})).await;
+        assert!(refused.is_error, "{lens}: {}", text_of(&refused));
+        assert!(
+            text_of(&refused).contains(expected),
+            "{lens}: {}",
+            text_of(&refused)
+        );
+    }
+
     let wrong = shot(json!({"aim": {"at": [1, 2]}})).await;
     assert!(wrong.is_error, "{}", text_of(&wrong));
     let both = shot(json!({"aim": {"at": [1, 2, 3], "look_at": [0, 0, 0]}})).await;
@@ -6745,11 +6805,13 @@ async fn an_aimed_screenshot_looks_at_a_point_and_leaves_the_game_camera_alone()
         &call(
             &tools,
             "godot_game_get",
-            json!({"run_id": run_id, "path": "Rig/Camera", "properties": ["current", "global_position"]}),
+            json!({"run_id": run_id, "path": "Rig/Camera", "properties": ["current", "global_position", "projection", "fov"]}),
         )
         .await,
     );
     assert_eq!(camera["properties"]["current"], true, "{camera}");
+    assert_eq!(camera["properties"]["projection"], 0, "{camera}");
+    assert!(close(&camera["properties"]["fov"], 75.0), "{camera}");
     assert!(
         close(&camera["properties"]["global_position"][1], 6.0),
         "{camera}"

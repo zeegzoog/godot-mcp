@@ -373,3 +373,122 @@ async fn an_image_is_imported_as_a_texture_3d_headless() {
 
 /// A 64×16 strip of four 16×16 slices.
 const STRIP: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="64" height="16"><rect width="16" height="16" fill="#000"/><rect x="16" width="16" height="16" fill="#555"/><rect x="32" width="16" height="16" fill="#aaa"/><rect x="48" width="16" height="16" fill="#fff"/></svg>"##;
+
+/// A glb with one triangle whose legs are `size` long: every size gives a file of the same length.
+fn triangle_glb(size: f32) -> Vec<u8> {
+    let json = format!(
+        concat!(
+            r#"{{"asset":{{"version":"2.0"}},"scene":0,"scenes":[{{"nodes":[0]}}],"#,
+            r#""nodes":[{{"mesh":0,"name":"Tri"}}],"meshes":[{{"primitives":[{{"attributes":{{"POSITION":0}}}}]}}],"#,
+            r#""accessors":[{{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3","min":[0,0,0],"max":[{size:.1},{size:.1},0]}}],"#,
+            r#""bufferViews":[{{"buffer":0,"byteOffset":0,"byteLength":36}}],"buffers":[{{"byteLength":36}}]}}"#
+        ),
+        size = size
+    );
+    let mut json = json.into_bytes();
+    while json.len() % 4 != 0 {
+        json.push(b' ');
+    }
+    let mut bin = Vec::new();
+    for value in [0.0, 0.0, 0.0, size, 0.0, 0.0, 0.0, size, 0.0] {
+        bin.extend(f32::to_le_bytes(value));
+    }
+    let total = 12 + 8 + json.len() + 8 + bin.len();
+    let mut glb = Vec::new();
+    for word in [0x4654_6C67u32, 2, total as u32] {
+        glb.extend(word.to_le_bytes());
+    }
+    glb.extend((json.len() as u32).to_le_bytes());
+    glb.extend(0x4E4F_534Au32.to_le_bytes());
+    glb.extend(json);
+    glb.extend((bin.len() as u32).to_le_bytes());
+    glb.extend(0x004E_4942u32.to_le_bytes());
+    glb.extend(bin);
+    glb
+}
+
+const MESH_SIZE_SCRIPT: &str = "extends SceneTree\n\nfunc _initialize() -> void:\n\
+    \tvar scene: Node = (load(\"res://m.glb\") as PackedScene).instantiate()\n\
+    \tvar mesh: MeshInstance3D = scene.find_child(\"*\", true, false) as MeshInstance3D\n\
+    \tprint(\"MESH_SIZE=%.1f\" % mesh.get_aabb().size.x)\n\
+    \tscene.free()\n\
+    \tquit()\n";
+
+async fn mesh_size(tools: &Arc<ToolManager>, root: &Path) -> String {
+    let run = call(
+        tools,
+        "godot_run_script",
+        json!({"script": "res://mesh_size.gd"}),
+        root,
+    )
+    .await;
+    let body = text(&run);
+    body.split("MESH_SIZE=")
+        .nth(1)
+        .and_then(|rest| rest.get(..3))
+        .unwrap_or_else(|| panic!("no MESH_SIZE in {body}"))
+        .to_string()
+}
+
+/// A model rewritten twice with new bytes of the same size: each headless resave lists it with
+/// its kind; one rewritten within the second Godot's last scan saw is skipped by Godot, named
+/// under still_stale, and imported by force.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ editor executable"]
+async fn a_rewritten_model_is_listed_reported_when_skipped_and_forced_headless() {
+    let dir = project();
+    let root = dir.path();
+    let source = root.join("m.glb");
+    std::fs::write(root.join("mesh_size.gd"), MESH_SIZE_SCRIPT).expect("script");
+    std::fs::write(&source, triangle_glb(1.0)).expect("glb");
+    let tools = manager();
+    let paths = json!({"paths": ["res://m.glb"]});
+    report(&call(&tools, "godot_resave_resources", json!({}), root).await);
+    assert_eq!(mesh_size(&tools, root).await, "1.0");
+
+    // A second second, so Godot's scan sees a new modification time and reimports.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    std::fs::write(&source, triangle_glb(2.0)).expect("glb");
+    assert_eq!(triangle_glb(1.0).len(), triangle_glb(2.0).len());
+    let listed = report(&call(&tools, "godot_resave_resources", paths.clone(), root).await);
+    assert_eq!(
+        listed["imported"],
+        json!([{"path": "res://m.glb", "kind": "scene", "type": "PackedScene"}]),
+        "{listed}"
+    );
+    assert_eq!(listed["still_stale"], json!([]), "{listed}");
+    assert_eq!(mesh_size(&tools, root).await, "2.0");
+
+    // New bytes whose modification time is in the same whole second as the one Godot recorded.
+    let recorded = std::fs::metadata(&source)
+        .and_then(|meta| meta.modified())
+        .expect("mtime");
+    let second = recorded
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("epoch")
+        .as_secs();
+    std::fs::write(&source, triangle_glb(3.0)).expect("glb");
+    std::fs::File::options()
+        .write(true)
+        .open(&source)
+        .and_then(|file| {
+            file.set_modified(
+                std::time::UNIX_EPOCH + std::time::Duration::from_millis(second * 1000 + 900),
+            )
+        })
+        .expect("same second");
+    let skipped = call(&tools, "godot_resave_resources", paths.clone(), root).await;
+    let body = text(&skipped);
+    assert!(skipped.is_error, "{body}");
+    assert!(body.contains("\"reason\": \"source_changed\""), "{body}");
+    assert!(body.contains("force: true"), "{body}");
+    assert_eq!(mesh_size(&tools, root).await, "2.0", "Godot skipped it");
+
+    let mut forced_args = paths;
+    forced_args["force"] = json!(true);
+    let forced = report(&call(&tools, "godot_resave_resources", forced_args, root).await);
+    assert_eq!(forced["forced"], json!(["res://m.glb"]), "{forced}");
+    assert_eq!(forced["imported"][0]["path"], "res://m.glb", "{forced}");
+    assert_eq!(forced["still_stale"], json!([]), "{forced}");
+    assert_eq!(mesh_size(&tools, root).await, "3.0");
+}

@@ -15,7 +15,8 @@ pub use binary_resource::{BinaryUid, binary_uid};
 pub use debug_ctl::{DebugCtl, StopInfo, split_breakpoint};
 pub use debug_session::DebugSession;
 pub use imports::{
-    IMPORTED_EXTENSIONS, changed_imports, import_current, import_fingerprints, stale_imports,
+    IMPORTED_EXTENSIONS, changed_imports, force_reimport, import_current, import_fingerprints,
+    import_kind, stale_imports, stale_reason,
 };
 pub use resource_audit::{BinaryUidFix, ResourceDamage, ResourceRepair, TextResourceSnapshot};
 pub use runs::{GameHub, ProcessStart, Run, RunInfo, json_id_eq};

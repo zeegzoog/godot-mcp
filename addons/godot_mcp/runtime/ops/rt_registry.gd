@@ -3,8 +3,8 @@ extends RefCounted
 ## registered by name by the project's adapter script (`register(registry)`). The runtime knows
 ## nothing of the game; this is the one place the game's own names enter.
 ##
-## The registration calls are the ones godot-dev-bridge's adapters already use, so an adapter
-## written for it registers here unchanged.
+## The registration calls are `add_state(name, provider)`, `add_command(name, callable, help)` and
+## `refuse(message)`; an adapter makes them in its `register(registry)`.
 
 ## A project command refuses its arguments by returning `refuse(message)`: a dictionary whose only
 ## key is this one. A command calls `refuse` instead of writing the key, so a typo in the key cannot

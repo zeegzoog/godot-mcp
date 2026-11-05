@@ -1,6 +1,6 @@
 # Held Stepping
 
-**Version:** 1.3.0
+**Version:** 1.2.2
 **Status:** Stable
 **Layer:** implementation
 **Implements:** l1-controlled-time.md
@@ -111,7 +111,6 @@ The step decision is the counter of the parent concept (its §4.2). The loop wai
 | `game.screenshot`, one frame, no camera: the viewport's last drawn frame, no render wait; an error asks for one held tick when nothing was drawn yet | `input.run` steps `wait`, `text`, `swipe` → instant steps with held steps between them |
 | `input.run` with only `key`, `action` (an Input Map action), `mouse_button`, `touch` (also its `move` phase), `joy_button` (press, release, tap), `click`, `click_node`, `mouse_move`, `joy_axis`, `time_scale`; taps and clicks release after `hold_ticks` (default 2, 1 to 600) | — |
 | `input.release_all` (also clears the schedule) | — |
-| `game.run_script`: a function with no await answers at once; one that awaits runs as a held step that lasts until it returns or its timeout, then answers from the hold point (the tick it resumes in finishes, so N awaited physics frames take N + 1 ticks) | — |
 
 ### 5.6 Exactness
 
@@ -178,4 +177,3 @@ Tests: `runtime_e2e_test.rs` for every row above and for `deterministic` on a he
 | 1.2.0 | 2026-10-26 | Agent (magic.spec) | [ADDED] §5.8: the scenario tool as merged (steps, snapshots, the run lock, the deadline and the release of input, the pause it lifts); the Input Map action drawback closed. Stable → RFC → Stable after Post-Update Review. The references name the `tools/game/` modules. |
 | 1.2.1 | 2026-11-02 | Agent (magic.spec) | Added the scenario guide `docs/game-checks.md` to Canonical References; ventilation found it unnamed. No requirement changed. |
 | 1.2.2 | 2026-11-05 | Agent (magic.spec) | Canonical References: the two paths of `[GAME]` are two rows, so each is read as a path. No requirement changed. Removed the `[ADDED]` and `[MODIFIED]` markers from the body: the history rows carry what changed. No requirement changed. |
-| 1.3.0 | 2026-11-05 | Agent (magic.spec) | [ADDED] `game.run_script` served while held, as a held step that lasts until the function returns. Stable → RFC → Stable after Post-Update Review. |

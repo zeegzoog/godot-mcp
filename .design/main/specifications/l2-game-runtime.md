@@ -1,6 +1,6 @@
 # Game Runtime Channel
 
-**Version:** 1.11.0
+**Version:** 1.10.1
 **Status:** Stable
 **Layer:** implementation
 **Implements:** l1-runtime-observability.md
@@ -62,7 +62,7 @@ addons/godot_mcp/
 ├── editor/game_relay.gd       EditorDebuggerPlugin relaying mcp:* messages
 └── runtime/
     ├── mcp_runtime.gd         autoload: registers the "mcp" capture, sends hello, dispatches requests
-    └── ops/rt_*.gd            rt_result (result helpers), rt_live (live tree and properties), rt_input (input and gestures), rt_view (pictures), rt_record (frame series saved as PNG files for godot_game_record), rt_output (output), rt_script (running a function of a project script), rt_hold, rt_registry, rt_project, rt_probe (raycasts for godot_game_probe)
+    └── ops/rt_*.gd            rt_result (result helpers), rt_live (live tree and properties), rt_input (input and gestures), rt_view (pictures), rt_record (frame series saved as PNG files for godot_game_record), rt_output (output), rt_hold, rt_registry, rt_project, rt_probe (raycasts for godot_game_probe)
 ```
 
 ### 5.2 Managed Process Run
@@ -85,7 +85,6 @@ addons/godot_mcp/
 | `game.physics`, `game.pause`, `game.body` | `godot_game_physics`; `godot_game_scenario` (pause and CharacterBody reads) |
 | `game.screenshot` | `godot_game_screenshot` (a window that stopped drawing is drawn by the capture itself without presenting it, and the answer says `path`; with `aim`, optionally `size` or `fov` for the copy only: a temporary camera in a temporary viewport sharing the game's world, drawn twice under Compatibility before the readback) |
 | `game.probe` | `godot_game_probe` |
-| `game.run_script` | `godot_game_run_script` |
 | `game.record` | `godot_game_record` |
 | `project.state`, `project.command` | `godot_game_state`, `godot_game_command`; see [l2-project-adapter.md](l2-project-adapter.md) |
 | output and errors | `godot_run_output` |
@@ -100,8 +99,6 @@ A property path of `game.get` and `game.set` is a node property followed by reso
 A scene stamp carries the long explanation of `script_sha256` once per answer, not once per stamped log line, and a baseline comparison without `max_dimension` is captured at the baseline's own size, so a baseline saved at 256 pixels can be compared without repeating the option.
 
 `game.probe` casts `PhysicsRayQueryParameters3D` rays through the direct space state of the main window's 3D world (or the world of the node `world` names) and moves no node; a grid answers a table of heights instead of one object per ray. An aimed `game.screenshot` copies the current `Camera3D` into a `SubViewport` that shares the game's `World3D`, so the game's own current camera is never switched; the viewport and camera are added under the runtime node, drawn once (a held game draws them with `RenderingServer.force_draw`, so no tick passes) and freed before the answer is sent. Only the 3D world is in that picture.
-
-`game.run_script` reads and compiles the named `res://` file on every call (`CACHE_MODE_IGNORE`), refuses a script that does not extend Node before anything runs, and adds the instance as a child of the runtime for the length of the call; the instance is freed afterwards, which also ends a function still suspended at an await. A function that awaits keeps the request open: the runtime polls it each frame, or, while held, it runs as a held step (`l2-held-stepping.md`). A script error fails the call only when the function's script is in the error's stack.
 
 A click on a node uses the node's transform with its canvas, so a scrolling camera or a CanvasLayer does not misplace it. The time scale set by a step or a wait is restored when the game exits.
 
@@ -150,4 +147,3 @@ A click on a node uses the node's transform with its canvas, so a scrolling came
 | 1.9.0 | 2026-11-04 | Agent (magic.spec) | [MODIFIED] `game.screenshot` with `aim`: the temporary viewport is drawn once more under Compatibility before it is read, because the renderer can omit instance-shaded meshes on a fresh viewport's first draw; the scene does not advance. Source: pull request 117. Stable → RFC → Stable after Post-Update Review. |
 | 1.10.0 | 2026-11-04 | Agent (magic.spec) | [MODIFIED] `game.screenshot`: a covered or minimized window is captured by drawing one frame of the rendering server, the answer names the path (`window`, `forced_draw`, `mixed`, `held`), and `aim` takes `size` or `fov` for its copy of the camera. Source: pull requests 116 and 119. Stable → RFC → Stable after Post-Update Review. |
 | 1.10.1 | 2026-11-05 | Agent (magic.spec) | Canonical References: the two paths of `[GAME]` are two rows, so each is read as a path. No requirement changed. Removed the `[ADDED]` and `[MODIFIED]` markers from the body: the history rows carry what changed. No requirement changed. |
-| 1.11.0 | 2026-11-05 | Agent (magic.spec) | [ADDED] `game.run_script` and `rt_script`. Stable → RFC → Stable after Post-Update Review. |

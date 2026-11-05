@@ -1,6 +1,6 @@
 # Tool Catalog
 
-**Version:** 1.19.0
+**Version:** 1.18.0
 **Status:** Stable
 **Layer:** concept
 
@@ -105,7 +105,6 @@ Agents call tools without seeing the implementation; a tool's contract has to be
 | `godot_game_state` | game | no | Values of the state the project's adapter registered, the adapter's status and its commands with their help |
 | `godot_game_command` | game | what the project's command does | Runs one command the project's adapter registered, by name, with a dictionary of arguments |
 | `godot_game_scenario` | game | managed process run only | One held play-through: Input Map actions and pointers, a known number of physics ticks per step, body and property snapshots, logs; one scenario per run; releases all input when it ends |
-| `godot_game_run_script` | game | what the script does | One function of a project `.gd` file run inside the running game against the live scene, compiled again on each call, with awaits, its value and its output; a held game runs ticks until it returns and holds again [ADDED] |
 | `godot_game_probe` | game | none | Raycasts in the running game's 3D physics world, moving no node: rays between two points or straight down, or a grid of down rays answered as ground heights (at most 1024 rays or 4096 points), with mask, exclude and areas; served while held |
 | `godot_game_screenshot` | game (windowed) | session memory of the run | PNG of the game, an optional frame sheet, pixel diff against the previous capture, named baselines with a region and a tolerance ; `aim`: one capture from a temporary copy of the game camera centred on a world point or placed with a look-at, leaving the game's cameras unmoved |
 | `godot_game_record` | game (windowed) | PNG files below the system temporary directory | Up to 240 frames of the game window written after the last grab; optional gif or mp4 through `ffmpeg`; refused while held |
@@ -171,4 +170,3 @@ graph TD
 | 1.16.0 | 2026-11-03 | Agent (magic.spec) | [ADDED] `godot_review_assets` in the catalog (an asset review rendered in a temporary process, nothing written to the project). Stable → RFC → Stable after Post-Update Review. |
 | 1.17.0 | 2026-11-04 | Agent (magic.spec) | [ADDED] `godot_world_map` in the catalog. Source: pull request 121. Stable → RFC → Stable after Post-Update Review. |
 | 1.18.0 | 2026-11-05 | Agent (magic.spec) | `godot_delete_file`: a file that a script only writes no longer refuses the deletion (CA-17). Stable → RFC → Stable after Post-Update Review. Removed the `[ADDED]` and `[MODIFIED]` markers from the body: the history rows carry what changed. No requirement changed. |
-| 1.19.0 | 2026-11-05 | Agent (magic.spec) | [ADDED] `godot_game_run_script` in the catalog. Stable → RFC → Stable after Post-Update Review. |

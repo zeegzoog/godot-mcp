@@ -76,7 +76,7 @@ Before submitting or committing changes, agents must execute and pass the comple
    cargo test --all-targets
    ```
 
-   Includes `tests/version_sync_test.rs`: the version in `addons/godot_mcp/plugin.cfg` must always equal `Cargo.toml` — bump both together — and every file naming the line's Godot version must agree with the version's `+godot.M.N`. New behaviour needs a test first: protocol and tool behaviour in `tests/stdio_protocol_test.rs` / `tests/tools_test.rs` (helpers in `tests/common/`), the agent feedback channel in `tests/feedback_test.rs`, bridge client in `tests/bridge_client_test.rs`, editor commands in `tests/editor_e2e_test.rs`, keeping the addon out of exports in `tests/addon_export_test.rs`, export presets and headless exports in `tests/export_e2e_test.rs`, launched processes staying independent of the server in `tests/detach_test.rs`, and a running game in `tests/runtime_e2e_test.rs`.
+   Includes `tests/version_sync_test.rs`: the version in `addons/godot_mcp/plugin.cfg` must always equal `Cargo.toml` — bump both together — and every file naming the line's Godot version must agree with the version's `+godot.M.N`. New behaviour needs a test first: protocol and tool behaviour in `tests/stdio_protocol_test.rs` / `tests/tools_test.rs` (helpers in `tests/common/`), the agent feedback channel in `tests/feedback_test.rs`, bridge client in `tests/bridge_client_test.rs`, editor commands in `tests/editor_e2e_test.rs`, keeping the addon out of exports in `tests/addon_export_test.rs`, export presets and headless exports in `tests/export_e2e_test.rs`, launched processes staying independent of the server in `tests/detach_test.rs`, a running game in `tests/runtime_e2e_test.rs`, and a played scenario in `tests/scenario_e2e_test.rs`.
 
 4. **GDScript Syntax Check**:
 
@@ -122,10 +122,11 @@ Before submitting or committing changes, agents must execute and pass the comple
    GODOT_PATH=/path/to/godot cargo test --test export_e2e_test -- --ignored --test-threads=1
    ```
 
-7. **Running game** (whenever the running-game tools, the debugger client, or the GDScript language-server client changed; same Godot build, ignored by default):
+7. **Running game** (whenever the running-game tools, the scenario tool, the debugger client, or the GDScript language-server client changed; same Godot build, ignored by default):
 
    ```bash
    GODOT_PATH=/path/to/godot cargo test --test runtime_e2e_test -- --ignored --test-threads=1
+   GODOT_PATH=/path/to/godot cargo test --test scenario_e2e_test -- --ignored --test-threads=1
    ```
 
    When an addon script changed, run the analyzer warning audit (part of that suite): `--check-only` never reports warnings.
@@ -181,7 +182,7 @@ Before concluding any development task, every agent MUST verify the following ch
 - [ ] **Verification Pipeline**: `cargo clippy`, `cargo fmt --check`, and `cargo test --all-targets` pass; the GDScript syntax check passes for every addon script.
 - [ ] **Editor End-to-End Tests**: If `addons/godot_mcp/` changed, `editor_e2e_test` and `addon_export_test` pass with the Godot build named in `.github/godot-version`, on every branch the change lands on.
 - [ ] **Export End-to-End Tests**: If the export tools or the headless runner changed, `export_e2e_test` passes with that same Godot build.
-- [ ] **Runtime End-to-End Tests**: If the running game, the debugger client, or the GDScript language-server client changed, `runtime_e2e_test` passes with that same Godot build.
+- [ ] **Runtime End-to-End Tests**: If the running game, the scenario tool, the debugger client, or the GDScript language-server client changed, `runtime_e2e_test` and `scenario_e2e_test` pass with that same Godot build.
 - [ ] **Tests First**: New behaviour is covered by a test in the matching `tests/` file.
 - [ ] **Version Sync**: The version in `addons/godot_mcp/plugin.cfg` equals the one in `Cargo.toml`.
 - [ ] **Undo/Redo**: Every editor mutation is wrapped in `EditorUndoRedoManager`, and no `.tscn` / `.tres` held by the editor is overwritten on disk behind its back.

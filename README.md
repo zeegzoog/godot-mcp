@@ -125,6 +125,7 @@ Set the environment variable `GODOT_MCP_NO_BRIDGE=1` for an editor that must not
 - Node paths are resolved inside the edited scene only; the scene root can't be removed.
 - `godot_game_call` runs only the methods you list in `permit`, and never one that can quit, evaluate code, call another method by name (`call`, `call_group`, `propagate_call`, `emit_signal`, `notification`, …), set a property by name (`set`, `set_deferred`, `set_indexed`) or free or replace a node (`free`, `queue_free`, `replace_by`). `godot_game_set` refuses `script` and private names, including on a resource reached with `:`. Nothing `godot_game_set` changes is saved to disk.
 - `godot_run_project` `user_args` are placed after `--` and only for `mode: "process"`. A value that starts with `-` is a game argument, not a Godot engine option.
+- `godot_review_assets` and `godot_world_map` run a fixed script in a temporary Godot process that reads the checked request from a JSON file, so no argument reaches the command line or generated source. `godot_review_assets` writes nothing into the project; `godot_world_map` writes only the `.png` named by `output_path`, inside the project, and its `.json` beside it, replacing earlier files of those names.
 - `godot_game_record` writes PNG files (and, with ffmpeg, one movie) only below the system temporary directory, never over an existing recording, and returns paths, not images.
 - The authoring tools never replace an existing scene or resource. `godot_set_project_setting` accepts only a plain `section/path` key, escapes the value, and keeps the type of a setting that exists, so it cannot add lines or sections to `project.godot`.
 
@@ -340,7 +341,7 @@ func _grant(args: Dictionary) -> Dictionary:
 - Reading is `godot_game_state` with `names` (all states when omitted); each state that fails is its own `{error}` entry, and the errors and warnings the engine logged meanwhile come back in `errors`. An answer larger than 262144 bytes is refused with the size of each state.
 - A command is `godot_game_command` with `name` and `args`. It is not limited by the refusals of `godot_game_call`: it may free nodes, change the scene or write files, whatever the project wrote. A script error inside it fails the call and may leave the game changed. A command and a state must not `await`; what a command defers (`call_deferred`, a timer) takes effect when the game next advances, so step a held game before reading the result.
 - Both tools work in a managed run, in editor Play and in a held game. `godot_get_run_status` shows each run's adapter: whether it loaded, what it registered and why a registration or the whole adapter was refused.
-- An adapter written for godot-dev-bridge works unchanged: set `godot_mcp/adapter` to the same script. Values with engine types (vectors, colors) come back as `godot_game_get` shows them.
+- Values with engine types (vectors, colors) come back as `godot_game_get` shows them.
 
 ## Playing a scenario
 

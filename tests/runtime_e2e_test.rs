@@ -4758,6 +4758,62 @@ async fn run_script_timeout_keeps_the_lines_godot_printed_before_the_kill() {
     assert!(buffered.contains("use printerr()"), "{buffered}");
 }
 
+/// godot_run_script with real Godot: fixed_fps runs physics frames without waiting for the clock,
+/// and the script counts the same frames and the same game time as in real time.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn run_script_with_fixed_fps_counts_the_same_frames_far_faster() {
+    let _ = IGNORE;
+    let project = project_dir_with_scripts();
+    std::fs::write(
+        project.path().join("scripts/frames.gd"),
+        "extends SceneTree\n\nfunc _initialize() -> void:\n\tvar game_time: float = 0.0\n\tvar first: int = Engine.get_physics_frames()\n\tfor index: int in 600:\n\t\tawait physics_frame\n\t\tgame_time += root.get_physics_process_delta_time()\n\tprint(\"FRAMES \", Engine.get_physics_frames() - first, \" GAME_TIME \", snappedf(game_time, 0.001))\n\tquit()\n",
+    )
+    .unwrap();
+    let tools = manager(project.path());
+    let mut answers = Vec::new();
+    for fixed_fps in [None, Some(60)] {
+        let mut arguments = json!({
+            "script": "res://scripts/frames.gd",
+            "project_path": project.path(),
+            "timeout_seconds": 120
+        });
+        if let Some(fps) = fixed_fps {
+            arguments["fixed_fps"] = json!(fps);
+        }
+        let started = std::time::Instant::now();
+        let answer = call(&tools, "godot_run_script", arguments).await;
+        let elapsed = started.elapsed();
+        let answer_text = text_of(&answer);
+        assert!(!answer.is_error, "{answer_text}");
+        let line = answer_text
+            .split("\\n")
+            .chain(answer_text.lines())
+            .find_map(|line| {
+                line.find("FRAMES ")
+                    .map(|at| line[at..].trim_end_matches(['\"', ',']))
+            })
+            .unwrap_or_else(|| panic!("no FRAMES line: {answer_text}"))
+            .to_string();
+        answers.push((line, elapsed));
+    }
+    let (real_time, real_time_elapsed) = &answers[0];
+    let (fast, fast_elapsed) = &answers[1];
+    assert_eq!(fast, real_time, "fixed_fps changed what the script counted");
+    assert!(
+        fast.starts_with("FRAMES 600 GAME_TIME 10"),
+        "600 physics frames at 60 per second: {fast}"
+    );
+    assert!(
+        *real_time_elapsed > std::time::Duration::from_secs(9),
+        "the real-time run should wait for the clock: {real_time_elapsed:?}"
+    );
+    assert!(
+        *fast_elapsed < std::time::Duration::from_secs(3),
+        "600 frames should finish far faster than the 10 s of real time: {fast_elapsed:?}"
+    );
+}
+
 #[tokio::test]
 #[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
 async fn run_script_returns_an_exit_code_and_kills_a_script_that_never_quits() {

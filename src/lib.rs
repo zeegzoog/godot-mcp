@@ -10,6 +10,7 @@ pub mod issues;
 pub mod journal;
 pub mod lsp;
 pub mod paths;
+pub mod progress;
 pub mod protocol;
 pub mod server;
 pub mod tools;

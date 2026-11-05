@@ -1,9 +1,10 @@
 use crate::error::{McpError, Result};
+use crate::progress::{self, ProgressSink};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -12,6 +13,18 @@ const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 const VALIDATE_TIMEOUT: Duration = Duration::from_secs(30);
 const CLASS_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 const SCRIPT_OUTPUT_CAP: usize = 64 * 1024;
+/// Where a `godot_run_script` stream that outgrew [`SCRIPT_OUTPUT_CAP`] is kept whole, inside the
+/// project's cache folder. The next run replaces the files.
+const SCRIPT_LOG_DIR: &str = ".godot/godot-mcp";
+const SCRIPT_STDOUT_LOG: &str = "script-run.stdout.log";
+const SCRIPT_STDERR_LOG: &str = "script-run.stderr.log";
+/// A script printing without end must not fill the disk: its log stops here.
+const SCRIPT_LOG_CAP: u64 = 256 * 1024 * 1024;
+/// Output reaches the MCP client at most this often; the answer holds every line anyway.
+const PROGRESS_OUTPUT_INTERVAL: Duration = Duration::from_millis(250);
+/// Without new output, how often the client still hears that the script is running.
+const PROGRESS_HEARTBEAT: Duration = Duration::from_secs(5);
+const PROGRESS_LINE_CHARS: usize = 500;
 /// How long to keep reading after the process tree was killed. A grandchild that
 /// survived the kill must not hold the tool open.
 const READER_DRAIN: Duration = Duration::from_secs(2);
@@ -40,6 +53,16 @@ pub struct ScriptRun {
     pub stdout: String,
     pub stderr: String,
     pub script_errors: Vec<ScriptErrorLoc>,
+    /// All the bytes each stream carried; `stdout` and `stderr` hold the last 64 KiB of them.
+    pub stdout_bytes: u64,
+    pub stderr_bytes: u64,
+    /// The file holding a stream that outgrew what the answer holds.
+    pub stdout_log: Option<PathBuf>,
+    pub stderr_log: Option<PathBuf>,
+    /// Why a stream that outgrew the answer could not be kept whole.
+    pub log_error: Option<String>,
+    /// The project turned off flushing `print()`, so a killed process loses what Godot still held.
+    pub stdout_buffered: bool,
 }
 
 /// What the world map process left: its run, the answer JSON and the PNG, when they were written.
@@ -647,7 +670,8 @@ impl CliRunner {
         let script = dir.join("shader_check.gd");
         std::fs::write(&script, SHADER_CHECK_SCRIPT)?;
         let run = self
-            .run_script(
+            .run_script_with(
+                &["--headless"],
                 project_path,
                 &script,
                 &[res_path.to_string()],
@@ -719,7 +743,7 @@ impl CliRunner {
     /// On timeout the process group is killed. Stdout and stderr are captured and never inherited,
     /// so they cannot corrupt the MCP stream. `user_args` are placed after `--`. `fixed_fps` adds
     /// `--fixed-fps <fps>`: frames no longer wait for the clock, each one advancing `1/fps` of game
-    /// time.
+    /// time. A stream that outgrows the answer is kept whole in the project's cache folder.
     pub async fn run_script(
         &self,
         project_path: &Path,
@@ -728,19 +752,27 @@ impl CliRunner {
         timeout_seconds: u64,
         fixed_fps: Option<u32>,
     ) -> Result<ScriptRun> {
+        let log_dir = project_path.join(SCRIPT_LOG_DIR);
+        for name in [SCRIPT_STDOUT_LOG, SCRIPT_STDERR_LOG] {
+            let _ = std::fs::remove_file(log_dir.join(name));
+        }
         let fixed_fps = fixed_fps.map(|fps| fps.to_string());
         let mut options = vec!["--headless"];
         if let Some(fps) = &fixed_fps {
             options.extend(["--fixed-fps", fps]);
         }
-        self.run_script_with(
-            &options,
-            project_path,
-            script_path,
-            user_args,
-            timeout_seconds,
-        )
-        .await
+        let mut run = self
+            .run_script_with(
+                &options,
+                project_path,
+                script_path,
+                user_args,
+                timeout_seconds,
+                Some(&log_dir),
+            )
+            .await?;
+        run.stdout_buffered = project_buffers_stdout(project_path);
+        Ok(run)
     }
 
     /// Runs the asset review script on the project in a small window, so the rendering server
@@ -770,6 +802,7 @@ impl CliRunner {
                     &script_file,
                     &[request_file.to_string_lossy().into_owned()],
                     timeout_seconds,
+                    None,
                 )
                 .await?;
             Ok::<_, McpError>((run, std::fs::read(&image).ok()))
@@ -787,6 +820,7 @@ impl CliRunner {
         script_path: &Path,
         user_args: &[String],
         timeout_seconds: u64,
+        log_dir: Option<&Path>,
     ) -> Result<ScriptRun> {
         let mut cmd = Command::new(&self.godot_binary);
         cmd.args(options)
@@ -821,20 +855,25 @@ impl CliRunner {
         let pid = child.id().unwrap_or(0);
         let stdout_buf = Arc::new(Mutex::new(Vec::new()));
         let stderr_buf = Arc::new(Mutex::new(Vec::new()));
-        let stdout_task = tokio::spawn(read_tail(
+        let stdout_stream: Arc<Mutex<StreamRecord>> = Arc::default();
+        let stderr_stream: Arc<Mutex<StreamRecord>> = Arc::default();
+        let stdout_task = tokio::spawn(read_stream(
             child.stdout.take(),
-            SCRIPT_OUTPUT_CAP,
             Arc::clone(&stdout_buf),
+            Arc::clone(&stdout_stream),
+            log_dir.map(|dir| (dir.to_path_buf(), SCRIPT_STDOUT_LOG)),
         ));
-        let stderr_task = tokio::spawn(read_tail(
+        let stderr_task = tokio::spawn(read_stream(
             child.stderr.take(),
-            SCRIPT_OUTPUT_CAP,
             Arc::clone(&stderr_buf),
+            Arc::clone(&stderr_stream),
+            log_dir.map(|dir| (dir.to_path_buf(), SCRIPT_STDERR_LOG)),
         ));
+        let mut progress = progress::current().map(ScriptProgress::new);
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_seconds);
         let mut quiet_since: Option<tokio::time::Instant> = None;
-        let mut last_len = 0usize;
+        let mut last_bytes = 0u64;
         let mut timed_out = false;
         let mut stopped_idle = false;
         let mut status = None;
@@ -862,9 +901,18 @@ impl CliRunner {
                     break;
                 }
                 Err(_elapsed) => {
-                    let len = buf_len(stdout_buf.as_ref()) + buf_len(stderr_buf.as_ref());
-                    if len != last_len {
-                        last_len = len;
+                    let (stdout_bytes, stderr_bytes) =
+                        (stream_bytes(&stdout_stream), stream_bytes(&stderr_stream));
+                    if let Some(progress) = &mut progress {
+                        progress.tick(
+                            (stdout_bytes, stdout_buf.as_ref()),
+                            (stderr_bytes, stderr_buf.as_ref()),
+                            timeout_seconds,
+                        );
+                    }
+                    let bytes = stdout_bytes + stderr_bytes;
+                    if bytes != last_bytes {
+                        last_bytes = bytes;
                         quiet_since = None;
                         continue;
                     }
@@ -902,6 +950,8 @@ impl CliRunner {
         }
         let mut script_errors = script_errors_in(&stdout);
         script_errors.extend(script_errors_in(&stderr));
+        let stdout_stream = take_stream(&stdout_stream);
+        let stderr_stream = take_stream(&stderr_stream);
         Ok(ScriptRun {
             exit_code: status.and_then(|status| status.code()),
             timed_out,
@@ -909,6 +959,12 @@ impl CliRunner {
             stdout,
             stderr,
             script_errors,
+            stdout_bytes: stdout_stream.bytes,
+            stderr_bytes: stderr_stream.bytes,
+            stdout_log: stdout_stream.log,
+            stderr_log: stderr_stream.log,
+            log_error: stdout_stream.log_error.or(stderr_stream.log_error),
+            stdout_buffered: false,
         })
     }
 
@@ -945,6 +1001,7 @@ impl CliRunner {
                     &script_file,
                     &[request_file.to_string_lossy().into_owned()],
                     timeout_seconds,
+                    None,
                 )
                 .await?;
             Ok::<_, McpError>(WorldMapRun {
@@ -1420,6 +1477,197 @@ where
     }
 }
 
+/// What a script's stream carried beyond the tail kept in memory.
+#[derive(Debug, Default)]
+struct StreamRecord {
+    bytes: u64,
+    log: Option<PathBuf>,
+    log_error: Option<String>,
+}
+
+fn stream_bytes(record: &Mutex<StreamRecord>) -> u64 {
+    lock_ignoring_poison(record).bytes
+}
+
+fn take_stream(record: &Mutex<StreamRecord>) -> StreamRecord {
+    std::mem::take(&mut *lock_ignoring_poison(record))
+}
+
+fn lock_ignoring_poison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Reads a script's stream as it is written, keeping the last [`SCRIPT_OUTPUT_CAP`] bytes in
+/// memory. Once the stream outgrows them and `log` names a directory and a file, everything it
+/// carried goes there, up to [`SCRIPT_LOG_CAP`]: an ordinary run writes no file.
+async fn read_stream<R>(
+    pipe: Option<R>,
+    into: Arc<Mutex<Vec<u8>>>,
+    record: Arc<Mutex<StreamRecord>>,
+    log: Option<(PathBuf, &'static str)>,
+) where
+    R: AsyncRead + Unpin,
+{
+    let Some(mut pipe) = pipe else {
+        return;
+    };
+    let mut chunk = [0u8; 8192];
+    let mut file: Option<tokio::fs::File> = None;
+    let mut logged = 0u64;
+    let mut logging_failed = log.is_none();
+    loop {
+        let n = match pipe.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        // The bytes the log has not seen yet: the whole stream the moment it first overflows.
+        let first_part = {
+            let mut buf = lock_ignoring_poison(&into);
+            buf.extend_from_slice(&chunk[..n]);
+            let overflow = buf.len().saturating_sub(SCRIPT_OUTPUT_CAP);
+            let first_part =
+                (overflow > 0 && file.is_none() && !logging_failed).then(|| buf.clone());
+            buf.drain(..overflow);
+            first_part
+        };
+        lock_ignoring_poison(&record).bytes += n as u64;
+        if logging_failed {
+            continue;
+        }
+        let written = match (first_part, &log, &mut file) {
+            (Some(first_part), Some((dir, name)), _) => {
+                let path = dir.join(name);
+                match open_log(dir, &path).await {
+                    Ok(mut opened) => {
+                        let result = write_log(&mut opened, &first_part, &mut logged).await;
+                        file = Some(opened);
+                        lock_ignoring_poison(&record).log = Some(path);
+                        result
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+            (None, _, Some(open)) => write_log(open, &chunk[..n], &mut logged).await,
+            _ => Ok(()),
+        };
+        if let Err(err) = written {
+            logging_failed = true;
+            lock_ignoring_poison(&record).log_error =
+                Some(format!("could not write the output log: {err}"));
+        }
+    }
+}
+
+async fn open_log(dir: &Path, path: &Path) -> std::io::Result<tokio::fs::File> {
+    tokio::fs::create_dir_all(dir).await?;
+    tokio::fs::File::create(path).await
+}
+
+async fn write_log(
+    file: &mut tokio::fs::File,
+    bytes: &[u8],
+    logged: &mut u64,
+) -> std::io::Result<()> {
+    let room = SCRIPT_LOG_CAP.saturating_sub(*logged);
+    let take = bytes.len().min(usize::try_from(room).unwrap_or(usize::MAX));
+    if take == 0 {
+        return Ok(());
+    }
+    file.write_all(&bytes[..take]).await?;
+    // Flushed chunk by chunk: a kill may abort this reader at any moment after.
+    file.flush().await?;
+    *logged += take as u64;
+    Ok(())
+}
+
+/// Whether the project keeps Godot from flushing stdout on every `print()` in a debug build, the
+/// kind of binary that runs scripts: `application/run/flush_stdout_on_print.debug=false`.
+/// `run/flush_stdout_on_print` alone does not, because a debug build reads the `.debug` value,
+/// which defaults to true. Godot has no command-line flag that overrides it.
+fn project_buffers_stdout(project_path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(project_path.join("project.godot")) else {
+        return false;
+    };
+    let mut in_application = false;
+    for line in text.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_application = line == "[application]";
+        } else if in_application
+            && let Some(value) = line.strip_prefix("run/flush_stdout_on_print.debug=")
+        {
+            return value.trim() == "false";
+        }
+    }
+    false
+}
+
+/// Tells the MCP client how a script is doing: its newest output line, or that it is still running.
+struct ScriptProgress {
+    sink: Arc<ProgressSink>,
+    started: tokio::time::Instant,
+    last_sent: tokio::time::Instant,
+    last_stdout: u64,
+    last_stderr: u64,
+}
+
+impl ScriptProgress {
+    fn new(sink: Arc<ProgressSink>) -> Self {
+        let now = tokio::time::Instant::now();
+        Self {
+            sink,
+            started: now,
+            last_sent: now,
+            last_stdout: 0,
+            last_stderr: 0,
+        }
+    }
+
+    fn tick(
+        &mut self,
+        (stdout_bytes, stdout): (u64, &Mutex<Vec<u8>>),
+        (stderr_bytes, stderr): (u64, &Mutex<Vec<u8>>),
+        timeout_seconds: u64,
+    ) {
+        let since_last = self.last_sent.elapsed();
+        if since_last < PROGRESS_OUTPUT_INTERVAL {
+            return;
+        }
+        let line = if stderr_bytes != self.last_stderr {
+            last_line(stderr)
+        } else if stdout_bytes != self.last_stdout {
+            last_line(stdout)
+        } else {
+            None
+        };
+        self.last_stdout = stdout_bytes;
+        self.last_stderr = stderr_bytes;
+        if line.is_none() && since_last < PROGRESS_HEARTBEAT {
+            return;
+        }
+        let elapsed = self.started.elapsed();
+        let message = line.unwrap_or_else(|| {
+            format!(
+                "running for {}s of at most {timeout_seconds}s",
+                elapsed.as_secs()
+            )
+        });
+        self.sink.send(elapsed.as_secs_f64(), &message);
+        self.last_sent = tokio::time::Instant::now();
+    }
+}
+
+/// The last whole line that is not blank, cut to [`PROGRESS_LINE_CHARS`].
+fn last_line(buf: &Mutex<Vec<u8>>) -> Option<String> {
+    let bytes = peek_tail(buf);
+    let whole = &bytes[..bytes.iter().rposition(|byte| *byte == b'\n')?];
+    let text = String::from_utf8_lossy(whole);
+    let line = text.lines().rev().find(|line| !line.trim().is_empty())?;
+    Some(line.trim_end().chars().take(PROGRESS_LINE_CHARS).collect())
+}
+
 /// Waits for both readers. After a kill, gives up after [`READER_DRAIN`] and aborts a
 /// reader that is still blocked, keeping whatever it already stored.
 async fn finish_readers(
@@ -1449,13 +1697,6 @@ async fn finish_readers(
         text_of(take_tail(stdout_buf)),
         text_of(take_tail(stderr_buf)),
     )
-}
-
-fn buf_len(buf: &Mutex<Vec<u8>>) -> usize {
-    match buf.lock() {
-        Ok(guard) => guard.len(),
-        Err(poisoned) => poisoned.into_inner().len(),
-    }
 }
 
 fn peek_tail(buf: &Mutex<Vec<u8>>) -> Vec<u8> {

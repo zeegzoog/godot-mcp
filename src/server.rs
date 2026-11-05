@@ -2,6 +2,7 @@ use crate::bridge::BridgeClient;
 use crate::cli_runner::CliRunner;
 use crate::config::Config;
 use crate::error::Result;
+use crate::progress::{self, ProgressSink};
 use crate::protocol::JsonRpcResponse;
 use crate::tools::ToolManager;
 use crate::util::lock;
@@ -199,6 +200,13 @@ impl McpServer {
             Some(arguments) => arguments.clone(),
         };
 
+        // MCP's token is a string or a number; anything else asks for nothing.
+        let progress = params
+            .get("_meta")
+            .and_then(|meta| meta.get("progressToken"))
+            .filter(|token| token.is_string() || token.is_number())
+            .map(|token| Arc::new(ProgressSink::new(token.clone(), out_tx.clone())));
+
         let key = id.to_string();
         let manager = self.tool_manager.clone();
         let responses = out_tx.clone();
@@ -209,7 +217,7 @@ impl McpServer {
         // its entry before it exists.
         let mut running = lock(in_flight);
         let handle = tasks.spawn(async move {
-            let result = manager.call_tool(&name, arguments).await;
+            let result = progress::with_sink(progress, manager.call_tool(&name, arguments)).await;
             let payload = serde_json::to_value(result).unwrap_or_else(|err| {
                 json!({
                     "content": [{"type": "text", "text": format!("Internal error: {err}")}],

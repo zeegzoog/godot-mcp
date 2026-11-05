@@ -136,6 +136,33 @@ sleep 8
     }
 }
 
+/// A stand-in for the Godot executable that prints a line, waits, prints another and exits.
+pub fn slowly_printing_godot(dir: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let path = dir.join("printing_godot.bat");
+        std::fs::write(
+            &path,
+            "@echo off\r\necho first line\r\nping -n 3 127.0.0.1 > nul\r\necho second line\r\nping -n 3 127.0.0.1 > nul\r\n",
+        )
+        .expect("write printing godot");
+        path
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("printing_godot.sh");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\necho first line\nsleep 1\necho second line\nsleep 1\n",
+        )
+        .expect("write printing godot");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod printing godot");
+        path
+    }
+}
+
 /// A stand-in for the Godot executable that answers the class check of the authoring fallbacks:
 /// it reads the class name after `--` (the last argument) and prints `GODOT_MCP_CLASS=scene` for
 /// a few Node classes, `resource` for a few Resource classes and `no` for anything else. It

@@ -216,6 +216,62 @@ async fn editor_errors_are_reported_as_is_without_cli_fallback() {
     );
 }
 
+/// Runs a slowly printing script with the given call params, and returns every frame up to and
+/// including the answer.
+async fn frames_of_a_slow_script(meta: Option<serde_json::Value>) -> Vec<serde_json::Value> {
+    let project = project_dir();
+    std::fs::write(project.path().join("slow.gd"), "extends SceneTree\n").expect("script");
+    let godot = common::slowly_printing_godot(project.path());
+    let mut session = Session::start(free_port(), &godot).await;
+    let mut params = json!({
+        "name": "godot_run_script",
+        "arguments": {"script": "slow.gd", "project_path": project.path()},
+    });
+    if let Some(meta) = meta {
+        params["_meta"] = meta;
+    }
+    session
+        .send(&json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":params}))
+        .await;
+    let mut frames = Vec::new();
+    while let Some(frame) = session.recv(Duration::from_secs(30)).await {
+        let answered = frame["id"] == json!(7);
+        frames.push(frame);
+        if answered {
+            break;
+        }
+    }
+    frames
+}
+
+#[tokio::test]
+async fn run_script_streams_its_output_to_a_client_that_asks_for_progress() {
+    let frames = frames_of_a_slow_script(Some(json!({"progressToken": "run-1"}))).await;
+    let answer = frames.last().expect("frames");
+    assert_eq!(answer["id"], json!(7), "{frames:?}");
+    let notes: Vec<&serde_json::Value> = frames[..frames.len() - 1].iter().collect();
+    assert!(notes.len() >= 2, "{frames:?}");
+    let mut last_progress = 0.0;
+    let mut messages = Vec::new();
+    for note in &notes {
+        assert_eq!(note["method"], "notifications/progress", "{note}");
+        assert!(note.get("id").is_none(), "{note}");
+        assert_eq!(note["params"]["progressToken"], "run-1", "{note}");
+        let progress = note["params"]["progress"].as_f64().expect("progress");
+        assert!(progress > last_progress, "progress must grow: {frames:?}");
+        last_progress = progress;
+        messages.push(note["params"]["message"].as_str().expect("message"));
+    }
+    assert_eq!(&messages[..2], ["first line", "second line"], "{frames:?}");
+}
+
+#[tokio::test]
+async fn run_script_sends_no_progress_to_a_client_that_did_not_ask() {
+    let frames = frames_of_a_slow_script(None).await;
+    assert_eq!(frames.len(), 1, "{frames:?}");
+    assert_eq!(frames[0]["id"], json!(7), "{frames:?}");
+}
+
 #[tokio::test]
 async fn cli_fallback_keeps_stdout_clean() {
     let project = project_dir();

@@ -652,6 +652,7 @@ impl CliRunner {
                 &script,
                 &[res_path.to_string()],
                 SHADER_CHECK_TIMEOUT.as_secs(),
+                None,
             )
             .await?;
         if let Some(answer) = run
@@ -716,16 +717,24 @@ impl CliRunner {
     /// Runs a `SceneTree` script headless: `godot --headless --path <project> -s <script> [-- args]`.
     ///
     /// On timeout the process group is killed. Stdout and stderr are captured and never inherited,
-    /// so they cannot corrupt the MCP stream. `user_args` are placed after `--`.
+    /// so they cannot corrupt the MCP stream. `user_args` are placed after `--`. `fixed_fps` adds
+    /// `--fixed-fps <fps>`: frames no longer wait for the clock, each one advancing `1/fps` of game
+    /// time.
     pub async fn run_script(
         &self,
         project_path: &Path,
         script_path: &Path,
         user_args: &[String],
         timeout_seconds: u64,
+        fixed_fps: Option<u32>,
     ) -> Result<ScriptRun> {
+        let fixed_fps = fixed_fps.map(|fps| fps.to_string());
+        let mut options = vec!["--headless"];
+        if let Some(fps) = &fixed_fps {
+            options.extend(["--fixed-fps", fps]);
+        }
         self.run_script_with(
-            &["--headless"],
+            &options,
             project_path,
             script_path,
             user_args,

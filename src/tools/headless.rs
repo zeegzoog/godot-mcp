@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 
 const DEFAULT_SCRIPT_TIMEOUT: u64 = 120;
 const MAX_SCRIPT_TIMEOUT: u64 = 600;
+const MAX_SCRIPT_FIXED_FPS: u64 = 1000;
 
 fn script_timeout_seconds(args: &Value) -> std::result::Result<u64, ToolResult> {
     let Some(value) = args.get("timeout_seconds").filter(|value| !value.is_null()) else {
@@ -40,6 +41,24 @@ fn script_timeout_seconds(args: &Value) -> std::result::Result<u64, ToolResult> 
         ));
     }
     Ok(seconds)
+}
+
+/// `fixed_fps`: the value for Godot's `--fixed-fps`, when the caller asked for one.
+fn script_fixed_fps(args: &Value) -> std::result::Result<Option<u32>, ToolResult> {
+    let Some(value) = args.get("fixed_fps").filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    value
+        .as_u64()
+        .filter(|fps| (1..=MAX_SCRIPT_FIXED_FPS).contains(fps))
+        .and_then(|fps| u32::try_from(fps).ok())
+        .map(Some)
+        .ok_or_else(|| {
+            ToolResult::error(
+                format!("fixed_fps must be a whole number from 1 to {MAX_SCRIPT_FIXED_FPS}"),
+                &["Use fixed_fps: 60, or omit it to run in real time"],
+            )
+        })
 }
 
 /// The `resource_damage` entries of a run's answer and a sentence for its summary.
@@ -273,6 +292,7 @@ fn script_run_result(
     report: &ScriptRun,
     script_res: &str,
     timeout_seconds: u64,
+    fixed_fps: Option<u32>,
     damage: &[ResourceDamage],
     repair: &RepairReport,
     imports: Option<&StaleImports>,
@@ -346,6 +366,7 @@ fn script_run_result(
         "exit_code": report.exit_code,
         "timed_out": report.timed_out,
         "stopped_idle": report.stopped_idle,
+        "fixed_fps": fixed_fps,
         "load_error": load_error,
         "stdout": stdout,
         "stderr": stderr,
@@ -379,13 +400,16 @@ fn script_run_result(
         text = format!("{warning}\n{text}");
     }
     if report.timed_out {
-        ToolResult::error(
-            text,
-            &[
-                "The process tree was killed",
-                "Make the script call quit(), or raise timeout_seconds up to 600",
-            ],
-        )
+        let mut hints = vec![
+            "The process tree was killed",
+            "Make the script call quit(), or raise timeout_seconds up to 600",
+        ];
+        if fixed_fps.is_none() {
+            hints.push(
+                "A script that waits on physics_frame or process_frame waits in real time: pass fixed_fps: 60 to run those frames as fast as the CPU allows",
+            );
+        }
+        ToolResult::error(text, &hints)
     } else if load_error.is_some() {
         ToolResult::error(
             text,
@@ -1007,6 +1031,10 @@ impl ToolManager {
             Ok(seconds) => seconds,
             Err(result) => return result,
         };
+        let fixed_fps = match script_fixed_fps(&args) {
+            Ok(fps) => fps,
+            Err(result) => return result,
+        };
         // A headless script loads the .godot/imported cache as it is, so stale imports are
         // reimported (or reported) before it starts, and before the snapshot, so a reimport is
         // not taken for the script's own writes.
@@ -1014,7 +1042,7 @@ impl ToolManager {
         let snapshot = TextResourceSnapshot::take(&project.dir);
         match self
             .cli
-            .run_script(&project.dir, &file, &user_args, timeout_seconds)
+            .run_script(&project.dir, &file, &user_args, timeout_seconds, fixed_fps)
             .await
         {
             Ok(report) => {
@@ -1024,6 +1052,7 @@ impl ToolManager {
                     &report,
                     &script_res,
                     timeout_seconds,
+                    fixed_fps,
                     &damage,
                     &repair,
                     imports.as_ref(),

@@ -124,6 +124,7 @@ Set the environment variable `GODOT_MCP_NO_BRIDGE=1` for an editor that must not
 - `godot_create_shader`, `godot_read_shader` and `godot_edit_shader` work on `.gdshader` and `.gdshaderinc` files inside the project only, never overwrite a file without `overwrite: true`, and never overwrite text you have typed in the shader editor and not saved. `godot_validate_shader` passes the shader path to Godot as data after `--`, never inside the check script.
 - Node paths are resolved inside the edited scene only; the scene root can't be removed.
 - `godot_game_call` runs only the methods you list in `permit`, and never one that can quit, evaluate code, call another method by name (`call`, `call_group`, `propagate_call`, `emit_signal`, `notification`, …), set a property by name (`set`, `set_deferred`, `set_indexed`) or free or replace a node (`free`, `queue_free`, `replace_by`). `godot_game_set` refuses `script` and private names, including on a resource reached with `:`. Nothing `godot_game_set` changes is saved to disk.
+- `godot_game_run_script` runs a `.gd` file of the project inside the running game with the game's full authority, as `godot_run_script` does in its own process: it is not limited by the refusals of `godot_game_call`, and code you put in the file is code. It takes a `res://` path only, never source text. Nothing it changes is saved unless the script saves it.
 - `godot_run_project` `user_args` are placed after `--` and only for `mode: "process"`. A value that starts with `-` is a game argument, not a Godot engine option.
 - `godot_review_assets` and `godot_world_map` run a fixed script in a temporary Godot process that reads the checked request from a JSON file, so no argument reaches the command line or generated source. `godot_review_assets` writes nothing into the project; `godot_world_map` writes only the `.png` named by `output_path`, inside the project, and its `.json` beside it, replacing earlier files of those names.
 - `godot_game_record` writes PNG files (and, with ffmpeg, one movie) only below the system temporary directory, never over an existing recording, and returns paths, not images.
@@ -201,6 +202,7 @@ Every tool takes only the parameters its schema lists (`additionalProperties: fa
 | `godot_game_wait` | Running game | Waits for process frames, for a node to exist (`node`), for a signal (`node` and `signal`), for a public property (`property`, `op`, `value`), or for a newer `scene_generation`. A missing `/` segment is an error that names it, not a timeout; `null` means the value is null. `timeout` is in frames. `time_scale` (0 to 8) sets `Engine.time_scale`; the runtime restores the previous value when the game exits. |
 | `godot_game_physics` | Running game | Controls game time. `hold` stops the game at the start of a physics tick; while held, `step` runs an exact number of ticks (or until a condition holds), input is applied by tick, and `resume` lets the game run. Without a hold, `step` advances N engine physics iterations and leaves the tree paused. See [Holding a game](#holding-a-game). |
 | `godot_game_scenario` | Running game | Plays one input sequence in a held managed game: Input Map actions and pointers, a known number of physics ticks per step, then `CharacterBody` and property snapshots, warnings, errors and an optional screenshot. Releases all input when it ends. See [Playing a scenario](#playing-a-scenario). |
+| `godot_game_run_script` | Running game | Runs one function of a `.gd` file inside the running game, against the live scene, so a heavy scene stays loaded between test scripts. The file is compiled again on every call. The function may await frames, timers or signals; a held game runs ticks as fast as it can until the function returns, then holds again. Returns the value, the printed output, the errors with their stacks and the ticks that passed. See [Keeping a scene loaded between test scripts](#keeping-a-scene-loaded-between-test-scripts). |
 | `godot_game_probe` | Running game | Raycasts in the game's 3D physics world without moving any node: rays between two points or straight down at (x, z), or a grid of down rays answered as a table of ground heights (up to 4096 points). A hit gives position, normal, distance, the collider's path and class, and the shape index with its owner node. `mask`, `exclude` (such as the player), `areas`. Works while held. |
 | `godot_game_screenshot` | Running game with a window | PNG of the game window, a viewport or a camera; `frames` (up to 8) stitches shots taken every `every` frames into one sheet. The text names the `godot_game_input` coordinate space (root viewport width and height) and the scale from image pixels to that space, including a sheet (per frame) and a camera. Compares with the previous capture, and can save or compare a named baseline (`save_baseline`, `baseline`, `tolerance`). `roi` is the comparison region and requires `baseline`; it does not crop the image. The text names the drawn-frame count and the path that produced the image (`path window`, or `path forced_draw` when the window drew no new frame because it is covered or minimized: the capture then draws the current game state itself, without showing it in the window), so a covered window still gives a current picture. An error, never an empty image; a headless game has nothing to capture. `aim` captures from a temporary copy of the game camera centred on a world point (`at`) or placed with `position` and `look_at`, optionally with its own lens (`size` for an orthographic overview, `fov` for a perspective angle), without moving the player or the camera rig; only the 3D world is drawn. |
 | `godot_game_record` | Running game with a window | Saves up to 240 PNG frames of the game window to a directory below the system temporary directory (`frames`, `every`, `max_dimension`, `directory`). The reply lists paths, sizes and timings and does not embed the images. `format` `gif` or `mp4` also builds a movie when `ffmpeg` is on `PATH`; without it the PNG files are the result. |
@@ -308,7 +310,7 @@ A step runs exactly that many physics ticks (1 to 600) and holds again; the answ
 
 Input is applied by tick while held. `godot_game_input` takes key, mouse button, touch and joypad button taps, clicks, mouse moves, axis values and `time_scale` at once; a tap stays down for `hold_ticks` ticks (default 2, 1 to 600) and is let go at the start of the tick it falls due on, so splitting a step in two does not change what the game sees. A press made while held is down from the next tick and is reported as just pressed on the second one. Leaving the hold, with `resume` or by closing the game, releases everything still held.
 
-A held game refuses what needs time to pass, and says to step instead: `godot_game_wait`, `godot_game_observe`, a screenshot sheet or camera switch (an `aim` capture is drawn at once), `godot_game_record`, and input `wait`, `text`, `swipe`, `path` and `circle` steps. `godot_debug_control` `pause` is refused too, since the game is already still; a breakpoint hit during a step stops the game as usual.
+`godot_game_run_script` runs in a held game too: a function that awaits runs ticks until it returns, then holds again. A held game refuses what needs time to pass, and says to step instead: `godot_game_wait`, `godot_game_observe`, a screenshot sheet or camera switch (an `aim` capture is drawn at once), `godot_game_record`, and input `wait`, `text`, `swipe`, `path` and `circle` steps. `godot_debug_control` `pause` is refused too, since the game is already still; a breakpoint hit during a step stops the game as usual.
 
 Steps are **exact** only for a game started with `godot_run_project` `{"mode": "process", "held": true}`. That start fixes the engine's frame rate to the project's tick rate (`physics/common/physics_ticks_per_second`, 60 when unset), so every tick is paired with one frame, and the answers say `"deterministic": true`. A hold entered later, or on the editor's Play, still stands still but is reported as `"deterministic": false` with a `deterministic_reason`: `not_started_held`, `fixed_rate_differs` (the game changed its tick rate) or `frames_did_not_follow_ticks` (a step saw frames fail to follow its ticks, which ends the claim for the rest of the run). A step runs its ticks as fast as the game can, so `max` bounds ticks, not seconds. Work on other threads and file loading takes real time, so after starting a game repeat short `until` steps instead of guessing a tick count. A held step that takes longer than 60 seconds is not cancelled: the call returns an error saying the game finishes it and holds again, and `status` shows where it is.
 
@@ -353,6 +355,61 @@ func _grant(args: Dictionary) -> Dictionary:
   {"frames": 40}
 ], "bodies": ["Player"], "nodes": [{"path": "Player", "properties": ["jump_count"]}]}
 ```
+
+## Keeping a scene loaded between test scripts
+
+`godot_run_script` starts a new process for every script, so a test of a large streamed level pays for loading it on every run. `godot_game_run_script` runs the script inside a game that is already running, so the scene is loaded once and a debugging session changes one line and runs again in milliseconds.
+
+Start the game held and headless: it runs at a fixed step, as fast as it can, and only when asked.
+
+```json
+{"mode": "process", "held": true, "headless": true, "scene": "res://levels/old_pond.tscn"}
+```
+
+Write the test as a Node with a function. It is not `extends SceneTree` and it does not call `quit()`: `get_tree()` is the game's own tree. A first call can do the setup, such as awaiting frames until the level has finished streaming:
+
+```gdscript
+# res://tests/frog_lands.gd
+extends Node
+
+func run(height: float) -> Dictionary:
+    var frog: Node3D = get_tree().current_scene.get_node("Frog")
+    frog.global_position.y = height
+    frog.velocity = Vector3.ZERO
+    for _i in 60:
+        await get_tree().physics_frame
+    print("landed: ", frog.is_on_floor())
+    return {"y": frog.global_position.y, "on_floor": frog.is_on_floor()}
+```
+
+Call it with `godot_game_run_script`:
+
+```json
+{"script": "res://tests/frog_lands.gd", "args": [5.0], "timeout_seconds": 30}
+```
+
+```json
+{
+  "ok": true,
+  "value": {"y": 0.48, "on_floor": true},
+  "output": ["landed: true"],
+  "errors": [],
+  "ticks_run": 61,
+  "frames_advanced": 61,
+  "elapsed_ms": 118,
+  "held": true,
+  "deterministic": true,
+  "scene": {"path": "res://levels/old_pond.tscn", "scene_instance_id": 33386661368, "scene_generation": 1}
+}
+```
+
+Change the file and call again. The file is read and compiled on every call, `scene_instance_id` stays the same, and the game holds between calls, so `godot_game_get`, `godot_game_probe` and `godot_game_screenshot` see it as the function left it.
+
+- `function` names another function of the file (default `run`), and `args` are converted to the types it declares. `_ready()` runs first, and the script's node is freed when the function ends.
+- While held, a function with no await runs with no tick passing. One that awaits runs ticks until it returns: it resumes at the start of a tick and that tick finishes before the game holds again, so N awaited physics frames take N + 1 ticks from a hold, the same on every call. Started with `held: true`, the steps are as exact as `godot_game_physics` steps. A game that is not held simply runs on while the function waits.
+- A call does not undo what the last one changed: a test that moves the frog leaves it moved. Put the state back in the test, or restart the game when it matters.
+- Only the named file is read again. Scripts it preloads and the game's own scripts stay as the game loaded them; restart the game to run changed game code.
+- A script error comes back as an error with the same answer (`ok` false, `failure` `script_error`, what was printed before it, the stack) and the scene stays loaded. An error elsewhere in the game meanwhile is listed in `errors` without failing the call. A function still waiting after `timeout_seconds` is ended at its await (`failure` `timeout`). A loop with no await cannot be ended from outside: stop the run.
 
 ## How it works
 

@@ -76,6 +76,7 @@ The tools below were added after the other columns were measured, so this table 
 | Update the addon | implemented `godot_update_addon`: installs the addon built into the server, optionally restarting the editor |
 | Project adapter | implemented `godot_game_state` and `godot_game_command`: the game's own states and commands, registered by one adapter script the project names (`godot_mcp/adapter`), in a managed run, in editor Play and in a held game |
 | Scenario | implemented `godot_game_scenario`: one input sequence in a held game with a known number of ticks per step ([game-checks.md](game-checks.md)) |
+| Scripts in a running game | implemented `godot_game_run_script`: one function of a project `.gd` file run inside the running game against the live scene, with awaits, its value and its output, compiled again on each call, in a managed run, in editor Play and in a held game |
 | Probing the level | implemented `godot_game_probe`: raycasts and ground-height grids in the game's 3D physics world without moving a node, and an aimed `godot_game_screenshot` |
 | Asset review | implemented `godot_review_assets`: scenes rendered together in one picture with their bounds and rendering cost, in a temporary Godot process (needs a window) |
 | World map | implemented `godot_world_map`: a top-down map of a world split into many scene files, with the scenes that lack collision or geometry named (needs a window) |

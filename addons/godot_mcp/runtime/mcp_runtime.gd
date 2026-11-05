@@ -20,6 +20,7 @@ const MODULES: Array = [
     preload("ops/rt_record.gd"),
     preload("ops/rt_project.gd"),
     preload("ops/rt_probe.gd"),
+    preload("ops/rt_script.gd"),
 ]
 
 var _methods: Dictionary = {}

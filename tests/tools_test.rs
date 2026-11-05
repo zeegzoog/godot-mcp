@@ -6301,3 +6301,37 @@ async fn world_map_is_listed_and_checks_its_request_before_starting_godot() {
         text(&no_engine)
     );
 }
+
+#[tokio::test]
+async fn a_game_script_is_listed_and_checked_before_reaching_a_game() {
+    let listed = ToolManager::list_tools()
+        .into_iter()
+        .find(|tool| tool.name == "godot_game_run_script")
+        .expect("godot_game_run_script is listed");
+    let schema = serde_json::to_value(&listed).expect("tool");
+    assert_eq!(schema["annotations"]["destructiveHint"], true, "{schema}");
+    assert_eq!(schema["annotations"]["idempotentHint"], false, "{schema}");
+    assert_eq!(
+        schema["inputSchema"]["required"],
+        json!(["script"]),
+        "{schema}"
+    );
+    for key in ["run_id", "script", "function", "args", "timeout_seconds"] {
+        assert!(
+            schema["inputSchema"]["properties"].get(key).is_some(),
+            "{key}: {schema}"
+        );
+    }
+
+    let outside = call("godot_game_run_script", json!({"script": "/tmp/a.gd"})).await;
+    assert!(outside.is_error, "{}", text(&outside));
+    assert!(text(&outside).contains("res://"), "{}", text(&outside));
+    // With a valid call and no game, the answer says how to start one.
+    let no_game = call("godot_game_run_script", json!({"script": "res://a.gd"})).await;
+    assert!(no_game.is_error, "{}", text(&no_game));
+    assert!(
+        text(&no_game).contains("godot_run_project") || text(&no_game).contains("editor"),
+        "{}",
+        text(&no_game)
+    );
+}

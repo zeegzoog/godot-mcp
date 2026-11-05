@@ -27,11 +27,12 @@ const IDLE_MSEC := 2
 const ARM_TIMEOUT_MSEC := 5000
 ## Input steps that last over frames; a held game takes the rest at once.
 const TIMED_STEPS: Array[String] = ["wait", "text", "swipe", "path"]
-## The runtime methods that answer at once and are therefore safe to serve while held.
+## The runtime methods that answer at once, or that say themselves how they let ticks run, and are
+## therefore safe to serve while held.
 const SERVED: Array[String] = [
     "game.tree", "game.get", "game.set", "game.call", "game.signals", "game.snapshot",
     "game.body", "game.pause", "game.physics", "rt.output", "input.release_all",
-    "project.state", "project.command", "game.probe",
+    "project.state", "project.command", "game.probe", "game.run_script",
 ]
 
 static var _armed := false
@@ -45,6 +46,8 @@ static var _total_ticks := 0
 static var _frames_at_start := 0
 static var _step_report: Dictionary = {}
 static var _revoked := false
+static var _while: Callable = Callable()
+static var _while_report: Callable = Callable()
 
 
 static func is_armed() -> bool:
@@ -205,6 +208,19 @@ static func step(_rt: Node, params: Dictionary) -> Dictionary:
     return {"_pending": true, "_tick": func() -> bool: return true}
 
 
+## Runs ticks for as long as `running` says, then holds again and answers with what `report`
+## returns. Used by a request that started something in the game which ends on its own. The answer
+## is sent from the hold point that ends it.
+static func run_while(running: Callable, report: Callable) -> Dictionary:
+    _while = running
+    _while_report = report
+    _cond = {}
+    _ticks_run = 0
+    _frames_at_start = Engine.get_process_frames()
+    _step_active = true
+    return {"_pending": true, "_tick": func() -> bool: return true}
+
+
 static func _parse_step(params: Dictionary) -> Dictionary:
     if params.has("until"):
         if params.has("ticks"):
@@ -245,6 +261,16 @@ static func serve(rt: Node) -> void:
 ## Decides for the tick that is about to start. The condition is read before every tick, the
 ## first included, so a step whose condition already holds runs none.
 static func _step_lets_tick_run(rt: Node) -> bool:
+    if _while.is_valid():
+        if _while.call():
+            _ticks_run += 1
+            _total_ticks += 1
+            return true
+        _finish_step({})
+        _step_report = _while_report.call()
+        _while = Callable()
+        _while_report = Callable()
+        return false
     var reading := {}
     if not _cond.is_empty():
         reading = Inputs.read_condition(rt, _cond)

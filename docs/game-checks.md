@@ -82,6 +82,10 @@ GODOT_PATH=/path/to/godot cargo test --test scenario_e2e_test -- --ignored --tes
 
 `scenario_e2e_test` needs the Godot build named in `.github/godot-version`.
 
+## Checks that need code
+
+A scenario sends no code. When a check needs some, or a heavy scene should stay loaded between several test scripts, use `godot_game_run_script`: see "Keeping a scene loaded between test scripts" in the [README](../README.md#keeping-a-scene-loaded-between-test-scripts).
+
 ## Backlog
 
 Not in this stage:

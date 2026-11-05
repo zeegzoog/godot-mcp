@@ -857,6 +857,7 @@ fn annotations(name: &str) -> Option<ToolAnnotations> {
         | "godot_edit_shader"
         | "godot_game_call"
         | "godot_game_command"
+        | "godot_game_run_script"
         | "godot_close_editor"
         | "godot_export_project" => [false, true, false],
         _ => return None,

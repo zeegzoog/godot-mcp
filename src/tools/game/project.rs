@@ -82,7 +82,7 @@ async fn forward(tools: &ToolManager, args: &Value, method: &str) -> ToolResult 
 }
 
 /// The run an answer came from: the managed run that was chosen, else the editor's Play session.
-fn run_label(tools: &ToolManager, run_id: Option<&str>) -> String {
+pub(super) fn run_label(tools: &ToolManager, run_id: Option<&str>) -> String {
     if run_id == Some("editor") {
         return "editor".into();
     }

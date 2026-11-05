@@ -132,6 +132,7 @@ godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_
 godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_registry.gd
 godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_project.gd
 godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_probe.gd
+godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_script.gd
 GODOT_PATH=/path/to/godot cargo test --test editor_e2e_test -- --ignored --test-threads=1
 GODOT_PATH=/path/to/godot cargo test --test addon_export_test -- --ignored --test-threads=1
 ```

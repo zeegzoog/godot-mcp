@@ -459,6 +459,24 @@ static func call_method(rt: Node, params: Dictionary) -> Dictionary:
             for arg_info: Dictionary in info.get("args", []):
                 arg_types.append(int(arg_info.get("type", TYPE_NIL)))
             break
+    var converted := convert_args(raw, arg_types, method)
+    if R.is_err(converted):
+        return converted
+    var args: Array = converted["args"]
+    # The path is taken before the call: a method that reloads or changes the scene takes the
+    # node out of the tree, and it has no path afterwards.
+    var path: String = rt.path_of(node)
+    var value: Variant = node.callv(method, args)
+    var answer: Dictionary = {"path": path, "method": method, "value": rt.encode(value)}
+    if not is_instance_valid(node) or not node.is_inside_tree():
+        answer["left_tree"] = true
+        answer["note"] = "The node left the scene tree during the call (for example the scene was reloaded or changed); path is where it was before the call. Wait for the new scene with godot_game_wait scene_generation before reading it."
+    return R.ok(answer)
+
+
+## JSON values converted to the types a method declares: `{args}`, or an error naming the argument
+## that cannot be converted. A wrongly typed argument would make the call do nothing and say nothing.
+static func convert_args(raw: Array, arg_types: Array, method: String) -> Dictionary:
     var args: Array = []
     var index := 0
     for item: Variant in raw:
@@ -470,15 +488,7 @@ static func call_method(rt: Node, params: Dictionary) -> Dictionary:
             return R.err(R.BAD_PARAMS, "Argument %d for '%s' is %s; expected %s." % [index, method, type_string(typeof(coerced)), type_string(expected)])
         args.append(coerced)
         index += 1
-    # The path is taken before the call: a method that reloads or changes the scene takes the
-    # node out of the tree, and it has no path afterwards.
-    var path: String = rt.path_of(node)
-    var value: Variant = node.callv(method, args)
-    var answer: Dictionary = {"path": path, "method": method, "value": rt.encode(value)}
-    if not is_instance_valid(node) or not node.is_inside_tree():
-        answer["left_tree"] = true
-        answer["note"] = "The node left the scene tree during the call (for example the scene was reloaded or changed); path is where it was before the call. Wait for the new scene with godot_game_wait scene_generation before reading it."
-    return R.ok(answer)
+    return {"args": args}
 
 
 static func signals_of(rt: Node, params: Dictionary) -> Dictionary:

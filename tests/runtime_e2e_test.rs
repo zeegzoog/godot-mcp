@@ -7726,3 +7726,431 @@ async fn world_map_refuses_a_map_godot_did_not_draw() {
         "{answer}"
     );
 }
+
+// ---- godot_game_run_script ----
+
+/// A scene that counts how often it was loaded and how many ticks it ran, and a method that raises
+/// a script error of its own.
+const LIVE_SCENE_SCRIPT: &str = r#"extends Node3D
+static var loads := 0
+var marker := "untouched"
+var ticks := 0
+
+func _ready() -> void:
+    loads += 1
+
+func _physics_process(_delta: float) -> void:
+    ticks += 1
+
+func boom() -> void:
+    var nothing: Variant = null
+    nothing.missing()
+"#;
+
+fn live_scene_project() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("project");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("tests")).unwrap();
+    std::fs::write(
+        root.join("project.godot"),
+        "config_version=5\n\n[application]\n\nconfig/name=\"LiveScene\"\nrun/main_scene=\"res://live.tscn\"\nconfig/features=PackedStringArray(\"4.5\")\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("live.gd"), LIVE_SCENE_SCRIPT).unwrap();
+    std::fs::write(
+        root.join("live.tscn"),
+        "[gd_scene load_steps=2 format=3]\n\n[ext_resource type=\"Script\" path=\"res://live.gd\" id=\"1\"]\n\n[node name=\"Live\" type=\"Node3D\"]\nscript = ExtResource(\"1\")\n",
+    )
+    .unwrap();
+    dir
+}
+
+async fn start_live_scene(held: bool) -> (tempfile::TempDir, Arc<ToolManager>, String) {
+    let project = live_scene_project();
+    let tools = manager(project.path());
+    let started = call(
+        &tools,
+        "godot_run_project",
+        json!({
+            "project_path": project.path(),
+            "scene": "res://live.tscn",
+            "mode": "process",
+            "headless": true,
+            "held": held
+        }),
+    )
+    .await;
+    assert!(!started.is_error, "{}", text_of(&started));
+    let run_id = run_id_of(&started);
+    (project, tools, run_id)
+}
+
+fn write_test(project: &tempfile::TempDir, name: &str, source: &str) -> String {
+    std::fs::write(project.path().join("tests").join(name), source).unwrap();
+    format!("res://tests/{name}")
+}
+
+async fn run_in_game(tools: &Arc<ToolManager>, run_id: &str, extra: Value) -> ToolResult {
+    let mut args = json!({"run_id": run_id});
+    if let (Some(base), Some(more)) = (args.as_object_mut(), extra.as_object()) {
+        for (key, value) in more {
+            base.insert(key.clone(), value.clone());
+        }
+    }
+    call(tools, "godot_game_run_script", args).await
+}
+
+/// The JSON at the start of an error's text: the hints follow it.
+fn failed_answer(result: &ToolResult) -> Value {
+    assert!(result.is_error, "{}", text_of(result));
+    let text = text_of(result);
+    let start = text.find('{').unwrap_or(0);
+    let mut values = serde_json::Deserializer::from_str(&text[start..]).into_iter::<Value>();
+    match values.next() {
+        Some(Ok(value)) => value,
+        _ => panic!("no JSON in: {text}"),
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn test_scripts_run_one_after_another_against_a_scene_that_stays_loaded() {
+    let _ = IGNORE;
+    let (project, tools, run_id) = start_live_scene(false).await;
+
+    // The file did not exist when the game started. It reaches the live scene, prints and returns.
+    let path = write_test(
+        &project,
+        "first.gd",
+        "extends Node\nfunc run() -> Dictionary:\n\tvar scene := get_tree().current_scene\n\tscene.marker = \"set by first\"\n\tprint(\"first ran in \", scene.name)\n\treturn {\"loads\": scene.get_script().loads, \"at\": Vector3(1, 2, 3)}\n",
+    );
+    let first = run_in_game(&tools, &run_id, json!({"script": path})).await;
+    assert!(!first.is_error, "{}", text_of(&first));
+    let first = json_of(&first);
+    assert_eq!(first["ok"], true, "{first}");
+    assert_eq!(first["value"]["loads"], 1, "{first}");
+    assert_eq!(first["value"]["at"], json!([1.0, 2.0, 3.0]), "{first}");
+    assert_eq!(first["output"], json!(["first ran in Live"]), "{first}");
+    assert_eq!(first["run_id"], run_id.as_str(), "{first}");
+    let instance = first["scene"]["scene_instance_id"].clone();
+
+    // The same file, changed, runs as changed; the change the first call made is still there.
+    let path = write_test(
+        &project,
+        "first.gd",
+        "extends Node\nfunc run() -> String:\n\treturn \"changed sees \" + get_tree().current_scene.marker\n",
+    );
+    let second = json_of(&run_in_game(&tools, &run_id, json!({"script": path})).await);
+    assert_eq!(second["value"], "changed sees set by first", "{second}");
+    assert_eq!(second["scene"]["scene_instance_id"], instance, "{second}");
+
+    // A named function, with arguments converted to the types it declares, that awaits.
+    let path = write_test(
+        &project,
+        "awaits.gd",
+        "extends Node\nfunc settle(frames: int, where: Vector3, tag := \"none\") -> Array:\n\tvar before: int = get_tree().current_scene.ticks\n\tfor _i in frames:\n\t\tawait get_tree().physics_frame\n\tprint(\"settled\")\n\treturn [get_tree().current_scene.ticks - before, where, tag]\n",
+    );
+    let awaited = json_of(
+        &run_in_game(
+            &tools,
+            &run_id,
+            json!({"script": path, "function": "settle", "args": [6, [1, 2, 3]]}),
+        )
+        .await,
+    );
+    assert_eq!(awaited["ok"], true, "{awaited}");
+    assert!(
+        json_number(&awaited["value"][0]) >= 5.0,
+        "the scene ran while the function waited: {awaited}"
+    );
+    assert_eq!(awaited["value"][1], json!([1.0, 2.0, 3.0]), "{awaited}");
+    assert_eq!(awaited["value"][2], "none", "{awaited}");
+    assert_eq!(awaited["output"], json!(["settled"]), "{awaited}");
+    assert!(json_number(&awaited["ticks_run"]) >= 6.0, "{awaited}");
+    assert_eq!(awaited["scene"]["scene_instance_id"], instance, "{awaited}");
+
+    // The node of each call is gone, and the scene was loaded once.
+    let tree = call(
+        &tools,
+        "godot_game_tree",
+        json!({"run_id": run_id, "root": "/root", "name": "McpTestScript"}),
+    )
+    .await;
+    assert_eq!(json_of(&tree)["count"], 0, "{}", text_of(&tree));
+    let path = write_test(
+        &project,
+        "loads.gd",
+        "extends Node\nfunc run() -> int:\n\treturn get_tree().current_scene.get_script().loads\n",
+    );
+    let loads = json_of(&run_in_game(&tools, &run_id, json!({"script": path})).await);
+    assert_eq!(loads["value"], 1, "{loads}");
+
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn a_held_game_runs_a_test_script_tick_by_tick_and_holds_again() {
+    let _ = IGNORE;
+    let (project, tools, run_id) = start_live_scene(true).await;
+    let status = call(
+        &tools,
+        "godot_game_physics",
+        json!({"run_id": run_id, "action": "status"}),
+    )
+    .await;
+    let start = json_of(&status)["total_ticks"].as_i64().unwrap_or(-1);
+
+    // No await: no tick passes.
+    let path = write_test(
+        &project,
+        "now.gd",
+        "extends Node\nfunc run() -> int:\n\tprint(\"at once\")\n\treturn get_tree().current_scene.ticks\n",
+    );
+    let now = json_of(&run_in_game(&tools, &run_id, json!({"script": path})).await);
+    assert_eq!(now["ok"], true, "{now}");
+    assert_eq!(now["ticks_run"], 0, "{now}");
+    assert_eq!(now["held"], true, "{now}");
+    assert_eq!(now["total_ticks"], start, "{now}");
+    assert_eq!(now["output"], json!(["at once"]), "{now}");
+    let ticks_before = now["value"].as_i64().unwrap_or(-1);
+
+    // Awaiting N physics frames from a hold: the function resumes at the start of the Nth tick
+    // after the one it stands in, and that tick finishes before the game holds again.
+    let path = write_test(
+        &project,
+        "ticks.gd",
+        "extends Node\nfunc run(count: int) -> int:\n\tvar seen: int = get_tree().current_scene.ticks\n\tfor _i in count:\n\t\tawait get_tree().physics_frame\n\treturn get_tree().current_scene.ticks - seen\n",
+    );
+    let awaited =
+        json_of(&run_in_game(&tools, &run_id, json!({"script": path, "args": [5]})).await);
+    assert_eq!(awaited["ok"], true, "{awaited}");
+    assert_eq!(awaited["value"], 5, "{awaited}");
+    assert_eq!(awaited["ticks_run"], 6, "{awaited}");
+    assert_eq!(awaited["frames_advanced"], 6, "{awaited}");
+    assert_eq!(awaited["held"], true, "{awaited}");
+    assert_eq!(awaited["deterministic"], true, "{awaited}");
+    assert_eq!(awaited["total_ticks"], start + 6, "{awaited}");
+
+    // The game stands still afterwards, and the same call takes the same ticks again.
+    let path = write_test(
+        &project,
+        "read.gd",
+        "extends Node\nfunc run() -> int:\n\treturn get_tree().current_scene.ticks\n",
+    );
+    let read = json_of(&run_in_game(&tools, &run_id, json!({"script": path.clone()})).await);
+    assert_eq!(read["value"], ticks_before + 6, "{read}");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let later = json_of(&run_in_game(&tools, &run_id, json!({"script": path})).await);
+    assert_eq!(later["value"], ticks_before + 6, "{later}");
+    let again = json_of(
+        &run_in_game(
+            &tools,
+            &run_id,
+            json!({"script": "res://tests/ticks.gd", "args": [5]}),
+        )
+        .await,
+    );
+    assert_eq!(again["ticks_run"], 6, "{again}");
+    assert_eq!(again["total_ticks"], start + 12, "{again}");
+
+    // Frames and timers pass too, and a step still works after a script.
+    let path = write_test(
+        &project,
+        "timer.gd",
+        "extends Node\nfunc run() -> String:\n\tawait get_tree().process_frame\n\tawait get_tree().create_timer(0.1).timeout\n\treturn \"timer fired\"\n",
+    );
+    let timer = json_of(&run_in_game(&tools, &run_id, json!({"script": path})).await);
+    assert_eq!(timer["value"], "timer fired", "{timer}");
+    assert_eq!(timer["held"], true, "{timer}");
+    let stepped = held_step(&tools, &run_id, json!({"ticks": 3})).await;
+    assert_eq!(json_of(&stepped)["ticks_run"], 3, "{}", text_of(&stepped));
+    assert_eq!(json_of(&stepped)["deterministic"], true);
+
+    // A failure while held still answers and holds again.
+    let path = write_test(
+        &project,
+        "late_error.gd",
+        "extends Node\nfunc run() -> void:\n\tawait get_tree().physics_frame\n\tprint(\"before the error\")\n\tvar nothing: Variant = null\n\tnothing.missing()\n",
+    );
+    let failed = failed_answer(&run_in_game(&tools, &run_id, json!({"script": path})).await);
+    assert_eq!(failed["failure"], "script_error", "{failed}");
+    assert_eq!(failed["output"], json!(["before the error"]), "{failed}");
+    assert_eq!(failed["held"], true, "{failed}");
+
+    // What never fires ends at the timeout, and the suspended function is gone.
+    let path = write_test(
+        &project,
+        "forever.gd",
+        "extends Node\nsignal never\nfunc run() -> void:\n\tprint(\"waiting\")\n\tawait never\n\tprint(\"resumed\")\n",
+    );
+    let late = failed_answer(
+        &run_in_game(
+            &tools,
+            &run_id,
+            json!({"script": path, "timeout_seconds": 1}),
+        )
+        .await,
+    );
+    assert_eq!(late["failure"], "timeout", "{late}");
+    assert_eq!(late["output"], json!(["waiting"]), "{late}");
+    assert_eq!(late["held"], true, "{late}");
+    let after = held_step(&tools, &run_id, json!({"ticks": 2})).await;
+    assert!(!after.is_error, "{}", text_of(&after));
+
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn a_test_script_that_cannot_run_or_fails_says_so_and_the_scene_stays() {
+    let _ = IGNORE;
+    let (project, tools, run_id) = start_live_scene(false).await;
+    let instance = |answer: &Value| answer["scene"]["scene_instance_id"].clone();
+
+    let missing = run_in_game(&tools, &run_id, json!({"script": "res://tests/none.gd"})).await;
+    assert_error(&missing, "no script exists");
+
+    // A parse error runs nothing; the same file, fixed, runs.
+    let path = write_test(&project, "edit.gd", "extends Node\nfunc run(:\n");
+    let broken = run_in_game(&tools, &run_id, json!({"script": path.clone()})).await;
+    assert_error(&broken, "did not compile");
+    assert_error(&broken, "nothing ran");
+    write_test(
+        &project,
+        "edit.gd",
+        "extends Node\nfunc run() -> String:\n\treturn \"fixed\"\n",
+    );
+    let fixed = json_of(&run_in_game(&tools, &run_id, json!({"script": path.clone()})).await);
+    assert_eq!(fixed["value"], "fixed", "{fixed}");
+    let scene = instance(&fixed);
+
+    // The form of godot_run_script, and a script that is not a node, say what to change.
+    let path_tree = write_test(
+        &project,
+        "tree.gd",
+        "extends SceneTree\nfunc _initialize() -> void:\n\tquit()\n",
+    );
+    let tree = run_in_game(&tools, &run_id, json!({"script": path_tree})).await;
+    assert_error(&tree, "extends Node");
+    assert_error(&tree, "godot_run_script");
+    let path_ref = write_test(&project, "plain.gd", "func run() -> int:\n\treturn 1\n");
+    assert_error(
+        &run_in_game(&tools, &run_id, json!({"script": path_ref})).await,
+        "extends Node",
+    );
+
+    // The function: unknown (the answer lists what there is), too few or wrong arguments.
+    let unknown = run_in_game(
+        &tools,
+        &run_id,
+        json!({"script": path.clone(), "function": "nope"}),
+    )
+    .await;
+    assert_error(&unknown, "no function nope");
+    assert_error(&unknown, "\"run\"");
+    let path_args = write_test(
+        &project,
+        "args.gd",
+        "extends Node\nfunc run(count: int, where: Vector3, tag := \"\") -> int:\n\treturn count\n",
+    );
+    assert_error(
+        &run_in_game(&tools, &run_id, json!({"script": path_args.clone()})).await,
+        "takes 2 to 3 arguments",
+    );
+    assert_error(
+        &run_in_game(
+            &tools,
+            &run_id,
+            json!({"script": path_args, "args": [1, "not a vector"]}),
+        )
+        .await,
+        "Argument 1",
+    );
+
+    // A script error with no await: the printed line comes back with the failure and its stack.
+    let path = write_test(
+        &project,
+        "sync_error.gd",
+        "extends Node\nfunc run() -> void:\n\tprint(\"before the error\")\n\tvar nothing: Variant = null\n\tnothing.missing()\n",
+    );
+    let failed = failed_answer(&run_in_game(&tools, &run_id, json!({"script": path})).await);
+    assert_eq!(failed["ok"], false, "{failed}");
+    assert_eq!(failed["failure"], "script_error", "{failed}");
+    assert_eq!(failed["output"], json!(["before the error"]), "{failed}");
+    assert!(
+        failed["errors"][0]["stack"][0]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("res://tests/sync_error.gd:5"),
+        "{failed}"
+    );
+    assert_eq!(instance(&failed), scene, "{failed}");
+
+    // An error in the game's own code while the function waits is reported, and is not its failure.
+    let path = write_test(
+        &project,
+        "elsewhere.gd",
+        "extends Node\nfunc run() -> String:\n\tget_tree().current_scene.boom.call_deferred()\n\tawait get_tree().process_frame\n\tawait get_tree().process_frame\n\treturn \"still fine\"\n",
+    );
+    let elsewhere = json_of(&run_in_game(&tools, &run_id, json!({"script": path})).await);
+    assert_eq!(elsewhere["ok"], true, "{elsewhere}");
+    assert_eq!(elsewhere["value"], "still fine", "{elsewhere}");
+    assert!(
+        elsewhere["errors"][0]["stack"][0]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("res://live.gd"),
+        "{elsewhere}"
+    );
+
+    // A number JSON cannot hold, and a value that is too large.
+    let path = write_test(
+        &project,
+        "values.gd",
+        "extends Node\nfunc infinite() -> Array:\n\treturn [INF, Vector3(NAN, 1, 2)]\nfunc huge() -> String:\n\tprint(\"made it\")\n\treturn \"x\".repeat(300000)\n",
+    );
+    let infinite = json_of(
+        &run_in_game(
+            &tools,
+            &run_id,
+            json!({"script": path.clone(), "function": "infinite"}),
+        )
+        .await,
+    );
+    assert_eq!(infinite["value"][0], "inf", "{infinite}");
+    assert_eq!(infinite["value"][1][0], "nan", "{infinite}");
+    let huge = failed_answer(
+        &run_in_game(&tools, &run_id, json!({"script": path, "function": "huge"})).await,
+    );
+    assert_eq!(huge["failure"], "value_too_large", "{huge}");
+    assert_eq!(huge["output"], json!(["made it"]), "{huge}");
+
+    // A timeout ends the function, and the node of the call is gone.
+    let path = write_test(
+        &project,
+        "forever.gd",
+        "extends Node\nsignal never\nfunc run() -> void:\n\tawait never\n",
+    );
+    let late = failed_answer(
+        &run_in_game(
+            &tools,
+            &run_id,
+            json!({"script": path, "timeout_seconds": 1}),
+        )
+        .await,
+    );
+    assert_eq!(late["failure"], "timeout", "{late}");
+    let tree = call(
+        &tools,
+        "godot_game_tree",
+        json!({"run_id": run_id, "root": "/root", "name": "McpTestScript"}),
+    )
+    .await;
+    assert_eq!(json_of(&tree)["count"], 0, "{}", text_of(&tree));
+
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+}

@@ -2871,11 +2871,142 @@ async fn run_script_refuses_a_path_outside_the_project_and_a_bad_timeout() {
         json!({
             "script": "ok.gd",
             "project_path": project.path(),
-            "timeout_seconds": 601
+            "timeout_seconds": 3601
         }),
     )
     .await;
-    assert!(text(&too_long).contains("600"), "{}", text(&too_long));
+    assert!(text(&too_long).contains("3600"), "{}", text(&too_long));
+}
+
+#[tokio::test]
+async fn run_script_timeout_returns_every_line_written_before_the_kill() {
+    let project = project_dir();
+    write_script(project.path(), "lines.gd", b"extends SceneTree\n");
+    let tools = manager_in(project.path(), scripted_godot(project.path()));
+    let answer = call_with(
+        &tools,
+        json!({"script": "lines.gd", "project_path": project.path(), "timeout_seconds": 2}),
+    )
+    .await;
+    assert!(answer.is_error, "{}", text(&answer));
+    let answer_text = text(&answer);
+    assert!(answer_text.contains("\"timed_out\": true"), "{answer_text}");
+    let body = run_script_body(&answer_text);
+    let stdout = body["stdout"].as_str().expect("stdout");
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    for index in 1..=200 {
+        assert!(
+            lines.contains(&format!("out line {index}").as_str()),
+            "{stdout}"
+        );
+    }
+    let stderr = body["stderr"].as_str().expect("stderr");
+    assert!(
+        stderr.contains("err line 1") && stderr.contains("err line 50"),
+        "{stderr}"
+    );
+    assert!(body["stdout_log"].is_null(), "{body}");
+    assert!(
+        !project.path().join(".godot/godot-mcp").exists(),
+        "a run that fits the answer writes no log"
+    );
+}
+
+#[tokio::test]
+async fn run_script_timeout_says_why_a_script_that_printed_nothing_has_no_output() {
+    let project = project_dir();
+    write_script(project.path(), "quiet.gd", b"extends SceneTree\n");
+    let tools = manager_in(project.path(), common::sleeping_godot(project.path()));
+    let answer = call_with(
+        &tools,
+        json!({"script": "quiet.gd", "project_path": project.path(), "timeout_seconds": 1}),
+    )
+    .await;
+    let answer_text = text(&answer);
+    assert!(answer.is_error, "{answer_text}");
+    assert!(
+        answer_text.contains("printed nothing before the kill")
+            && answer_text.contains("print each result as it is made"),
+        "{answer_text}"
+    );
+    assert!(!answer_text.contains("(no output)"), "{answer_text}");
+    assert_eq!(run_script_body(&answer_text)["stdout_buffered"], false);
+}
+
+#[tokio::test]
+async fn run_script_timeout_names_a_project_that_buffers_stdout() {
+    let project = project_dir();
+    std::fs::write(
+        project.path().join("project.godot"),
+        "config_version=5\n\n[application]\n\nconfig/name=\"Test\"\nrun/flush_stdout_on_print.debug=false\n",
+    )
+    .expect("project");
+    write_script(project.path(), "hang.gd", b"extends SceneTree\n");
+    let tools = manager_in(project.path(), scripted_godot(project.path()));
+    let answer_text = text(
+        &call_with(
+            &tools,
+            json!({"script": "hang.gd", "project_path": project.path(), "timeout_seconds": 1}),
+        )
+        .await,
+    );
+    assert_eq!(run_script_body(&answer_text)["stdout_buffered"], true);
+    assert!(
+        answer_text.contains("flush_stdout_on_print.debug") && answer_text.contains("printerr()"),
+        "{answer_text}"
+    );
+}
+
+#[tokio::test]
+async fn run_script_keeps_a_stream_that_outgrows_the_answer_in_a_log() {
+    let project = project_dir();
+    write_script(project.path(), "spill.gd", b"extends SceneTree\n");
+    let tools = manager_in(project.path(), scripted_godot(project.path()));
+    let answer = call_with(
+        &tools,
+        json!({"script": "spill.gd", "project_path": project.path(), "timeout_seconds": 60}),
+    )
+    .await;
+    let answer_text = text(&answer);
+    let body = run_script_body(&answer_text);
+    let stdout = body["stdout"].as_str().expect("stdout");
+    assert!(stdout.contains("spill line 6000"), "tail lost");
+    assert!(
+        !stdout.contains("spill line 1 with"),
+        "the answer is bounded"
+    );
+    let bytes = body["stdout_bytes"].as_u64().expect("stdout_bytes");
+    assert!(bytes > 128 * 1024, "{bytes}");
+    let log = body["stdout_log"].as_str().expect("stdout_log");
+    assert!(log.contains("script-run.stdout.log"), "{log}");
+    assert!(
+        answer_text.contains("script-run.stdout.log"),
+        "{answer_text}"
+    );
+    let whole = std::fs::read_to_string(log).expect("log");
+    assert_eq!(whole.len() as u64, bytes);
+    assert!(
+        whole.contains("spill line 1 with"),
+        "the head of the stream"
+    );
+    assert!(whole.contains("spill line 6000"), "the end of the stream");
+
+    // The next run that fits the answer leaves no stale log behind.
+    write_script(project.path(), "boom.gd", b"extends SceneTree\n");
+    let next = call_with(
+        &tools,
+        json!({"script": "boom.gd", "project_path": project.path()}),
+    )
+    .await;
+    assert!(run_script_body(&text(&next))["stdout_log"].is_null());
+    assert!(!std::path::Path::new(log).exists(), "stale log kept");
+}
+
+/// The JSON document of a `godot_run_script` answer, without the hints around it.
+fn run_script_body(answer: &str) -> Value {
+    let start = answer.find("{\n").expect("answer body");
+    let end = answer.rfind("\n}").expect("answer body") + 2;
+    serde_json::from_str(&answer[start..end]).expect("answer body parses")
 }
 
 #[tokio::test]
@@ -3956,6 +4087,19 @@ case "$*" in
     sleep 30 &
     wait
     ;;
+  *lines.gd*)
+    i=1
+    while [ $i -le 200 ]; do echo "out line $i"; i=$((i + 1)); done
+    i=1
+    while [ $i -le 50 ]; do echo "err line $i" >&2; i=$((i + 1)); done
+    sleep 30 &
+    wait
+    ;;
+  *spill.gd*)
+    i=1
+    while [ $i -le 6000 ]; do echo "spill line $i with some more text to fill it up"; i=$((i + 1)); done
+    exit 0
+    ;;
   *wrongbase.gd*)
     echo 'ERROR: Can'"'"'t load the script "wrongbase.gd" as it doesn'"'"'t inherit from SceneTree or MainLoop.' >&2
     echo '   at: start (main/main.cpp:4409)' >&2
@@ -3994,7 +4138,7 @@ esac
         let path = dir.join("scripted_godot.bat");
         std::fs::write(
             &path,
-            "@echo off\r\necho ARGS %*\r\necho %* | findstr hang.gd >nul\r\nif %errorlevel%==0 (\r\n  echo HANGING\r\n  ping -n 30 127.0.0.1 >nul\r\n  exit /b 0\r\n)\r\necho %* | findstr wrongbase.gd >nul\r\nif %errorlevel%==0 (\r\n  echo ERROR: Can't load the script \"wrongbase.gd\" as it doesn't inherit from SceneTree or MainLoop. 1>&2\r\n  exit /b 0\r\n)\r\necho %* | findstr broken.gd >nul\r\nif %errorlevel%==0 (\r\n  echo SCRIPT ERROR: Parse Error: Expected expression. 1>&2\r\n  echo           at: GDScript::reload ^(res://broken.gd:3^) 1>&2\r\n  echo ERROR: Failed to load script \"res://broken.gd\" with error \"Parse error\". 1>&2\r\n  exit /b 0\r\n)\r\necho %* | findstr gone.gd >nul\r\nif %errorlevel%==0 (\r\n  echo ERROR: Can't load script: gone.gd 1>&2\r\n  exit /b 0\r\n)\r\necho %* | findstr idle.gd >nul\r\nif %errorlevel%==0 (\r\n  echo SCRIPT ERROR: Parse Error: unexpected.\r\n  echo    at: _init ^(res://idle.gd:3^)\r\n  ping -n 30 127.0.0.1 >nul\r\n  exit /b 0\r\n)\r\necho SCRIPT ERROR: Assertion failed.\r\necho    at: _initialize (res://scripts/boom.gd:4)\r\nexit /b 3\r\n",
+            "@echo off\r\necho ARGS %*\r\necho %* | findstr hang.gd >nul\r\nif %errorlevel%==0 (\r\n  echo HANGING\r\n  ping -n 30 127.0.0.1 >nul\r\n  exit /b 0\r\n)\r\necho %* | findstr lines.gd >nul\r\nif %errorlevel%==0 (\r\n  for /L %%i in (1,1,200) do echo out line %%i\r\n  for /L %%i in (1,1,50) do echo err line %%i 1>&2\r\n  ping -n 30 127.0.0.1 >nul\r\n  exit /b 0\r\n)\r\necho %* | findstr spill.gd >nul\r\nif %errorlevel%==0 (\r\n  for /L %%i in (1,1,6000) do echo spill line %%i with some more text to fill it up\r\n  exit /b 0\r\n)\r\necho %* | findstr wrongbase.gd >nul\r\nif %errorlevel%==0 (\r\n  echo ERROR: Can't load the script \"wrongbase.gd\" as it doesn't inherit from SceneTree or MainLoop. 1>&2\r\n  exit /b 0\r\n)\r\necho %* | findstr broken.gd >nul\r\nif %errorlevel%==0 (\r\n  echo SCRIPT ERROR: Parse Error: Expected expression. 1>&2\r\n  echo           at: GDScript::reload ^(res://broken.gd:3^) 1>&2\r\n  echo ERROR: Failed to load script \"res://broken.gd\" with error \"Parse error\". 1>&2\r\n  exit /b 0\r\n)\r\necho %* | findstr gone.gd >nul\r\nif %errorlevel%==0 (\r\n  echo ERROR: Can't load script: gone.gd 1>&2\r\n  exit /b 0\r\n)\r\necho %* | findstr idle.gd >nul\r\nif %errorlevel%==0 (\r\n  echo SCRIPT ERROR: Parse Error: unexpected.\r\n  echo    at: _init ^(res://idle.gd:3^)\r\n  ping -n 30 127.0.0.1 >nul\r\n  exit /b 0\r\n)\r\necho SCRIPT ERROR: Assertion failed.\r\necho    at: _initialize (res://scripts/boom.gd:4)\r\nexit /b 3\r\n",
         )
         .expect("write scripted godot");
         path

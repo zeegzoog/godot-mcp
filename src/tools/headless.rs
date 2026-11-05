@@ -18,7 +18,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 const DEFAULT_SCRIPT_TIMEOUT: u64 = 120;
-const MAX_SCRIPT_TIMEOUT: u64 = 600;
+const MAX_SCRIPT_TIMEOUT: u64 = 3600;
+const MAX_SCRIPT_FIXED_FPS: u64 = 1000;
+const STDOUT_BUFFERED: &str = "This project sets application/run/flush_stdout_on_print.debug to false, so Godot held print() lines in a buffer and the ones not yet written died with the process. Godot has no command-line flag to force a flush: use printerr(), which is never buffered, or set the setting back to true.";
+const NOTHING_PRINTED: &str = "The script printed nothing before the kill. Godot writes each print() line as it is made and the server reads it at once, so what a script holds back for the end is lost when it is killed: print each result as it is made.";
 
 fn script_timeout_seconds(args: &Value) -> std::result::Result<u64, ToolResult> {
     let Some(value) = args.get("timeout_seconds").filter(|value| !value.is_null()) else {
@@ -40,6 +43,24 @@ fn script_timeout_seconds(args: &Value) -> std::result::Result<u64, ToolResult> 
         ));
     }
     Ok(seconds)
+}
+
+/// `fixed_fps`: the value for Godot's `--fixed-fps`, when the caller asked for one.
+fn script_fixed_fps(args: &Value) -> std::result::Result<Option<u32>, ToolResult> {
+    let Some(value) = args.get("fixed_fps").filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    value
+        .as_u64()
+        .filter(|fps| (1..=MAX_SCRIPT_FIXED_FPS).contains(fps))
+        .and_then(|fps| u32::try_from(fps).ok())
+        .map(Some)
+        .ok_or_else(|| {
+            ToolResult::error(
+                format!("fixed_fps must be a whole number from 1 to {MAX_SCRIPT_FIXED_FPS}"),
+                &["Use fixed_fps: 60, or omit it to run in real time"],
+            )
+        })
 }
 
 /// The `resource_damage` entries of a run's answer and a sentence for its summary.
@@ -273,6 +294,7 @@ fn script_run_result(
     report: &ScriptRun,
     script_res: &str,
     timeout_seconds: u64,
+    fixed_fps: Option<u32>,
     damage: &[ResourceDamage],
     repair: &RepairReport,
     imports: Option<&StaleImports>,
@@ -303,10 +325,11 @@ fn script_run_result(
             "Stopped after a SCRIPT ERROR while the main loop was idle{detail}. The process was still running, so it was stopped without waiting out the {timeout_seconds}s timeout."
         )
     } else if report.timed_out {
-        format!(
-            "Timed out after {timeout_seconds}s and killed the process tree.\nLast output:\n{}",
-            last_output_lines(&stdout, &stderr, 20)
-        )
+        let output = last_output_lines(&stdout, &stderr, 20).map_or_else(
+            || NOTHING_PRINTED.to_string(),
+            |lines| format!("Last output:\n{lines}"),
+        );
+        format!("Timed out after {timeout_seconds}s and killed the process tree.\n{output}")
     } else if let Some(message) = &load_error {
         let detail = script_errors
             .first()
@@ -323,6 +346,16 @@ fn script_run_result(
         )
     } else {
         format!("Script finished with exit code {exit}.")
+    };
+    let killed = report.timed_out || report.stopped_idle;
+    let summary = if killed && report.stdout_buffered {
+        format!("{summary}\n{STDOUT_BUFFERED}")
+    } else {
+        summary
+    };
+    let summary = match output_log_sentence(report) {
+        Some(sentence) => format!("{summary}\n{sentence}"),
+        None => summary,
     };
     let (resource_damage, warning) = damage_report(damage);
     let summary = match repair.sentence() {
@@ -346,9 +379,16 @@ fn script_run_result(
         "exit_code": report.exit_code,
         "timed_out": report.timed_out,
         "stopped_idle": report.stopped_idle,
+        "fixed_fps": fixed_fps,
         "load_error": load_error,
         "stdout": stdout,
         "stderr": stderr,
+        "stdout_bytes": report.stdout_bytes,
+        "stderr_bytes": report.stderr_bytes,
+        "stdout_log": report.stdout_log,
+        "stderr_log": report.stderr_log,
+        "output_log_error": report.log_error,
+        "stdout_buffered": report.stdout_buffered,
         "exit_leaks": (!exit_leaks.is_empty()).then_some(&exit_leaks),
         "hint": (!exit_leaks.is_empty()).then_some(EXIT_LEAK_HINT),
         "script_errors": script_errors.iter().map(|error| json!({
@@ -379,13 +419,19 @@ fn script_run_result(
         text = format!("{warning}\n{text}");
     }
     if report.timed_out {
-        ToolResult::error(
-            text,
-            &[
-                "The process tree was killed",
-                "Make the script call quit(), or raise timeout_seconds up to 600",
-            ],
-        )
+        let raise = format!(
+            "Make the script call quit(), or raise timeout_seconds up to {MAX_SCRIPT_TIMEOUT}"
+        );
+        let mut hints = vec![
+            "The process tree was killed; stdout and stderr hold what it printed before that",
+            raise.as_str(),
+        ];
+        if fixed_fps.is_none() {
+            hints.push(
+                "A script that waits on physics_frame or process_frame waits in real time: pass fixed_fps: 60 to run those frames as fast as the CPU allows",
+            );
+        }
+        ToolResult::error(text, &hints)
     } else if load_error.is_some() {
         ToolResult::error(
             text,
@@ -474,16 +520,37 @@ const STILL_STALE_FORCED_HINTS: &[&str] = &[
     "The import was forced and still did not match: read the import errors in the output, and check that nothing rewrote the source during the import",
 ];
 
-fn last_output_lines(stdout: &str, stderr: &str, count: usize) -> String {
+/// The last `count` lines of the output, or `None` when the process printed nothing.
+fn last_output_lines(stdout: &str, stderr: &str, count: usize) -> Option<String> {
     let mut lines: Vec<&str> = stdout.lines().chain(stderr.lines()).collect();
     if lines.len() > count {
         lines = lines.split_off(lines.len() - count);
     }
-    if lines.is_empty() {
-        "(no output)".into()
-    } else {
-        lines.join("\n")
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+/// Says where a stream that outgrew the answer is, or why it could not be kept.
+fn output_log_sentence(report: &ScriptRun) -> Option<String> {
+    let name = |stream: &str, log: Option<&PathBuf>, bytes: u64| {
+        log.map(|path| format!("{stream} ({bytes} bytes): {}", path.display()))
+    };
+    let logs: Vec<String> = [
+        name("stdout", report.stdout_log.as_ref(), report.stdout_bytes),
+        name("stderr", report.stderr_log.as_ref(), report.stderr_bytes),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if !logs.is_empty() {
+        return Some(format!(
+            "The answer holds the last 64 KiB of each stream. The first 256 MiB of what outgrew it are in {}.",
+            logs.join(", ")
+        ));
     }
+    report
+        .log_error
+        .as_ref()
+        .map(|problem| format!("The answer holds the last 64 KiB of each stream, and {problem}."))
 }
 
 /// The outcome of godot_validate_script's check.
@@ -866,7 +933,8 @@ impl ToolManager {
         });
         let text = serde_json::to_string_pretty(&body).unwrap_or_default();
         if report.timed_out || report.exit_code != Some(0) {
-            let tail = last_output_lines(&report.stdout, &report.stderr, 20);
+            let tail = last_output_lines(&report.stdout, &report.stderr, 20)
+                .unwrap_or_else(|| "(no output)".to_string());
             return ToolResult::error(
                 format!("{text}\n`{command}` did not finish cleanly.\n{tail}"),
                 &[
@@ -1007,6 +1075,10 @@ impl ToolManager {
             Ok(seconds) => seconds,
             Err(result) => return result,
         };
+        let fixed_fps = match script_fixed_fps(&args) {
+            Ok(fps) => fps,
+            Err(result) => return result,
+        };
         // A headless script loads the .godot/imported cache as it is, so stale imports are
         // reimported (or reported) before it starts, and before the snapshot, so a reimport is
         // not taken for the script's own writes.
@@ -1014,7 +1086,7 @@ impl ToolManager {
         let snapshot = TextResourceSnapshot::take(&project.dir);
         match self
             .cli
-            .run_script(&project.dir, &file, &user_args, timeout_seconds)
+            .run_script(&project.dir, &file, &user_args, timeout_seconds, fixed_fps)
             .await
         {
             Ok(report) => {
@@ -1024,6 +1096,7 @@ impl ToolManager {
                     &report,
                     &script_res,
                     timeout_seconds,
+                    fixed_fps,
                     &damage,
                     &repair,
                     imports.as_ref(),

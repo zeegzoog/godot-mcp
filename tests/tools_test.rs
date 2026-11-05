@@ -2879,6 +2879,89 @@ async fn run_script_refuses_a_path_outside_the_project_and_a_bad_timeout() {
 }
 
 #[tokio::test]
+async fn run_script_passes_fixed_fps_to_godot_only_when_asked() {
+    let project = project_dir();
+    write_script(
+        project.path(),
+        "boom.gd",
+        b"extends SceneTree\nfunc _initialize():\n\tquit()\n",
+    );
+    let godot = scripted_godot(project.path());
+    let tools = manager_in(project.path(), godot);
+
+    let fast = text(
+        &call_with(
+            &tools,
+            json!({"script": "boom.gd", "project_path": project.path(), "fixed_fps": 60}),
+        )
+        .await,
+    );
+    assert!(fast.contains("--headless --fixed-fps 60 --path"), "{fast}");
+    assert!(fast.contains("\"fixed_fps\": 60"), "{fast}");
+
+    let real_time = text(
+        &call_with(
+            &tools,
+            json!({"script": "boom.gd", "project_path": project.path()}),
+        )
+        .await,
+    );
+    assert!(!real_time.contains("--fixed-fps"), "{real_time}");
+    assert!(real_time.contains("\"fixed_fps\": null"), "{real_time}");
+}
+
+#[tokio::test]
+async fn run_script_refuses_a_fixed_fps_that_is_not_a_whole_number_in_range() {
+    let project = project_dir();
+    write_script(project.path(), "ok.gd", b"extends SceneTree\n");
+    let godot = project.path().join("godot-binary-that-does-not-exist");
+    let tools = manager_in(project.path(), godot);
+    for bad in [json!(0), json!(1001), json!(-60), json!(1.5), json!("60")] {
+        let answer = call_with(
+            &tools,
+            json!({"script": "ok.gd", "project_path": project.path(), "fixed_fps": bad}),
+        )
+        .await;
+        assert!(answer.is_error, "{bad}: {}", text(&answer));
+        assert!(
+            text(&answer).contains("fixed_fps"),
+            "{bad}: {}",
+            text(&answer)
+        );
+    }
+}
+
+#[tokio::test]
+async fn run_script_timeout_names_fixed_fps_unless_it_was_used() {
+    let project = project_dir();
+    write_script(project.path(), "hang.gd", b"extends SceneTree\n");
+    let godot = scripted_godot(project.path());
+    let tools = manager_in(project.path(), godot);
+    let hint = "pass fixed_fps: 60";
+    let real_time = text(
+        &call_with(
+            &tools,
+            json!({"script": "hang.gd", "project_path": project.path(), "timeout_seconds": 1}),
+        )
+        .await,
+    );
+    assert!(real_time.contains(hint), "{real_time}");
+    let fast = text(
+        &call_with(
+            &tools,
+            json!({
+                "script": "hang.gd",
+                "project_path": project.path(),
+                "timeout_seconds": 1,
+                "fixed_fps": 60
+            }),
+        )
+        .await,
+    );
+    assert!(!fast.contains(hint), "{fast}");
+}
+
+#[tokio::test]
 async fn run_script_parses_script_errors_and_kills_a_hang() {
     let project = project_dir();
     write_script(

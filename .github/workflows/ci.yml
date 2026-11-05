@@ -86,3 +86,6 @@ jobs:
 
       - name: Running game
         run: cargo test --test runtime_e2e_test -- --ignored --test-threads=1
+
+      - name: Played scenario
+        run: cargo test --test scenario_e2e_test -- --ignored --test-threads=1

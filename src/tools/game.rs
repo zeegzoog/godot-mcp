@@ -16,6 +16,7 @@ mod probe;
 mod project;
 mod record;
 mod screenshot;
+mod script;
 mod session;
 
 use crate::error::McpError;
@@ -27,6 +28,7 @@ use input::game_input;
 use probe::probe;
 use record::record;
 use screenshot::screenshot;
+use script::run_script;
 use serde_json::{Value, json};
 
 const DENY_METHODS: &[&str] = &[
@@ -69,6 +71,7 @@ pub fn handles(name: &str) -> bool {
             | "godot_game_wait"
             | "godot_game_physics"
             | "godot_game_scenario"
+            | "godot_game_run_script"
             | "godot_game_probe"
             | "godot_game_screenshot"
             | "godot_game_record"
@@ -95,6 +98,7 @@ pub async fn call(tools: &ToolManager, name: &str, args: Value) -> ToolResult {
         "godot_game_wait" => runtime(tools, &args, "input.wait").await,
         "godot_game_physics" => runtime(tools, &args, "game.physics").await,
         "godot_game_scenario" => crate::tools::scenario::call(tools, &args).await,
+        "godot_game_run_script" => run_script(tools, &args).await,
         "godot_game_probe" => probe(tools, &args).await,
         "godot_game_screenshot" => screenshot(tools, &args).await,
         "godot_game_record" => record(tools, &args).await,

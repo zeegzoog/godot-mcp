@@ -20,6 +20,12 @@ impl ToolManager {
                 Err(error) => return Err(error),
             }
         }
+        if method == SCRIPT_METHOD {
+            let wait = script_wait(&params);
+            return editor_runtime(self, method, params, wait)
+                .await
+                .map_err(script_timeout);
+        }
         if method == "game.record" {
             return editor_runtime(self, method, params, RECORD_WAIT)
                 .await
@@ -37,6 +43,19 @@ const HELD_STEP_WAIT: Duration = Duration::from_secs(60);
 /// time. The 512 MB pixel cap keeps the write inside it.
 const RECORD_WAIT: Duration = Duration::from_secs(120);
 
+const SCRIPT_METHOD: &str = "game.run_script";
+
+/// The game ends a function at its own timeout and then answers, so the server waits a little
+/// longer than that. A function that never awaits cannot be ended, and that is what this catches.
+fn script_wait(params: &Value) -> Duration {
+    let seconds = params
+        .get("timeout_seconds")
+        .and_then(Value::as_u64)
+        .unwrap_or(super::script::DEFAULT_TIMEOUT_SECONDS)
+        .min(super::script::MAX_TIMEOUT_SECONDS);
+    Duration::from_secs(seconds + 15)
+}
+
 /// A runtime call that knows whether the game is held: a held step gets the long wait, a timeout
 /// of one says the game is still running it, and the answer to a physics call keeps the run's
 /// idea of "held" current.
@@ -47,8 +66,11 @@ async fn held_aware_call(
 ) -> Result<Value, McpError> {
     let physics = method == "game.physics";
     let recording = method == "game.record";
+    let script = method == SCRIPT_METHOD;
     let was_held = physics && run.is_held();
-    let wait = if recording {
+    let wait = if script {
+        script_wait(&params)
+    } else if recording {
         RECORD_WAIT
     } else if was_held {
         HELD_STEP_WAIT
@@ -67,7 +89,9 @@ async fn held_aware_call(
         }
     }
     outcome.map_err(|error| {
-        if recording {
+        if script {
+            script_timeout(error)
+        } else if recording {
             record_timeout(error)
         } else {
             held_step_timeout(was_held, error)
@@ -94,6 +118,19 @@ fn record_timeout(error: McpError) -> McpError {
         McpError::Process(message) if message.starts_with("timed out") => {
             McpError::Process(format!(
                 "timed out while the game was writing the recorded PNG files ({message}). The frames were already captured. Wait and look in the directory, or record fewer or smaller frames"
+            ))
+        }
+        other => other,
+    }
+}
+
+/// The game ends a function that awaits, so one that outlives the wait is running without an await
+/// or the game stopped answering.
+fn script_timeout(error: McpError) -> McpError {
+    match error {
+        McpError::Process(message) if message.starts_with("timed out") => {
+            McpError::Process(format!(
+                "the game did not answer in time ({message}). A function that loops without an await cannot be ended from outside, and in editor Play a script error stops at the editor's debugger. Other game tools wait until it returns. Stop the run with godot_stop_project if it does not"
             ))
         }
         other => other,
@@ -231,6 +268,19 @@ mod tests {
             held_step_timeout(true, other()).to_string(),
             other().to_string()
         );
+    }
+
+    #[test]
+    fn a_script_gets_its_own_timeout_and_a_little_more() {
+        assert_eq!(script_wait(&json!({})), Duration::from_secs(75));
+        assert_eq!(
+            script_wait(&json!({"timeout_seconds": 300})),
+            Duration::from_secs(315)
+        );
+        let text = script_timeout(McpError::Process("timed out waiting".into())).to_string();
+        assert!(text.contains("godot_stop_project"), "{text}");
+        let other = || McpError::Process("the game disconnected".into());
+        assert_eq!(script_timeout(other()).to_string(), other().to_string());
     }
 
     #[test]

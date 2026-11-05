@@ -71,6 +71,10 @@ const RUNTIME_FILES: &[(&str, &str)] = &[
         "addons/godot_mcp/runtime/ops/rt_probe.gd",
         include_str!("../../addons/godot_mcp/runtime/ops/rt_probe.gd"),
     ),
+    (
+        "addons/godot_mcp/runtime/ops/rt_script.gd",
+        include_str!("../../addons/godot_mcp/runtime/ops/rt_script.gd"),
+    ),
 ];
 
 /// Where the game loads the runtime from.

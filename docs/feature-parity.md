@@ -56,7 +56,7 @@ Tool names are the MCP names. Solo and Vollkorn do not use a `godot_` prefix.
 | Script attach | implemented `godot_attach_script` (undoable, editor only; the editor e2e test attaches, detaches, and refuses a missing script) | implemented `godot_script_attach` | unsupported | implemented `attach_script` | `Node.script` via undo | Editor only. Creating the file stays `godot_create_script` |
 | Script read / edit | implemented `godot_read_script` and `godot_edit_script`. Verified in the editor e2e test on a real editor: the unsaved editor text is read, one fragment is replaced as one undo step and saved, a stale label, zero and several matches and unsaved typing are refused, a running tool script gets the new code. Without an editor the file is changed through a temporary file (host tests: line endings, byte order mark, refusals) | not compared | not compared | not compared | `ScriptEditor` code editor, `ResourceSaver` | Fragment replacement only, refused over unsaved editor changes. No full-file overwrite |
 | Resources | partial `godot_create_resource` (editor `ResourceSaver`, or a text `.tres` if the editor is closed). Never replaces an existing file. `godot_resave_resources` reimports. No property editor for an existing `.tres` | implemented read/create/set/deps | unsupported | implemented `create_resource` | `ClassDB.instantiate` + `ResourceSaver` | Class must extend `Resource` |
-| Import | partial `godot_resave_resources` (pre-existing reimport). `godot_run_project` reimports a source newer than its `.godot/imported` cache when the editor has the project open, and otherwise warns and names `godot_resave_resources`. No import-option editor | implemented `godot_import_get`, `godot_import_set` | unsupported | partial asset search/install | `EditorFileSystem.reimport_files` | Changing `.import` options is documented-only here |
+| Import | implemented `godot_get_import_params` and `godot_set_import_params` (the `[params]` of a `.import` sidecar and the importer, as the Import dock stores them: through the editor's file system, or Godot's `ConfigFile` plus a headless reimport; checked on a real editor and a real engine), and `godot_resave_resources` (reimport). `godot_run_project` reimports a source newer than its `.godot/imported` cache when the editor has the project open, and otherwise warns and names `godot_resave_resources` | implemented `godot_import_get`, `godot_import_set` | unsupported | partial asset search/install | `EditorFileSystem.reimport_files` | Import options are changed through `godot_set_import_params` |
 | Project settings | partial `godot_get_project_settings`, `godot_set_project_setting`. Editor uses `ProjectSettings.save`. Offline path rewrites `project.godot` (tested: escaping, the key check, that a setting keeps its type, and that a new entry keeps the section layout). The type of a setting not stored yet comes from the editor, or without one from the engine, asked headless; with and without the editor a Color takes an HTML color or a name, other types their `project.godot` text. A value of another type than the setting is refused. Input map: `godot_get_input_map` and `godot_edit_input_action` (editor only, one undo step, saved with `ProjectSettings.save`; the editor e2e test adds key, mouse and joypad events, refuses a missing event and an unknown key, undoes, creates and deletes). Autoloads are not tools | implemented, plus input map, autoloads, plugins | unsupported | implemented `edit_project_settings`, `manage_autoloads` | `ProjectSettings` | One key at a time |
 | Delete files | implemented `godot_delete_file`. With the editor: tabs closed, cached copy detached, `EditorFileSystem.update_file`, the dock's `file_removed`, system trash by default. Without it: deleted on disk, `rescan_needed`. Companions `.uid`, `.import`, `.godot/imported` data and `.md5`. References by `res://` path or `uid://` in text files (the editor also asks `.scn`/`.res` for their dependencies) refuse the call unless `force`; all or nothing. A reference from a `.gd` script that only writes the file (`ResourceSaver.save`, `FileAccess.open` for writing, `DirAccess` removal, `Image.save_png`, through constants and variables) is `written` and does not refuse it; any other is `used` (`tests/script-reference-vectors.json`). Verified by `files_are_deleted_on_disk_with_their_companions_unless_still_referenced`, `a_file_only_written_by_a_generator_script_is_deleted_without_force`, `the_addon_classifies_script_references_like_the_server` and the editor e2e `files_are_deleted_through_the_editor_with_companions_and_tabs`. No move or rename | implemented files tools | unsupported | partial | `OS.move_to_trash`, `EditorFileSystem.update_file` | References by class_name or by a path built at run time are not found |
 | UID rewrite, sprite, mesh library | unsupported | files tools cover moves; uid is implicit | implemented `get_uid`, `update_project_uids`, `load_sprite`, `export_mesh_library` | same plus tile helpers | CLI | Not the reliable path for an AI loop. Left unsupported |
@@ -64,19 +64,36 @@ Tool names are the MCP names. Solo and Vollkorn do not use a `godot_` prefix.
 | Animation, tilemap, navigation, audio, visual shader, class reference, GUT/GdUnit4 | unsupported | implemented as their own groups | unsupported | partial: animation, tiles, `run_tests`, asset install | various editor APIs | Documented-only. Porting them as one-shot CLI scripts would skip undo and the debugger. Add them on the editor bridge when a workflow needs them |
 | Unrestricted eval | unsupported | `godot_game_eval` only with `--allow-eval` | unsupported | `evaluate_expression`, `execute_script` | `Expression` / `GDScript` | Not implemented |
 
+## Capabilities added after the comparison
+
+The tools below were added after the other columns were measured, so this table does not compare them. A row is **implemented** under the same rule as above.
+
+| Capability | Rust |
+| --- | --- |
+| Shaders | implemented `godot_create_shader`, `godot_read_shader`, `godot_edit_shader` (the script tools' rules for `.gdshader` and `.gdshaderinc`, through the shader editor when it is open) and `godot_validate_shader` (Godot's own shader compiler, headless) |
+| InputMap actions | implemented `godot_get_input_map` and `godot_edit_input_action` (one undo step, saved to `project.godot`; editor only) |
+| New project | implemented `godot_create_project`: a minimal Godot 4 project without an engine or editor; never replaces `project.godot` |
+| Update the addon | implemented `godot_update_addon`: installs the addon built into the server, optionally restarting the editor |
+| Project adapter | implemented `godot_game_state` and `godot_game_command`: the game's own states and commands, registered by one adapter script the project names (`godot_mcp/adapter`), in a managed run, in editor Play and in a held game |
+| Scenario | implemented `godot_game_scenario`: one input sequence in a held game with a known number of ticks per step ([game-checks.md](game-checks.md)) |
+| Probing the level | implemented `godot_game_probe`: raycasts and ground-height grids in the game's 3D physics world without moving a node, and an aimed `godot_game_screenshot` |
+| Asset review | implemented `godot_review_assets`: scenes rendered together in one picture with their bounds and rendering cost, in a temporary Godot process (needs a window) |
+| World map | implemented `godot_world_map`: a top-down map of a world split into many scene files, with the scenes that lack collision or geometry named (needs a window) |
+
 ## Source map (Rust)
 
 | Area | Files |
 | --- | --- |
-| Tool catalog and handlers | `src/tools.rs`, `src/tools/game.rs`, `src/tools/game/*.rs`, `src/tools/code.rs`, `src/tools/authoring.rs`, `src/tools/scripts.rs`, `src/tools/files.rs`, `src/tools/run.rs`, `src/tools/headless.rs`, `src/tools/project.rs`, `src/tools/export.rs` |
+| Tool catalog and handlers | `src/tools.rs`, `src/tools/game.rs`, `src/tools/game/*.rs`, `src/tools/code.rs`, `src/tools/authoring.rs`, `src/tools/scripts.rs`, `src/tools/files.rs`, `src/tools/run.rs`, `src/tools/headless.rs`, `src/tools/project.rs`, `src/tools/scenario.rs`, `src/tools/export.rs`, `src/tools/shaders.rs`, `src/tools/import_params.rs`, `src/tools/input_map.rs`, `src/tools/addon_update.rs`, `src/tools/review.rs`, `src/tools/world_map.rs`, `src/tools/main_loop.rs`, `src/tools/exit_leaks.rs`, `src/tools/reference_kind.rs` |
 | Remote debugger session, variant codec | `src/godot/debug_session.rs`, `src/godot/variant.rs` |
+| Binary resources, resource audit, import cache, uid cache | `src/godot/binary_resource.rs`, `src/godot/resource_audit.rs`, `src/godot/imports.rs`, `src/godot/uid_cache.rs` |
 | Breakpoints, pause, step, stack | `src/godot/debug_ctl.rs` |
 | Process runs, `override.cfg` autoload, logs | `src/godot/runs.rs` |
 | GDScript LSP client | `src/lsp/client.rs`, `src/lsp/framing.rs` |
 | Editor bridge commands, stale-scene reload, file deletion | `addons/godot_mcp/bridge_server.gd`, `addons/godot_mcp/editor/file_ops.gd` |
 | In-game runtime | `addons/godot_mcp/runtime/mcp_runtime.gd`, `addons/godot_mcp/runtime/ops/rt_*.gd` |
 | Editor Play relay | `addons/godot_mcp/editor/game_relay.gd`, `addons/godot_mcp/core/runtime_override.gd` |
-| Behavior tests | `src/godot/variant.rs`, `src/godot/debug_session.rs`, `src/lsp/framing.rs`, `src/tools/game.rs`, `src/tools/game/*.rs`, `src/tools/authoring.rs`, `tests/tools_test.rs`, `tests/runtime_e2e_test.rs`, `tests/editor_e2e_test.rs`, `tests/addon_export_test.rs`, `tests/export_e2e_test.rs` |
+| Behavior tests | `src/godot/variant.rs`, `src/godot/debug_session.rs`, `src/lsp/framing.rs`, `src/tools/game.rs`, `src/tools/game/*.rs`, `src/tools/authoring.rs`, `tests/tools_test.rs`, `tests/runtime_e2e_test.rs`, `tests/editor_e2e_test.rs`, `tests/addon_export_test.rs`, `tests/export_e2e_test.rs`, `tests/scenario_e2e_test.rs` |
 
 ## Errors and limits
 
@@ -131,7 +148,8 @@ build named in `.github/godot-version` (see the README):
   authoring tools, including reading and editing scripts; and a game tool called right after
   editor Play (skipped on a Linux machine without a display).
 - `addon_export_test`: the addon stays out of exported games.
-- `export_e2e_test`: export presets created and changed through Godot, a `.pck` export, and a failing release export.
+- `export_e2e_test`: export presets created and changed through Godot, a `.pck` export, a failing release export, and import parameters read and changed without the editor.
+- `scenario_e2e_test`: a scenario that moves, jumps, pauses and releases input in a held game, a second scenario refused while the first plays, and a resumed game given back its own pause.
 
 No end-to-end test drives: step into/over/out, or language-server completion, definition and
 references. `godot_game_signals` is only checked to answer in a held game. A GUT / GdUnit4
@@ -141,7 +159,7 @@ the end-to-end tests already compile the scripts.
 ## Remaining gaps
 
 - LSP rename, hover, and the offline class reference (`godot_docs_*`).
-- Input-map, autoload, plugin, and import-option editors.
+- Autoload and plugin editors.
 - Animation, tilemaps, navigation, audio buses, visual shaders.
 - Export patches, deleting or renaming a preset, and checking option names against the platform.
 - Scene inherit, batch undo, node rename/reparent/duplicate.

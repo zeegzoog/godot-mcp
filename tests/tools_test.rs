@@ -6335,3 +6335,159 @@ async fn a_game_script_is_listed_and_checked_before_reaching_a_game() {
         text(&no_game)
     );
 }
+
+/// The class names the project's global class cache lists, with their scripts.
+fn cached_classes(project: &Path) -> Vec<(String, String)> {
+    godot_mcp::godot::class_cache::listed(project)
+        .into_iter()
+        .collect()
+}
+
+#[tokio::test]
+async fn create_and_edit_without_an_editor_keep_the_class_cache_up_to_date() {
+    let project = project_dir();
+    let created = call(
+        "godot_create_script",
+        json!({"script_path": "res://scripts/part_flight.gd", "extends_class": "RefCounted",
+               "class_name": "PartFlight", "project_path": project.path()}),
+    )
+    .await;
+    assert!(!created.is_error, "{}", text(&created));
+    assert!(
+        text(&created).contains("Registered global class PartFlight"),
+        "{}",
+        text(&created)
+    );
+    assert_eq!(
+        cached_classes(project.path()),
+        [(
+            "PartFlight".to_string(),
+            "res://scripts/part_flight.gd".to_string()
+        )]
+    );
+    let cache =
+        std::fs::read_to_string(project.path().join(".godot/global_script_class_cache.cfg"))
+            .expect("cache written");
+    assert!(cache.contains("\"base\": &\"RefCounted\""), "{cache}");
+
+    let renamed = call(
+        "godot_edit_script",
+        json!({"script_path": "res://scripts/part_flight.gd", "old_text": "class_name PartFlight",
+               "new_text": "class_name FlightOfParts", "project_path": project.path()}),
+    )
+    .await;
+    assert!(!renamed.is_error, "{}", text(&renamed));
+    assert!(
+        text(&renamed).contains("Registered global class FlightOfParts"),
+        "{}",
+        text(&renamed)
+    );
+    assert_eq!(
+        cached_classes(project.path()),
+        [(
+            "FlightOfParts".to_string(),
+            "res://scripts/part_flight.gd".to_string()
+        )]
+    );
+
+    let removed = call(
+        "godot_edit_script",
+        json!({"script_path": "res://scripts/part_flight.gd", "old_text": "class_name FlightOfParts\n",
+               "new_text": "", "project_path": project.path()}),
+    )
+    .await;
+    assert!(!removed.is_error, "{}", text(&removed));
+    assert!(
+        text(&removed).contains("Removed global class FlightOfParts"),
+        "{}",
+        text(&removed)
+    );
+    assert!(cached_classes(project.path()).is_empty());
+
+    std::fs::write(project.path().join("taken.gd"), "class_name Taken\n").expect("taken");
+    let first = call(
+        "godot_create_script",
+        json!({"script_path": "res://taken.gd", "class_name": "Taken",
+               "overwrite": true, "project_path": project.path()}),
+    )
+    .await;
+    assert!(!first.is_error, "{}", text(&first));
+    let clash = call(
+        "godot_create_script",
+        json!({"script_path": "res://clash.gd", "class_name": "Taken",
+               "project_path": project.path()}),
+    )
+    .await;
+    assert!(
+        text(&clash).contains("already registered for res://taken.gd"),
+        "{}",
+        text(&clash)
+    );
+    assert_eq!(
+        cached_classes(project.path()),
+        [("Taken".to_string(), "res://taken.gd".to_string())]
+    );
+}
+
+#[tokio::test]
+async fn validate_script_fails_a_script_that_uses_an_unregistered_class() {
+    let project = project_dir();
+    std::fs::write(
+        project.path().join("part_flight.gd"),
+        "extends RefCounted\nclass_name PartFlight\n",
+    )
+    .expect("class");
+    std::fs::write(
+        project.path().join("pump_goal.gd"),
+        "extends Node\n\nfunc _ready() -> void:\n\tvar flight = PartFlight.new()\n",
+    )
+    .expect("user");
+    let engine = tempfile::tempdir().expect("engine dir");
+    let cwd = tempfile::tempdir().expect("working dir");
+    let tools = Arc::new(
+        ToolManager::new(
+            BridgeClient::new(free_port()),
+            CliRunner::new(quiet_godot(engine.path())),
+        )
+        .with_working_dir(cwd.path().to_path_buf())
+        .with_lsp_port(free_port()),
+    );
+    let validate = |path: &'static str| {
+        let tools = Arc::clone(&tools);
+        let project = project.path().to_path_buf();
+        async move {
+            tools
+                .call_tool(
+                    "godot_validate_script",
+                    json!({"script_path": path, "project_path": project}),
+                )
+                .await
+        }
+    };
+
+    let user = validate("res://pump_goal.gd").await;
+    assert!(user.is_error, "{}", text(&user));
+    let shown = text(&user);
+    assert!(
+        shown.contains("uses PartFlight (res://part_flight.gd)")
+            && shown.contains("godot_resave_resources"),
+        "{shown}"
+    );
+
+    let own = validate("res://part_flight.gd").await;
+    assert!(!own.is_error, "{}", text(&own));
+    assert!(
+        text(&own).contains("declares class_name PartFlight"),
+        "{}",
+        text(&own)
+    );
+
+    godot_mcp::godot::class_cache::register(
+        project.path(),
+        "res://part_flight.gd",
+        "extends RefCounted\nclass_name PartFlight\n",
+    );
+    let after = validate("res://pump_goal.gd").await;
+    assert!(!after.is_error, "{}", text(&after));
+    assert!(!text(&after).contains("PartFlight"), "{}", text(&after));
+}

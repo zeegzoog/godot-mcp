@@ -101,8 +101,10 @@ The tools below were added after the other columns were measured, so this table 
 - A disconnected editor is `BridgeUnavailable`. Scene create, resource create, and project
   settings then use the text fallback. Attach, signals, and live editor tools return the
   bridge error and say how to launch the editor.
-- A crashed or exited game fails the next runtime call (`the game disconnected` / `the game
-  exited before the runtime said hello`). `godot_stop_project` and dropping the server kill
+- A game that ends fails the runtime call waiting for it within a moment, and every later one,
+  with the run's id, exit code or signal, who ended it and the last stderr lines; it does not
+  point at the editor bridge. A timeout ends no run: the answer says whether the function was
+  ended and that the game is still alive. `godot_stop_project` and dropping the server kill
   the child and restore `override.cfg`. The autoload is injected only through `override.cfg`,
   never `project.godot`. A stale marker from a crash is removed on the next run.
 - Script errors are logged and, by default, do not freeze the game

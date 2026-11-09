@@ -20,20 +20,41 @@ impl ToolManager {
                 Err(error) => return Err(error),
             }
         }
-        if method == SCRIPT_METHOD {
+        let answer = if method == SCRIPT_METHOD {
             let wait = script_wait(&params);
-            return editor_runtime(self, method, params, wait)
+            editor_runtime(self, method, params, wait)
                 .await
-                .map_err(script_timeout);
-        }
-        if method == "game.record" {
-            return editor_runtime(self, method, params, RECORD_WAIT)
+                .map_err(script_timeout)
+        } else if method == "game.record" {
+            editor_runtime(self, method, params, RECORD_WAIT)
                 .await
-                .map_err(record_timeout);
+                .map_err(record_timeout)
+        } else {
+            editor_runtime(self, method, params, Duration::from_secs(20)).await
+        };
+        answer.map_err(|error| self.or_ended_run(run_id, error))
+    }
+
+    /// No game to reach and a managed run that has ended: that end is the news, and neither the
+    /// editor bridge nor its port has anything to do with it. A call that named the editor asked
+    /// about the editor.
+    fn or_ended_run(&self, run_id: Option<&str>, error: McpError) -> McpError {
+        let no_game = match &error {
+            McpError::BridgeUnavailable(_) => true,
+            McpError::Process(message) => message == NO_EDITOR_GAME,
+            _ => false,
+        };
+        if !no_game || run_id.is_some() {
+            return error;
         }
-        editor_runtime(self, method, params, Duration::from_secs(20)).await
+        match self.games.last_ended() {
+            Some(run) => McpError::RunEnded(run.ended_report(None)),
+            None => error,
+        }
     }
 }
+
+const NO_EDITOR_GAME: &str = "No game started from the editor is running.";
 
 /// How long a held step may take before the server stops waiting. The game still finishes it.
 const HELD_STEP_WAIT: Duration = Duration::from_secs(60);
@@ -169,9 +190,7 @@ async fn ready_editor_session(tools: &ToolManager) -> Result<i64, McpError> {
                 .send_command("get_run_status", json!({}))
                 .await?;
             if state.get("running").and_then(Value::as_bool) != Some(true) {
-                return Err(McpError::Process(
-                    "No game started from the editor is running.".into(),
-                ));
+                return Err(McpError::Process(NO_EDITOR_GAME.into()));
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }

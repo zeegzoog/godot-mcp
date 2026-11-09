@@ -241,6 +241,7 @@ impl ToolManager {
         // TL-11: stop everything that runs, and say what was stopped. The managed runs are
         // independent of the editor, so they are stopped first and an editor failure cannot
         // leave them running.
+        let recently_ended = self.games.ended_runs();
         let runs = self.games.stop_all().await;
         let mut editor_play = false;
         let mut editor_error = None;
@@ -267,7 +268,7 @@ impl ToolManager {
             );
         }
         let message = match (editor_play, runs.len()) {
-            (false, 0) => "Nothing was running.".to_string(),
+            (false, 0) => format!("Nothing was running.{}", ended_sentence(&recently_ended)),
             (true, 0) => "Stopped the editor's Play mode.".to_string(),
             (false, count) => format!("Stopped {count} managed run(s)."),
             (true, count) => format!("Stopped the editor's Play mode and {count} managed run(s)."),
@@ -276,6 +277,7 @@ impl ToolManager {
             serde_json::to_string_pretty(&json!({
                 "message": message,
                 "stopped": {"editor_play": editor_play, "runs": runs},
+                "recently_ended": recently_ended,
             }))
             .unwrap_or_default(),
         )
@@ -283,6 +285,7 @@ impl ToolManager {
 
     pub(super) async fn handle_run_status(&self) -> ToolResult {
         let processes = self.games.status();
+        let ended = self.games.ended_runs();
         let answer = match self.bridge.send_command("get_run_status", json!({})).await {
             Ok(mut combined) => {
                 if let Value::Object(map) = &mut combined {
@@ -299,7 +302,8 @@ impl ToolManager {
                     "process_runs": processes,
                 });
                 if nothing {
-                    answer["message"] = json!("Nothing is running.");
+                    answer["message"] =
+                        json!(format!("Nothing is running.{}", ended_sentence(&ended)));
                 }
                 answer
             }
@@ -307,4 +311,16 @@ impl ToolManager {
         };
         ToolResult::text(serde_json::to_string_pretty(&answer).unwrap_or_default())
     }
+}
+
+/// How the newest ended run ended, for the sentence that says nothing runs. Empty without one.
+fn ended_sentence(ended: &[Value]) -> String {
+    let Some(run) = ended.first() else {
+        return String::new();
+    };
+    format!(
+        " Managed run {} ended: {}.",
+        run["run_id"].as_str().unwrap_or("?"),
+        run["how_ended"].as_str().unwrap_or("how is not known")
+    )
 }

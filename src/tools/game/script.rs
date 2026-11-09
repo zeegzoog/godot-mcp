@@ -24,9 +24,24 @@ pub(super) async fn run_script(tools: &ToolManager, args: &Value) -> ToolResult 
             if let Some(map) = value.as_object_mut() {
                 map.insert("run_id".into(), json!(run_label(tools, run_id)));
             }
+            mark_timeout(&mut value);
             answer(&value)
         }
         Err(error) => script_error(&error),
+    }
+}
+
+/// The game itself answered this timeout, so what it ended is the function and not the run.
+fn mark_timeout(value: &mut Value) {
+    if value.get("failure").and_then(Value::as_str) != Some("timeout") {
+        return;
+    }
+    let message = value.get("message").and_then(Value::as_str).unwrap_or("");
+    let message = format!("{message} The run was not stopped, and the game is still running.");
+    if let Some(map) = value.as_object_mut() {
+        map.insert("message".into(), json!(message));
+        map.insert("timeout_ended".into(), json!("function"));
+        map.insert("game_running".into(), json!(true));
     }
 }
 
@@ -171,8 +186,17 @@ mod tests {
         let text = text_of(&failed);
         assert!(text.contains("before"), "{text}");
         assert!(text.contains("stays loaded"), "{text}");
-        let late = answer(&json!({"ok": false, "failure": "timeout"}));
+        let mut timed_out = json!({"ok": false, "failure": "timeout", "message": "Ended."});
+        mark_timeout(&mut timed_out);
+        assert_eq!(timed_out["timeout_ended"], "function");
+        assert_eq!(timed_out["game_running"], true);
+        let said = timed_out["message"].as_str().unwrap_or("");
+        assert!(said.contains("still running"), "{said}");
+        let late = answer(&timed_out);
         assert!(text_of(&late).contains("timeout_seconds"));
+        let mut other = json!({"ok": false, "failure": "script_error"});
+        mark_timeout(&mut other);
+        assert!(other.get("timeout_ended").is_none());
         let done = answer(&json!({"ok": true, "value": 3}));
         assert!(!done.is_error);
     }

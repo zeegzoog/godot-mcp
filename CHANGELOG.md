@@ -8,6 +8,10 @@ Each Godot version has its own release line and branch (`godot-v4.5`, `godot-v4.
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-11-09
+
+A test script can run inside the running game, so a heavy scene stays loaded between tests, and a script can run its frames as fast as the CPU allows. Two new tools render a set of scenes into one picture and draw a top-down map of a streamed world. A managed game that ends during a call is now reported with how it ended, and a class created without the editor is known to the runs that follow.
+
 ### Added
 
 - `godot_run_script` takes `fixed_fps`, which starts Godot with `--fixed-fps`: frames stop waiting for the clock, so a test script that waits on `physics_frame` runs as fast as the CPU allows and counts the same frames. 600 physics frames take about 10 s in real time and well under a second with `fixed_fps: 60`. Game time stays exact (physics keeps the project's rate and delta); what reads the wall clock, threads and background loads do not follow it, and the tool description says so.
@@ -395,7 +399,7 @@ part of every release), and note the behaviour changes below.
   property operations, viewport capture), headless CLI fallback for version, script validation
   and launching the editor.
 
-[Unreleased]: https://github.com/zeegzoog/godot-mcp/compare/v0.13.0...master
+[Unreleased]: https://github.com/zeegzoog/godot-mcp/compare/v0.14.0...master
 [0.4.0]: https://github.com/zeegzoog/godot-mcp/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/zeegzoog/godot-mcp/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/zeegzoog/godot-mcp/compare/v0.1.0...v0.2.0

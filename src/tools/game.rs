@@ -160,7 +160,7 @@ async fn output(tools: &ToolManager, args: &Value) -> ToolResult {
     };
     match tools
         .games
-        .logs(str_arg(args, "run_id"), since_of(args), level_of(args))
+        .logs_or_last_ended(str_arg(args, "run_id"), since_of(args), level_of(args))
     {
         Ok(mut value) => {
             if let Some(lines) = value.get_mut("lines").and_then(Value::as_array_mut) {
@@ -244,9 +244,17 @@ fn text_result(result: Result<Value, McpError>) -> ToolResult {
 
 fn runtime_error(error: &McpError) -> ToolResult {
     match error {
-        McpError::BridgeUnavailable(_) | McpError::Bridge(_) | McpError::ToolExecution(_) => {
-            super::bridge_error_result(error)
-        }
+        McpError::BridgeUnavailable(_)
+        | McpError::Bridge(_)
+        | McpError::ToolExecution(_)
+        | McpError::RunEnded(_) => super::bridge_error_result(error),
+        McpError::Process(detail) if detail.contains("is still alive") => ToolResult::error(
+            error.to_string(),
+            &[
+                "Read godot_run_output and godot_get_run_status to see what the game is doing",
+                "Stop the run with godot_stop_project if it stays stuck, then start it again with godot_run_project",
+            ],
+        ),
         other => ToolResult::error(
             other.to_string(),
             &[

@@ -668,6 +668,12 @@ fn list_paths(paths: &[String]) -> String {
     }
 }
 
+/// What to do about a managed run that has ended. The error names the run.
+const RUN_ENDED_HINTS: &[&str] = &[
+    "Pass that run_id to godot_run_output to read everything the game printed before it ended",
+    "Start the game again with godot_run_project",
+];
+
 /// Turns a bridge failure into a tool error whose recovery hints match what actually failed.
 fn bridge_error_result(error: &McpError) -> ToolResult {
     match error {
@@ -689,6 +695,7 @@ fn bridge_error_result(error: &McpError) -> ToolResult {
         McpError::ToolExecution(message) => {
             ToolResult::error(message.clone(), editor_error_hints(message))
         }
+        McpError::RunEnded(report) => ToolResult::error(report.clone(), RUN_ENDED_HINTS),
         McpError::Process(detail) => ToolResult::error(
             format!("Engine process error: {detail}"),
             &["Verify GODOT_PATH points to a working Godot executable"],

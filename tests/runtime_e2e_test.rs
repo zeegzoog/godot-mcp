@@ -15,6 +15,7 @@ use godot_mcp::tools::ToolManager;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 const IGNORE: &str = "needs GODOT_PATH pointing at a Godot 4.5+ executable";
 
@@ -8313,4 +8314,130 @@ async fn a_class_created_without_the_editor_is_known_to_the_next_run() {
         "{}",
         text_of(&ran)
     );
+}
+
+// ---- a game that goes away during a call ----
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn a_game_that_quits_during_a_script_says_so_at_once() {
+    let _ = IGNORE;
+    let (project, tools, run_id) = start_live_scene(false).await;
+    let path = write_test(
+        &project,
+        "quits.gd",
+        "extends Node\nfunc run() -> void:\n\tawait get_tree().create_timer(0.3).timeout\n\tget_tree().quit(7)\n\tawait get_tree().create_timer(600.0).timeout\n",
+    );
+    let started = std::time::Instant::now();
+    let during = run_in_game(
+        &tools,
+        &run_id,
+        json!({"script": path, "timeout_seconds": 120}),
+    )
+    .await;
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_error(&during, "code 7");
+    assert_error(&during, &run_id);
+    assert_error(&during, "game.run_script");
+
+    // Without a run id nothing is live, and the answer is that end and not the editor's port.
+    let next = call(
+        &tools,
+        "godot_game_run_script",
+        json!({"script": "res://tests/quits.gd"}),
+    )
+    .await;
+    assert_error(&next, "code 7");
+    assert!(!text_of(&next).contains("bridge"), "{}", text_of(&next));
+
+    let status = json_of(&call(&tools, "godot_get_run_status", json!({})).await);
+    let run = &status["process_runs"][0];
+    assert_eq!(run["exit_code"], 7, "{status}");
+    assert_eq!(run["ended_by"], "game", "{status}");
+    let stopped = json_of(&call(&tools, "godot_stop_project", json!({})).await);
+    assert_eq!(stopped["recently_ended"][0]["exit_code"], 7, "{stopped}");
+    assert_eq!(stopped["stopped"]["runs"], json!([]), "{stopped}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn a_game_killed_during_a_script_names_the_signal_at_once() {
+    let (project, tools, run_id) = start_live_scene(false).await;
+    let path = write_test(
+        &project,
+        "killed.gd",
+        "extends Node\nfunc run() -> void:\n\tawait get_tree().create_timer(0.3).timeout\n\tOS.kill(OS.get_process_id())\n\tawait get_tree().create_timer(600.0).timeout\n",
+    );
+    let started = std::time::Instant::now();
+    let during = run_in_game(
+        &tools,
+        &run_id,
+        json!({"script": path, "timeout_seconds": 120}),
+    )
+    .await;
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_error(&during, "signal");
+    assert_error(&during, &run_id);
+    let status = json_of(&call(&tools, "godot_get_run_status", json!({})).await);
+    let run = &status["process_runs"][0];
+    assert!(run["signal"].is_number(), "{status}");
+    assert_eq!(run["ended_by"], "game", "{status}");
+}
+
+/// The game's own timeout ends the function and leaves the run, and the answer says both.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn a_timeout_says_what_it_ended_and_that_the_game_lives() {
+    let (project, tools, run_id) = start_live_scene(false).await;
+    let forever = write_test(
+        &project,
+        "forever_frames.gd",
+        "extends Node\nfunc run() -> void:\n\twhile true:\n\t\tawait get_tree().physics_frame\n",
+    );
+    let late = failed_answer(
+        &run_in_game(
+            &tools,
+            &run_id,
+            json!({"script": forever, "timeout_seconds": 1}),
+        )
+        .await,
+    );
+    assert_eq!(late["failure"], "timeout", "{late}");
+    assert_eq!(late["timeout_ended"], "function", "{late}");
+    assert_eq!(late["game_running"], true, "{late}");
+    let status = json_of(&call(&tools, "godot_get_run_status", json!({})).await);
+    assert_eq!(status["process_runs"][0]["running"], true, "{status}");
+
+    // A function with no await cannot be ended: the server stops waiting and ends nothing.
+    let spin = write_test(
+        &project,
+        "spin.gd",
+        "extends Node\nfunc run() -> void:\n\twhile true:\n\t\tpass\n",
+    );
+    let stuck = run_in_game(
+        &tools,
+        &run_id,
+        json!({"script": spin, "timeout_seconds": 1}),
+    )
+    .await;
+    assert_error(&stuck, "did not answer in time");
+    assert_error(&stuck, "still alive");
+    assert_error(&stuck, "did not stop it");
+    assert_error(&stuck, &run_id);
+    let status = json_of(&call(&tools, "godot_get_run_status", json!({})).await);
+    assert_eq!(status["process_runs"][0]["running"], true, "{status}");
+
+    let stopped = json_of(&call(&tools, "godot_stop_project", json!({"run_id": run_id})).await);
+    assert_eq!(stopped["ended_by"], "server", "{stopped}");
+    let again = json_of(&call(&tools, "godot_stop_project", json!({})).await);
+    assert_eq!(again["recently_ended"][0]["ended_by"], "server", "{again}");
 }

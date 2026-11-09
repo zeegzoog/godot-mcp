@@ -6491,3 +6491,220 @@ async fn validate_script_fails_a_script_that_uses_an_unregistered_class() {
     assert!(!after.is_error, "{}", text(&after));
     assert!(!text(&after).contains("PartFlight"), "{}", text(&after));
 }
+
+/// A stand-in for the Godot executable that runs a shell script.
+#[cfg(unix)]
+fn shell_godot(dir: &Path, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("shell_godot.sh");
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write shell godot");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod shell godot");
+    path
+}
+
+#[cfg(unix)]
+async fn wait_until_ended(manager: &Arc<ToolManager>, id: &str) -> Value {
+    for _ in 0..100 {
+        let run = run_in(&status_of(manager).await, id);
+        if run["running"] == false {
+            return run;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("run {id} did not end");
+}
+
+#[cfg(unix)]
+fn assert_not_about_the_editor(answer: &str) {
+    assert!(
+        !answer.contains("bridge") && !answer.contains("Launch Godot Editor"),
+        "{answer}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_game_that_dies_during_a_call_says_how_and_every_tool_agrees() {
+    let project = project_dir();
+    let tools = tempfile::tempdir().expect("tools dir");
+    let godot = shell_godot(
+        tools.path(),
+        "echo first-words >&2\necho last-words >&2\nsleep 1\nexit 3",
+    );
+    let manager = manager_in(project.path(), godot);
+    let id = start_fake_run(&manager, project.path()).await;
+
+    // The call is waiting for the game when it dies, and does not wait out any timeout.
+    let started = std::time::Instant::now();
+    let during = manager
+        .clone()
+        .call_tool("godot_game_tree", json!({}))
+        .await;
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(during.is_error, "{}", text(&during));
+    let answer = text(&during);
+    assert!(answer.contains(&id), "{answer}");
+    assert!(answer.contains("code 3"), "{answer}");
+    assert!(answer.contains("did not stop it"), "{answer}");
+    assert!(answer.contains("last-words"), "{answer}");
+    assert!(answer.contains("game.tree"), "{answer}");
+    assert_not_about_the_editor(&answer);
+
+    // The next call, with no run to route to, says the same and not that the editor is missing.
+    let next = manager
+        .clone()
+        .call_tool("godot_game_run_script", json!({"script": "res://check.gd"}))
+        .await;
+    assert!(next.is_error, "{}", text(&next));
+    let answer = text(&next);
+    assert!(
+        answer.contains(&id) && answer.contains("code 3"),
+        "{answer}"
+    );
+    assert_not_about_the_editor(&answer);
+
+    // Naming the run says the same.
+    let named = manager
+        .clone()
+        .call_tool("godot_game_tree", json!({"run_id": id}))
+        .await;
+    assert!(text(&named).contains("code 3"), "{}", text(&named));
+
+    let status = status_of(&manager).await;
+    let run = run_in(&status, &id);
+    assert_eq!(run["running"], false, "{run}");
+    assert_eq!(run["exit_code"], 3, "{run}");
+    assert!(run["signal"].is_null(), "{run}");
+    assert_eq!(run["ended_by"], "game", "{run}");
+    assert_eq!(run["last_stderr"], json!(["first-words", "last-words"]));
+    let message = status["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("Nothing is running") && message.contains(&id),
+        "{status}"
+    );
+
+    let stopped = manager
+        .clone()
+        .call_tool("godot_stop_project", json!({}))
+        .await;
+    assert!(!stopped.is_error, "{}", text(&stopped));
+    let stopped = script_answer(&stopped);
+    let message = stopped["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("Nothing was running") && message.contains("code 3"),
+        "{stopped}"
+    );
+    let ended = &stopped["recently_ended"][0];
+    assert_eq!(ended["run_id"], id.as_str(), "{stopped}");
+    assert_eq!(ended["exit_code"], 3, "{stopped}");
+    assert_eq!(ended["ended_by"], "game", "{stopped}");
+    assert_eq!(ended["how_ended"], run["how_ended"], "{stopped}");
+    assert_eq!(ended["last_stderr"], run["last_stderr"], "{stopped}");
+
+    // What it printed stays readable without knowing the id.
+    let output = manager
+        .clone()
+        .call_tool("godot_run_output", json!({}))
+        .await;
+    assert!(!output.is_error, "{}", text(&output));
+    let output = script_answer(&output);
+    assert_eq!(output["run_id"], id.as_str(), "{output}");
+    assert_eq!(output["running"], false, "{output}");
+    assert!(output.to_string().contains("last-words"), "{output}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_game_killed_from_outside_names_the_signal() {
+    let project = project_dir();
+    let tools = tempfile::tempdir().expect("tools dir");
+    let manager = manager_in(
+        project.path(),
+        shell_godot(tools.path(), "sleep 0.2\nkill -KILL $$"),
+    );
+    let id = start_fake_run(&manager, project.path()).await;
+    let run = wait_until_ended(&manager, &id).await;
+    assert_eq!(run["signal"], 9, "{run}");
+    assert_eq!(run["exit_code"], -1, "{run}");
+    assert_eq!(run["ended_by"], "game", "{run}");
+    let how = run["how_ended"].as_str().unwrap_or("");
+    assert!(how.contains("SIGKILL") && how.contains("outside"), "{how}");
+    assert!(how.contains("did not stop it"), "{how}");
+    let call = manager
+        .clone()
+        .call_tool("godot_game_tree", json!({"run_id": id}))
+        .await;
+    assert!(text(&call).contains("SIGKILL"), "{}", text(&call));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_game_this_server_stopped_says_so_afterwards() {
+    let project = project_dir();
+    let tools = tempfile::tempdir().expect("tools dir");
+    let manager = manager_in(project.path(), common::sleeping_godot(tools.path()));
+    let id = start_fake_run(&manager, project.path()).await;
+
+    let stopped = manager
+        .clone()
+        .call_tool("godot_stop_project", json!({}))
+        .await;
+    let stopped = script_answer(&stopped);
+    assert_eq!(stopped["message"], "Stopped 1 managed run(s).", "{stopped}");
+    assert_eq!(stopped["stopped"]["runs"][0]["ended_by"], "server");
+    assert_eq!(stopped["recently_ended"], json!([]), "{stopped}");
+
+    let again = manager
+        .clone()
+        .call_tool("godot_stop_project", json!({}))
+        .await;
+    let again = script_answer(&again);
+    let message = again["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("Nothing was running") && message.contains("this server stopped it"),
+        "{again}"
+    );
+    assert_eq!(again["recently_ended"][0]["run_id"], id.as_str(), "{again}");
+
+    let call = manager
+        .clone()
+        .call_tool("godot_game_tree", json!({}))
+        .await;
+    assert!(
+        text(&call).contains("this server stopped it"),
+        "{}",
+        text(&call)
+    );
+}
+
+/// Output that is not UTF-8 must not close the pipe: the game's next print would die of SIGPIPE.
+#[cfg(unix)]
+#[tokio::test]
+async fn output_that_is_not_utf8_does_not_kill_the_game() {
+    let project = project_dir();
+    let tools = tempfile::tempdir().expect("tools dir");
+    let manager = manager_in(
+        project.path(),
+        shell_godot(
+            tools.path(),
+            "printf 'bad \\377 bytes\\n'\nprintf 'bad \\377 bytes\\n' >&2\nwhile :; do echo still-here; echo still-here >&2; sleep 0.1; done",
+        ),
+    );
+    let id = start_fake_run(&manager, project.path()).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let run = run_in(&status_of(&manager).await, &id);
+    assert_eq!(run["running"], true, "{run}");
+    let stopped = manager
+        .clone()
+        .call_tool("godot_stop_project", json!({"run_id": id}))
+        .await;
+    let stopped = script_answer(&stopped);
+    assert_eq!(stopped["ended_by"], "server", "{stopped}");
+    let tail = stopped["last_stderr"].to_string();
+    assert!(tail.contains("still-here"), "{tail}");
+}

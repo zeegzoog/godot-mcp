@@ -7,6 +7,7 @@ use super::run::StaleImports;
 use super::{ToolManager, bridge_error_result, code, missing_argument, str_arg, user_args_of};
 use crate::cli_runner::{ScriptErrorLoc, ScriptRun, script_load_failure};
 use crate::error::McpError;
+use crate::godot::class_cache;
 use crate::godot::{
     IMPORTED_EXTENSIONS, ResourceDamage, ResourceRepair, TextResourceSnapshot, UidCacheUpdate,
     changed_imports, force_reimport, import_fingerprints, import_kind, record_uids, stale_reason,
@@ -520,6 +521,101 @@ const STILL_STALE_FORCED_HINTS: &[&str] = &[
     "The import was forced and still did not match: read the import errors in the output, and check that nothing rewrote the source during the import",
 ];
 
+/// What to do about classes the project's class cache lacks.
+const UNREGISTERED_RECOVERY: &str = "Register the classes with godot_resave_resources (without the editor it runs `godot --headless --path <project> --import`, which rewrites the class cache), or open the project in the editor, then validate again";
+
+/// What `godot_validate_script` adds about classes the project's class cache lacks.
+struct CacheReport {
+    text: String,
+    /// The script uses a class another script declares, so loading it outside the editor fails.
+    used: bool,
+}
+
+/// Classes declared in the project but missing from `.godot/global_script_class_cache.cfg`
+/// that the validated script declares or uses, or `None` when there are none.
+async fn cache_report(project: &Path, file: &Path, script_path: &str) -> Option<CacheReport> {
+    let project = project.to_path_buf();
+    let file = file.to_path_buf();
+    let script_path = script_path.to_string();
+    tokio::task::spawn_blocking(move || {
+        let text = std::fs::read_to_string(&file).ok()?;
+        let own = file
+            .strip_prefix(&project)
+            .ok()
+            .map(|relative| format!("res://{}", relative.to_string_lossy().replace('\\', "/")));
+        let mut lines = Vec::new();
+        let mut used = false;
+        for class in class_cache::unregistered(&project) {
+            if Some(&class.path) == own.as_ref() {
+                lines.push(format!(
+                    "Warning: {script_path} declares class_name {}, which the project's class cache ({}) does not list yet, so headless runs and process runs cannot find it.",
+                    class.class,
+                    class_cache::CACHE_FILE
+                ));
+            } else if class_cache::mentions(&text, &class.class) {
+                used = true;
+                lines.push(format!(
+                    "Error: {script_path} uses {} ({}), a class the project's class cache ({}) does not list yet: headless runs and process runs fail with Could not find type \"{}\" until it is registered.",
+                    class.class,
+                    class.path,
+                    class_cache::CACHE_FILE,
+                    class.class
+                ));
+            }
+        }
+        if lines.is_empty() {
+            return None;
+        }
+        lines.push(format!("To register them, {}.", class_cache::REGISTER_STEP));
+        Some(CacheReport {
+            text: lines.join("\n"),
+            used,
+        })
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// `result` with the class cache report added: before its recovery suggestions, and failing a
+/// script that uses an unregistered class.
+fn with_cache_report(result: ToolResult, report: Option<&CacheReport>) -> ToolResult {
+    let Some(report) = report else {
+        return result;
+    };
+    const HINTS: &str = "\n\nActionable recovery suggestions:\n";
+    let mut text: String = result
+        .content
+        .iter()
+        .filter_map(|content| match content {
+            crate::protocol::ToolContent::Text { text } => Some(text.as_str()),
+            crate::protocol::ToolContent::Image { .. } => None,
+        })
+        .collect();
+    if !result.is_error && !report.used {
+        return ToolResult::text(format!("{text}\n{}", report.text));
+    }
+    if !result.is_error {
+        return ToolResult::error(format!("{text}\n{}", report.text), &[UNREGISTERED_RECOVERY]);
+    }
+    match text.find(HINTS) {
+        Some(at) => {
+            text.insert_str(at, &format!("\n{}", report.text));
+            if !text.ends_with('\n') {
+                text.push('\n');
+            }
+            if report.used {
+                text.push_str(&format!("- {UNREGISTERED_RECOVERY}\n"));
+            }
+        }
+        None => text.push_str(&format!("\n{}", report.text)),
+    }
+    ToolResult {
+        content: vec![crate::protocol::ToolContent::Text { text }],
+        is_error: true,
+    }
+}
+
 /// The last `count` lines of the output, or `None` when the process printed nothing.
 fn last_output_lines(stdout: &str, stderr: &str, count: usize) -> Option<String> {
     let mut lines: Vec<&str> = stdout.lines().chain(stderr.lines()).collect();
@@ -650,6 +746,10 @@ impl ToolManager {
                             unregistered = code::unregistered_classes(dir, &file, &value);
                         }
                     }
+                    // The class cache is what headless runs and process runs know; the language
+                    // server scans the project itself, so it can know classes they do not.
+                    let classes = cache_report(dir, &file, script_path).await;
+                    let finish = |result: ToolResult| with_cache_report(result, classes.as_ref());
                     let mut report = code::report_diagnostics(script_path, &value);
                     if code::addon_warnings_hidden(dir, &file) {
                         report.text = format!("{}\n{}", report.text, code::ADDON_WARNINGS_HIDDEN);
@@ -663,7 +763,7 @@ impl ToolManager {
                             "Register the declaring script with godot_resave_resources (paths: {}), or focus the editor so it rescans, then validate again",
                             scripts.join(", ")
                         );
-                        return ScriptCheck::Checked(ToolResult::error(
+                        return ScriptCheck::Checked(finish(ToolResult::error(
                             format!(
                                 "{}\n{}",
                                 report.text,
@@ -674,9 +774,9 @@ impl ToolManager {
                                 "godot_run_script compiles scripts with the project's own class list, without the language server",
                                 "Fix the other error lines. A warning is listed and does not by itself fail this check",
                             ],
-                        ));
+                        )));
                     }
-                    return ScriptCheck::Checked(if report.failed {
+                    return ScriptCheck::Checked(finish(if report.failed {
                         ToolResult::error(
                             report.text,
                             &[
@@ -686,24 +786,29 @@ impl ToolManager {
                         )
                     } else {
                         ToolResult::text(report.text)
-                    });
+                    }));
                 }
                 Ok(None) => {}
                 Err(error) => lsp_problem = Some(error),
             }
         }
 
+        let classes = match &project_dir {
+            Some(dir) => cache_report(dir, &file, script_path).await,
+            None => None,
+        };
+        let finish = |result: ToolResult| with_cache_report(result, classes.as_ref());
         match self
             .cli
             .validate_script(project_dir.as_deref(), Path::new(script_path))
             .await
         {
-            Ok(msg) => ScriptCheck::Checked(match lsp_problem {
+            Ok(msg) => ScriptCheck::Checked(finish(match lsp_problem {
                 Some(error) => ToolResult::text(format!(
                     "No parse errors (headless check). Analyzer warnings were not checked: the language server was reached but did not answer ({error}); retry, or use godot_code_diagnostics."
                 )),
                 None => ToolResult::text(msg),
-            }),
+            })),
             // The engine could not be run at all: that is a path problem, not a script problem.
             Err(e @ McpError::Process(_)) => ScriptCheck::NoEngine(ToolResult::error(
                 format!("Script validation failed: {e}"),
@@ -712,13 +817,13 @@ impl ToolManager {
                     "Run the executable with --version to see whether it starts",
                 ],
             )),
-            Err(e) => ScriptCheck::Checked(ToolResult::error(
+            Err(e) => ScriptCheck::Checked(finish(ToolResult::error(
                 format!("Script validation failed: {e}"),
                 &[
                     "Check GDScript syntax line numbers",
                     "Ensure base class and node types exist in the engine",
                 ],
-            )),
+            ))),
         }
     }
 

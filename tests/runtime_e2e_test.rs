@@ -8160,6 +8160,145 @@ async fn a_test_script_that_cannot_run_or_fails_says_so_and_the_scene_stays() {
     assert!(!stopped.is_error, "{}", text_of(&stopped));
 }
 
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn a_class_created_without_the_editor_is_known_to_the_next_run() {
+    let _ = IGNORE;
+    let dir = tempfile::tempdir().expect("class project");
+    let root = dir.path();
+    std::fs::write(
+        root.join("project.godot"),
+        "config_version=5\n\n[application]\n\nconfig/name=\"ClassCache\"\nconfig/features=PackedStringArray(\"4.8\")\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("scripts")).unwrap();
+    std::fs::write(
+        root.join("scripts/use_class.gd"),
+        "extends SceneTree\n\nfunc _init() -> void:\n\tvar flight: PartFlight = PartFlight.new()\n\tprint(\"CLASS=\", flight.get_script().get_global_name())\n\tquit()\n",
+    )
+    .unwrap();
+    let tools = manager(root);
+    let godot = godot_path();
+    let import = || {
+        std::process::Command::new(&godot)
+            .args(["--headless", "--path"])
+            .arg(root)
+            .arg("--import")
+            .output()
+            .expect("import")
+    };
+    import();
+    let run = |script: &'static str| {
+        let tools = Arc::clone(&tools);
+        async move {
+            call(
+                &tools,
+                "godot_run_script",
+                json!({"script": script, "project_path": root, "timeout_seconds": 60}),
+            )
+            .await
+        }
+    };
+
+    // The failure this guards against: a class written to disk is unknown to a run.
+    std::fs::write(
+        root.join("scripts/stray.gd"),
+        "extends RefCounted\nclass_name StrayClass\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("scripts/use_stray.gd"),
+        "extends SceneTree\n\nfunc _init() -> void:\n\tprint(StrayClass.new())\n\tquit()\n",
+    )
+    .unwrap();
+    let stray = run("res://scripts/use_stray.gd").await;
+    assert!(stray.is_error, "{}", text_of(&stray));
+    let validated = call(
+        &tools,
+        "godot_validate_script",
+        json!({"script_path": "res://scripts/use_stray.gd", "project_path": root}),
+    )
+    .await;
+    assert!(validated.is_error, "{}", text_of(&validated));
+    assert!(
+        text_of(&validated).contains("uses StrayClass (res://scripts/stray.gd)"),
+        "{}",
+        text_of(&validated)
+    );
+    std::fs::remove_file(root.join("scripts/stray.gd")).unwrap();
+    std::fs::remove_file(root.join("scripts/use_stray.gd")).unwrap();
+
+    let created = call(
+        &tools,
+        "godot_create_script",
+        json!({"script_path": "res://scripts/part_flight.gd", "extends_class": "RefCounted",
+               "class_name": "PartFlight", "project_path": root}),
+    )
+    .await;
+    assert!(!created.is_error, "{}", text_of(&created));
+    let ran = run("res://scripts/use_class.gd").await;
+    assert!(!ran.is_error, "{}", text_of(&ran));
+    assert!(
+        text_of(&ran).contains("CLASS=PartFlight"),
+        "{}",
+        text_of(&ran)
+    );
+    let validated = call(
+        &tools,
+        "godot_validate_script",
+        json!({"script_path": "res://scripts/use_class.gd", "project_path": root}),
+    )
+    .await;
+    assert!(!validated.is_error, "{}", text_of(&validated));
+
+    // A class that extends it by path records the base the editor records.
+    let child = call(
+        &tools,
+        "godot_create_script",
+        json!({"script_path": "res://scripts/child.gd", "extends_class": "Node",
+               "class_name": "ChildFlight", "project_path": root}),
+    )
+    .await;
+    assert!(!child.is_error, "{}", text_of(&child));
+    let by_path = call(
+        &tools,
+        "godot_edit_script",
+        json!({"script_path": "res://scripts/child.gd", "old_text": "extends Node\n",
+               "new_text": "@tool\nextends \"part_flight.gd\"\n", "project_path": root}),
+    )
+    .await;
+    assert!(!by_path.is_error, "{}", text_of(&by_path));
+
+    // The editor's own scan writes the very same cache.
+    let cache = root.join(".godot/global_script_class_cache.cfg");
+    let ours = std::fs::read_to_string(&cache).expect("cache");
+    import();
+    let editors = std::fs::read_to_string(&cache).expect("cache");
+    assert_eq!(ours, editors);
+
+    // A rename by edit is what the next run sees.
+    let renamed = call(
+        &tools,
+        "godot_edit_script",
+        json!({"script_path": "res://scripts/part_flight.gd", "old_text": "class_name PartFlight",
+               "new_text": "class_name RenamedFlight", "project_path": root}),
+    )
+    .await;
+    assert!(!renamed.is_error, "{}", text_of(&renamed));
+    std::fs::write(
+        root.join("scripts/use_class.gd"),
+        "extends SceneTree\n\nfunc _init() -> void:\n\tprint(\"CLASS=\", RenamedFlight.new().get_script().get_global_name())\n\tquit()\n",
+    )
+    .unwrap();
+    let ran = run("res://scripts/use_class.gd").await;
+    assert!(!ran.is_error, "{}", text_of(&ran));
+    assert!(
+        text_of(&ran).contains("CLASS=RenamedFlight"),
+        "{}",
+        text_of(&ran)
+    );
+}
+
 // ---- a game that goes away during a call ----
 
 #[tokio::test]

@@ -6,6 +6,7 @@
 
 use super::{EditorChoice, ToolManager, str_arg};
 use crate::error::McpError;
+use crate::godot::class_cache::{self, Registration};
 use crate::paths::resolve_in_project;
 use crate::protocol::{Tool, ToolResult};
 use serde_json::{Value, json};
@@ -71,7 +72,7 @@ pub fn catalog() -> Vec<Tool> {
         ),
         super::tool(
             "godot_edit_script",
-            "Replaces one fragment of an existing .gd script: old_text must occur exactly once (any other count is refused with the count), and new_text takes its place. With the editor connected the change is one undoable editor action and the script is saved; it is refused while the script has unsaved changes in the editor. Without an editor the file is replaced as a whole. Pass the version from godot_read_script to refuse the edit if the script changed since. Never creates a file (use godot_create_script); run godot_validate_script after an edit. The text is data to this tool, but a script is code: Godot runs a @tool script in the editor as soon as it is saved.",
+            "Replaces one fragment of an existing .gd script: old_text must occur exactly once (any other count is refused with the count), and new_text takes its place. With the editor connected the change is one undoable editor action and the script is saved; it is refused while the script has unsaved changes in the editor. Without an editor the file is replaced as a whole, and a class_name the edit adds, renames or removes is updated in the project's class cache (.godot/global_script_class_cache.cfg) as the editor's scan would (class_cache in the answer; class_cache_warning when it could not be). Pass the version from godot_read_script to refuse the edit if the script changed since. Never creates a file (use godot_create_script); run godot_validate_script after an edit. The text is data to this tool, but a script is code: Godot runs a @tool script in the editor as soon as it is saved.",
             json!({
                 "script_path": {"type": "string", "description": "res:// path to an existing .gd file."},
                 "old_text": {"type": "string", "description": "The exact fragment to replace; it must occur once."},
@@ -207,17 +208,33 @@ pub(super) async fn edit_file(tools: &ToolManager, args: &Value, kind: &TextKind
     if let Err(result) = replace_file(&script, &edited, kind.noun).await {
         return result;
     }
-    ToolResult::text(
-        serde_json::to_string_pretty(&json!({
-            "path": script.res_path,
-            "replaced": 1,
-            "version": label(&edited),
-            "source": "file",
-            "editor_consulted": false,
-            "project_dir": script.project.display().to_string(),
-        }))
-        .unwrap_or_default(),
-    )
+    let mut answer = json!({
+        "path": script.res_path,
+        "replaced": 1,
+        "version": label(&edited),
+        "source": "file",
+        "editor_consulted": false,
+        "project_dir": script.project.display().to_string(),
+    });
+    // Without the editor nothing else registers a class_name the edit added or renamed.
+    if script.res_path.ends_with(".gd") {
+        let registration = class_cache::register(&script.project, &script.res_path, &edited);
+        if let Some(note) = registration
+            .note(&script.res_path)
+            .filter(|_| !matches!(registration, Registration::Unchanged(_)))
+        {
+            let key = if matches!(
+                registration,
+                Registration::Failed(_) | Registration::Taken { .. }
+            ) {
+                "class_cache_warning"
+            } else {
+                "class_cache"
+            };
+            answer[key] = json!(note);
+        }
+    }
+    ToolResult::text(serde_json::to_string_pretty(&answer).unwrap_or_default())
 }
 
 /// How often `fragment` occurs in `text`, counting overlapping occurrences (as the addon

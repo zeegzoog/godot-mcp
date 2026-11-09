@@ -180,6 +180,14 @@ pub async fn call(tools: &ToolManager, args: &Value) -> ToolResult {
     // Select once: a new process must never change the target of an in-flight scenario.
     let run = match tools.games.select(str_arg(args, "run_id")) {
         Ok(Some(run)) => run,
+        Ok(None) if tools.games.last_ended().is_some() => {
+            let report = tools
+                .games
+                .last_ended()
+                .map(|run| run.ended_report(None))
+                .unwrap_or_default();
+            return super::bridge_error_result(&McpError::RunEnded(report));
+        }
         Ok(None) => {
             return ToolResult::error(
                 "A scenario needs a managed process run.",

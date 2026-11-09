@@ -1,6 +1,6 @@
 # Content Authoring Tools (Realization)
 
-**Version:** 1.0.0
+**Version:** 1.1.0
 **Status:** Stable
 **Layer:** implementation
 **Implements:** l1-content-authoring.md
@@ -11,7 +11,7 @@ Where each invariant of the content authoring concept is kept: which file in the
 
 ## Related Specifications
 
-- [l1-content-authoring.md](l1-content-authoring.md) - Parent concept: CA-1 to CA-17.
+- [l1-content-authoring.md](l1-content-authoring.md) - Parent concept: CA-1 to CA-18.
 - [l2-tool-handlers.md](l2-tool-handlers.md) - The host side: script tools (§5.4), authoring fallbacks (§5.5), project creation (§5.6), shaders (§5.8), import parameters (§5.9), InputMap and deletion (§5.10).
 - [l2-godot-editor-addon.md](l2-godot-editor-addon.md) - The editor side: handler notes (§5.2), script commands (§5.3), shader, import and file commands (§5.4).
 - [l1-tool-catalog.md](l1-tool-catalog.md) - TL-4 (confined, non-destructive writes) and TL-5 (no injection), which several rows rely on.
@@ -45,6 +45,7 @@ The authoring tools are realized by two specifications written for other concept
 | CA-15 Import parameters | `src/tools/import_params.rs` (§5.9); `editor/import_ops.gd`, shared with the headless path | `import_params_go_through_the_editor_that_has_the_project_and_name_dropped_options`; `import_params_are_read_set_copied_and_reimported_headless` (`tests/export_e2e_test.rs`) |
 | CA-16 InputMap actions | `src/tools/input_map.rs` (§5.10); `get_input_map` and `edit_input_action` in `bridge_server.gd` | `input_action_edits_are_checked_first_and_never_write_project_godot`; `input_actions_are_edited_saved_and_undone_through_the_editor` |
 | CA-17 Deleting | `src/tools/files.rs`, `src/tools/reference_kind.rs` (§5.10); `editor/file_ops.gd` and its classifier | `files_are_deleted_on_disk_with_their_companions_unless_still_referenced`; `a_file_only_written_by_a_generator_script_is_deleted_without_force`; `files_are_deleted_through_the_editor_with_companions_and_tabs`; `the_addon_classifies_script_references_like_the_server` |
+| CA-18 Created classes are known to runs | `src/godot/class_cache.rs` (`register`, `unregistered`), called from `godot_create_script` in `src/tools.rs`, from the edit fallback in `src/tools/scripts.rs` and from the syntax check in `src/tools/headless.rs` (§5.4) | `create_and_edit_without_an_editor_keep_the_class_cache_up_to_date`; `validate_script_fails_a_script_that_uses_an_unregistered_class`; `a_class_created_without_the_editor_is_known_to_the_next_run`; the unit tests of `class_cache.rs` |
 
 ## 7. Drawbacks & Alternatives
 
@@ -68,3 +69,4 @@ The authoring tools are realized by two specifications written for other concept
 | Version | Date | Author | Description |
 | --- | --- | --- | --- |
 | 1.0.0 | 2026-11-05 | Agent (magic.spec) | Created: `l1-content-authoring.md` had no implementation specification of its own, so a change to it reached nothing downstream. The table names, for each of CA-1 to CA-17, the file and the test that keep it; the mechanisms stay in the tool handlers and the addon. |
+| 1.1.0 | 2026-11-09 | Agent (magic.spec) | [ADDED] The row of CA-18. Source: pull requests 130 and 131. Stable → RFC → Stable after Post-Update Review. |

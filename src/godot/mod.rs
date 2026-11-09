@@ -4,6 +4,7 @@
 //! does not implement a debugger; it is a client of that protocol.
 
 mod binary_resource;
+pub mod class_cache;
 mod debug_ctl;
 mod debug_session;
 mod imports;

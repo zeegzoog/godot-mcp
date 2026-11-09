@@ -13,6 +13,10 @@ pub enum McpError {
     #[error("Engine process error: {0}")]
     Process(String),
 
+    /// A managed game process has ended. The text says how; no editor is involved.
+    #[error("{0}")]
+    RunEnded(String),
+
     #[error("Protocol error: {0}")]
     Protocol(String),
 

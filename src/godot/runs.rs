@@ -13,7 +13,7 @@ use crate::util::lock;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -24,6 +24,15 @@ use uuid::Uuid;
 
 const MARKER: &str = "; godot_mcp: temporary runtime autoload (removed automatically)";
 const MAX_LOGS: usize = 2_000;
+/// The last stderr lines a run keeps for the report of how it ended.
+const STDERR_TAIL_LINES: usize = 20;
+const STDERR_TAIL_CHARS: usize = 500;
+/// How often a call waiting for the game looks whether the game is still there.
+const WATCH_INTERVAL: Duration = Duration::from_millis(250);
+/// How long a process that closed its debugger connection may take to exit.
+const EXIT_GRACE: Duration = Duration::from_secs(5);
+/// How long a report waits for the last output of a process that has ended.
+const PIPE_DRAIN: Duration = Duration::from_millis(300);
 static NEXT_REQUEST: AtomicI64 = AtomicI64::new(1);
 
 const RUNTIME_FILES: &[(&str, &str)] = &[
@@ -110,6 +119,113 @@ struct Logs {
     errors: VecDeque<Value>,
 }
 
+/// How a run ended. `code` is what the process exited with, `signal` the signal that ended it.
+#[derive(Clone, Copy)]
+struct Ended {
+    /// `server` when this server stopped it, `game` for anything else.
+    by: &'static str,
+    /// Seconds since the Unix epoch.
+    at: u64,
+    code: Option<i32>,
+    signal: Option<i32>,
+}
+
+impl Ended {
+    /// One clause that says what ended the process.
+    fn describe(&self) -> String {
+        if self.by == "server" {
+            return match self.signal {
+                Some(signal) => format!(
+                    "this server stopped it (godot_stop_project), so it ended with signal {signal} ({})",
+                    signal_name(signal)
+                ),
+                None => format!(
+                    "this server stopped it (godot_stop_project), and it exited with code {}",
+                    self.code.unwrap_or(-1)
+                ),
+            };
+        }
+        match (self.signal, self.code) {
+            (Some(signal), _) => format!(
+                "signal {signal} ({}) ended the process, {}. This server did not stop it",
+                signal_name(signal),
+                signal_cause(signal)
+            ),
+            (None, Some(0)) => "the process exited by itself with code 0: the game quit, or its window was closed. This server did not stop it".to_string(),
+            (None, Some(code)) => format!(
+                "the process exited by itself with code {code}. This server did not stop it"
+            ),
+            (None, None) => "the process ended, and its exit status could not be read. This server did not stop it".to_string(),
+        }
+    }
+}
+
+/// The name of a signal, so an agent need not know the numbers of this platform.
+fn signal_name(signal: i32) -> &'static str {
+    #[cfg(unix)]
+    {
+        match signal {
+            libc::SIGHUP => "SIGHUP",
+            libc::SIGINT => "SIGINT",
+            libc::SIGQUIT => "SIGQUIT",
+            libc::SIGILL => "SIGILL",
+            libc::SIGTRAP => "SIGTRAP",
+            libc::SIGABRT => "SIGABRT",
+            libc::SIGBUS => "SIGBUS",
+            libc::SIGFPE => "SIGFPE",
+            libc::SIGKILL => "SIGKILL",
+            libc::SIGSEGV => "SIGSEGV",
+            libc::SIGPIPE => "SIGPIPE",
+            libc::SIGTERM => "SIGTERM",
+            _ => "another signal",
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = signal;
+        "a signal"
+    }
+}
+
+/// What a signal says about the cause. A signal does not name its sender, so this stays general.
+fn signal_cause(signal: i32) -> &'static str {
+    #[cfg(unix)]
+    {
+        match signal {
+            libc::SIGILL
+            | libc::SIGTRAP
+            | libc::SIGABRT
+            | libc::SIGBUS
+            | libc::SIGFPE
+            | libc::SIGSEGV => "which is how a crash ends a process",
+            libc::SIGPIPE => "because it wrote to a pipe nobody reads",
+            _ => "which came from outside the game: a person, another program or the system",
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = signal;
+        "which came from outside the game"
+    }
+}
+
+#[cfg(unix)]
+fn signal_of(status: &ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal()
+}
+
+#[cfg(not(unix))]
+fn signal_of(_status: &ExitStatus) -> Option<i32> {
+    None
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
 struct OverrideState {
     path: PathBuf,
     backup_path: PathBuf,
@@ -133,9 +249,12 @@ pub struct Run {
     running: AtomicBool,
     /// Whether the game last said it is held (or was started held).
     held: AtomicBool,
-    exit_code: Mutex<Option<i32>>,
-    /// Who ended the run (`game` or `server`) and when (seconds since the Unix epoch); set once.
-    ended: Mutex<Option<(&'static str, u64)>>,
+    /// How the run ended; set once.
+    ended: Mutex<Option<Ended>>,
+    /// The last lines the process wrote to stderr, which outlast the debugger connection.
+    stderr_tail: Mutex<VecDeque<String>>,
+    /// How many of the process's output pipes are still being read.
+    pipes_open: AtomicU32,
     override_state: OverrideState,
     restored: AtomicBool,
 }
@@ -204,8 +323,9 @@ impl GameHub {
             hello: Mutex::new(None),
             running: AtomicBool::new(true),
             held: AtomicBool::new(held),
-            exit_code: Mutex::new(None),
             ended: Mutex::new(None),
+            stderr_tail: Mutex::new(VecDeque::new()),
+            pipes_open: AtomicU32::new(0),
             override_state,
             restored: AtomicBool::new(false),
         });
@@ -269,8 +389,8 @@ impl GameHub {
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         *lock(&run.child) = Some(child);
-        spawn_pipe(Arc::clone(&run), stdout, "stdout");
-        spawn_pipe(Arc::clone(&run), stderr, "stderr");
+        spawn_pipe(Arc::clone(&run), stdout, false);
+        spawn_pipe(Arc::clone(&run), stderr, true);
         spawn_wait(Arc::clone(&run));
 
         let mut runs = lock(&self.runs);
@@ -306,6 +426,25 @@ impl GameHub {
             stopped.push(run.summary());
         }
         stopped
+    }
+
+    /// The runs that have ended, newest first, each with how it ended.
+    pub fn ended_runs(&self) -> Vec<Value> {
+        lock(&self.runs)
+            .iter()
+            .rev()
+            .filter(|run| !run.is_alive())
+            .map(|run| run.ended_summary())
+            .collect()
+    }
+
+    /// The newest run that has ended.
+    pub fn last_ended(&self) -> Option<Arc<Run>> {
+        lock(&self.runs)
+            .iter()
+            .rev()
+            .find(|run| !run.is_alive())
+            .cloned()
     }
 
     pub async fn stop(&self, run_id: Option<&str>) -> Result<Value> {
@@ -349,6 +488,22 @@ impl GameHub {
         run.runtime(method, params, wait).await
     }
 
+    /// The logs of the named run, of the live run, or else of the run that ended last: what a run
+    /// printed is what explains its end.
+    pub fn logs_or_last_ended(
+        &self,
+        run_id: Option<&str>,
+        since: u64,
+        level: &str,
+    ) -> Result<Value> {
+        if run_id.is_none() && self.select(None)?.is_none() {
+            if let Some(run) = self.last_ended() {
+                return Ok(run.page_logs(since, level));
+            }
+        }
+        self.logs(run_id, since, level)
+    }
+
     pub fn logs(&self, run_id: Option<&str>, since: u64, level: &str) -> Result<Value> {
         let run = self
             .select(run_id)?
@@ -357,12 +512,17 @@ impl GameHub {
     }
 
     pub fn debug(&self, run_id: Option<&str>) -> Result<Arc<Run>> {
-        self.select(run_id)?.ok_or_else(|| {
-            McpError::ToolExecution(
-                "Breakpoint debugging needs a process run (godot_run_project mode \"process\")."
-                    .into(),
-            )
-        })
+        match self.select(run_id)? {
+            Some(run) if run.is_alive() => Ok(run),
+            Some(run) => Err(McpError::RunEnded(run.ended_report(None))),
+            None => Err(match self.last_ended().filter(|_| run_id.is_none()) {
+                Some(run) => McpError::RunEnded(run.ended_report(None)),
+                None => McpError::ToolExecution(
+                    "Breakpoint debugging needs a process run (godot_run_project mode \"process\")."
+                        .into(),
+                ),
+            }),
+        }
     }
 }
 
@@ -393,6 +553,7 @@ impl Run {
     }
 
     fn summary(&self) -> Value {
+        let ended = *lock(&self.ended);
         json!({
             "run_id": self.id,
             "pid": self.pid.load(Ordering::Acquire),
@@ -407,9 +568,12 @@ impl Run {
                 .as_ref()
                 .and_then(|hello| hello.get("adapter"))
                 .cloned(),
-            "exit_code": lock(&self.exit_code).clone(),
-            "ended_by": lock(&self.ended).map(|(who, _)| who),
-            "ended_at": lock(&self.ended).map(|(_, at)| at),
+            "exit_code": ended.map(|ended| ended.code.unwrap_or(-1)),
+            "signal": ended.and_then(|ended| ended.signal),
+            "ended_by": ended.map(|ended| ended.by),
+            "ended_at": ended.map(|ended| ended.at),
+            "how_ended": ended.map(|ended| ended.describe()),
+            "last_stderr": ended.map(|_| self.last_stderr()),
             "stopped": self.debug.stop().map(|stop| json!({
                 "reason": stop.reason,
                 "error": stop.error,
@@ -419,30 +583,110 @@ impl Run {
         })
     }
 
+    /// What `godot_stop_project` lists about a run that had ended before it was called.
+    fn ended_summary(&self) -> Value {
+        let ended = *lock(&self.ended);
+        json!({
+            "run_id": self.id,
+            "exit_code": ended.map(|ended| ended.code.unwrap_or(-1)),
+            "signal": ended.and_then(|ended| ended.signal),
+            "ended_by": ended.map(|ended| ended.by),
+            "ended_at": ended.map(|ended| ended.at),
+            "how_ended": ended.map(|ended| ended.describe()),
+            "last_stderr": self.last_stderr(),
+        })
+    }
+
+    fn last_stderr(&self) -> Vec<String> {
+        lock(&self.stderr_tail).iter().cloned().collect()
+    }
+
+    /// Says that this run has ended, how, and what it last wrote to stderr. `during` names the
+    /// request that was waiting for the game when it went away.
+    pub fn ended_report(&self, during: Option<&str>) -> String {
+        let ended = *lock(&self.ended);
+        let how = ended.map_or_else(
+            || "the process has ended, and how is not known yet".to_string(),
+            |ended| ended.describe(),
+        );
+        let ago = ended.map_or(String::new(), |ended| {
+            format!(", {} s ago", unix_now().saturating_sub(ended.at))
+        });
+        let waiting = during.map_or(String::new(), |method| {
+            format!(" No answer to '{method}' came, so what it did is not known.")
+        });
+        let stderr = self.last_stderr();
+        let tail = if stderr.is_empty() {
+            "It wrote nothing to stderr.".to_string()
+        } else {
+            format!("Last stderr lines:\n{}", stderr.join("\n"))
+        };
+        format!(
+            "Managed run {} has ended (PID {}{ago}): {how}.{waiting} {tail}",
+            self.id,
+            self.pid.load(Ordering::Acquire),
+        )
+    }
+
+    /// The error of a call that cannot reach the game any more, once the process's last output
+    /// has been read. A process that closed the connection and still runs gets a moment to exit.
+    async fn gone(&self, during: &str) -> McpError {
+        let deadline = tokio::time::Instant::now() + EXIT_GRACE;
+        while self.is_alive() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        if self.is_alive() {
+            return McpError::Process(format!(
+                "the game closed its debugger connection during '{during}', and its process is still alive (run {}, PID {}). This server did not stop it",
+                self.id,
+                self.pid.load(Ordering::Acquire),
+            ));
+        }
+        self.drain_pipes().await;
+        McpError::RunEnded(self.ended_report(Some(during)))
+    }
+
+    /// Output a process wrote just before it ended may still be on its way.
+    async fn drain_pipes(&self) {
+        let deadline = tokio::time::Instant::now() + PIPE_DRAIN;
+        while self.pipes_open.load(Ordering::Acquire) > 0 && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     async fn kill(&self) {
         let child = lock(&self.child).take();
         if let Some(mut child) = child {
-            let _ = child.start_kill();
-            if let Ok(status) = child.wait().await {
-                self.record_end("server", status.code());
+            // A process that already exited ended by itself, whether or not the watcher saw it.
+            if let Ok(Some(status)) = child.try_wait() {
+                self.record_end("game", Some(status));
+            } else {
+                let _ = child.start_kill();
+                if let Ok(status) = child.wait().await {
+                    self.record_end("server", Some(status));
+                }
             }
         }
         self.running.store(false, Ordering::Release);
         self.restore();
+        self.drain_pipes().await;
     }
 
     /// Records how the process ended, once: the first writer (the watcher for a game that quit by
-    /// itself, `kill` for a stop) wins. A process without an exit code (killed by a signal) is -1.
-    fn record_end(&self, who: &'static str, code: Option<i32>) {
+    /// itself, `kill` for a stop) wins. `exit_code` reports a process without one (killed by a
+    /// signal) as -1, and `signal` says which.
+    fn record_end(&self, who: &'static str, status: Option<ExitStatus>) {
         let mut ended = lock(&self.ended);
         if ended.is_some() {
             return;
         }
-        let at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_secs());
-        *ended = Some((who, at));
-        *lock(&self.exit_code) = Some(code.unwrap_or(-1));
+        *ended = Some(Ended {
+            by: who,
+            at: unix_now(),
+            code: status.and_then(|status| status.code()),
+            signal: status.as_ref().and_then(signal_of),
+        });
     }
 
     fn restore(&self) {
@@ -513,6 +757,7 @@ impl Run {
         json!({
             "run_id": self.id,
             "running": self.is_alive(),
+            "how_ended": lock(&self.ended).map(|ended| ended.describe()),
             "lines": lines,
             "errors": logs.errors.iter().cloned().collect::<Vec<_>>(),
             "next": next,
@@ -520,11 +765,10 @@ impl Run {
     }
 
     pub async fn runtime(&self, method: &str, params: Value, wait: Duration) -> Result<Value> {
-        self.wait_hello(Duration::from_secs(8).min(wait)).await?;
-        if !self.session.is_connected() {
-            return Err(McpError::Process(
-                "the game exited before the runtime answered".into(),
-            ));
+        self.wait_hello(method, Duration::from_secs(8).min(wait))
+            .await?;
+        if !self.is_alive() || !self.session.is_connected() {
+            return Err(self.gone(method).await);
         }
         let id = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed);
         let mut rx = self.session.subscribe();
@@ -539,20 +783,24 @@ impl Run {
         loop {
             let left = deadline.saturating_duration_since(tokio::time::Instant::now());
             if left.is_zero() {
-                return Err(McpError::Process(format!(
-                    "timed out waiting for the game runtime to answer '{method}'"
-                )));
+                if self.gone_away() {
+                    return Err(self.gone(method).await);
+                }
+                return Err(self.no_answer(method));
             }
-            let message = match tokio::time::timeout(left, rx.recv()).await {
+            // A reply that arrived before the game went away is read first: this only looks at
+            // the process when nothing is waiting to be read.
+            let message = match tokio::time::timeout(left.min(WATCH_INTERVAL), rx.recv()).await {
                 Ok(Ok(message)) => message,
                 Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
                 Ok(Err(broadcast::error::RecvError::Closed)) => {
-                    return Err(McpError::Process("the game disconnected".into()));
+                    return Err(self.gone(method).await);
                 }
                 Err(_) => {
-                    return Err(McpError::Process(format!(
-                        "timed out waiting for the game runtime to answer '{method}'"
-                    )));
+                    if self.gone_away() {
+                        return Err(self.gone(method).await);
+                    }
+                    continue;
                 }
             };
             if message.message != "mcp:reply" {
@@ -572,16 +820,28 @@ impl Run {
         }
     }
 
-    async fn wait_hello(&self, wait: Duration) -> Result<Value> {
+    fn gone_away(&self) -> bool {
+        !self.is_alive() || self.session.is_closed()
+    }
+
+    /// The server only stops waiting at a timeout: it ends neither the call in the game nor the
+    /// run, so the game may still be working on the request.
+    fn no_answer(&self, method: &str) -> McpError {
+        McpError::Process(format!(
+            "timed out waiting for the game runtime to answer '{method}'. Run {} is still alive (PID {}): this server did not stop it, and did not end the request in the game",
+            self.id,
+            self.pid.load(Ordering::Acquire),
+        ))
+    }
+
+    async fn wait_hello(&self, method: &str, wait: Duration) -> Result<Value> {
         let deadline = tokio::time::Instant::now() + wait;
         loop {
             if let Some(hello) = lock(&self.hello).clone() {
                 return Ok(hello);
             }
-            if !self.is_alive() && self.session.is_closed() {
-                return Err(McpError::Process(
-                    "the game exited before the runtime said hello. Read godot_run_output.".into(),
-                ));
+            if !self.is_alive() {
+                return Err(self.gone(method).await);
             }
             let left = deadline.saturating_duration_since(tokio::time::Instant::now());
             if left.is_zero() {
@@ -627,9 +887,9 @@ impl Run {
         *lock(&self.hello) = Some(payload);
     }
 
-    fn note_exit(&self, code: Option<i32>) {
+    fn note_exit(&self, status: Option<ExitStatus>) {
+        self.record_end("game", status);
         self.running.store(false, Ordering::Release);
-        self.record_end("game", code);
         self.restore();
     }
 }
@@ -760,13 +1020,24 @@ fn parse_error(data: &[Value]) -> Option<(String, String, Vec<String>)> {
     ))
 }
 
-fn spawn_pipe(run: Arc<Run>, pipe: Option<impl AsyncRead + Unpin + Send + 'static>, _name: &str) {
+fn spawn_pipe(run: Arc<Run>, pipe: Option<impl AsyncRead + Unpin + Send + 'static>, stderr: bool) {
     let Some(pipe) = pipe else {
         return;
     };
+    run.pipes_open.fetch_add(1, Ordering::AcqRel);
     tokio::spawn(async move {
-        let mut lines = BufReader::new(pipe).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
+        let mut reader = BufReader::new(pipe);
+        let mut bytes = Vec::new();
+        // Lines are read as bytes: output that is not UTF-8 must not end this loop. Closing the
+        // read end would kill the game with SIGPIPE at its next print.
+        loop {
+            bytes.clear();
+            match reader.read_until(b'\n', &mut bytes).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let text = String::from_utf8_lossy(&bytes);
+            let line = text.trim_end_matches(['\n', '\r']);
             let level = if line.contains("ERROR") {
                 "error"
             } else if line.contains("WARNING") {
@@ -774,8 +1045,16 @@ fn spawn_pipe(run: Arc<Run>, pipe: Option<impl AsyncRead + Unpin + Send + 'stati
             } else {
                 "info"
             };
-            run.push_line(level, &line, Vec::new());
+            run.push_line(level, line, Vec::new());
+            if stderr && !line.is_empty() {
+                let mut tail = lock(&run.stderr_tail);
+                tail.push_back(line.chars().take(STDERR_TAIL_CHARS).collect());
+                while tail.len() > STDERR_TAIL_LINES {
+                    tail.pop_front();
+                }
+            }
         }
+        run.pipes_open.fetch_sub(1, Ordering::AcqRel);
     });
 }
 
@@ -792,7 +1071,7 @@ fn spawn_wait(run: Arc<Run>) {
             };
             match status {
                 Ok(Some(code)) => {
-                    run.note_exit(code.code());
+                    run.note_exit(Some(code));
                     break;
                 }
                 Ok(None) => {}

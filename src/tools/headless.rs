@@ -521,7 +521,7 @@ const STILL_STALE_FORCED_HINTS: &[&str] = &[
     "The import was forced and still did not match: read the import errors in the output, and check that nothing rewrote the source during the import",
 ];
 
-/// The last `count` lines of the output, or `None` when the process printed nothing.
+/// What to do about classes the project's class cache lacks.
 const UNREGISTERED_RECOVERY: &str = "Register the classes with godot_resave_resources (without the editor it runs `godot --headless --path <project> --import`, which rewrites the class cache), or open the project in the editor, then validate again";
 
 /// What `godot_validate_script` adds about classes the project's class cache lacks.
@@ -616,6 +616,7 @@ fn with_cache_report(result: ToolResult, report: Option<&CacheReport>) -> ToolRe
     }
 }
 
+/// The last `count` lines of the output, or `None` when the process printed nothing.
 fn last_output_lines(stdout: &str, stderr: &str, count: usize) -> Option<String> {
     let mut lines: Vec<&str> = stdout.lines().chain(stderr.lines()).collect();
     if lines.len() > count {

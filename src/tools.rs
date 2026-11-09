@@ -412,13 +412,16 @@ impl ToolManager {
         }
 
         let mut reload_note = String::new();
+        // Whether an editor took the file in; its scan then registers the class_name.
+        let mut editor_scanned = false;
         if editor_holds_project {
             if let Some(res_path) = &res_path {
                 // Let the editor pick the file up (and give it a .uid) right away.
-                let _ = self
+                editor_scanned = self
                     .bridge
                     .send_command("resave_resources", json!({ "paths": [res_path] }))
-                    .await;
+                    .await
+                    .is_ok();
                 if open_tab.is_some() {
                     // The refresh above already reloads a clean tab; this call catches an
                     // older addon or a tab the refresh did not reach.
@@ -435,6 +438,19 @@ impl ToolManager {
                         }
                         _ => String::new(),
                     };
+                }
+            }
+        }
+
+        // The editor registers a class_name when its scan sees the file; without the editor,
+        // nothing would, and every run would fail to find the class.
+        if !editor_scanned {
+            if let Some(res_path) = &res_path {
+                let registration =
+                    crate::godot::class_cache::register(&project.dir, res_path, &content);
+                if let Some(note) = registration.note(res_path) {
+                    reload_note.push(' ');
+                    reload_note.push_str(&note);
                 }
             }
         }
@@ -1111,7 +1127,7 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
         ),
         tool(
             "godot_create_script",
-            "Creates a new GDScript file inside a Godot project: the given content, or a standard header (extends_class, class_name and an empty _ready) when content is absent. Content is validated after it is written, and a script that does not validate is reported as an error; the file stays written so it can be fixed with godot_edit_script. Refuses to overwrite an existing file unless overwrite is true. When the editor has the script open in a tab, an overwrite is refused while the tab has unsaved changes, and otherwise reloads the tab with the new text. script_path is the same parameter the other script tools use; file_path is its older name.",
+            "Creates a new GDScript file inside a Godot project: the given content, or a standard header (extends_class, class_name and an empty _ready) when content is absent. Content is validated after it is written, and a script that does not validate is reported as an error; the file stays written so it can be fixed with godot_edit_script. Refuses to overwrite an existing file unless overwrite is true. When the editor has the script open in a tab, an overwrite is refused while the tab has unsaved changes, and otherwise reloads the tab with the new text. script_path is the same parameter the other script tools use; file_path is its older name. Without the editor, a class_name is registered in the project's class cache (.godot/global_script_class_cache.cfg) the way the editor's scan does, so headless runs and process runs know the class at once; with the editor open, the editor registers it.",
             json!({
                 "script_path": {
                     "type": "string",
@@ -1146,7 +1162,7 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
         ),
         tool(
             "godot_validate_script",
-            "Checks a GDScript file. When a language server is already running (the open editor, or one godot_code_diagnostics started), returns its errors and warnings as file:line:col, code and message, with 1-based lines. A warning does not fail the check; an error does. When the language server calls a class unknown that another script of the project declares with class_name (a script written outside the editor is unknown to it until the editor rescans), the connected editor is asked to register that script and the check runs again; if the class is still unknown, the answer says so. Without a language server, runs godot --headless --check-only, which sees parse errors only, and says that analyzer warnings were not checked. godot_code_diagnostics is the tool that starts a language server when none is running.",
+            "Checks a GDScript file. When a language server is already running (the open editor, or one godot_code_diagnostics started), returns its errors and warnings as file:line:col, code and message, with 1-based lines. A warning does not fail the check; an error does. When the language server calls a class unknown that another script of the project declares with class_name (a script written outside the editor is unknown to it until the editor rescans), the connected editor is asked to register that script and the check runs again; if the class is still unknown, the answer says so. Without a language server, runs godot --headless --check-only, which sees parse errors only, and says that analyzer warnings were not checked. godot_code_diagnostics is the tool that starts a language server when none is running. It also reports classes the project declares but its class cache (.godot/global_script_class_cache.cfg) does not list yet: using one fails the check, since headless runs and process runs fail with Could not find type until godot_resave_resources or the editor registers it.",
             json!({
                 "script_path": {
                     "type": "string",

@@ -56,7 +56,7 @@ Out of scope:
 - An AI assistant doing what its user allowed it to do, such as editing the open scene or running the project.
 - Releases listed as unsupported above.
 
-The security measures themselves are described in the [Security section of the README](README.md#security).
+The security measures themselves are described in the [security document](docs/security.md).
 
 ## How Fixes Are Released
 

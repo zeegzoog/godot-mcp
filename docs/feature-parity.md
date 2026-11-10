@@ -134,7 +134,7 @@ not permitted and refusing `quit`, the PNG dimension check, and the text fallbac
 authoring tools (a scene, a resource, and project settings, including what they refuse).
 
 The tests that need a real Godot are ignored by default. Run them with `GODOT_PATH` set to the
-build named in `.github/godot-version` (see the README):
+build named in `.github/godot-version` (see CONTRIBUTING.md):
 
 - `runtime_e2e_test`: a process run with a live tree, keyboard, mouse, touch, joypad button
   and axis, a wait step, property readback, a permitted call, signal observation, headless

@@ -84,7 +84,7 @@ GODOT_PATH=/path/to/godot cargo test --test scenario_e2e_test -- --ignored --tes
 
 ## Checks that need code
 
-A scenario sends no code. When a check needs some, or a heavy scene should stay loaded between several test scripts, use `godot_game_run_script`: see "Keeping a scene loaded between test scripts" in the [README](../README.md#keeping-a-scene-loaded-between-test-scripts).
+A scenario sends no code. When a check needs some, or a heavy scene should stay loaded between several test scripts, use `godot_game_run_script`: see "Keeping a scene loaded between test scripts" in [running-game.md](running-game.md#keeping-a-scene-loaded-between-test-scripts).
 
 ## Backlog
 

@@ -124,7 +124,7 @@ Session     { client_name?, client_version?, started_at }
 | `godot_draft_feedback` | `note_ids` must name existing notes (drafted ones allowed), default every undrafted note; at least one note is required (otherwise the error says to record a note first); `title` optional, scrubbed, newlines replaced by spaces, shortened to 100 characters, always prefixed with `[agent-feedback]` and a space | Draft id, title, report in a fenced block, link or reason, fingerprint, `delivery` lines (copy: always; link: when it fits; submit: when mode is `full` and `gh` is found on `PATH` or at the configured path), notes left out, next-step instruction for the agent |
 | `godot_submit_feedback` | `draft_id`, `confirmed` required; `allow_duplicate` optional | One of the four outcomes with address or recovery steps; always repeats that the report is now public when created |
 
-The next-step instruction in a draft answer says, in order: show the complete report to the human in the human's language; offer copy by hand, the link, submission (only when listed as available) or discard; do not call submit without an explicit yes from the human in this conversation.
+The next-step instruction in a draft answer says, in order: show the complete report to the human in the human's language, the issue title first and then the issue body; offer copy by hand, the link, submission (only when listed as available) or discard; do not call submit without an explicit yes from the human in this conversation.
 
 ### 5.5 Scrubber
 

@@ -108,7 +108,7 @@ pub(super) fn catalog(mode: FeedbackMode) -> Vec<Tool> {
         tools.push(tool(
             DRAFT,
             &format!(
-                "Builds one report for the godot-mcp maintainers from your notes (by default every note not yet in a report; pass note_ids to choose, one report per problem) plus what the server observed: versions, platform, failures of the tools your notes name and requests for tools that do not exist. It contacts no remote service. Call it when the user's request is completed or abandoned, or when the user asks for feedback, and only when notes exist. Then show the user the COMPLETE report, in the user's language, and offer: copy it, open the link, {submission}or discard it."
+                "Builds one report for the godot-mcp maintainers from your notes (by default every note not yet in a report; pass note_ids to choose, one report per problem) plus what the server observed: versions, platform, failures of the tools your notes name and requests for tools that do not exist. It contacts no remote service. Call it when the user's request is completed or abandoned, or when the user asks for feedback, and only when notes exist. Then show the user the COMPLETE report, in the user's language: the issue title first, then the issue body. Then offer: copy it, open the link, {submission}or discard it."
             ),
             json!({
                 "note_ids": {
@@ -166,8 +166,8 @@ pub fn instructions(mode: FeedbackMode) -> Option<String> {
          tried, what came back, what you expected, one problem per note. Do not note your own \
          mistakes or problems in the user's project. When the user's request is completed or \
          abandoned, or when asked for feedback, and notes exist, call godot_draft_feedback, show \
-         the user the complete report, and {ending} Notes stay in memory; nothing leaves this \
-         machine otherwise."
+         the user the complete report (the issue title first, then the issue body), and {ending} \
+         Notes stay in memory; nothing leaves this machine otherwise."
     ))
 }
 
@@ -453,8 +453,8 @@ impl ToolManager {
         let draft = &built.draft;
         let submit = self.feedback.mode.submits() && self.gh_available();
         let mut out = format!(
-            "Draft {} is ready. Nothing has been sent anywhere.\n\nTitle: {}\nFingerprint: {}\n\n\
-             Report (the complete text, exactly as it would be published):\n\n",
+            "Draft {} is ready. Nothing has been sent anywhere.\n\nIssue title: {}\nFingerprint: {}\n\n\
+             Issue body (the complete text, exactly as it would be published):\n\n",
             draft.id, draft.title, draft.fingerprint
         );
         out.push_str(&fenced_as(&draft.body, "markdown"));
@@ -492,7 +492,7 @@ impl ToolManager {
             }
         }
         out.push_str(
-            "\nNext steps for you:\n1. Show the user the COMPLETE report above in your reply. Keep the report text as it is; explain around it in the user's language.\n",
+            "\nNext steps for you:\n1. Show the user the COMPLETE report above in your reply: the issue title first, then the issue body. Keep both texts as they are; explain around them in the user's language.\n",
         );
         if submit {
             out.push_str(

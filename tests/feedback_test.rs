@@ -269,6 +269,29 @@ async fn a_draft_shows_the_whole_report_and_every_way_to_deliver_it() {
 }
 
 #[tokio::test]
+async fn a_draft_names_the_issue_title_before_the_body_and_tells_the_agent_to_show_both() {
+    let mut session = session().await;
+    note_with(&mut session, note("bug", "add_node ignores names")).await;
+
+    let text = draft_text(&mut session, json!({})).await;
+
+    let title_at = text
+        .find("Issue title: [agent-feedback] bug: add_node ignores names")
+        .unwrap_or_else(|| panic!("no issue title line in\n{text}"));
+    let body_at = text
+        .find("Issue body")
+        .unwrap_or_else(|| panic!("no issue body label in\n{text}"));
+    let fence_at = text
+        .find("markdown\n")
+        .unwrap_or_else(|| panic!("no body fence in\n{text}"));
+    assert!(title_at < body_at && body_at < fence_at, "{text}");
+    assert!(
+        text.contains("the issue title first, then the issue body"),
+        "the next step must ask for the title and then the body: {text}"
+    );
+}
+
+#[tokio::test]
 async fn submission_is_listed_as_available_when_the_client_is_found() {
     let gh = FakeGh::new();
     let env = gh.server_env();
@@ -633,7 +656,7 @@ async fn a_confirmed_draft_is_published_exactly_as_shown_and_only_once() {
     let mut session = started(&gh).await;
     let draft = drafted(&mut session).await;
     let fingerprint = line_after(&draft, "Fingerprint: ");
-    let title = line_after(&draft, "Title: ");
+    let title = line_after(&draft, "Issue title: ");
 
     let reply = submit(&mut session, confirmed("d1")).await;
 

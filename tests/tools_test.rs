@@ -1235,6 +1235,42 @@ async fn a_run_that_is_not_held_gets_no_fixed_rate_and_no_game_arguments() {
 }
 
 #[tokio::test]
+async fn the_answer_of_a_process_run_says_whether_the_game_is_held() {
+    let project = project_dir();
+    let (godot, _record) = recording_godot(project.path());
+    let tools = manager_in(project.path(), godot);
+
+    let held = Arc::clone(&tools)
+        .call_tool(
+            "godot_run_project",
+            json!({"mode": "process", "held": true}),
+        )
+        .await;
+    assert!(!held.is_error, "{}", text(&held));
+    assert!(
+        text(&held).contains("Held at its first physics tick"),
+        "{}",
+        text(&held)
+    );
+    assert!(
+        text(&held).contains("godot_game_physics"),
+        "{}",
+        text(&held)
+    );
+
+    let running = Arc::clone(&tools)
+        .call_tool("godot_run_project", json!({"mode": "process"}))
+        .await;
+    assert!(!running.is_error, "{}", text(&running));
+    assert!(text(&running).contains("Not held"), "{}", text(&running));
+    assert!(
+        !text(&running).contains("Held at its first physics tick"),
+        "{}",
+        text(&running)
+    );
+}
+
+#[tokio::test]
 async fn user_args_are_placed_after_the_engine_separator_and_shown_in_status() {
     let project = project_dir();
     let (godot, record) = recording_godot(project.path());

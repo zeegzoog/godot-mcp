@@ -173,7 +173,7 @@ When interacting with a Godot project, agents must adhere to the following workf
 
 6. **Feedback to the Maintainers**:
    - When godot-mcp itself blocks or misleads you (a tool fails for a reason its message does not explain, a needed capability has no tool, a description or schema is wrong), record it with `godot_note_feedback` in English: what you tried, what came back, what you expected, one problem per note. Do not note your own mistakes or problems in the user's project.
-   - When the request is completed or abandoned, and notes exist, call `godot_draft_feedback`, show the user the complete report, and offer: copy it, open the link, submit it, or discard it.
+   - When the request is completed or abandoned, and notes exist, call `godot_draft_feedback`, show the user the complete report (the issue title first, then the issue body), and offer: copy it, open the link, submit it, or discard it.
    - Never call `godot_submit_feedback` without the user's explicit yes in the conversation.
 
 ## Completion Protocol (Mandatory Checklist)

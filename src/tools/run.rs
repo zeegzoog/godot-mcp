@@ -155,10 +155,16 @@ impl ToolManager {
         {
             Ok(info) => with_notice(
                 ToolResult::text(format!(
-                    "Spawned a managed Godot process (PID: {}, run_id: {}). Stop it with godot_stop_project. Project: '{}'.",
+                    "Spawned a managed Godot process (PID: {}, run_id: {}). Stop it with godot_stop_project. Project: '{}'.
+{}",
                     info.pid,
                     info.id,
-                    path.display()
+                    path.display(),
+                    if held {
+                        "Held at its first physics tick: advance it with godot_game_physics (step), and resume or stop the run when done."
+                    } else {
+                        "Not held: the game runs on its own."
+                    }
                 )),
                 &notice,
             ),

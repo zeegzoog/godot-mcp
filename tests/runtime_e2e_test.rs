@@ -8430,3 +8430,75 @@ async fn a_timeout_says_what_it_ended_and_that_the_game_lives() {
     let again = json_of(&call(&tools, "godot_stop_project", json!({})).await);
     assert_eq!(again["recently_ended"][0]["ended_by"], "server", "{again}");
 }
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn a_run_that_ends_while_another_starts_leaves_it_the_runtime() {
+    let _ = IGNORE;
+    let project = project();
+    // Two managers stand for two MCP servers (two agent sessions) running the same project.
+    let first_server = manager(project.path());
+    let second_server = manager(project.path());
+    let start = |tools: Arc<ToolManager>| {
+        let path = project.path().to_path_buf();
+        async move {
+            call(
+                &tools,
+                "godot_run_project",
+                json!({
+                    "project_path": path,
+                    "scene": "res://scenes/main.tscn",
+                    "mode": "process",
+                    "headless": true
+                }),
+            )
+            .await
+        }
+    };
+    let first = start(Arc::clone(&first_server)).await;
+    assert!(!first.is_error, "{}", text_of(&first));
+    let first_id = run_id_of(&first);
+    let tree = call(
+        &first_server,
+        "godot_game_tree",
+        json!({"run_id": first_id}),
+    )
+    .await;
+    assert!(!tree.is_error, "{}", text_of(&tree));
+
+    // The second game is still starting, and reading override.cfg, when the first run ends.
+    let second = start(Arc::clone(&second_server)).await;
+    assert!(!second.is_error, "{}", text_of(&second));
+    let second_id = run_id_of(&second);
+    let stopped = call(
+        &first_server,
+        "godot_stop_project",
+        json!({"run_id": first_id}),
+    )
+    .await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+    assert!(
+        std::fs::read_to_string(project.path().join("override.cfg"))
+            .is_ok_and(|text| text.contains("GodotMcpRuntime")),
+        "the first run's end removed the runtime autoload the second run still needs"
+    );
+
+    let tree = call(
+        &second_server,
+        "godot_game_tree",
+        json!({"run_id": second_id}),
+    )
+    .await;
+    let tree_text = text_of(&tree);
+    let _ = call(
+        &second_server,
+        "godot_stop_project",
+        json!({"run_id": second_id}),
+    )
+    .await;
+    assert!(!tree.is_error, "{tree_text}");
+    assert!(
+        !project.path().join("override.cfg").exists(),
+        "override.cfg stayed after the last run ended"
+    );
+}

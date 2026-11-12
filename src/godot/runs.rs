@@ -1,7 +1,8 @@
 //! Managed Godot process runs.
 //!
 //! A run listens as the game's remote debugger, injects the runtime autoload through
-//! `override.cfg` (never `project.godot`), and restores that file when the process exits.
+//! `override.cfg` (never `project.godot`), and restores that file when the last run of the
+//! project exits (see `LEASE_DIR`).
 //! The runtime scripts come from the project's own addon when it has all of them. Otherwise
 //! they are copied to a private folder under `.godot/` (which the editor does not scan and
 //! version control ignores), and that copy is removed when the run ends.
@@ -9,7 +10,7 @@
 use crate::error::{McpError, Result};
 use crate::godot::debug_ctl::DebugCtl;
 use crate::godot::debug_session::{DebugSession, GameMessage};
-use crate::util::lock;
+use crate::util::{lock, process_runs};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -227,9 +228,10 @@ fn unix_now() -> u64 {
 }
 
 struct OverrideState {
+    project: PathBuf,
     path: PathBuf,
     backup_path: PathBuf,
-    previous: Option<Vec<u8>>,
+    lease: PathBuf,
     copied: Option<PathBuf>,
 }
 
@@ -286,7 +288,7 @@ impl GameHub {
         let id = Uuid::new_v4().simple().to_string();
         let id = id[..8].to_string();
         let source = ensure_runtime(project, &id)?;
-        let override_state = inject_override(project, &source)?;
+        let override_state = inject_override(project, &source, &id)?;
         let session = match DebugSession::listen().await {
             Ok(session) => session,
             Err(err) => {
@@ -1152,67 +1154,174 @@ fn prune_empty_parents(path: &Path) {
     }
 }
 
-fn inject_override(project: &Path, source: &RuntimeSource) -> Result<OverrideState> {
-    write_override(project, source).inspect_err(|_| {
+fn inject_override(project: &Path, source: &RuntimeSource, run_id: &str) -> Result<OverrideState> {
+    write_override(project, source, run_id).inspect_err(|_| {
         if let Some(dir) = &source.copied {
             remove_copy(dir);
         }
     })
 }
 
-fn write_override(project: &Path, source: &RuntimeSource) -> Result<OverrideState> {
-    let path = project.join("override.cfg");
-    let backup_path = project.join(COPY_ROOT).join("override.cfg.user-backup");
-    if path.is_file() {
-        let current = std::fs::read(&path)?;
-        if String::from_utf8_lossy(&current).contains(MARKER) {
-            if backup_path.is_file() {
-                std::fs::rename(&backup_path, &path)?;
-            } else {
-                std::fs::remove_file(&path)?;
-            }
+/// Every managed run of a project, from this server or another one on the same machine, shares
+/// the project's `override.cfg`. Each run holds a lease in this folder while it may need the
+/// file, and only the last run to end gives the person's own file back. Without that, a run
+/// ending while another game was still starting removed the runtime autoload under it, and that
+/// game came up without the MCP runtime.
+const LEASE_DIR: &str = ".godot/godot_mcp/override-leases";
+/// Serializes changes to `override.cfg` between servers. A lock older than this was left by a
+/// server that died while holding it.
+const LOCK_FILE: &str = ".godot/godot_mcp/override.lock";
+const STALE_LOCK_AGE: Duration = Duration::from_secs(10);
+const LOCK_WAIT: Duration = Duration::from_secs(3);
+
+/// Holds the cross-process override lock until dropped.
+struct OverrideLock(Option<PathBuf>);
+
+impl Drop for OverrideLock {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = std::fs::remove_file(path);
         }
     }
-    let previous = if path.is_file() {
-        let bytes = std::fs::read(&path)?;
-        if let Some(parent) = backup_path.parent() {
-            std::fs::create_dir_all(parent)?;
+}
+
+/// Takes the override lock. When another server holds it past `LOCK_WAIT`, the change goes ahead
+/// without it: a rare overlap is better than a run that cannot start or a file never restored.
+fn lock_override(project: &Path) -> OverrideLock {
+    let path = project.join(LOCK_FILE);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let deadline = std::time::Instant::now() + LOCK_WAIT;
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => return OverrideLock(Some(path)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = std::fs::metadata(&path)
+                    .and_then(|meta| meta.modified())
+                    .ok()
+                    .and_then(|modified| modified.elapsed().ok())
+                    .is_some_and(|age| age > STALE_LOCK_AGE);
+                if stale {
+                    let _ = std::fs::remove_file(&path);
+                    continue;
+                }
+            }
+            Err(_) => return OverrideLock(None),
         }
-        std::fs::write(&backup_path, &bytes)?;
-        Some(bytes)
+        if std::time::Instant::now() >= deadline {
+            return OverrideLock(None);
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// The leases of runs that still need `override.cfg`. A lease names the server process that
+/// holds it; one whose server is gone (it crashed before restoring) is removed.
+fn live_leases(project: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(project.join(LEASE_DIR)) else {
+        return 0;
+    };
+    let mut live = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let owner = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok());
+        let alive = owner.is_some_and(|pid| pid == std::process::id() || process_runs(pid));
+        if alive {
+            live += 1;
+        } else {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    live
+}
+
+fn write_override(project: &Path, source: &RuntimeSource, run_id: &str) -> Result<OverrideState> {
+    let path = project.join("override.cfg");
+    let backup_path = project.join(COPY_ROOT).join("override.cfg.user-backup");
+    let lease = project.join(LEASE_DIR).join(format!("run-{run_id}"));
+    let _guard = lock_override(project);
+    // Drops the leases of servers that died, so their marker file is treated as stale below.
+    live_leases(project);
+    // The person's own file: the current one, or, when the current one is ours (another run's,
+    // live or left by a crash), the backup taken when the first run replaced it.
+    let current = if path.is_file() {
+        Some(std::fs::read(&path)?)
     } else {
         None
     };
+    let original = match current {
+        Some(bytes) if String::from_utf8_lossy(&bytes).contains(MARKER) => {
+            if backup_path.is_file() {
+                Some(std::fs::read(&backup_path)?)
+            } else {
+                None
+            }
+        }
+        Some(bytes) => {
+            if let Some(parent) = backup_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&backup_path, &bytes)?;
+            Some(bytes)
+        }
+        None => {
+            let _ = std::fs::remove_file(&backup_path);
+            None
+        }
+    };
+    if let Some(parent) = lease.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&lease, std::process::id().to_string())?;
     let autoload = format!(
         "{MARKER}\n[autoload]\n\nGodotMcpRuntime=\"{}\"\n",
         source.autoload
     );
-    let body = match &previous {
+    let body = match &original {
         Some(bytes) => format!(
             "{}\n\n{autoload}",
             String::from_utf8_lossy(bytes).trim_end()
         ),
         None => autoload,
     };
-    std::fs::write(&path, body)?;
+    if let Err(err) = std::fs::write(&path, body) {
+        let _ = std::fs::remove_file(&lease);
+        return Err(err.into());
+    }
     Ok(OverrideState {
+        project: project.to_path_buf(),
         path,
         backup_path,
-        previous,
+        lease,
         copied: source.copied.clone(),
     })
 }
 
+/// Ends this run's lease. While another run still holds one, `override.cfg` keeps the runtime
+/// autoload; the last run puts the person's file back (or removes ours when there was none).
 fn restore_override(state: &OverrideState) {
-    match &state.previous {
-        Some(bytes) => {
-            let _ = std::fs::write(&state.path, bytes);
-        }
-        None => {
-            let _ = std::fs::remove_file(&state.path);
+    {
+        let _guard = lock_override(&state.project);
+        let _ = std::fs::remove_file(&state.lease);
+        if live_leases(&state.project) == 0 {
+            if let Ok(bytes) = std::fs::read(&state.backup_path) {
+                let _ = std::fs::write(&state.path, bytes);
+                let _ = std::fs::remove_file(&state.backup_path);
+            } else if std::fs::read(&state.path)
+                .is_ok_and(|bytes| String::from_utf8_lossy(&bytes).contains(MARKER))
+            {
+                let _ = std::fs::remove_file(&state.path);
+            }
         }
     }
-    let _ = std::fs::remove_file(&state.backup_path);
+    prune_empty_parents(&state.lease);
     prune_empty_parents(&state.backup_path);
     if let Some(dir) = &state.copied {
         remove_copy(dir);
@@ -1301,7 +1410,7 @@ mod tests {
             "the runtime was copied into the project's addons folder"
         );
 
-        let state = inject_override(project.path(), &source).unwrap();
+        let state = inject_override(project.path(), &source, "abc12345").unwrap();
         let config = std::fs::read_to_string(project.path().join("override.cfg")).unwrap();
         assert!(config.contains("temporary runtime autoload"), "{config}");
         assert!(config.contains(&source.autoload), "{config}");
@@ -1327,7 +1436,7 @@ mod tests {
         );
         assert!(source.copied.is_none());
 
-        let state = inject_override(project.path(), &source).unwrap();
+        let state = inject_override(project.path(), &source, "abc12345").unwrap();
         restore_override(&state);
 
         for (relative, _) in RUNTIME_FILES {
@@ -1354,7 +1463,7 @@ mod tests {
             "an addon that lacks a runtime file must not be used in place of this server's copy"
         );
         assert!(source.autoload.contains(".godot/godot_mcp/"));
-        let state = inject_override(project.path(), &source).unwrap();
+        let state = inject_override(project.path(), &source, "abc12345").unwrap();
         restore_override(&state);
         assert!(
             !project
@@ -1385,7 +1494,7 @@ mod tests {
             "the project's addon was completed with runtime files"
         );
 
-        let state = inject_override(project.path(), &source).unwrap();
+        let state = inject_override(project.path(), &source, "abc12345").unwrap();
         restore_override(&state);
         assert!(mine.is_file());
         assert!(!project.path().join(".godot").exists());
@@ -1399,7 +1508,7 @@ mod tests {
             "[display]\n\nwindow/size/viewport_width=640\n",
         );
         let source = ensure_runtime(project.path(), "abc12345").unwrap();
-        let state = inject_override(project.path(), &source).unwrap();
+        let state = inject_override(project.path(), &source, "abc12345").unwrap();
         let during = std::fs::read_to_string(project.path().join("override.cfg")).unwrap();
         assert!(during.contains("viewport_width=640"), "{during}");
         assert!(during.contains(&source.autoload), "{during}");
@@ -1415,6 +1524,44 @@ mod tests {
                 .join(".godot/godot_mcp/run-abc12345")
                 .exists()
         );
+    }
+
+    #[test]
+    fn the_runtime_autoload_stays_until_the_last_overlapping_run_ends() {
+        let project = project();
+        let user = "[display]\n\nwindow/size/viewport_width=640\n";
+        let override_path = project.path().join("override.cfg");
+        write(&override_path, user);
+        let first_source = ensure_runtime(project.path(), "aaaa1111").unwrap();
+        let first = inject_override(project.path(), &first_source, "aaaa1111").unwrap();
+        let second_source = ensure_runtime(project.path(), "bbbb2222").unwrap();
+        let second = inject_override(project.path(), &second_source, "bbbb2222").unwrap();
+        let during = std::fs::read_to_string(&override_path).unwrap();
+        assert!(during.contains(&second_source.autoload), "{during}");
+        assert_eq!(during.matches("viewport_width=640").count(), 1, "{during}");
+
+        // The first run ends while the second game may still be reading the file.
+        restore_override(&first);
+        let after_first = std::fs::read_to_string(&override_path).unwrap();
+        assert!(after_first.contains("GodotMcpRuntime="), "{after_first}");
+        assert!(after_first.contains("viewport_width=640"), "{after_first}");
+
+        restore_override(&second);
+        assert_eq!(std::fs::read_to_string(&override_path).unwrap(), user);
+        assert!(!project.path().join(".godot").exists());
+    }
+
+    #[test]
+    fn a_lease_left_by_a_server_that_is_gone_does_not_keep_the_autoload() {
+        let project = project();
+        let lease = project.path().join(super::LEASE_DIR).join("run-dead0000");
+        // No process has this id: Linux, macOS and Windows keep ids far below it.
+        write(&lease, "4000000000");
+        let source = ensure_runtime(project.path(), "abc12345").unwrap();
+        let state = inject_override(project.path(), &source, "abc12345").unwrap();
+        restore_override(&state);
+        assert!(!lease.exists(), "the dead server's lease was kept");
+        assert!(!project.path().join("override.cfg").exists());
     }
 
     #[test]
@@ -1440,7 +1587,7 @@ mod tests {
             "a recent copy, maybe of a live run, was removed"
         );
         assert!(base.join("run-22222222/mcp_runtime.gd").is_file());
-        let state = inject_override(project.path(), &source).unwrap();
+        let state = inject_override(project.path(), &source, "abc12345").unwrap();
         restore_override(&state);
         assert!(recent.is_file());
     }

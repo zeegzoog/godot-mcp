@@ -574,8 +574,18 @@ pub fn fake_gh() -> PathBuf {
     static PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     PATH.get_or_init(|| {
         let exe = std::env::current_exe().expect("test executable path");
+        // The test executable sits in `<profile>/deps/` or, with the build layout of Rust 1.100,
+        // in `<profile>/build/<package>/<hash>/out/`. The profile directory is the parent of the
+        // nearest `deps` or `build` folder.
         let profile_dir = exe
-            .parent()
+            .ancestors()
+            .skip(1)
+            .find(|dir| {
+                matches!(
+                    dir.file_name().and_then(|name| name.to_str()),
+                    Some("deps" | "build")
+                )
+            })
             .and_then(Path::parent)
             .expect("profile directory")
             .to_path_buf();

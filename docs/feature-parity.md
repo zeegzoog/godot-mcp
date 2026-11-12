@@ -106,7 +106,11 @@ The tools below were added after the other columns were measured, so this table 
   point at the editor bridge. A timeout ends no run: the answer says whether the function was
   ended and that the game is still alive. `godot_stop_project` and dropping the server kill
   the child and restore `override.cfg`. The autoload is injected only through `override.cfg`,
-  never `project.godot`. A stale marker from a crash is removed on the next run.
+  never `project.godot`. Runs of one project share that file, from this server or another one
+  on the same machine: each holds a lease in `.godot/godot_mcp/override-leases/` while it runs,
+  and only the last run to end gives the person's own file back, so a run that ends never
+  removes the autoload under a game that is still starting. A stale marker or lease from a
+  crash is removed on the next run.
 - Script errors are logged and, by default, do not freeze the game
   (`core:set_ignore_error_breaks`). `break_on_errors: true` on `godot_run_project` keeps
   Godot's default stop.

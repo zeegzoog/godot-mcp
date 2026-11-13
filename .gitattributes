@@ -1,8 +1,10 @@
-# Configure line endings
+# Normalize line endings: every text file is stored and checked out with LF,
+# regardless of a contributor's core.autocrlf setting.
 * text=auto eol=lf
 
-# Markdown files should use LF line endings
-*.md text eol=lf
+# Explicit scripts — always use CRLF.
+*.{cmd,[cC][mM][dD]} text eol=crlf
+*.{bat,[bB][aA][tT]} text eol=crlf
 
 # Planning files are shared in the repository but are not part of source archives
 /.design export-ignore

@@ -1,6 +1,7 @@
 /.github/     @teratron
 /.agents/     @teratron
 /.claude/     @teratron
+/.codex/      @teratron
 /.cargo/      @teratron
 build.rs      @teratron
 /SECURITY.md  @teratron

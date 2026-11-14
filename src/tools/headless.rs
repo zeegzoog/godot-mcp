@@ -5,12 +5,13 @@ use super::exit_leaks::{EXIT_LEAK_HINT, collapse_exit_leaks};
 use super::main_loop::main_loop_problem;
 use super::run::StaleImports;
 use super::{ToolManager, bridge_error_result, code, missing_argument, str_arg, user_args_of};
-use crate::cli_runner::{ScriptErrorLoc, ScriptRun, script_load_failure};
+use crate::cli_runner::{ScriptErrorLoc, ScriptRun, binary_uid_limit, script_load_failure};
 use crate::error::McpError;
 use crate::godot::class_cache;
 use crate::godot::{
-    IMPORTED_EXTENSIONS, ResourceDamage, ResourceRepair, TextResourceSnapshot, UidCacheUpdate,
-    changed_imports, force_reimport, import_fingerprints, import_kind, record_uids, stale_reason,
+    BinaryUidFix, IMPORTED_EXTENSIONS, ResourceDamage, ResourceRepair, TextResourceSnapshot,
+    UidCacheUpdate, changed_imports, force_reimport, import_fingerprints, import_kind, record_uids,
+    stale_reason,
 };
 use crate::paths::{res_display, resolve_in_project, same_directory};
 use crate::protocol::ToolResult;
@@ -62,6 +63,56 @@ fn script_fixed_fps(args: &Value) -> std::result::Result<Option<u32>, ToolResult
                 &["Use fixed_fps: 60, or omit it to run in real time"],
             )
         })
+}
+
+/// How many times the server starts Godot to write the binary uids a run dropped. A pass that
+/// runs out of time keeps what it wrote, so the next one starts with the files still missing.
+const BINARY_UID_PASSES: usize = 3;
+
+/// Writes the uids of `plan` with `write`, which gets the fixes still missing, for up to
+/// [`BINARY_UID_PASSES`] passes, stopping early once every file carries its uid (`carries`) or a
+/// pass wrote none. Returns why some files still lack their uid, with what to do about it.
+async fn write_binary_uids_in_passes<W, F>(
+    plan: &[BinaryUidFix],
+    mut write: W,
+    carries: impl Fn(&BinaryUidFix) -> bool,
+) -> Option<String>
+where
+    W: FnMut(Vec<BinaryUidFix>) -> F,
+    F: std::future::Future<Output = crate::error::Result<()>>,
+{
+    let mut pending: Vec<BinaryUidFix> = plan.to_vec();
+    let mut last_error = None;
+    let mut passes = 0;
+    while !pending.is_empty() && passes < BINARY_UID_PASSES {
+        passes += 1;
+        let before = pending.len();
+        let outcome = write(pending.clone()).await;
+        pending.retain(|fix| !carries(fix));
+        match outcome {
+            Err(error) => last_error = Some(error.to_string()),
+            Ok(()) if !pending.is_empty() => {
+                last_error = Some(
+                    "Godot finished without writing them (ResourceSaver.set_uid failed)".into(),
+                );
+            }
+            Ok(()) => {}
+        }
+        if pending.len() == before {
+            break;
+        }
+    }
+    if pending.is_empty() {
+        return None;
+    }
+    let reason = last_error.unwrap_or_default();
+    let paths = path_examples(pending.iter().map(|fix| fix.path.as_str()));
+    Some(format!(
+        "{} of {} rewritten binary scenes and resources still lack their uid after {passes} Godot {} ({paths}): {reason}. resource_damage lists the ones that lost a uid with the uid they had: write each back with ResourceSaver.set_uid(path, ResourceUID.text_to_id(uid)) in a godot_run_script, or restore them from version control; a file that never had a uid only needs a re-save in the editor (godot_resave_resources).",
+        pending.len(),
+        plan.len(),
+        if passes == 1 { "pass" } else { "passes" },
+    ))
 }
 
 /// The `resource_damage` entries of a run's answer and a sentence for its summary.
@@ -1073,13 +1124,27 @@ impl ToolManager {
         let mut binary_error = None;
         let mut repairs = Vec::new();
         if !plan.is_empty() {
-            let uids: Vec<(String, String)> = plan
-                .iter()
-                .map(|fix| (fix.path.clone(), fix.uid.clone()))
-                .collect();
-            if let Err(error) = self.cli.set_binary_uids(project, &uids).await {
-                binary_error = Some(error.to_string());
-            }
+            let carries = |fix: &BinaryUidFix| {
+                !snapshot
+                    .binary_repairs(project, std::slice::from_ref(fix))
+                    .is_empty()
+            };
+            let write = |pending: Vec<BinaryUidFix>| async move {
+                let bytes = pending
+                    .iter()
+                    .filter_map(|fix| {
+                        std::fs::metadata(resolve_in_project(project, &fix.path).ok()?).ok()
+                    })
+                    .map(|meta| meta.len())
+                    .sum();
+                let limit = binary_uid_limit(pending.len(), bytes);
+                let uids: Vec<(String, String)> = pending
+                    .iter()
+                    .map(|fix| (fix.path.clone(), fix.uid.clone()))
+                    .collect();
+                self.cli.set_binary_uids(project, &uids, limit).await
+            };
+            binary_error = write_binary_uids_in_passes(&plan, write, carries).await;
             repairs = snapshot.binary_repairs(project, &plan);
         }
         repairs.extend(snapshot.repair_since(project));
@@ -1252,6 +1317,90 @@ mod tests {
         assert_eq!(
             path_examples(["res://a", "res://b", "res://c", "res://d", "res://e"].into_iter()),
             "res://a, res://b, res://c and 2 more"
+        );
+    }
+
+    fn fixes(count: usize) -> Vec<BinaryUidFix> {
+        (0..count)
+            .map(|index| BinaryUidFix {
+                path: format!("res://zones/zone_{index}_mesh.res"),
+                uid: format!("uid://zone{index}"),
+                new_uid: false,
+            })
+            .collect()
+    }
+
+    /// The frog-world run: one Godot process wrote 77 of 97 uids before its time ran out. Each
+    /// further pass gets only the files still missing, until all of them carry their uid.
+    #[tokio::test]
+    async fn binary_uids_left_by_a_timed_out_pass_are_written_by_the_next() {
+        let plan = fixes(100);
+        let written = std::sync::Mutex::new(std::collections::BTreeSet::new());
+        let sizes = std::sync::Mutex::new(Vec::new());
+        let error = write_binary_uids_in_passes(
+            &plan,
+            |pending: Vec<BinaryUidFix>| {
+                sizes.lock().expect("sizes").push(pending.len());
+                let mut written = written.lock().expect("written");
+                for fix in pending.iter().take(77) {
+                    written.insert(fix.path.clone());
+                }
+                let timed_out = pending.len() > 77;
+                async move {
+                    if timed_out {
+                        Err(McpError::Process(
+                            "Godot did not write them within 30s".into(),
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+            |fix| written.lock().expect("written").contains(&fix.path),
+        )
+        .await;
+        assert_eq!(error, None);
+        assert_eq!(*sizes.lock().expect("sizes"), vec![100, 23]);
+        assert_eq!(written.lock().expect("written").len(), 100);
+    }
+
+    /// A pass that writes nothing ends the passes, and the error says how many files are left,
+    /// why, and how to put the uids back.
+    #[tokio::test]
+    async fn binary_uids_still_missing_are_counted_with_the_remedy() {
+        let plan = fixes(5);
+        let written = std::sync::Mutex::new(std::collections::BTreeSet::new());
+        let calls = std::sync::Mutex::new(0);
+        let error = write_binary_uids_in_passes(
+            &plan,
+            |pending: Vec<BinaryUidFix>| {
+                let mut count = calls.lock().expect("calls");
+                *count += 1;
+                if *count == 1 {
+                    let mut written = written.lock().expect("written");
+                    for fix in pending.iter().take(1) {
+                        written.insert(fix.path.clone());
+                    }
+                }
+                async {
+                    Err(McpError::Process(
+                        "Godot did not write them within 30s".into(),
+                    ))
+                }
+            },
+            |fix| written.lock().expect("written").contains(&fix.path),
+        )
+        .await
+        .expect("error");
+        assert_eq!(*calls.lock().expect("calls"), 2);
+        assert!(
+            error.starts_with("4 of 5 rewritten binary scenes and resources still lack their uid after 2 Godot passes (res://zones/zone_1_mesh.res, "),
+            "{error}"
+        );
+        assert!(error.contains("within 30s"), "{error}");
+        assert!(
+            error.contains("ResourceSaver.set_uid(path, ResourceUID.text_to_id(uid))"),
+            "{error}"
         );
     }
 }

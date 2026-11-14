@@ -8,6 +8,10 @@ Each Godot version has its own release line and branch (`godot-v4.5`, `godot-v4.
 
 ## [Unreleased]
 
+### Fixed
+
+- `godot_run_script` no longer gives a rewritten scene or resource a new uid when its header had none at the start of the run but the project's uid cache still holds its uid: a file an earlier run left without its uid (a run stopped before its repair, or a headless run in another session on the same project) got a new uid, and every `uid://` reference to it in other scenes and the uid cache then pointed at nothing. The repair, `resource_damage` and the binary uid writes take the uid from the header as it was before the run and, when it has none, from `.godot/uid_cache.bin`, unless another file's header now carries that uid; a new uid is made only for a file with neither.
+
 ## [0.14.0] - 2026-11-09
 
 A test script can run inside the running game, so a heavy scene stays loaded between tests, and a script can run its frames as fast as the CPU allows. Two new tools render a set of scenes into one picture and draw a top-down map of a streamed world. A managed game that ends during a call is now reported with how it ended, and a class created without the editor is known to the runs that follow.

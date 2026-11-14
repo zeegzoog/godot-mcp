@@ -8,6 +8,10 @@ Each Godot version has its own release line and branch (`godot-v4.5`, `godot-v4.
 
 ## [Unreleased]
 
+### Fixed
+
+- `godot_run_script` gives every rewritten binary scene and resource its uid back, however many the script re-saved. The Godot process that writes them had 30 s, whatever the number and size of the files, so a run that re-saved 96 compressed meshes (373 MB) repaired 77 and left 20 without their uid. Its time now grows with the files and their size, and a pass that runs out of time is followed by up to two more for the files still missing. When some are still left, `binary_uid_error` counts them, names a few and says how to write the uids back.
+
 ## [0.14.0] - 2026-11-09
 
 A test script can run inside the running game, so a heavy scene stays loaded between tests, and a script can run its frames as fast as the CPU allows. Two new tools render a set of scenes into one picture and draw a top-down map of a streamed world. A managed game that ends during a call is now reported with how it ended, and a class created without the editor is known to the runs that follow.

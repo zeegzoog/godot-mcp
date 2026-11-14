@@ -6438,6 +6438,76 @@ async fn run_script_writes_back_the_uid_of_a_rewritten_binary_scene() {
     );
 }
 
+/// A tool script that re-saves a hundred compressed binary meshes in one run, as a shadow bake
+/// does for every zone of a region. Each of them gets its uid back, not only those Godot wrote
+/// before a fixed time ran out.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn run_script_writes_back_the_uids_of_a_hundred_rewritten_binary_meshes() {
+    const COUNT: usize = 100;
+    let dir = tempfile::tempdir().expect("project dir");
+    let root = dir.path();
+    std::fs::write(
+        root.join("project.godot"),
+        "config_version=5\n\n[application]\n\nconfig/name=\"Many binary uids\"\n",
+    )
+    .expect("project.godot");
+    std::fs::create_dir_all(root.join("tools")).expect("tools dir");
+    std::fs::create_dir_all(root.join("zones")).expect("zones dir");
+    let save = |name: &str, source: &str| {
+        std::fs::write(root.join("tools").join(name), source).expect("script");
+    };
+    save(
+        "make.gd",
+        &format!(
+            "extends SceneTree\n\nfunc _init() -> void:\n\tvar sphere := SphereMesh.new()\n\tsphere.radial_segments = 128\n\tsphere.rings = 64\n\tfor index in {COUNT}:\n\t\tvar mesh := ArrayMesh.new()\n\t\tmesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, sphere.get_mesh_arrays())\n\t\tvar path := \"res://zones/zone_%d_mesh.res\" % index\n\t\tResourceSaver.save(mesh, path, ResourceSaver.FLAG_COMPRESS)\n\t\tResourceSaver.set_uid(path, ResourceUID.create_id())\n\tquit()\n"
+        ),
+    );
+    save(
+        "bake.gd",
+        &format!(
+            "extends SceneTree\n\nfunc _init() -> void:\n\tfor index in {COUNT}:\n\t\tvar path := \"res://zones/zone_%d_mesh.res\" % index\n\t\tvar mesh: ArrayMesh = load(path)\n\t\tmesh.surface_set_material(0, StandardMaterial3D.new())\n\t\tResourceSaver.save(mesh, path, ResourceSaver.FLAG_COMPRESS)\n\tquit()\n"
+        ),
+    );
+    let tools = manager(root);
+    let run = |script: &'static str| {
+        let tools = Arc::clone(&tools);
+        let root = root.to_path_buf();
+        async move {
+            let result = call(
+                &tools,
+                "godot_run_script",
+                json!({"script": script, "project_path": root, "timeout_seconds": 300}),
+            )
+            .await;
+            let text = text_of(&result);
+            assert!(!result.is_error, "{text}");
+            serde_json::from_str::<Value>(&text[text.find('{').expect("json")..]).expect("JSON")
+        }
+    };
+    run("res://tools/make.gd").await;
+    let zone = |index: usize| root.join(format!("zones/zone_{index}_mesh.res"));
+    let before: Vec<BinaryUid> = (0..COUNT).map(|index| binary_uid(&zone(index))).collect();
+    assert!(
+        before.iter().all(|uid| matches!(uid, BinaryUid::Uid(_))),
+        "{before:?}"
+    );
+
+    let body = run("res://tools/bake.gd").await;
+    assert_eq!(body["binary_uid_error"], Value::Null, "{body}");
+    assert_eq!(body["resource_repairs_total"], COUNT, "{body}");
+    assert_eq!(body["resource_damage"], json!([]), "{body}");
+    for (index, uid) in before.iter().enumerate() {
+        assert!(
+            std::fs::read(zone(index))
+                .expect("zone")
+                .starts_with(b"RSCC"),
+            "zone {index} still compressed"
+        );
+        assert_eq!(&binary_uid(&zone(index)), uid, "zone {index}");
+    }
+}
+
 /// A tool script that builds new scenes and resources headless leaves them without uids; the
 /// server writes new ones back. The project's uid cache must learn them too, or the next script
 /// that loads the scenes prints an "invalid UID" warning for every ext_resource.

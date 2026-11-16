@@ -21,6 +21,26 @@ pub const EXPORT: &str = "godot_export_project";
 const MAX_NAME_CHARS: usize = 128;
 const MAX_FIELD_CHARS: usize = 4096;
 const MAX_OPTIONS: usize = 128;
+/// A preset's `export_files` list; a large game names a few thousand resources.
+const MAX_EXPORT_FILES: usize = 100_000;
+/// The values of a preset's `export_filter`, as Godot stores them.
+const EXPORT_FILTERS: &[&str] = &[
+    "all_resources",
+    "scenes",
+    "resources",
+    "exclude",
+    "customized",
+];
+/// The fields a set call stores as text, as `export_presets.cfg` holds them.
+const TEXT_FIELDS: &[&str] = &[
+    "export_path",
+    "export_filter",
+    "include_filter",
+    "exclude_filter",
+    "custom_features",
+];
+/// How many missing `export_files` an answer names.
+const MAX_LISTED_MISSING: usize = 20;
 const DEFAULT_TIMEOUT_SECONDS: u64 = 600;
 /// How much of each output stream an answer quotes.
 const LOG_TAIL_BYTES: usize = 12 * 1024;
@@ -52,18 +72,20 @@ pub fn catalog() -> Vec<Tool> {
     vec![
         super::tool(
             LIST,
-            "Lists the export presets in the project's export_presets.cfg, read by Godot's own ConfigFile: index, name, platform, export_path, export_filter, include_filter, exclude_filter, custom_features and every stored option (such as binary_format/architecture or texture_format/etc2_astc). Options the preset never stored are absent; Godot uses the platform's default for them. Needs the Godot binary, not the editor.",
+            "Lists the export presets in the project's export_presets.cfg, read by Godot's own ConfigFile: index, name, platform, export_path, export_filter, export_files (the res:// paths the resources, exclude and scenes filters use, when stored), include_filter, exclude_filter, custom_features and every stored option (such as binary_format/architecture or texture_format/etc2_astc). Options the preset never stored are absent; Godot uses the platform's default for them. Needs the Godot binary, not the editor.",
             json!({ "project_path": project_path }),
             &[],
         ),
         super::tool(
             SET,
-            "Creates an export preset (create true, with platform) or changes one, in export_presets.cfg through Godot's own ConfigFile, the way the editor's Export dialog stores it. Only the fields and options given are changed; a new preset exports all resources, and every option it does not store gets the platform's default when Godot loads it. An option keeps the type it already has (a whole number becomes an int unless the option holds a float). Godot ignores an option name its platform does not have, so the answer lists new_options: the names that were not stored before; check them for typos. Refused while the editor has the project open, because the editor would write its own copy of the presets back: close it with godot_close_editor first. Platform names: Linux, Windows Desktop, macOS, Android, iOS, Web, visionOS, or one an export plugin adds.",
+            "Creates an export preset (create true, with platform) or changes one, in export_presets.cfg through Godot's own ConfigFile, the way the editor's Export dialog stores it. Only the fields and options given are changed; a new preset exports all resources (export_filter all_resources), and every option it does not store gets the platform's default when Godot loads it. An option keeps the type it already has (a whole number becomes an int unless the option holds a float). Godot ignores an option name its platform does not have, so the answer lists new_options: the names that were not stored before; check them for typos. Refused while the editor has the project open, because the editor would write its own copy of the presets back: close it with godot_close_editor first. Platform names: Linux, Windows Desktop, macOS, Android, iOS, Web, visionOS, or one an export plugin adds.",
             json!({
                 "name": {"type": "string", "description": "Preset name, as godot_export_project and the Export dialog show it."},
                 "create": {"type": "boolean", "description": "Create the preset when no preset has this name. Default false, which refuses an unknown name."},
                 "platform": {"type": "string", "description": "Export platform, such as Linux or Android. Required to create a preset; for an existing preset it must equal the stored platform."},
                 "export_path": {"type": "string", "description": "Default output path, relative to the project, such as build/game.pck."},
+                "export_filter": {"type": "string", "enum": EXPORT_FILTERS, "description": "Which resources the export takes. all_resources: every resource in the project (export_files is not used). scenes: the scenes listed in export_files and their dependencies. resources: only the files listed in export_files and their dependencies. exclude: every resource except the files listed in export_files. customized: per-file choices the Export dialog stores (customized_files), which this tool does not set. include_filter and exclude_filter apply on top of every filter."},
+                "export_files": {"type": "array", "items": {"type": "string"}, "description": "The files the scenes, resources or exclude filter lists, as res:// paths (a project-relative path gets res:// added), such as [\"res://main.tscn\", \"res://levels/one.tscn\"]. Replaces the whole stored list; [] empties it. The answer's missing_files names listed files the project does not have."},
                 "include_filter": {"type": "string", "description": "Comma-separated globs of non-resource files to include, such as *.json, data/*."},
                 "exclude_filter": {"type": "string", "description": "Comma-separated globs of files to leave out, such as tests/*."},
                 "custom_features": {"type": "string", "description": "Comma-separated custom feature tags for OS.has_feature()."},
@@ -148,6 +170,21 @@ async fn set(tools: &ToolManager, args: &Value) -> ToolResult {
             ],
         );
     }
+    let mut missing_files: Vec<String> = Vec::new();
+    if let Some(files) = request.get("export_files").and_then(Value::as_array) {
+        for path in files.iter().filter_map(Value::as_str) {
+            match resolve_in_project(&project, path) {
+                Ok(file) if file.is_file() => {}
+                Ok(_) => missing_files.push(path.to_string()),
+                Err(problem) => {
+                    return ToolResult::error(
+                        format!("export_files entry {path:?} is not usable: {problem}"),
+                        &["List files inside the project only, as res:// paths"],
+                    );
+                }
+            }
+        }
+    }
     let mut request = request;
     request["action"] = json!("set");
     request["file"] = json!(presets_file(&project));
@@ -201,6 +238,26 @@ async fn set(tools: &ToolManager, args: &Value) -> ToolResult {
         "new_options": answer.get("new_options").cloned().unwrap_or(json!([])),
         "preset": answer.get("preset").cloned().unwrap_or(Value::Null),
     });
+    if !missing_files.is_empty() {
+        report["missing_files_count"] = json!(missing_files.len());
+        missing_files.truncate(MAX_LISTED_MISSING);
+        report["missing_files"] = json!(missing_files);
+    }
+    let preset_value = &report["preset"];
+    let filter = preset_value["export_filter"].as_str().unwrap_or("");
+    let listed = preset_value["export_files"]
+        .as_array()
+        .is_some_and(|files| !files.is_empty());
+    if matches!(filter, "scenes" | "resources") && !listed {
+        report["note"] = json!(format!(
+            "export_filter is {filter} and export_files is empty, so the export takes no {}; set export_files",
+            if filter == "scenes" {
+                "scenes"
+            } else {
+                "resources"
+            }
+        ));
+    }
     if let Some(platform) = str_arg(args, "platform") {
         if !BUILT_IN_PLATFORMS.contains(&platform) {
             report["warning"] = json!(format!(
@@ -443,12 +500,7 @@ fn set_request(args: &Value) -> Result<Value, String> {
         }
         None => {}
     }
-    for field in [
-        "export_path",
-        "include_filter",
-        "exclude_filter",
-        "custom_features",
-    ] {
+    for &field in TEXT_FIELDS {
         if let Some(text) = str_arg(args, field) {
             if text.chars().count() > MAX_FIELD_CHARS || text.chars().any(char::is_control) {
                 return Err(format!(
@@ -457,6 +509,17 @@ fn set_request(args: &Value) -> Result<Value, String> {
             }
             request.insert(field.into(), json!(text));
         }
+    }
+    if let Some(filter) = str_arg(args, "export_filter") {
+        if !EXPORT_FILTERS.contains(&filter) {
+            return Err(format!(
+                "export_filter {filter:?} is not one of Godot's filters: {}",
+                EXPORT_FILTERS.join(", ")
+            ));
+        }
+    }
+    if let Some(files) = args.get("export_files").filter(|value| !value.is_null()) {
+        request.insert("export_files".into(), json!(export_files(files)?));
     }
     if let Some(options) = args.get("options").filter(|value| !value.is_null()) {
         let Some(options) = options.as_object() else {
@@ -487,20 +550,57 @@ fn set_request(args: &Value) -> Result<Value, String> {
     }
     let changes_something = create
         || request.contains_key("options")
-        || [
-            "export_path",
-            "include_filter",
-            "exclude_filter",
-            "custom_features",
-        ]
-        .iter()
-        .any(|field| request.contains_key(*field));
+        || request.contains_key("export_files")
+        || TEXT_FIELDS.iter().any(|field| request.contains_key(*field));
     if !changes_something {
         return Err(format!(
-            "nothing to change for preset {name:?}: pass create, options or one of export_path, include_filter, exclude_filter, custom_features"
+            "nothing to change for preset {name:?}: pass create, options, export_files or one of {}",
+            TEXT_FIELDS.join(", ")
         ));
     }
     Ok(Value::Object(request))
+}
+
+/// The `export_files` of a set call as the `res://` paths Godot stores, in the given order
+/// without repeats: a project-relative path gets `res://`, and `\\` becomes `/`.
+fn export_files(files: &Value) -> Result<Vec<String>, String> {
+    let Some(files) = files.as_array() else {
+        return Err("export_files must be an array of res:// paths".into());
+    };
+    if files.len() > MAX_EXPORT_FILES {
+        return Err(format!(
+            "export_files holds {} paths; at most {MAX_EXPORT_FILES}",
+            files.len()
+        ));
+    }
+    let mut paths: Vec<String> = Vec::with_capacity(files.len());
+    let mut seen = std::collections::HashSet::new();
+    for file in files {
+        let Some(text) = file.as_str() else {
+            return Err(format!("export_files entry {file} is not a string"));
+        };
+        let relative = text
+            .trim()
+            .strip_prefix("res://")
+            .unwrap_or(text.trim())
+            .replace('\\', "/");
+        let bad = relative.contains(':')
+            || relative.chars().count() > MAX_FIELD_CHARS
+            || relative.chars().any(char::is_control)
+            || relative
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == "..");
+        if bad {
+            return Err(format!(
+                "export_files entry {text:?} is not a file path inside the project, such as res://levels/one.tscn (no '..', no absolute path)"
+            ));
+        }
+        let path = format!("res://{relative}");
+        if seen.insert(path.clone()) {
+            paths.push(path);
+        }
+    }
+    Ok(paths)
 }
 
 /// A preset name travels to Godot as the argument after `--export-*`, so one that starts with
@@ -849,6 +949,46 @@ mod tests {
             set_request(&json!({"name": "webOS", "export_path": "a\nb"})).is_err(),
             "a line break"
         );
+    }
+
+    #[test]
+    fn export_files_become_res_paths_without_repeats() {
+        let request = set_request(&json!({
+            "name": "Data", "export_filter": "resources",
+            "export_files": ["res://main.tscn", "levels\\one.tscn", " res://main.tscn "]
+        }))
+        .expect("request");
+        assert_eq!(request["export_filter"], "resources");
+        assert_eq!(
+            request["export_files"],
+            json!(["res://main.tscn", "res://levels/one.tscn"])
+        );
+        assert_eq!(
+            set_request(&json!({"name": "Data", "export_files": []})).expect("empty")["export_files"],
+            json!([]),
+            "an empty list is a change: it clears the stored list"
+        );
+        for bad in [
+            "",
+            "res://",
+            "res://levels/",
+            "res://a//b.tscn",
+            "res://./a.tscn",
+            "res://a/../../b.tscn",
+            "C:/game/a.tscn",
+            "user://save.tres",
+            "/abs/a.tscn",
+            "a\nb.tscn",
+        ] {
+            assert!(
+                set_request(&json!({"name": "Data", "export_files": [bad]})).is_err(),
+                "{bad:?}"
+            );
+        }
+        for filter in EXPORT_FILTERS {
+            assert!(set_request(&json!({"name": "Data", "export_filter": filter})).is_ok());
+        }
+        assert!(set_request(&json!({"name": "Data", "export_filter": "Resources"})).is_err());
     }
 
     #[test]

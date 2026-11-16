@@ -5286,6 +5286,44 @@ async fn creating_a_preset_needs_a_platform() {
     );
 }
 
+#[tokio::test]
+async fn an_export_filter_and_export_files_are_checked_before_godot_runs() {
+    let project = project_dir();
+    for (args, expected) in [
+        (
+            json!({"name": "Data", "export_filter": "everything"}),
+            "customized",
+        ),
+        (
+            json!({"name": "Data", "export_files": "res://main.tscn"}),
+            "must be an array",
+        ),
+        (
+            json!({"name": "Data", "export_files": ["res://../secret.tscn"]}),
+            "no '..'",
+        ),
+        (
+            json!({"name": "Data", "export_files": ["/etc/passwd"]}),
+            "no absolute path",
+        ),
+        (
+            json!({"name": "Data", "export_files": [7]}),
+            "must be a string",
+        ),
+    ] {
+        let mut args = args;
+        args["project_path"] = json!(project.path());
+        let result = call("godot_set_export_preset", args.clone()).await;
+        assert!(result.is_error, "{args}");
+        assert!(
+            text(&result).contains(expected),
+            "{args}: {}",
+            text(&result)
+        );
+    }
+    assert!(!project.path().join("export_presets.cfg").exists());
+}
+
 const WATER: &str = "shader_type spatial;\n\nuniform float depth = 1.0;\n\nvoid fragment() {\n\tALBEDO = vec3(0.1, 0.3, depth);\n}\n";
 
 fn shader_args(project: &Path, path: &str) -> Value {

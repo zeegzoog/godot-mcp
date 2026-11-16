@@ -13,6 +13,9 @@ const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 const VALIDATE_TIMEOUT: Duration = Duration::from_secs(30);
 const CLASS_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 const SCRIPT_OUTPUT_CAP: usize = 64 * 1024;
+/// How much of each stream a pack run keeps: its load errors come at the start, and a game
+/// prints far more than a script before it is stopped.
+const PACK_OUTPUT_CAP: usize = 1024 * 1024;
 /// Where a `godot_run_script` stream that outgrew [`SCRIPT_OUTPUT_CAP`] is kept whole, inside the
 /// project's cache folder. The next run replaces the files.
 const SCRIPT_LOG_DIR: &str = ".godot/godot-mcp";
@@ -1409,9 +1412,50 @@ impl CliRunner {
         self.run_bounded(command, limit).await
     }
 
+    /// `godot --main-pack <pack> [--headless] [--scene <scene>] [-- <user args>]`, stopped after
+    /// `limit`, from an empty temporary folder so no `project.godot` or `override.cfg` there is
+    /// read.
+    ///
+    /// The caller passes an absolute `pack` and a `res://` `scene`, so neither starts with `-`;
+    /// the user arguments follow `--`, where Godot reads no engine option.
+    pub async fn run_pack(
+        &self,
+        pack: &Path,
+        headless: bool,
+        scene: Option<&str>,
+        user_args: &[String],
+        limit: Duration,
+    ) -> Result<HeadlessRun> {
+        let dir = create_scratch_dir("pack-run")?;
+        let mut command = Command::new(&self.godot_binary);
+        command.current_dir(&dir).arg("--main-pack").arg(pack);
+        if headless {
+            command.arg("--headless");
+        }
+        if let Some(scene) = scene {
+            command.arg("--scene").arg(scene);
+        }
+        if !user_args.is_empty() {
+            command.arg("--").args(user_args);
+        }
+        let run = self.run_capped(command, limit, PACK_OUTPUT_CAP).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        run
+    }
+
     /// Runs `command` with piped output, keeping the last [`SCRIPT_OUTPUT_CAP`] bytes of each
     /// stream. After `limit` the process tree is killed and the run reports `timed_out`.
-    async fn run_bounded(&self, mut command: Command, limit: Duration) -> Result<HeadlessRun> {
+    async fn run_bounded(&self, command: Command, limit: Duration) -> Result<HeadlessRun> {
+        self.run_capped(command, limit, SCRIPT_OUTPUT_CAP).await
+    }
+
+    /// [`Self::run_bounded`], keeping the last `cap` bytes of each stream.
+    async fn run_capped(
+        &self,
+        mut command: Command,
+        limit: Duration,
+        cap: usize,
+    ) -> Result<HeadlessRun> {
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -1434,16 +1478,10 @@ impl CliRunner {
         let pid = child.id().unwrap_or(0);
         let stdout_buf = Arc::new(Mutex::new(Vec::new()));
         let stderr_buf = Arc::new(Mutex::new(Vec::new()));
-        let stdout_task = tokio::spawn(read_tail(
-            child.stdout.take(),
-            SCRIPT_OUTPUT_CAP,
-            Arc::clone(&stdout_buf),
-        ));
-        let stderr_task = tokio::spawn(read_tail(
-            child.stderr.take(),
-            SCRIPT_OUTPUT_CAP,
-            Arc::clone(&stderr_buf),
-        ));
+        let stdout_task =
+            tokio::spawn(read_tail(child.stdout.take(), cap, Arc::clone(&stdout_buf)));
+        let stderr_task =
+            tokio::spawn(read_tail(child.stderr.take(), cap, Arc::clone(&stderr_buf)));
         let (status, timed_out) = match timeout(limit, child.wait()).await {
             Ok(Ok(status)) => (Some(status), false),
             Ok(Err(err)) => {

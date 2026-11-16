@@ -28,6 +28,7 @@ mod headless;
 mod import_params;
 mod input_map;
 mod main_loop;
+mod pack_run;
 mod project;
 mod reference_kind;
 mod review;
@@ -150,6 +151,7 @@ impl ToolManager {
             name if game::handles(name) => game::call(&self, name, args).await,
             name if code::handles(name) => code::call(&self, name, args).await,
             name if export::handles(name) => export::call(&self, name, args).await,
+            name if pack_run::handles(name) => pack_run::call(&self, args).await,
             name if addon_update::handles(name) => addon_update::call(&self, args).await,
             name if import_params::handles(name) => import_params::call(&self, name, args).await,
             name if review::handles(name) => review::call(&self, args).await,
@@ -851,6 +853,7 @@ fn annotations(name: &str) -> Option<ToolAnnotations> {
         | "godot_debug_breakpoints" => [false, false, true],
         "godot_launch_editor"
         | "godot_run_project"
+        | "godot_run_pack"
         | "godot_add_node"
         | "godot_game_input"
         | "godot_game_physics"
@@ -1241,6 +1244,7 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
     tools.extend(game::catalog());
     tools.extend(code::catalog());
     tools.extend(export::catalog());
+    tools.extend(pack_run::catalog());
     tools.extend(import_params::catalog());
     tools.extend(review::catalog());
     tools.extend(world_map::catalog());

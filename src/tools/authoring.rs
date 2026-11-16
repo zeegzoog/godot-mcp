@@ -72,8 +72,8 @@ pub fn catalog() -> Vec<Tool> {
         ),
         tool(
             "godot_set_project_setting",
-            "Sets one project setting and saves it. Uses the live editor when connected. The value must be a string, number or boolean, and of the type the setting has: the stored one, else the engine's definition of the setting (a feature override such as name.mobile has the type of name). A setting of another type takes a string, with and without the editor: an HTML color or color name (\"#102b38\", \"white\") for a Color, otherwise the text project.godot stores (\"Vector2i(1152, 648)\"); an Object is never created. Without the editor, project.godot is written and the engine is asked for the type of a setting that is not stored yet. InputMap actions (input/...) are changed with godot_edit_input_action.",
-            json!({"key": s("For example application/config/name."), "value": {"description": "String, number, or boolean."}, "project_path": s("")}),
+            "Sets one project setting and saves it. Uses the live editor when connected. The value is a string, number, boolean, array or object, of the type the setting has: the stored one, else the engine's definition of the setting (a feature override such as name.mobile has the type of name); importer_defaults/<importer> (the Import dock's defaults) is a Dictionary of import options, such as {\"detect_3d/compress_to\": 0} for importer_defaults/texture. A JSON object becomes a Dictionary and an array an Array or a packed array, nested values kept as JSON gives them except that a whole number becomes an int. A setting of another type takes a string, with and without the editor: an HTML color or color name (\"#102b38\", \"white\") for a Color, otherwise the text project.godot stores (\"Vector2i(1152, 648)\", \"{\\\"key\\\": 1}\"); an Object is never created. Without the editor, project.godot is written and the engine is asked for the type of a setting that is not stored yet. InputMap actions (input/...) are changed with godot_edit_input_action.",
+            json!({"key": s("For example application/config/name."), "value": {"description": "String, number, boolean, array or object."}, "project_path": s("")}),
             &["key", "value"],
         ),
     ]
@@ -387,7 +387,7 @@ async fn editor_or_error(tools: &ToolManager, command: &str, args: &Value) -> To
 async fn set_setting(tools: &ToolManager, args: &Value) -> ToolResult {
     if str_arg(args, "key").is_some_and(|key| key.starts_with("input/")) {
         return ToolResult::error(
-            "An input/ setting is an InputMap action (a deadzone and a list of InputEvents), not a string, number or boolean",
+            "An input/ setting is an InputMap action (a deadzone and a list of InputEvents), not a plain value",
             &[
                 "Read the actions with godot_get_input_map and change one with godot_edit_input_action",
             ],
@@ -419,7 +419,7 @@ async fn set_setting(tools: &ToolManager, args: &Value) -> ToolResult {
             let Some(value) = args.get("value") else {
                 return ToolResult::error(
                     "Missing value",
-                    &["Pass value: a string, number or boolean"],
+                    &["Pass value: a string, number, boolean, array or object"],
                 );
             };
             let project = match tools.host_project(args) {
@@ -589,7 +589,12 @@ fn render_setting(value: &Value, stored: Option<StoredKind>) -> Result<String, S
             Some(StoredKind::Fraction) => Ok(format!("{:?}", number.as_f64().unwrap_or_default())),
             Some(kind) => Err(mismatch(kind)),
         },
-        _ => Err("value must be a string, number or boolean".to_string()),
+        _ => match stored {
+            Some(kind) => Err(mismatch(kind)),
+            None => Err(
+                "An array or object value is stored as the engine converts it, and the engine gave no text for it".to_string(),
+            ),
+        },
     }
 }
 
@@ -616,8 +621,8 @@ async fn write_setting_on_disk(
             &["Use a key like application/config/name"],
         );
     }
-    if !matches!(value, Value::String(_) | Value::Bool(_) | Value::Number(_)) {
-        return wrong_type("value must be a string, number or boolean".to_string());
+    if value.is_null() {
+        return wrong_type("value must be a string, number, boolean, array or object".to_string());
     }
     let original = std::fs::read_to_string(path).unwrap_or_default();
     let stored = stored_setting(&original, key);
@@ -659,7 +664,18 @@ async fn write_setting_on_disk(
 
 /// The text to store for `value`, given what the engine answered about the setting.
 fn render_typed(value: &Value, found: &SettingType) -> Result<String, String> {
+    let one_line = found
+        .text
+        .as_deref()
+        .filter(|text| !text.is_empty() && !text.contains(['\n', '\r']));
     let Some(type_name) = found.type_name.as_deref() else {
+        // A setting the engine does not define keeps the type of the value; an array or object
+        // is written as the engine converted it.
+        if value.is_array() || value.is_object() {
+            if let Some(text) = one_line {
+                return Ok(text.to_string());
+            }
+        }
         return render_setting(value, None);
     };
     let plain = match type_name {
@@ -672,64 +688,162 @@ fn render_typed(value: &Value, found: &SettingType) -> Result<String, String> {
     if let Some(kind) = plain {
         return render_setting(value, Some(kind));
     }
-    match found.text.as_deref() {
-        Some(text) if !text.is_empty() && !text.contains(['\n', '\r']) => Ok(text.to_string()),
+    match one_line {
+        Some(text) => Ok(text.to_string()),
         _ if type_name == "Color" => Err(
             "This setting expects a Color: send an HTML color such as \"#102b38\" or \"#102b38ff\", or a color name such as \"white\"".to_string(),
         ),
+        _ if matches!(type_name, "Dictionary" | "Array") => Err(format!(
+            "This setting expects a {type_name}: send a JSON {}, or a string holding the text project.godot stores, such as {}. An Object is never created.",
+            if type_name == "Array" { "array" } else { "object" },
+            if type_name == "Array" { "[1, \"two\"]" } else { "{\"key\": 1}" },
+        )),
+        _ if type_name.starts_with("Packed") => Err(format!(
+            "This setting expects a {type_name}: send a JSON array of its elements, or a string holding the text project.godot stores, such as \"{type_name}(...)\""
+        )),
         _ => Err(format!(
             "This setting expects a {type_name}: send it as a string the way project.godot stores it, such as \"{type_name}(...)\". Change settings of other types in the editor's Project Settings."
         )),
     }
 }
 
-/// The section header and the line prefix of `key` in `project.godot`.
-fn setting_parts(key: &str) -> Option<(String, String)> {
+/// The section and the entry name of `key` in `project.godot`.
+fn setting_parts(key: &str) -> Option<(&str, &str)> {
     key.split_once('/')
-        .map(|(section, name)| (format!("[{section}]"), format!("{name}=")))
 }
 
-/// The lines of `[section]` in `lines`: the header's index and the index of the next header (or
-/// the end).
-fn section_range(lines: &[&str], header: &str) -> Option<(usize, usize)> {
-    let start = lines.iter().position(|line| line.trim() == header)?;
-    let end = lines
-        .iter()
-        .enumerate()
-        .skip(start + 1)
-        .find(|(_, line)| line.trim().starts_with('['))
-        .map_or(lines.len(), |(index, _)| index);
-    Some((start, end))
+/// A section header of `project.godot` and the line it is on.
+struct Header {
+    name: String,
+    line: usize,
 }
 
-/// The value text `project.godot` holds for `key`, if any.
+/// One `name=value` entry of `project.godot`: its section, its name, its value text (every line
+/// of it: Godot writes a Dictionary over several lines) and the lines `first..end` it spans.
+struct Entry {
+    section: String,
+    name: String,
+    value: String,
+    first: usize,
+    end: usize,
+}
+
+/// The headers and entries of `project.godot`. A value continues on the next lines while a
+/// bracket, brace or parenthesis is open or a string is not closed, so the lines inside a
+/// Dictionary are part of its entry and never read as entries or headers of their own.
+fn layout(lines: &[&str]) -> (Vec<Header>, Vec<Entry>) {
+    let mut headers = Vec::new();
+    let mut entries = Vec::new();
+    let mut section = String::new();
+    let mut index = 0;
+    while index < lines.len() {
+        let trimmed = lines[index].trim();
+        if let Some(name) = trimmed
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
+            section = name.to_string();
+            headers.push(Header {
+                name: section.clone(),
+                line: index,
+            });
+            index += 1;
+            continue;
+        }
+        let Some((name, rest)) = trimmed.split_once('=') else {
+            index += 1;
+            continue;
+        };
+        let end = value_end(lines, index, rest);
+        let mut value = rest.trim().to_string();
+        for line in &lines[index + 1..end] {
+            value.push('\n');
+            value.push_str(line);
+        }
+        entries.push(Entry {
+            section: section.clone(),
+            name: name.trim().to_string(),
+            value: value.trim_end().to_string(),
+            first: index,
+            end,
+        });
+        index = end;
+    }
+    (headers, entries)
+}
+
+/// The line after the last line of the value that starts as `rest` on line `first`.
+fn value_end(lines: &[&str], first: usize, rest: &str) -> usize {
+    let mut depth: i64 = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut line = first;
+    let mut text = rest;
+    loop {
+        for character in text.chars() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if character == '\\' {
+                    escaped = true;
+                } else if character == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match character {
+                '"' => in_string = true,
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                _ => {}
+            }
+        }
+        line += 1;
+        if (depth <= 0 && !in_string) || line >= lines.len() {
+            return line;
+        }
+        text = lines[line];
+    }
+}
+
+/// The lines of `[section]`: the header's index and the index of the next header (or the end).
+fn section_range(headers: &[Header], line_count: usize, section: &str) -> Option<(usize, usize)> {
+    let at = headers.iter().position(|header| header.name == section)?;
+    let end = headers.get(at + 1).map_or(line_count, |next| next.line);
+    Some((headers[at].line, end))
+}
+
+/// The value text `project.godot` holds for `key`, if any, with every line of it.
 fn stored_setting(text: &str, key: &str) -> Option<String> {
-    let (header, prefix) = setting_parts(key)?;
+    let (section, name) = setting_parts(key)?;
     let lines: Vec<&str> = text.lines().collect();
-    let (start, end) = section_range(&lines, &header)?;
-    lines[start + 1..end].iter().find_map(|line| {
-        line.trim_start()
-            .strip_prefix(&prefix)
-            .map(|stored| stored.trim().to_string())
-    })
+    let (_, entries) = layout(&lines);
+    entries
+        .into_iter()
+        .find(|entry| entry.section == section && entry.name == name)
+        .map(|entry| entry.value)
 }
 
-/// `text` with `key` set to the stored text `rendered`: an existing entry is replaced in place, a
-/// new one goes after the last entry of its section, keeping the blank line before the next
-/// section, and a new section is added at the end the way Godot writes one.
+/// `text` with `key` set to the stored text `rendered`: an existing entry is replaced in place
+/// (all its lines), a new one goes after the last entry of its section, keeping the blank line
+/// before the next section, and a new section is added at the end the way Godot writes one.
 fn put_setting(text: &str, key: &str, rendered: &str) -> String {
-    let Some((header, prefix)) = setting_parts(key) else {
+    let Some((section, name)) = setting_parts(key) else {
         return text.to_string();
     };
-    let assignment = format!("{prefix}{rendered}");
+    let assignment = format!("{name}={rendered}");
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
     let borrowed: Vec<&str> = lines.iter().map(String::as_str).collect();
-    let range = section_range(&borrowed, &header);
-    let existing = range.and_then(|(start, end)| {
-        (start + 1..end).find(|&index| borrowed[index].trim_start().starts_with(&prefix))
-    });
+    let (headers, entries) = layout(&borrowed);
+    let existing = entries
+        .iter()
+        .find(|entry| entry.section == section && entry.name == name)
+        .map(|entry| (entry.first, entry.end));
+    let range = section_range(&headers, borrowed.len(), section);
     match (existing, range) {
-        (Some(index), _) => lines[index] = assignment,
+        (Some((first, end)), _) => {
+            lines.splice(first..end, [assignment]);
+        }
         (None, Some((start, end))) => {
             let last = (start..end)
                 .rev()
@@ -757,7 +871,7 @@ fn put_setting(text: &str, key: &str, rendered: &str) -> String {
             if !lines.is_empty() && !lines.last().is_some_and(|line| line.trim().is_empty()) {
                 lines.push(String::new());
             }
-            lines.push(header);
+            lines.push(format!("[{section}]"));
             lines.push(String::new());
             lines.push(assignment);
         }
@@ -779,26 +893,16 @@ fn plain_value(stored: &str) -> String {
 }
 
 fn read_settings(text: &str, prefix: &str) -> Value {
-    let mut section = String::new();
+    let lines: Vec<&str> = text.lines().collect();
+    let (_, entries) = layout(&lines);
     let mut settings = serde_json::Map::new();
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if let Some(name) = trimmed
-            .strip_prefix('[')
-            .and_then(|rest| rest.strip_suffix(']'))
-        {
-            section = name.to_string();
+    for entry in entries {
+        if entry.section.is_empty() {
             continue;
         }
-        let Some((name, value)) = trimmed.split_once('=') else {
-            continue;
-        };
-        if section.is_empty() {
-            continue;
-        }
-        let key = format!("{section}/{name}");
+        let key = format!("{}/{}", entry.section, entry.name);
         if prefix.is_empty() || key.starts_with(prefix) {
-            settings.insert(key, Value::String(plain_value(value)));
+            settings.insert(key, Value::String(plain_value(&entry.value)));
         }
     }
     Value::Object(settings)
@@ -871,6 +975,83 @@ mod tests {
             put_setting("[a]\n\nx=1\n[b]\n", "a/k", "2"),
             "[a]\n\nx=1\nk=2\n\n[b]\n"
         );
+    }
+
+    #[test]
+    fn a_value_written_over_several_lines_is_one_entry() {
+        // How Godot writes a Dictionary: the lines inside it are neither entries nor headers.
+        let text = "config_version=5\n\n[importer_defaults]\n\ntexture={\n\"detect_3d/compress_to\": 0,\n\"a=b\": \"x\\\"}[y]\",\n\"list\": [\n1]\n}\nscene={}\n\n[input]\n\nui_accept={\n\"deadzone\": 0.5\n}\n";
+        assert_eq!(
+            stored_setting(text, "importer_defaults/texture").as_deref(),
+            Some("{\n\"detect_3d/compress_to\": 0,\n\"a=b\": \"x\\\"}[y]\",\n\"list\": [\n1]\n}")
+        );
+        assert_eq!(
+            stored_setting(text, "importer_defaults/scene").as_deref(),
+            Some("{}")
+        );
+        let settings = read_settings(text, "importer_defaults/");
+        assert_eq!(
+            settings.as_object().map(|map| map.len()),
+            Some(2),
+            "{settings}"
+        );
+        assert_eq!(
+            put_setting(
+                text,
+                "importer_defaults/texture",
+                "{\"detect_3d/compress_to\": 1}"
+            ),
+            "config_version=5\n\n[importer_defaults]\n\ntexture={\"detect_3d/compress_to\": 1}\nscene={}\n\n[input]\n\nui_accept={\n\"deadzone\": 0.5\n}\n"
+        );
+        // A new entry goes after the whole last value of its section.
+        assert_eq!(
+            put_setting(text, "input/ui_cancel", "{}"),
+            format!("{text}ui_cancel={{}}\n")
+        );
+        assert_eq!(
+            put_setting("[a]\n\nx={\n\"k\": 1\n}\n\n[b]\n", "a/y", "2"),
+            "[a]\n\nx={\n\"k\": 1\n}\ny=2\n\n[b]\n"
+        );
+    }
+
+    #[test]
+    fn an_array_or_object_is_stored_as_the_engine_converts_it() {
+        let typed = |type_name: Option<&str>, text: Option<&str>| SettingType {
+            type_name: type_name.map(str::to_string),
+            text: text.map(str::to_string),
+        };
+        let value = json!({"detect_3d/compress_to": 0});
+        assert_eq!(
+            render_typed(
+                &value,
+                &typed(Some("Dictionary"), Some("{\"detect_3d/compress_to\": 0}"))
+            ),
+            Ok("{\"detect_3d/compress_to\": 0}".to_string())
+        );
+        // A setting nobody defines keeps the value's type: the engine's text of the array.
+        assert_eq!(
+            render_typed(&json!([1, "two"]), &typed(None, Some("[1, \"two\"]"))),
+            Ok("[1, \"two\"]".to_string())
+        );
+        // No text, or one that would add lines, is never written.
+        for found in [
+            typed(Some("Dictionary"), None),
+            typed(Some("Dictionary"), Some("{\n\"a\": 1\n}")),
+            typed(None, None),
+            typed(None, Some("[\n]")),
+        ] {
+            assert!(render_typed(&value, &found).is_err(), "{found:?}");
+        }
+        let refused = render_typed(&json!(5), &typed(Some("Dictionary"), None)).unwrap_err();
+        assert!(
+            refused.contains("expects a Dictionary") && refused.contains("JSON object"),
+            "{refused}"
+        );
+        let refused = render_typed(&json!(5), &typed(Some("PackedStringArray"), None)).unwrap_err();
+        assert!(refused.contains("JSON array"), "{refused}");
+        // An object for a string setting names the type it expects.
+        let refused = render_setting(&value, Some(StoredKind::Text)).unwrap_err();
+        assert!(refused.contains("expects a string"), "{refused}");
     }
 
     #[test]

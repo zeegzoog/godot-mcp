@@ -1165,8 +1165,8 @@ func on_ready() -> void:
         "Unknown resource class",
     );
 
-    // Project settings: a scalar is saved and the old value comes back; a structure, or a value
-    // of the wrong type for an existing setting, is refused and changes nothing.
+    // Project settings: a scalar is saved and the old value comes back; a value of the wrong type
+    // for an existing setting (a structure for a string) is refused and changes nothing.
     let set = call(
         "set_project_setting",
         json!({"key": "application/config/name", "value": "Renamed"}),
@@ -1188,7 +1188,7 @@ func on_ready() -> void:
             json!({"key": "application/config/name", "value": {"a": 1}}),
         )
         .await,
-        "string, number or boolean",
+        "expects a string",
     );
     expect_error(
         call(
@@ -1318,6 +1318,85 @@ async fn project_settings_convert_the_same_text_forms_as_the_file_fallback() {
             .await,
         "#102b38",
     );
+    assert_eq!(
+        std::fs::read_to_string(&project_file).expect("project.godot"),
+        before,
+        "a refused value changed project.godot"
+    );
+}
+
+/// Arrays and objects through a real editor, with the rules of the file fallback (its real-engine
+/// test has the same table): an importer's defaults are a Dictionary, the text form in a string
+/// works, nested whole numbers are ints, a packed array comes from a JSON array, and a text with
+/// an Object or a Resource is refused.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn project_settings_store_arrays_and_objects_like_the_file_fallback() {
+    let editor = start_editor(false).await;
+    let bridge = &editor.bridge;
+    let project_file = editor.project.join("project.godot");
+
+    for (key, value) in [
+        (
+            "importer_defaults/texture",
+            json!({"detect_3d/compress_to": 0}),
+        ),
+        (
+            "importer_defaults/scene",
+            json!(" {\"meshes/generate_lods\": false}"),
+        ),
+        ("custom/tuning/table", json!({"speeds": [1, 2.5]})),
+        ("application/config/features", json!(["4.8", "Mobile"])),
+    ] {
+        bridge
+            .send_command("set_project_setting", json!({"key": key, "value": value}))
+            .await
+            .unwrap_or_else(|error| panic!("{key} = {value}: {error}"));
+    }
+    let written = std::fs::read_to_string(&project_file).expect("project.godot");
+    for part in [
+        "\n[importer_defaults]\n",
+        "\ntexture={\n\"detect_3d/compress_to\": 0\n}\n",
+        "\nscene={\n\"meshes/generate_lods\": false\n}\n",
+        "\ntuning/table={\n\"speeds\": [1, 2.5]\n}\n",
+        "\nconfig/features=PackedStringArray(\"4.8\", \"Mobile\")\n",
+    ] {
+        assert!(written.contains(part), "{part:?} missing from:\n{written}");
+    }
+
+    let before = std::fs::read_to_string(&project_file).expect("project.godot");
+    for (key, value, needle) in [
+        (
+            "importer_defaults/texture",
+            json!(5),
+            "expects a Dictionary",
+        ),
+        (
+            "importer_defaults/texture",
+            json!("{\"a\": Object(Node)}"),
+            "expects a Dictionary",
+        ),
+        (
+            "importer_defaults/texture",
+            json!("{\"a\": Resource(\"res://x.tres\")}"),
+            "expects a Dictionary",
+        ),
+        (
+            "importer_defaults/texture",
+            json!([1]),
+            "expects a Dictionary",
+        ),
+        (
+            "application/config/features",
+            json!(7),
+            "expects a PackedStringArray",
+        ),
+    ] {
+        let result = bridge
+            .send_command("set_project_setting", json!({"key": key, "value": value}))
+            .await;
+        expect_error(result, needle);
+    }
     assert_eq!(
         std::fs::read_to_string(&project_file).expect("project.godot"),
         before,

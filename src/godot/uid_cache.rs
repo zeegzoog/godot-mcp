@@ -10,9 +10,12 @@
 //! entry a `u64` id, a `u32` byte length and that many bytes of the UTF-8 `res://` path. When an
 //! id appears twice, Godot keeps the last one.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+
+use super::binary_resource::uid_text;
 
 /// Where Godot keeps the uid cache of `project`.
 pub fn uid_cache_file(project: &Path) -> PathBuf {
@@ -76,6 +79,32 @@ pub fn record(project: &Path, entries: &[(String, String)]) -> io::Result<UidCac
         return Err(error);
     }
     Ok(UidCacheUpdate::Recorded(changed))
+}
+
+/// The uid the cache gives each `res://` path, as Godot resolves it: when an id appears twice the
+/// last entry wins, and when a path has two ids the later entry wins. Empty when the project has
+/// no cache or it does not parse.
+pub(super) fn uids_by_path(project: &Path) -> BTreeMap<String, String> {
+    let Some(entries) = fs::read(uid_cache_file(project))
+        .ok()
+        .and_then(|bytes| parse(&bytes))
+    else {
+        return BTreeMap::new();
+    };
+    let mut last_of_id: BTreeMap<u64, usize> = BTreeMap::new();
+    for (index, (id, _)) in entries.iter().enumerate() {
+        last_of_id.insert(*id, index);
+    }
+    let mut by_path = BTreeMap::new();
+    for (index, (id, path)) in entries.iter().enumerate() {
+        if last_of_id.get(id) != Some(&index) {
+            continue;
+        }
+        if let Ok(path) = String::from_utf8(path.clone()) {
+            by_path.insert(path, uid_text(*id));
+        }
+    }
+    by_path
 }
 
 /// The entries of a cache file in their order, or `None` when it is cut short or has bytes left.
@@ -181,6 +210,25 @@ mod tests {
         assert_eq!(uid_id("uid://"), None);
         assert_eq!(uid_id("uid://<invalid>"), None);
         assert_eq!(uid_id("res://a.tres"), None);
+    }
+
+    #[test]
+    fn uids_by_path_follow_the_last_entry_of_an_id() {
+        let dir = tempfile::tempdir().expect("project");
+        let project = dir.path();
+        assert!(uids_by_path(project).is_empty());
+        cache_with(
+            project,
+            &[
+                (7, "res://moved_from.tscn"),
+                (9, "res://kept.res"),
+                (7, "res://moved_to.tscn"),
+            ],
+        );
+        let by_path = uids_by_path(project);
+        assert_eq!(by_path.len(), 2, "{by_path:?}");
+        assert_eq!(by_path["res://kept.res"], uid_text(9));
+        assert_eq!(by_path["res://moved_to.tscn"], uid_text(7));
     }
 
     #[test]

@@ -33,6 +33,27 @@ const READER_DRAIN: Duration = Duration::from_secs(2);
 const SCRIPT_ERROR_IDLE: Duration = Duration::from_millis(1500);
 const IMPORT_TIMEOUT: Duration = Duration::from_secs(120);
 const PRESETS_TIMEOUT: Duration = Duration::from_secs(30);
+/// What one Godot process that writes binary uids always gets: its start in a large project.
+const BINARY_UIDS_BASE: Duration = Duration::from_secs(30);
+/// Added for each file it writes.
+const BINARY_UIDS_PER_FILE: Duration = Duration::from_millis(500);
+/// Added for each MiB of those files. `ResourceSaver.set_uid` reads and writes the whole file
+/// (a compressed one is decompressed and compressed again): Godot 4.8 takes about 35 ms per MiB
+/// of compressed mesh on an idle machine, so this leaves room for a busy one.
+const BINARY_UIDS_PER_MIB: Duration = Duration::from_millis(300);
+/// The most one such process gets.
+const BINARY_UIDS_MAX: Duration = Duration::from_secs(1800);
+
+/// How long one Godot process may take to write the uids of `files` binary resources that hold
+/// `bytes` in all.
+pub fn binary_uid_limit(files: usize, bytes: u64) -> Duration {
+    let files = u32::try_from(files).unwrap_or(u32::MAX);
+    let mib = u32::try_from(bytes.div_ceil(1 << 20)).unwrap_or(u32::MAX);
+    BINARY_UIDS_BASE
+        .saturating_add(BINARY_UIDS_PER_FILE.saturating_mul(files))
+        .saturating_add(BINARY_UIDS_PER_MIB.saturating_mul(mib))
+        .min(BINARY_UIDS_MAX)
+}
 
 /// One `SCRIPT ERROR` block from a headless script run.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1155,10 +1176,16 @@ impl CliRunner {
     /// Writes each `(res path, uid://)` pair into the header of that binary scene or resource of
     /// `project` with `ResourceSaver.set_uid`, which rewrites a compressed file as well. The pairs
     /// reach a fixed script outside the project as a JSON file, never on the command line. The
-    /// caller reads the headers back to see which ones took.
-    pub async fn set_binary_uids(&self, project: &Path, uids: &[(String, String)]) -> Result<()> {
+    /// caller reads the headers back to see which ones took. The process is killed after `limit`
+    /// (see [`binary_uid_limit`]); the files it wrote by then keep their uid.
+    pub async fn set_binary_uids(
+        &self,
+        project: &Path,
+        uids: &[(String, String)],
+        limit: Duration,
+    ) -> Result<()> {
         let dir = create_scratch_dir("binary-uids")?;
-        let outcome = self.run_set_binary_uids(project, &dir, uids).await;
+        let outcome = self.run_set_binary_uids(project, &dir, uids, limit).await;
         let _ = std::fs::remove_dir_all(&dir);
         outcome
     }
@@ -1168,6 +1195,7 @@ impl CliRunner {
         project: &Path,
         dir: &Path,
         uids: &[(String, String)],
+        limit: Duration,
     ) -> Result<()> {
         let request: Vec<serde_json::Value> = uids
             .iter()
@@ -1188,12 +1216,13 @@ impl CliRunner {
             .arg(&request_file)
             .stdin(Stdio::null())
             .kill_on_drop(true);
-        let output = timeout(PRESETS_TIMEOUT, command.output())
+        let output = timeout(limit, command.output())
             .await
             .map_err(|_| {
                 McpError::Process(format!(
-                    "Godot did not write the binary resource uids within {}s",
-                    PRESETS_TIMEOUT.as_secs()
+                    "Godot did not write the uids of {} binary resources within {}s",
+                    uids.len(),
+                    limit.as_secs()
                 ))
             })?
             .map_err(|e| {
@@ -1819,7 +1848,22 @@ fn strip_banner(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{script_errors_in, strip_banner};
+    use super::{binary_uid_limit, script_errors_in, strip_banner};
+    use std::time::Duration;
+
+    /// The run that lost 20 uids: 96 compressed meshes of 373 MB in all were given 30 s, while
+    /// Godot needs about 13 s for them on an idle machine and more under load.
+    #[test]
+    fn binary_uid_limit_grows_with_the_files_and_their_size() {
+        assert_eq!(binary_uid_limit(1, 1), Duration::from_millis(30_800));
+        let frog_world = binary_uid_limit(96, 373_000_000);
+        assert!(frog_world >= Duration::from_secs(150), "{frog_world:?}");
+        assert!(binary_uid_limit(200, 0) > binary_uid_limit(100, 0));
+        assert_eq!(
+            binary_uid_limit(usize::MAX, u64::MAX),
+            Duration::from_secs(1800)
+        );
+    }
 
     #[test]
     fn banner_is_removed_and_the_rest_is_kept() {

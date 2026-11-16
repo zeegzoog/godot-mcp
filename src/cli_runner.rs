@@ -352,17 +352,26 @@ pub struct SettingType {
     /// when the engine defines no such setting and `project.godot` holds none.
     pub type_name: Option<String>,
     /// The value converted to that type, as `project.godot` stores it. Only given for a type
-    /// that is not a string, number or boolean, and only when the value could be converted.
+    /// that is not a string, number or boolean, and only when the value could be converted; also
+    /// given without a type for an array or object value of a setting nobody defines.
     pub text: Option<String>,
 }
 
 /// The script the setting type check runs. Fixed text: the request reaches it as
 /// `res://request.json` of its throw-away project, never inside the source or on the command
 /// line. A string becomes a value of another type only as an HTML color for a Color, or as the
-/// text Godot writes for that type (`Vector2i(1152, 648)`); never as an Object.
+/// text Godot writes for that type (`Vector2i(1152, 648)`, `{"key": 1}`); never as an Object,
+/// and a text with any constructor that is not a built-in type is refused before it is parsed.
+/// A JSON array or object becomes an Array, a Dictionary or a packed array, a whole number in it
+/// an int. The text it answers is one line: strings in it are escaped. `importer_defaults/<name>`
+/// with nothing stored is a Dictionary. The editor runs the same rules (`_setting_from_value` in
+/// `addons/godot_mcp/bridge_server.gd`).
 const SETTING_TYPE_SCRIPT: &str = r#"extends SceneTree
 
 const PLAIN_TYPES: Array[int] = [TYPE_STRING, TYPE_BOOL, TYPE_INT, TYPE_FLOAT]
+## A setting under this prefix that is neither stored nor defined is an importer's defaults: a
+## Dictionary of import options, as the Import dock's "Set as Default" stores it.
+const IMPORTER_DEFAULTS: String = "importer_defaults/"
 
 
 func _init() -> void:
@@ -376,26 +385,32 @@ func _answer() -> Dictionary:
 		return {"error": "the request could not be read"}
 	var key: String = str(request.get("key", ""))
 	var value: Variant = request.get("value")
-	var current: Variant = null
+	var type: int = TYPE_NIL
 	if request.has("stored"):
 		var stored: String = str(request["stored"]).strip_edges()
-		if stored.begins_with("Object("):
+		if stored.begins_with("Object(") or not _builds_no_object(stored):
 			return {"type": "Object"}
-		current = str_to_var(stored)
+		var current: Variant = str_to_var(stored)
 		if current == null:
 			return {"error": "the value stored in project.godot could not be read"}
+		type = typeof(current)
 	else:
 		var defined: String = _defined_key(key)
-		if defined.is_empty():
-			return {}
-		current = ProjectSettings.get_setting(defined)
-	var type: int = typeof(current)
+		if not defined.is_empty():
+			type = typeof(ProjectSettings.get_setting(defined))
+		elif key.begins_with(IMPORTER_DEFAULTS):
+			type = TYPE_DICTIONARY
+	if type == TYPE_NIL:
+		# A setting nobody defines keeps the type of the value; an array or object is converted.
+		if value is Array or value is Dictionary:
+			return {"text": _text(_from_json(value))}
+		return {}
 	var answer: Dictionary = {"type": type_string(type)}
 	if type in PLAIN_TYPES:
 		return answer
 	var converted: Variant = _convert(value, type)
 	if converted != null:
-		answer["text"] = var_to_str(converted)
+		answer["text"] = _text(converted)
 	return answer
 
 
@@ -413,6 +428,12 @@ func _defined_key(key: String) -> String:
 
 
 func _convert(value: Variant, type: int) -> Variant:
+	if (type == TYPE_DICTIONARY or type == TYPE_ARRAY) and typeof(value) == type:
+		return _from_json(value)
+	if type >= TYPE_PACKED_BYTE_ARRAY and type < TYPE_MAX and value is Array:
+		var packed: Variant = type_convert(_from_json(value), type)
+		if typeof(packed) == type:
+			return packed
 	if not value is String:
 		return null
 	var text: String = (value as String).strip_edges()
@@ -426,12 +447,112 @@ func _convert(value: Variant, type: int) -> Variant:
 			return StringName(value)
 		TYPE_NODE_PATH:
 			return NodePath(value)
-	if type == TYPE_OBJECT or not text.begins_with(type_string(type) + "("):
+	if type == TYPE_OBJECT or not _opens_as(text, type) or not _builds_no_object(text):
 		return null
 	var parsed: Variant = str_to_var(text)
 	if typeof(parsed) == type:
 		return parsed
 	return null
+
+
+## Whether text starts the way project.godot writes a value of type.
+func _opens_as(text: String, type: int) -> bool:
+	if type == TYPE_DICTIONARY:
+		return text.begins_with("{") or text.begins_with("Dictionary[")
+	if type == TYPE_ARRAY:
+		return text.begins_with("[") or text.begins_with("Array[")
+	return text.begins_with(type_string(type) + "(")
+
+
+## Whether every constructor in a value text, outside its strings, is a built-in type other than
+## Object, so parsing it creates no Object and loads no Resource.
+func _builds_no_object(text: String) -> bool:
+	var in_string: bool = false
+	var escaped: bool = false
+	var word: String = ""
+	var last_word: String = ""
+	for character: String in text:
+		if in_string:
+			if escaped:
+				escaped = false
+			elif character == "\\":
+				escaped = true
+			elif character == "\"":
+				in_string = false
+			continue
+		if character == "_" or (character >= "a" and character <= "z") or (character >= "A" and character <= "Z") or (character >= "0" and character <= "9"):
+			word += character
+			continue
+		if not word.is_empty():
+			last_word = word
+			word = ""
+		if character == "\"":
+			in_string = true
+		elif character == "(":
+			if last_word.is_empty() or last_word == "Object" or not _is_builtin_type(last_word):
+				return false
+			last_word = ""
+		elif character != " " and character != "\t" and character != "\n" and character != "\r" and character != "[" and character != "]":
+			last_word = ""
+	return not in_string
+
+
+func _is_builtin_type(type_name: String) -> bool:
+	for type: int in range(TYPE_NIL + 1, TYPE_MAX):
+		if type != TYPE_OBJECT and type_string(type) == type_name:
+			return true
+	return false
+
+
+## A JSON value as a setting holds it: a whole number becomes an int (JSON does not tell 3 from
+## 3.0), arrays and objects are converted entry by entry, anything else is kept.
+func _from_json(value: Variant) -> Variant:
+	if value is Dictionary:
+		var entries: Dictionary = {}
+		for entry_key: Variant in value:
+			entries[entry_key] = _from_json(value[entry_key])
+		return entries
+	if value is Array:
+		var items: Array = []
+		for item: Variant in value:
+			items.append(_from_json(item))
+		return items
+	if typeof(value) == TYPE_FLOAT:
+		var number: float = value
+		if is_finite(number) and number == floorf(number) and absf(number) < 9.0e15:
+			return int(number)
+	return value
+
+
+## A value as project.godot stores it, on one line: strings escaped, so no value adds a line.
+func _text(value: Variant) -> String:
+	match typeof(value):
+		TYPE_STRING:
+			return "\"" + (value as String).c_escape() + "\""
+		TYPE_STRING_NAME:
+			return "&\"" + String(value).c_escape() + "\""
+		TYPE_NODE_PATH:
+			return "^\"" + String(value).c_escape() + "\""
+		TYPE_DICTIONARY:
+			var dictionary: Dictionary = value
+			if not dictionary.is_typed():
+				var pairs: PackedStringArray = []
+				for entry_key: Variant in dictionary:
+					pairs.append(_text(entry_key) + ": " + _text(dictionary[entry_key]))
+				return "{" + ", ".join(pairs) + "}"
+		TYPE_ARRAY:
+			var array: Array = value
+			if not array.is_typed():
+				var items: PackedStringArray = []
+				for item: Variant in array:
+					items.append(_text(item))
+				return "[" + ", ".join(items) + "]"
+		TYPE_PACKED_STRING_ARRAY:
+			var strings: PackedStringArray = []
+			for item: String in value:
+				strings.append(_text(item))
+			return "PackedStringArray(" + ", ".join(strings) + ")"
+	return var_to_str(value)
 "#;
 
 const SHADER_CHECK_TIMEOUT: Duration = Duration::from_secs(30);

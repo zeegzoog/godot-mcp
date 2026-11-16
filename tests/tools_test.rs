@@ -789,7 +789,7 @@ async fn project_setting_without_an_editor_cannot_add_lines_to_project_godot() {
     let structure = set("application/config/name", json!({"a": 1})).await;
     assert!(structure.is_error, "{}", text(&structure));
     assert!(
-        text(&structure).contains("string, number or boolean"),
+        text(&structure).contains("expects a string"),
         "{}",
         text(&structure)
     );
@@ -953,6 +953,84 @@ async fn project_setting_without_an_editor_refuses_a_value_of_another_type() {
 }
 
 #[tokio::test]
+async fn project_setting_without_an_editor_stores_an_object_as_a_dictionary() {
+    let project = project_dir();
+    let project_file = project.path().join("project.godot");
+    std::fs::write(&project_file, FROG_PROJECT).expect("project.godot");
+    let engine = tempfile::tempdir().expect("engine dir");
+    let (godot, request) = common::setting_godot(
+        engine.path(),
+        r#"{"type":"Dictionary","text":"{\"detect_3d/compress_to\": 0}"}"#,
+    );
+
+    let result = set_with_engine(
+        godot,
+        json!({"key": "importer_defaults/texture", "value": {"detect_3d/compress_to": 0},
+               "project_path": project.path()}),
+    )
+    .await;
+
+    assert!(!result.is_error, "{}", text(&result));
+    // The object reaches the engine as it is, for the engine to convert.
+    let asked: Value =
+        serde_json::from_str(&std::fs::read_to_string(&request).expect("request")).expect("json");
+    assert_eq!(
+        asked,
+        json!({"key": "importer_defaults/texture", "value": {"detect_3d/compress_to": 0}})
+    );
+    assert_eq!(
+        std::fs::read_to_string(&project_file).expect("project.godot"),
+        format!(
+            "{FROG_PROJECT}\n[importer_defaults]\n\ntexture={{\"detect_3d/compress_to\": 0}}\n"
+        )
+    );
+}
+
+#[tokio::test]
+async fn project_setting_without_an_editor_replaces_a_value_written_over_several_lines() {
+    let project = project_dir();
+    let project_file = project.path().join("project.godot");
+    // As Godot writes a Dictionary; the lines inside it are part of the value.
+    let before = "config_version=5\n\n[importer_defaults]\n\ntexture={\n\"detect_3d/compress_to\": 1,\n\"[autoload]\": \"x\"\n}\n\n[input]\n\nui_accept={\n\"deadzone\": 0.5\n}\n";
+    std::fs::write(&project_file, before).expect("project.godot");
+    let engine = tempfile::tempdir().expect("engine dir");
+    let (godot, request) = common::setting_godot(
+        engine.path(),
+        r#"{"type":"Dictionary","text":"{\"detect_3d/compress_to\": 0}"}"#,
+    );
+
+    let result = set_with_engine(
+        godot,
+        json!({"key": "importer_defaults/texture", "value": {"detect_3d/compress_to": 0},
+               "project_path": project.path()}),
+    )
+    .await;
+
+    assert!(!result.is_error, "{}", text(&result));
+    let asked: Value =
+        serde_json::from_str(&std::fs::read_to_string(&request).expect("request")).expect("json");
+    assert_eq!(
+        asked["stored"], "{\n\"detect_3d/compress_to\": 1,\n\"[autoload]\": \"x\"\n}",
+        "{asked}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&project_file).expect("project.godot"),
+        "config_version=5\n\n[importer_defaults]\n\ntexture={\"detect_3d/compress_to\": 0}\n\n[input]\n\nui_accept={\n\"deadzone\": 0.5\n}\n"
+    );
+    let read = call(
+        "godot_get_project_settings",
+        json!({"prefix": "input/", "project_path": project.path()}),
+    )
+    .await;
+    let settings: Value = serde_json::from_str(&text(&read)).expect("settings json");
+    assert_eq!(
+        settings["settings"],
+        json!({"input/ui_accept": "{\n\"deadzone\": 0.5\n}"}),
+        "{settings}"
+    );
+}
+
+#[tokio::test]
 async fn project_setting_without_an_editor_or_engine_changes_nothing() {
     let project = project_dir();
     let project_file = project.path().join("project.godot");
@@ -1028,6 +1106,132 @@ async fn project_setting_without_an_editor_converts_with_the_real_engine() {
         written.contains("run/main_scene=\"res://main.tscn\"\nboot_splash/bg_color=")
             && written.contains("\n\n[display]\n"),
         "{written}"
+    );
+}
+
+/// Arrays and objects with the real engine: an importer's defaults are a Dictionary, the text
+/// form in a string works (with a leading space), nested values keep their JSON type with whole
+/// numbers as ints, a packed array comes from a JSON array, strings stay on one line, and a text
+/// with an Object or a Resource is refused. What is written loads back in Godot.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn project_setting_without_an_editor_stores_arrays_and_objects_with_the_real_engine() {
+    let godot = PathBuf::from(std::env::var("GODOT_PATH").expect("set GODOT_PATH"));
+    let project = project_dir();
+    let project_file = project.path().join("project.godot");
+    std::fs::write(&project_file, FROG_PROJECT).expect("project.godot");
+    let set = |key: &str, value: Value| {
+        set_with_engine(
+            godot.clone(),
+            json!({"key": key, "value": value, "project_path": project.path()}),
+        )
+    };
+
+    for (key, value) in [
+        (
+            "importer_defaults/texture",
+            json!({"detect_3d/compress_to": 0}),
+        ),
+        (
+            "importer_defaults/scene",
+            json!(" {\"meshes/generate_lods\": false}"),
+        ),
+        (
+            "custom/tuning/table",
+            json!({"speeds": [1, 2.5], "name": "a\"b\n[autoload]"}),
+        ),
+        ("application/config/features", json!(["4.8", "Mobile"])),
+    ] {
+        let result = set(key, value.clone()).await;
+        assert!(!result.is_error, "{key} = {value}: {}", text(&result));
+    }
+    let written = std::fs::read_to_string(&project_file).expect("project.godot");
+    for line in [
+        "\n[importer_defaults]\n\ntexture={\"detect_3d/compress_to\": 0}\nscene={\"meshes/generate_lods\": false}\n",
+        "\ntuning/table={\"name\": \"a\\\"b\\n[autoload]\", \"speeds\": [1, 2.5]}\n",
+        "\nconfig/features=PackedStringArray(\"4.8\", \"Mobile\")\n",
+    ] {
+        assert!(written.contains(line), "{line:?} missing from:\n{written}");
+    }
+    assert!(
+        written.lines().all(|line| line.trim() != "[autoload]"),
+        "{written}"
+    );
+
+    // A stored Dictionary is replaced by a new one; what does not convert changes nothing.
+    let replaced = set(
+        "importer_defaults/texture",
+        json!({"detect_3d/compress_to": 1}),
+    )
+    .await;
+    assert!(!replaced.is_error, "{}", text(&replaced));
+    let before = std::fs::read_to_string(&project_file).expect("project.godot");
+    assert!(
+        before.contains("\ntexture={\"detect_3d/compress_to\": 1}\n"),
+        "{before}"
+    );
+    for (key, value, needle) in [
+        (
+            "importer_defaults/texture",
+            json!(5),
+            "expects a Dictionary",
+        ),
+        (
+            "importer_defaults/texture",
+            json!("{\"a\": Object(Node)}"),
+            "expects a Dictionary",
+        ),
+        (
+            "importer_defaults/texture",
+            json!("{\"a\": Resource(\"res://x.tres\")}"),
+            "expects a Dictionary",
+        ),
+        (
+            "importer_defaults/texture",
+            json!([1]),
+            "expects a Dictionary",
+        ),
+        (
+            "application/config/name",
+            json!({"a": 1}),
+            "expects a string",
+        ),
+        (
+            "application/config/features",
+            json!(7),
+            "expects a PackedStringArray",
+        ),
+    ] {
+        let result = set(key, value.clone()).await;
+        assert!(result.is_error, "{key} = {value}: {}", text(&result));
+        assert!(text(&result).contains(needle), "{}", text(&result));
+    }
+    assert_eq!(
+        std::fs::read_to_string(&project_file).expect("project.godot"),
+        before,
+        "a refused value changed project.godot"
+    );
+
+    // Godot reads the file back with the types that were written.
+    let script = project.path().join("read_back.gd");
+    std::fs::write(
+        &script,
+        "extends SceneTree\n\nfunc _init() -> void:\n\tvar texture: Variant = ProjectSettings.get_setting(\"importer_defaults/texture\")\n\tvar table: Variant = ProjectSettings.get_setting(\"custom/tuning/table\")\n\tprint(\"READ_BACK=\", type_string(typeof(texture)), \" \", type_string(typeof(texture[\"detect_3d/compress_to\"])), \" \", type_string(typeof(table[\"speeds\"][0])), \" \", table[\"name\"].c_escape())\n\tquit()\n",
+    )
+    .expect("read-back script");
+    let output = std::process::Command::new(&godot)
+        .arg("--headless")
+        .arg("--path")
+        .arg(project.path())
+        .arg("--script")
+        .arg(&script)
+        .output()
+        .expect("run godot");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("READ_BACK=Dictionary int int a\\\"b\\n[autoload]"),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

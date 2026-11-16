@@ -595,3 +595,90 @@ async fn a_rewritten_model_is_listed_reported_when_skipped_and_forced_headless()
     assert_eq!(forced["still_stale"], json!([]), "{forced}");
     assert_eq!(mesh_size(&tools, root).await, "3.0");
 }
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ editor executable"]
+async fn a_pack_run_names_a_file_the_game_loads_by_a_built_path() {
+    let dir = project();
+    let root = dir.path();
+    // The path is built at run time, so no scene names the file and a resources filter that
+    // lists the main scene leaves it out.
+    std::fs::write(
+        root.join("main.gd"),
+        "extends Sprite2D\n\nfunc _ready() -> void:\n\tprint(\"pack game ready\")\n\
+         \tvar extra: Resource = load(\"res://levels/\" + \"extra.tres\")\n\
+         \tprint(\"extra loaded: \", extra != null)\n",
+    )
+    .expect("main.gd");
+    std::fs::create_dir_all(root.join("levels")).expect("levels");
+    std::fs::write(
+        root.join("levels/extra.tres"),
+        "[gd_resource type=\"Resource\" format=3]\n\n[resource]\n",
+    )
+    .expect("extra.tres");
+    let tools = manager();
+
+    report(
+        &call(
+            &tools,
+            "godot_set_export_preset",
+            json!({"name": "Full", "create": true, "platform": "Linux",
+                   "export_path": "build/full.pck"}),
+            root,
+        )
+        .await,
+    );
+    report(
+        &call(
+            &tools,
+            "godot_set_export_preset",
+            json!({"name": "Trimmed", "create": true, "platform": "Linux",
+                   "export_path": "build/trimmed.pck", "export_filter": "resources",
+                   "export_files": ["res://main.tscn"]}),
+            root,
+        )
+        .await,
+    );
+    for preset in ["Full", "Trimmed"] {
+        let exported = report(
+            &call(
+                &tools,
+                "godot_export_project",
+                json!({"preset": preset, "timeout_seconds": 300}),
+                root,
+            )
+            .await,
+        );
+        assert_eq!(exported["ok"], true, "{exported}");
+    }
+
+    let full = report(
+        &call(
+            &tools,
+            "godot_run_pack",
+            json!({"pack_path": "build/full.pck", "seconds": 4}),
+            root,
+        )
+        .await,
+    );
+    assert_eq!(full["ok"], true, "{full}");
+    assert_eq!(full["ran_full_time"], true, "{full}");
+    let log = full["log"].as_str().unwrap_or("");
+    assert!(
+        log.contains("pack game ready") && log.contains("extra loaded: true"),
+        "{full}"
+    );
+
+    let trimmed = call(
+        &tools,
+        "godot_run_pack",
+        json!({"pack_path": "res://build/trimmed.pck", "seconds": 4}),
+        root,
+    )
+    .await;
+    assert!(trimmed.is_error, "{}", text(&trimmed));
+    let message = text(&trimmed);
+    assert!(message.contains("res://levels/extra.tres"), "{message}");
+    assert!(message.contains("export_files"), "{message}");
+    assert!(message.contains("extra loaded: false"), "{message}");
+}

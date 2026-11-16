@@ -170,6 +170,7 @@ When interacting with a Godot project, agents must adhere to the following workf
 5. **Exporting**:
    - List the presets with `godot_list_export_presets` before exporting, and create or change one with `godot_set_export_preset`; never edit `export_presets.cfg` by hand. Check `new_options` in its answer: Godot ignores an option name its platform does not have.
    - Export with `godot_export_project` and read `ok`, `size_bytes` and `errors`; it imports first. A release or debug export needs export templates or a `custom_template/*` option, a pack does not.
+   - After a trimmed export (`export_filter` `resources` or `scenes`), smoke-run the pack with `godot_run_pack` and add every path in `missing_resources` to the preset's `export_files` (non-resource files to `include_filter`), then export again.
 
 6. **Feedback to the Maintainers**:
    - When godot-mcp itself blocks or misleads you (a tool fails for a reason its message does not explain, a needed capability has no tool, a description or schema is wrong), record it with `godot_note_feedback` in English: what you tried, what came back, what you expected, one problem per note. Do not note your own mistakes or problems in the user's project.

@@ -169,7 +169,7 @@ func _init() -> void:
 /// of its throw-away project, never inside the source or on the command line.
 const EXPORT_PRESETS_SCRIPT: &str = r#"extends SceneTree
 
-const STRING_FIELDS: Array[String] = ["export_path", "include_filter", "exclude_filter", "custom_features"]
+const STRING_FIELDS: Array[String] = ["export_path", "export_filter", "include_filter", "exclude_filter", "custom_features"]
 
 
 func _init() -> void:
@@ -262,6 +262,14 @@ func _change(config: ConfigFile, file: String, request: Dictionary) -> Dictionar
 			if created or str(config.get_value(section, field, "")) != text:
 				changed.append(field)
 			config.set_value(section, field, text)
+	if request.has("export_files") and typeof(request["export_files"]) == TYPE_ARRAY:
+		var files: PackedStringArray = PackedStringArray()
+		for listed: Variant in request["export_files"]:
+			files.append(str(listed))
+		var old_files: Variant = config.get_value(section, "export_files", PackedStringArray())
+		if created or typeof(old_files) != TYPE_PACKED_STRING_ARRAY or old_files != files:
+			changed.append("export_files")
+		config.set_value(section, "export_files", files)
 	var new_options: Array = []
 	var options: Variant = request.get("options", {})
 	if typeof(options) == TYPE_DICTIONARY:

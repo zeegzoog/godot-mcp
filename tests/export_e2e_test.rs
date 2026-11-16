@@ -180,6 +180,109 @@ async fn a_preset_is_created_changed_and_used_for_a_pack_export() {
 
 #[tokio::test]
 #[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ editor executable"]
+async fn a_resources_filter_exports_only_the_listed_files_and_their_dependencies() {
+    let dir = project();
+    let root = dir.path();
+    std::fs::write(root.join("unused.gd"), "extends Node\n").expect("unused.gd");
+    std::fs::write(
+        root.join("unused.tscn"),
+        "[gd_scene format=3]\n\n[node name=\"Unused\" type=\"Node\"]\n",
+    )
+    .expect("unused.tscn");
+    let tools = manager();
+
+    let created = report(
+        &call(
+            &tools,
+            "godot_set_export_preset",
+            json!({
+                "name": "Data", "create": true, "platform": "Linux",
+                "export_path": "build/data.pck", "export_filter": "resources",
+                "export_files": ["res://main.tscn", "missing.tscn", "res://main.tscn"]
+            }),
+            root,
+        )
+        .await,
+    );
+    assert_eq!(created["preset"]["export_filter"], "resources");
+    assert_eq!(
+        created["preset"]["export_files"],
+        json!(["res://main.tscn", "res://missing.tscn"]),
+        "res:// is added and a repeat dropped"
+    );
+    assert_eq!(created["missing_files"], json!(["res://missing.tscn"]));
+    let stored = std::fs::read_to_string(root.join("export_presets.cfg")).expect("presets file");
+    assert!(stored.contains("export_filter=\"resources\""), "{stored}");
+    assert!(
+        stored.contains(
+            "export_files=PackedStringArray(\"res://main.tscn\", \"res://missing.tscn\")"
+        ),
+        "{stored}"
+    );
+
+    let same = report(
+        &call(
+            &tools,
+            "godot_set_export_preset",
+            json!({"name": "Data", "export_files": ["res://main.tscn"]}),
+            root,
+        )
+        .await,
+    );
+    assert_eq!(same["changed"], json!(["export_files"]));
+    assert!(same.get("missing_files").is_none(), "{same}");
+    let again = report(
+        &call(
+            &tools,
+            "godot_set_export_preset",
+            json!({"name": "Data", "export_filter": "resources", "export_files": ["res://main.tscn"]}),
+            root,
+        )
+        .await,
+    );
+    assert_eq!(again["changed"], json!([]), "the same list changes nothing");
+
+    let listed = report(&call(&tools, "godot_list_export_presets", json!({}), root).await);
+    assert_eq!(
+        listed["presets"][0]["export_files"],
+        json!(["res://main.tscn"])
+    );
+
+    let exported = report(
+        &call(
+            &tools,
+            "godot_export_project",
+            json!({"preset": "Data", "timeout_seconds": 300}),
+            root,
+        )
+        .await,
+    );
+    assert_eq!(exported["ok"], true, "{exported}");
+    let bytes = std::fs::read(root.join("build/data.pck")).expect("pack bytes");
+    let names = String::from_utf8_lossy(&bytes);
+    assert!(
+        names.contains("main.tscn"),
+        "the listed scene is in the pack"
+    );
+    assert!(names.contains("main.gd"), "its dependency is in the pack");
+    assert!(
+        !names.contains("unused.tscn") && !names.contains("unused.gd"),
+        "files nothing lists stay out"
+    );
+
+    let bad = call(
+        &tools,
+        "godot_set_export_preset",
+        json!({"name": "Data", "export_filter": "everything"}),
+        root,
+    )
+    .await;
+    assert!(bad.is_error);
+    assert!(text(&bad).contains("all_resources"), "{}", text(&bad));
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ editor executable"]
 async fn an_unusable_release_template_is_an_error_with_the_log() {
     let dir = project();
     let root = dir.path();

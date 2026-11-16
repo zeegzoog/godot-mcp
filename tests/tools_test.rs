@@ -4813,6 +4813,381 @@ async fn a_file_only_written_by_a_generator_script_is_deleted_without_force() {
     assert!(root.join("scripts/tools/preview_bed_relief.gd").exists());
 }
 
+/// Without an editor, godot_move_file moves a script with its .uid and a whole folder (scenes, an
+/// imported image with its .import) on disk, renames the imported data to the name Godot derives
+/// from the new path, rewrites every res:// mention in text files (project.godot and the moved
+/// files included), updates the uid and global class caches, and names the binary resources that
+/// still hold an old path. A dry run and every refusal leave the project as it was.
+#[tokio::test]
+async fn files_and_folders_are_moved_on_disk_with_their_references_rewritten() {
+    let project = project_dir();
+    let root = project.path();
+    let write = |name: &str, bytes: &[u8]| {
+        let path = root.join(name);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("folder");
+        std::fs::write(path, bytes).expect("fixture file");
+    };
+    let read = |name: &str| std::fs::read_to_string(root.join(name)).expect("readable file");
+    let md5 = |path: &str| {
+        // The md5 Godot names the imported data after.
+        use md5::{Digest, Md5};
+        Md5::digest(path.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    let old_base = format!("icon.png-{}", md5("res://levels/level_01/icon.png"));
+    let new_base = format!("icon.png-{}", md5("res://legacy/level_01/icon.png"));
+    write(
+        "project.godot",
+        b"config_version=5\n\n[application]\n\nrun/main_scene=\"res://main.tscn\"\n\n[autoload]\n\nPlayer=\"*res://scripts/player.gd\"\n",
+    );
+    write("scripts/player.gd", b"class_name Player\nextends Node\n");
+    write("scripts/player.gd.uid", b"uid://playerscript\n");
+    write("scripts/player.gdshader", b"shader_type canvas_item;\n");
+    write(
+        "main.tscn",
+        b"[gd_scene format=3 uid=\"uid://mainscene\"]\n\n[ext_resource type=\"Script\" uid=\"uid://playerscript\" path=\"res://scripts/player.gd\" id=\"1\"]\n[ext_resource type=\"PackedScene\" uid=\"uid://levelone\" path=\"res://levels/level_01/level.tscn\" id=\"2\"]\n[ext_resource type=\"Shader\" path=\"res://scripts/player.gdshader\" id=\"3\"]\n\n[node name=\"Main\" type=\"Node\"]\nscript = ExtResource(\"1\")\n",
+    );
+    write(
+        "levels/level_01/level.tscn",
+        b"[gd_scene format=3 uid=\"uid://levelone\"]\n\n[ext_resource type=\"Script\" uid=\"uid://enemyscript\" path=\"res://levels/level_01/enemy.gd\" id=\"1\"]\n[ext_resource type=\"Texture2D\" uid=\"uid://iconpng\" path=\"res://levels/level_01/icon.png\" id=\"2\"]\n\n[node name=\"Level\" type=\"Node\"]\nscript = ExtResource(\"1\")\n",
+    );
+    write(
+        "levels/level_01/enemy.gd",
+        b"extends Node\n\nconst ICON := preload(\"res://levels/level_01/icon.png\")\nconst FOLDER := \"res://levels/level_01\"\nconst OTHER := \"res://levels/level_010/x.tscn\"\n",
+    );
+    write("levels/level_01/enemy.gd.uid", b"uid://enemyscript\n");
+    write("levels/level_01/icon.png", b"png bytes");
+    write(
+        "levels/level_01/icon.png.import",
+        format!("[remap]\n\nimporter=\"texture\"\ntype=\"CompressedTexture2D\"\nuid=\"uid://iconpng\"\npath=\"res://.godot/imported/{old_base}.ctex\"\n\n[deps]\n\nsource_file=\"res://levels/level_01/icon.png\"\ndest_files=[\"res://.godot/imported/{old_base}.ctex\"]\n").as_bytes(),
+    );
+    write(&format!(".godot/imported/{old_base}.ctex"), b"texture");
+    write(
+        &format!(".godot/imported/{old_base}.md5"),
+        b"source_md5=\"x\"\n",
+    );
+    write(
+        "levels/old.scn",
+        b"RSRC\x00\x00\x00\x17res://scripts/player.gd\x00binary",
+    );
+    // An empty uid cache, as Godot writes it: a zero entry count.
+    write(".godot/uid_cache.bin", &[0, 0, 0, 0]);
+    write(
+        ".godot/global_script_class_cache.cfg",
+        b"list=[{\n\"class\": &\"Player\",\n\"path\": \"res://scripts/player.gd\"\n}]\n",
+    );
+    let snapshot = || {
+        let mut files = Vec::new();
+        for entry in walk(root) {
+            files.push((
+                entry.strip_prefix(root).expect("inside").to_path_buf(),
+                std::fs::read(&entry).expect("readable"),
+            ));
+        }
+        files
+    };
+    let before = snapshot();
+    let mv = |args: Value| async move {
+        let mut args = args;
+        args["project_path"] = json!(root);
+        call("godot_move_file", args).await
+    };
+    let both = json!([
+        {"from": "res://scripts/player.gd", "to": "res://scripts/actors/player.gd"},
+        {"from": "res://levels/level_01", "to": "res://legacy/"},
+    ]);
+
+    // A dry run lists the moves and the rewrites and changes nothing.
+    let dry = mv(json!({"moves": both, "dry_run": true})).await;
+    assert!(!dry.is_error, "{}", text(&dry));
+    let report: Value = serde_json::from_str(&text(&dry)).expect("JSON report");
+    assert_eq!(report["source"], "disk", "{report}");
+    assert_eq!(
+        report["would_move"][1]["to"], "res://legacy/level_01",
+        "{report}"
+    );
+    assert_eq!(
+        report["files_moved"], 4,
+        "player.gd, enemy.gd, icon.png, level.tscn: {report}"
+    );
+    let listed = report["would_rewrite"]["listed"].to_string();
+    for file in [
+        "res://main.tscn",
+        "res://project.godot",
+        "res://legacy/level_01/level.tscn",
+        "res://legacy/level_01/enemy.gd",
+        "res://legacy/level_01/icon.png.import",
+    ] {
+        assert!(listed.contains(file), "{file}: {report}");
+    }
+    assert_eq!(
+        report["binary_references"],
+        json!(["res://levels/old.scn"]),
+        "{report}"
+    );
+    assert!(snapshot() == before, "a dry run changed files");
+
+    // Every refusal names its reason, and nothing moves while anything is refused.
+    std::fs::write(root.join("taken.gd"), "extends Node\n").expect("taken.gd");
+    let before = snapshot();
+    for (moves, needle) in [
+        (
+            json!([{"from": "res://scripts/player.gd", "to": "res://taken.gd"}]),
+            "already exists",
+        ),
+        (
+            json!([{"from": "res://scripts/player.gd", "to": "res://.godot/player.gd"}]),
+            ".godot",
+        ),
+        (
+            json!([{"from": "res://project.godot", "to": "res://other.godot"}]),
+            "project file",
+        ),
+        (
+            json!([{"from": "res://scripts/player.gd.uid", "to": "res://x.gd.uid"}]),
+            "move player.gd instead",
+        ),
+        (
+            json!([{"from": "res://levels", "to": "res://levels/inner/levels"}]),
+            "into itself",
+        ),
+        (
+            json!([{"from": "res://missing.gd", "to": "res://found.gd"}]),
+            "does not exist",
+        ),
+        (
+            json!([{"from": "res://../outside.gd", "to": "res://inside.gd"}]),
+            "..",
+        ),
+        (
+            json!([{"from": "res://scripts/player.gd", "to": "res://scripts/player.gd"}]),
+            "already at",
+        ),
+        (
+            json!([{"from": "res://taken.gd", "to": "res://addons/godot_mcp/taken.gd"}]),
+            "addon",
+        ),
+        (
+            json!([
+                {"from": "res://levels/level_01", "to": "res://legacy/level_01"},
+                {"from": "res://levels/level_01/enemy.gd", "to": "res://enemy.gd"},
+            ]),
+            "overlaps",
+        ),
+        (
+            json!([
+                {"from": "res://scripts/player.gd", "to": "res://actors/player.gd"},
+                {"from": "res://taken.gd", "to": "res://actors/player.gd"},
+            ]),
+            "overlaps",
+        ),
+    ] {
+        let refused = mv(json!({"moves": moves})).await;
+        assert!(refused.is_error, "{moves}: {}", text(&refused));
+        assert!(
+            text(&refused).contains("Nothing was moved"),
+            "{moves}: {}",
+            text(&refused)
+        );
+        assert!(
+            text(&refused).contains(needle),
+            "{moves}: expected {needle:?} in {}",
+            text(&refused)
+        );
+    }
+    let mixed = mv(json!({"moves": [
+        {"from": "res://scripts/player.gd", "to": "res://scripts/actors/player.gd"},
+        {"from": "res://taken.gd", "to": "res://main.tscn"},
+    ]}))
+    .await;
+    assert!(mixed.is_error, "{}", text(&mixed));
+    assert!(snapshot() == before, "a refused call changed files");
+    std::fs::remove_file(root.join("taken.gd")).expect("remove taken.gd");
+
+    let moved = mv(json!({"moves": both})).await;
+    assert!(!moved.is_error, "{}", text(&moved));
+    let report: Value = serde_json::from_str(&text(&moved)).expect("JSON report");
+    assert_eq!(report["rescan_needed"], true, "{report}");
+    assert_eq!(
+        report["moved"][0]["companions"],
+        json!(["res://scripts/actors/player.gd.uid"]),
+        "{report}"
+    );
+    assert_eq!(
+        report["binary_references"],
+        json!(["res://levels/old.scn"]),
+        "{report}"
+    );
+    assert!(
+        report["warnings"].to_string().contains("binary"),
+        "{report}"
+    );
+    assert!(
+        report["created_dirs"].to_string().contains("res://legacy"),
+        "{report}"
+    );
+    for gone in [
+        "scripts/player.gd",
+        "scripts/player.gd.uid",
+        "levels/level_01",
+    ] {
+        assert!(!root.join(gone).exists(), "{gone} still exists: {report}");
+    }
+    assert_eq!(read("scripts/actors/player.gd.uid"), "uid://playerscript\n");
+    assert!(root.join("legacy/level_01/enemy.gd.uid").is_file());
+    assert!(read("project.godot").contains("Player=\"*res://scripts/actors/player.gd\""));
+    let main = read("main.tscn");
+    assert!(
+        main.contains("path=\"res://scripts/actors/player.gd\""),
+        "{main}"
+    );
+    assert!(
+        main.contains("path=\"res://legacy/level_01/level.tscn\""),
+        "{main}"
+    );
+    assert!(
+        main.contains("path=\"res://scripts/player.gdshader\""),
+        "a longer name stays: {main}"
+    );
+    let level = read("legacy/level_01/level.tscn");
+    assert!(
+        level.contains("path=\"res://legacy/level_01/enemy.gd\""),
+        "{level}"
+    );
+    assert!(
+        level.contains("path=\"res://legacy/level_01/icon.png\""),
+        "{level}"
+    );
+    let enemy = read("legacy/level_01/enemy.gd");
+    assert!(
+        enemy.contains("preload(\"res://legacy/level_01/icon.png\")"),
+        "{enemy}"
+    );
+    assert!(
+        enemy.contains("FOLDER := \"res://legacy/level_01\""),
+        "{enemy}"
+    );
+    assert!(
+        enemy.contains("\"res://levels/level_010/x.tscn\""),
+        "another folder stays: {enemy}"
+    );
+    let import = read("legacy/level_01/icon.png.import");
+    assert!(
+        import.contains("source_file=\"res://legacy/level_01/icon.png\""),
+        "{import}"
+    );
+    assert!(
+        import.contains(&format!("res://.godot/imported/{new_base}.ctex")),
+        "{import}"
+    );
+    assert!(!import.contains(&old_base), "{import}");
+    for suffix in ["ctex", "md5"] {
+        assert!(
+            root.join(format!(".godot/imported/{new_base}.{suffix}"))
+                .is_file(),
+            "{suffix}"
+        );
+        assert!(
+            !root
+                .join(format!(".godot/imported/{old_base}.{suffix}"))
+                .exists(),
+            "{suffix}"
+        );
+    }
+    let cache = std::fs::read(root.join(".godot/uid_cache.bin")).expect("uid cache");
+    let cached = String::from_utf8_lossy(&cache);
+    assert!(
+        cached.contains("res://scripts/actors/player.gd"),
+        "{cached}"
+    );
+    assert!(
+        cached.contains("res://legacy/level_01/level.tscn"),
+        "{cached}"
+    );
+    assert!(
+        read(".godot/global_script_class_cache.cfg").contains("res://scripts/actors/player.gd")
+    );
+
+    // A file renamed in place; the old binary file is untouched.
+    let renamed =
+        mv(json!({"moves": [{"from": "res://main.tscn", "to": "res://start.tscn"}]})).await;
+    assert!(!renamed.is_error, "{}", text(&renamed));
+    assert!(read("project.godot").contains("run/main_scene=\"res://start.tscn\""));
+    assert!(
+        std::fs::read(root.join("levels/old.scn"))
+            .expect("old.scn")
+            .ends_with(b"binary")
+    );
+
+    // A single imported file takes its rewritten .import and its imported data along.
+    let logo_base = format!("logo.png-{}", md5("res://art/logo.png"));
+    let image = mv(
+        json!({"moves": [{"from": "res://legacy/level_01/icon.png", "to": "res://art/logo.png"}]}),
+    )
+    .await;
+    assert!(!image.is_error, "{}", text(&image));
+    assert!(!root.join("legacy/level_01/icon.png.import").exists());
+    let import = read("art/logo.png.import");
+    assert!(
+        import.contains("source_file=\"res://art/logo.png\""),
+        "{import}"
+    );
+    assert!(
+        import.contains(&format!("res://.godot/imported/{logo_base}.ctex")),
+        "{import}"
+    );
+    assert!(
+        root.join(format!(".godot/imported/{logo_base}.ctex"))
+            .is_file()
+    );
+    assert!(read("legacy/level_01/level.tscn").contains("path=\"res://art/logo.png\""));
+
+    let tools = ToolManager::list_tools();
+    let tool = tools
+        .iter()
+        .find(|tool| tool.name == "godot_move_file")
+        .expect("move tool listed");
+    for word in [
+        ".uid",
+        ".import",
+        "uid://",
+        "dry_run",
+        "binary",
+        "rescan",
+        ".godot/",
+        "already exists",
+    ] {
+        assert!(
+            tool.description.contains(word),
+            "{word} missing: {}",
+            tool.description
+        );
+    }
+}
+
+/// Every file under `dir`, sorted.
+fn walk(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(folder) = stack.pop() {
+        for entry in std::fs::read_dir(&folder)
+            .expect("readable folder")
+            .flatten()
+        {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
 #[test]
 fn every_tool_declares_all_four_hints() {
     let listed = serde_json::to_value(ToolManager::list_tools()).expect("tools serialize");
@@ -4851,6 +5226,7 @@ fn every_tool_declares_all_four_hints() {
     }
     for name in [
         "godot_delete_file",
+        "godot_move_file",
         "godot_remove_node",
         "godot_edit_script",
         "godot_edit_shader",

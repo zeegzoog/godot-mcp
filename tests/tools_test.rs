@@ -5449,6 +5449,260 @@ async fn export_outputs_and_preset_names_are_checked_before_godot_runs() {
     );
 }
 
+/// A stand-in for the Godot executable for `godot_run_pack`. It appends its working directory
+/// and its command line to `calls.txt` in `dir`, then runs `body`.
+#[cfg(unix)]
+fn pack_running_godot(dir: &Path, body: &str) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let calls = dir.join("calls.txt");
+    let path = dir.join("pack_godot.sh");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\necho \"$PWD|$*\" >> '{}'\n{body}\n",
+            calls.display()
+        ),
+    )
+    .expect("write pack godot");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod pack godot");
+    (path, calls)
+}
+
+/// A project with an exported pack at build/game.pck.
+#[cfg(unix)]
+fn project_with_pack() -> tempfile::TempDir {
+    let project = project_dir();
+    std::fs::create_dir_all(project.path().join("build")).expect("build dir");
+    std::fs::write(project.path().join("build/game.pck"), "GDPC").expect("pack");
+    project
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_pack_run_names_the_files_the_trimmed_pack_lacks() {
+    let project = project_with_pack();
+    let engine = tempfile::tempdir().expect("engine dir");
+    let (godot, calls) = pack_running_godot(
+        engine.path(),
+        "echo 'Godot Engine v4.8.beta1 - https://godotengine.org'\necho 'game started'\n\
+         echo 'ERROR: Resource file not found: res://levels/two.tscn (expected type: PackedScene)' >&2\n\
+         echo '   at: _load (core/io/resource_loader.cpp:345)' >&2\n\
+         echo \"ERROR: Can't open file from path 'res://data/items.json'.\" >&2\n\
+         echo '   at: get_file_as_string (core/io/file_access.cpp:870)' >&2\n\
+         echo 'ERROR: Resource file not found: res://levels/two.tscn (expected type: PackedScene)' >&2\n\
+         echo 'WARNING: slow frame' >&2\n\
+         sleep 30",
+    );
+    let cwd = tempfile::tempdir().expect("working dir");
+    let result = manager_in(cwd.path(), godot)
+        .call_tool(
+            "godot_run_pack",
+            json!({"pack_path": "res://build/game.pck", "scene": "res://main.tscn",
+                   "user_args": ["--skip-intro"], "seconds": 1,
+                   "project_path": project.path()}),
+        )
+        .await;
+    assert!(result.is_error, "a pack that misses files fails");
+    let message = text(&result);
+    assert!(message.contains("2 file(s)"), "{message}");
+    assert!(
+        message.contains("export_files"),
+        "says how to fix it: {message}"
+    );
+    let details = message
+        .split_once("Details:\n")
+        .map(|(_, rest)| rest)
+        .expect("details");
+    let report: Value = serde_json::from_str(&details[..details.rfind('}').expect("JSON end") + 1])
+        .expect("JSON details");
+    assert_eq!(report["ok"], false);
+    assert_eq!(report["ran_full_time"], true, "{report}");
+    assert_eq!(
+        report["missing_resources"],
+        json!(["res://levels/two.tscn", "res://data/items.json"]),
+        "each missing file once, in the order Godot named them: {report}"
+    );
+    assert_eq!(
+        report["errors"].as_array().map(Vec::len),
+        Some(3),
+        "{report}"
+    );
+    assert_eq!(report["warnings"], json!(["WARNING: slow frame"]));
+    assert!(
+        report["log"]
+            .as_str()
+            .unwrap_or("")
+            .contains("game started")
+    );
+    assert!(
+        !report["log"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Godot Engine v")
+    );
+
+    let calls = std::fs::read_to_string(&calls).expect("calls");
+    let (dir, line) = calls.trim().split_once('|').expect("cwd and arguments");
+    let pack = std::fs::canonicalize(project.path().join("build/game.pck")).expect("pack");
+    assert!(
+        line.starts_with(&format!(
+            "--main-pack {} --headless --scene res://main.tscn -- --skip-intro",
+            pack.display()
+        )) || line.starts_with(&format!(
+            "--main-pack {} --headless --scene res://main.tscn -- --skip-intro",
+            project.path().join("build/game.pck").display()
+        )),
+        "{line}"
+    );
+    let project_real = std::fs::canonicalize(project.path()).expect("project");
+    assert!(
+        !Path::new(dir).starts_with(&project_real) && !Path::new(dir).starts_with(project.path()),
+        "Godot does not run inside the project, whose project.godot would be found: {dir}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_clean_pack_run_is_ok_and_stopped_after_its_time() {
+    let project = project_with_pack();
+    let engine = tempfile::tempdir().expect("engine dir");
+    let (godot, calls) = pack_running_godot(engine.path(), "echo 'hello from the pack'\nsleep 30");
+    let cwd = tempfile::tempdir().expect("working dir");
+    let started = std::time::Instant::now();
+    let result = manager_in(cwd.path(), godot)
+        .call_tool(
+            "godot_run_pack",
+            json!({"pack_path": "build/game.pck", "headless": false, "seconds": 1,
+                   "project_path": project.path()}),
+        )
+        .await;
+    assert!(!result.is_error, "{}", text(&result));
+    assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    let report: Value = serde_json::from_str(&text(&result)).expect("JSON report");
+    assert_eq!(report["ok"], true);
+    assert_eq!(report["ran_full_time"], true);
+    assert_eq!(report["exit_code"], Value::Null);
+    assert_eq!(report["missing_resources"], json!([]));
+    assert_eq!(report["errors"], json!([]));
+    assert!(
+        report["log"]
+            .as_str()
+            .unwrap_or("")
+            .contains("hello from the pack")
+    );
+    let calls = std::fs::read_to_string(&calls).expect("calls");
+    assert!(
+        !calls.contains("--headless"),
+        "headless false opens a window: {calls}"
+    );
+    assert!(
+        !calls.contains(" -- "),
+        "no user args, no separator: {calls}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_pack_that_quits_early_with_an_error_fails() {
+    let project = project_with_pack();
+    let engine = tempfile::tempdir().expect("engine dir");
+    let (godot, _) = pack_running_godot(
+        engine.path(),
+        "echo 'Error: Couldn'\\''t load project data at path \".\". Is the .pck file missing?' >&2\nexit 1",
+    );
+    let cwd = tempfile::tempdir().expect("working dir");
+    let result = manager_in(cwd.path(), godot)
+        .call_tool(
+            "godot_run_pack",
+            json!({"pack_path": "build/game.pck", "seconds": 5,
+                   "project_path": project.path()}),
+        )
+        .await;
+    assert!(result.is_error);
+    let message = text(&result);
+    assert!(message.contains("exit code 1"), "{message}");
+    assert!(
+        message.contains("load project data"),
+        "quotes Godot: {message}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_pack_that_quits_cleanly_before_its_time_is_ok() {
+    let project = project_with_pack();
+    let engine = tempfile::tempdir().expect("engine dir");
+    let (godot, _) = pack_running_godot(engine.path(), "echo 'done'\nexit 0");
+    let cwd = tempfile::tempdir().expect("working dir");
+    let result = manager_in(cwd.path(), godot)
+        .call_tool(
+            "godot_run_pack",
+            json!({"pack_path": "build/game.pck", "project_path": project.path()}),
+        )
+        .await;
+    assert!(!result.is_error, "{}", text(&result));
+    let report: Value = serde_json::from_str(&text(&result)).expect("JSON report");
+    assert_eq!(report["ok"], true);
+    assert_eq!(report["ran_full_time"], false);
+    assert_eq!(report["exit_code"], 0);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn pack_run_arguments_are_checked_before_godot_runs() {
+    let project = project_with_pack();
+    std::fs::write(project.path().join("build/game.exe"), "MZ").expect("exe");
+    let engine = tempfile::tempdir().expect("engine dir");
+    let (godot, calls) = pack_running_godot(engine.path(), "exit 0");
+    let cwd = tempfile::tempdir().expect("working dir");
+    let manager = manager_in(cwd.path(), godot);
+    for (args, expected) in [
+        (json!({}), "pack_path"),
+        (json!({"pack_path": "build/other.pck"}), "no file"),
+        (json!({"pack_path": "../outside.pck"}), "Parent directory"),
+        (json!({"pack_path": "build/game.exe"}), ".pck or .zip"),
+        (
+            json!({"pack_path": "build/game.pck", "scene": "main.tscn"}),
+            "res://",
+        ),
+        (
+            json!({"pack_path": "build/game.pck", "scene": "res://../x.tscn"}),
+            "res://",
+        ),
+        (
+            json!({"pack_path": "build/game.pck", "seconds": 0}),
+            "seconds",
+        ),
+        (
+            json!({"pack_path": "build/game.pck", "seconds": 601}),
+            "seconds",
+        ),
+        (
+            json!({"pack_path": "build/game.pck", "user_args": ["--godot-mcp-hold"]}),
+            "--godot-mcp-",
+        ),
+    ] {
+        let mut args = args;
+        args["project_path"] = json!(project.path());
+        let result = Arc::clone(&manager)
+            .call_tool("godot_run_pack", args.clone())
+            .await;
+        assert!(result.is_error, "{args}");
+        assert!(
+            text(&result).contains(expected),
+            "{args}: {}",
+            text(&result)
+        );
+    }
+    assert!(
+        std::fs::read_to_string(&calls)
+            .unwrap_or_default()
+            .is_empty(),
+        "Godot never ran"
+    );
+}
+
 #[tokio::test]
 async fn a_preset_is_not_changed_while_the_editor_has_the_project_open() {
     let project = project_dir();

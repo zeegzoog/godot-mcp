@@ -725,7 +725,7 @@ pub(super) fn godot_failed(error: &crate::error::McpError) -> ToolResult {
     )
 }
 
-fn failure(summary: String, report: &Value, hints: &[&str]) -> ToolResult {
+pub(super) fn failure(summary: String, report: &Value, hints: &[&str]) -> ToolResult {
     ToolResult::error(
         format!(
             "{summary}\n\nDetails:\n{}",
@@ -798,7 +798,7 @@ fn is_progress(line: &str) -> bool {
 /// Each message of both streams that starts with `prefix` (such as `ERROR:`), with the lines
 /// that continue it up to Godot's `at:` source line, at most [`MAX_LISTED_LINES`] of them.
 /// Godot prints the reason an export failed on the lines after its `ERROR:` line.
-fn messages(run: &HeadlessRun, prefix: &str) -> Vec<String> {
+pub(super) fn messages(run: &HeadlessRun, prefix: &str) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
     for stream in [&run.stdout, &run.stderr] {
         let mut current: Option<String> = None;
@@ -826,7 +826,7 @@ fn messages(run: &HeadlessRun, prefix: &str) -> Vec<String> {
 }
 
 /// The end of `text`, at most [`LOG_TAIL_BYTES`] bytes, cut at a line start.
-fn tail(text: &str) -> String {
+pub(super) fn tail(text: &str) -> String {
     let text = text.trim();
     if text.len() <= LOG_TAIL_BYTES {
         return text.to_string();

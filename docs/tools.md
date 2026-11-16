@@ -53,6 +53,7 @@ Every tool takes only the parameters its schema lists (`additionalProperties: fa
 | `godot_get_import_params` | — | Reads a file's import parameters, the `[params]` of its `.import` sidecar that the Import dock shows: `importer`, the imported `type`, `params` and each option's Godot type under `types`. From the editor when it has the project open, else with the Godot binary. A file with no `.import` yet is refused; import it with `godot_resave_resources` first. |
 | `godot_set_import_params` | — | Changes import parameters the way the Import dock does and reimports the file: `params` (such as `{"compress/mode": 2, "compress/high_quality": true}`) are set after copying every parameter of `copy_from`'s `.import` (same importer only). An option keeps its type. With the editor the change goes through its file system, so the dock and the loaded resource follow; without it Godot's `ConfigFile` edits the file and `godot --headless --import` reimports. `new_options` lists names the file did not hold before and `ignored_options` the ones the importer dropped on reimport (a typo or another importer's option). Nothing changed means no reimport; `reimport: false` only edits the file. `importer` switches the importer as the dock's "Import As" does (`3d_texture` with `slices/horizontal` turns a PNG strip into a `Texture3D`): the new importer starts from its defaults, the name is checked against Godot's importers for the file type, and the answer gives `importer`, `previous_importer` and the imported `type`; an importer Godot does not have for the file is an error, not a silent fallback. |
 | `godot_export_project` | Godot editor binary | Exports with a preset, headless: `mode` `pack` (default, `--export-pack`, a `.pck` or `.zip`, no template needed), `release` (`--export-release`) or `debug` (`--export-debug`), after `godot --headless --import` (skipped with `import: false`, or while the editor has the project open). `output_path` defaults to the preset's `export_path` and must stay inside the project. Returns `ok`, `output_path`, `size_bytes`, `exit_code`, `duration_seconds`, the `ERROR`/`WARNING` lines and the end of the log. A missing preset, a missing export template, a failed import, no file written or a timeout (`timeout_seconds`, default 600) is an error with that log. See [Exporting](#exporting). |
+| `godot_run_pack` | Godot binary | Smoke-runs an exported pack: `godot --main-pack <pack_path>` (a `.pck` or `.zip` inside the project), `--headless` unless `headless: false`, `--scene` with `scene`, `user_args` after `--`, from an empty temporary folder, stopped after `seconds` (default 10, at most 600). Returns `ok`, `ran_full_time`, `exit_code`, `duration_seconds`, `missing_resources` (the `res://`/`uid://` paths of failed loads), the `ERROR`/`WARNING` lines and the end of stdout and stderr. A missing file, a logged error, or an early quit with a non-zero exit code or a crash is an error with that report. See [Exporting](#exporting). |
 | `godot_run_output` | Running game | Logs, warnings and errors, with stack traces, from a managed process run or the editor's running game (`since`, `level`). |
 | `godot_game_tree` | Running game | Live nodes of the running game: path, class, position, visible text. Filter by `name`, `class`, `group` or `text`. |
 | `godot_game_get` | Running game | A live node's properties, groups and, optionally, signals and methods. `/` reads a Dictionary key or an Object property (get only; private names are refused). A missing segment is that property's entry in `property_errors` and names the segment; other properties are still returned. `null` is a value that really is null. `:` steps through a Resource (`material:shader_parameter/caustics`), including a name that starts with `_`. A requested `script` is omitted. A non-resource `:` step names the `/` form. |
@@ -105,6 +106,21 @@ To ship only what the game loads, list it and pick the `resources` filter: the e
 ```
 
 A pack holds the project data only; run it with a matching engine binary (`godot --main-pack game.pck`). `release` and `debug` also need the export templates of this exact Godot version, or the preset's `custom_template/release` / `custom_template/debug` option pointing at a template binary. The output must stay inside the project; copy it elsewhere afterwards. The import before the export uses the same `timeout_seconds`.
+
+### Checking a trimmed pack
+
+A `resources` or `scenes` export leaves out every file the game loads by a path it builds at run time (`load("res://levels/%s.tscn" % name)`), because no scene names it. Run the pack with `godot_run_pack` before shipping it: the Godot binary of this machine runs a pack made for any platform, since the pack holds the project data only.
+
+```jsonc
+// godot_run_pack
+{"pack_path": "build/game.pck", "seconds": 20}
+// The answer when the pack lacks a file (an error, with these details):
+{"ok": false, "ran_full_time": true, "exit_code": null,
+ "missing_resources": ["res://levels/two.tscn", "res://data/items.json"],
+ "errors": ["ERROR: Resource file not found: res://levels/two.tscn (expected type: PackedScene)", "..."]}
+```
+
+Add each missing resource to `export_files` with `godot_set_export_preset` (and a non-resource file such as `*.json` to `include_filter`), export again and run the pack again. Only what the game loads during the run is checked: start the scenes that load the rest with `scene`, pass the game's own flags with `user_args`, or give it more `seconds`. The run is headless unless `headless: false`, so shaders are not compiled. The game writes to its own `user://` folder, as any run of it does. It is not a managed run: `godot_get_run_status` does not list it, and the running-game tools cannot reach it.
 
 ## Feedback to the maintainers
 

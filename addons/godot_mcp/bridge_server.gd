@@ -2390,6 +2390,10 @@ func _is_setting_key(key: String) -> bool:
             return false
     return true
 
+## A setting under this prefix that is neither stored nor defined is an importer's defaults: a
+## Dictionary of import options, as the Import dock's "Set as Default" stores it.
+const IMPORTER_DEFAULTS: String = "importer_defaults/"
+
 ## The setting whose type governs `key`: the key itself when the engine or the project has it, or,
 ## for a feature override (`name.mobile`), the base setting it overrides. "" when neither exists,
 ## so a setting the engine does not define keeps the type of the value (as the server's file
@@ -2404,12 +2408,20 @@ func _defined_setting_key(key: String) -> String:
             return base
     return ""
 
-## The value of a setting whose type has no JSON form, from the text the caller sent, or null when
-## the text does not give that type: an HTML color or color name for a Color, a name for a
-## StringName or NodePath, otherwise the text project.godot stores (`Vector2i(1152, 648)`), which
-## must start with the type's own name and parse to that type. An Object is never created.
+## The value of a setting whose type is not a string, number or boolean, from what the caller
+## sent, or null when it does not give that type: a JSON object or array for a Dictionary or an
+## Array (see _setting_from_json), a JSON array for a packed array, an HTML color or color name
+## for a Color, a name for a StringName or NodePath, otherwise the text project.godot stores
+## (`Vector2i(1152, 648)`, `{"key": 1}`), which must start the way that type is written, use no
+## constructor but built-in types and parse to that type. An Object is never created.
 ## The server's file fallback runs the same rules (SETTING_TYPE_SCRIPT in src/cli_runner.rs).
-func _setting_from_text(value: Variant, type: int) -> Variant:
+func _setting_from_value(value: Variant, type: int) -> Variant:
+    if (type == TYPE_DICTIONARY or type == TYPE_ARRAY) and typeof(value) == type:
+        return _setting_from_json(value)
+    if type >= TYPE_PACKED_BYTE_ARRAY and type < TYPE_MAX and value is Array:
+        var packed: Variant = type_convert(_setting_from_json(value), type)
+        if typeof(packed) == type:
+            return packed
     if not value is String:
         return null
     var text: String = (value as String).strip_edges()
@@ -2423,17 +2435,89 @@ func _setting_from_text(value: Variant, type: int) -> Variant:
             return StringName(value)
         TYPE_NODE_PATH:
             return NodePath(value)
-    if type == TYPE_OBJECT or not text.begins_with(type_string(type) + "("):
+    if type == TYPE_OBJECT or not _setting_text_opens_as(text, type) or not _setting_text_builds_no_object(text):
         return null
     var parsed: Variant = str_to_var(text)
     if typeof(parsed) == type:
         return parsed
     return null
 
+## Whether text starts the way project.godot writes a value of type.
+func _setting_text_opens_as(text: String, type: int) -> bool:
+    if type == TYPE_DICTIONARY:
+        return text.begins_with("{") or text.begins_with("Dictionary[")
+    if type == TYPE_ARRAY:
+        return text.begins_with("[") or text.begins_with("Array[")
+    return text.begins_with(type_string(type) + "(")
+
+## Whether every constructor in a value text, outside its strings, is a built-in type other than
+## Object, so parsing it creates no Object and loads no Resource.
+func _setting_text_builds_no_object(text: String) -> bool:
+    var in_string: bool = false
+    var escaped: bool = false
+    var word: String = ""
+    var last_word: String = ""
+    for character: String in text:
+        if in_string:
+            if escaped:
+                escaped = false
+            elif character == "\\":
+                escaped = true
+            elif character == "\"":
+                in_string = false
+            continue
+        if character == "_" or (character >= "a" and character <= "z") or (character >= "A" and character <= "Z") or (character >= "0" and character <= "9"):
+            word += character
+            continue
+        if not word.is_empty():
+            last_word = word
+            word = ""
+        if character == "\"":
+            in_string = true
+        elif character == "(":
+            if last_word.is_empty() or last_word == "Object" or not _is_builtin_type_name(last_word):
+                return false
+            last_word = ""
+        elif character != " " and character != "\t" and character != "\n" and character != "\r" and character != "[" and character != "]":
+            last_word = ""
+    return not in_string
+
+func _is_builtin_type_name(type_name: String) -> bool:
+    for type: int in range(TYPE_NIL + 1, TYPE_MAX):
+        if type != TYPE_OBJECT and type_string(type) == type_name:
+            return true
+    return false
+
+## A JSON value as a setting holds it: a whole number becomes an int (JSON does not tell 3 from
+## 3.0, as with new metadata in set_node_properties), arrays and objects are converted entry by
+## entry, anything else is kept.
+func _setting_from_json(value: Variant) -> Variant:
+    if value is Dictionary:
+        var entries: Dictionary = {}
+        for entry_key: Variant in value:
+            entries[entry_key] = _setting_from_json(value[entry_key])
+        return entries
+    if value is Array:
+        var items: Array = []
+        for item: Variant in value:
+            items.append(_setting_from_json(item))
+        return items
+    if typeof(value) == TYPE_FLOAT:
+        var number: float = value
+        if is_finite(number) and number == floorf(number) and absf(number) < 9.0e15:
+            return int(number)
+    return value
+
 func _setting_type_refusal(type: int) -> String:
     if type == TYPE_COLOR:
         return "This setting expects a Color: send an HTML color such as \"#102b38\" or \"#102b38ff\", or a color name such as \"white\""
     var type_name: String = type_string(type)
+    if type == TYPE_DICTIONARY:
+        return "This setting expects a Dictionary: send a JSON object, or a string holding the text project.godot stores, such as {\"key\": 1}. An Object is never created."
+    if type == TYPE_ARRAY:
+        return "This setting expects a Array: send a JSON array, or a string holding the text project.godot stores, such as [1, \"two\"]. An Object is never created."
+    if type >= TYPE_PACKED_BYTE_ARRAY and type < TYPE_MAX:
+        return "This setting expects a %s: send a JSON array of its elements, or a string holding the text project.godot stores, such as \"%s(...)\"" % [type_name, type_name]
     return "This setting expects a %s: send it as a string the way project.godot stores it, such as \"%s(...)\". Change settings of other types in the editor's Project Settings." % [type_name, type_name]
 
 ## The value to store for a setting of the type of `current`, or an error. The value must have
@@ -2454,7 +2538,7 @@ func _coerce_setting(current: Variant, value: Variant) -> Dictionary:
             if (value is float or value is int) and not value is bool:
                 return {"value": float(value)}
         _:
-            var converted: Variant = _setting_from_text(value, type)
+            var converted: Variant = _setting_from_value(value, type)
             if converted != null:
                 return {"value": converted}
             return {"error": _setting_type_refusal(type)}
@@ -2466,19 +2550,26 @@ func set_project_setting(peer: WebSocketPeer, cmd_id: String, params: Dictionary
         send_error(peer, cmd_id, "key must start with a section and use only letters, digits and _ / . -, like application/config/name")
         return
     var value: Variant = params.get("value")
-    if not (value is String or value is bool or value is int or value is float):
-        send_error(peer, cmd_id, "value must be a string, number or boolean")
+    if not (value is String or value is bool or value is int or value is float or value is Array or value is Dictionary):
+        send_error(peer, cmd_id, "value must be a string, number, boolean, array or object")
         return
     var previous: Variant = null
     if ProjectSettings.has_setting(key):
         previous = ProjectSettings.get_setting(key)
     var governing: String = _defined_setting_key(key)
+    var current: Variant = null
     if not governing.is_empty():
-        var coerced: Dictionary = _coerce_setting(ProjectSettings.get_setting(governing), value)
+        current = ProjectSettings.get_setting(governing)
+    elif key.begins_with(IMPORTER_DEFAULTS):
+        current = {}
+    if current != null:
+        var coerced: Dictionary = _coerce_setting(current, value)
         if coerced.has("error"):
             send_error(peer, cmd_id, "'%s': %s" % [key, coerced["error"]])
             return
         value = coerced["value"]
+    elif value is Array or value is Dictionary:
+        value = _setting_from_json(value)
     ProjectSettings.set_setting(key, value)
     var err: Error = ProjectSettings.save()
     if err != OK:

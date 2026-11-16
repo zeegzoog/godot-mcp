@@ -9,6 +9,9 @@ extends RefCounted
 ## names or nothing. A file that another project file still names by path or UID is refused unless
 ## the caller passes force. A script that only writes the file (a generator saving its output)
 ## does not count: it can create the file again (classify_script).
+##
+## It also takes the editor's part of a move (godot_move_file): move_check before the server
+## changes any file, move_apply after it moved them and rewrote their references.
 
 ## Text files whose content is searched for a path or UID of a file being deleted.
 const TEXT_EXTENSIONS: PackedStringArray = [
@@ -637,3 +640,197 @@ func _listing(targets: Array[Dictionary]) -> Array:
         companions.append_array(target.get("imported", []))
         listing.append({"path": target["path"], "kind": target["kind"], "companions": companions})
     return listing
+
+## The editor's part of a move (godot_move_file), before the server changes any file: refuses a
+## file the move changes (moves, rewrites or saves again) while it is open with unsaved changes.
+## params: files (Array of {from, to}), rewrite and binary (Arrays of res:// paths).
+func move_check(bridge: Object, params: Dictionary) -> Dictionary:
+    var report: Dictionary = {"refused": [], "warnings": []}
+    if bool(bridge.call("is_import_running", EditorInterface.get_resource_filesystem())):
+        return {"error": "A resource import is running in the editor. Retry the move once it finishes."}
+    var paths: Array[String] = []
+    for item: Variant in params.get("files", []):
+        if item is Dictionary:
+            paths.append(str((item as Dictionary).get("from", "")))
+    for key: String in ["rewrite", "binary"]:
+        for item: Variant in params.get(key, []):
+            paths.append(str(item))
+    var open_scenes: PackedStringArray = EditorInterface.get_open_scenes()
+    var seen: Dictionary = {}
+    for res_path: String in paths:
+        if not res_path.begins_with("res://") or seen.has(res_path):
+            continue
+        seen[res_path] = true
+        if open_scenes.has(res_path) and bool(bridge.call("_has_unsaved_changes", res_path)):
+            _refuse(report, res_path, "is open in the editor with unsaved changes, and the move changes it. Save or close the scene first")
+        if res_path.get_extension() == "gd":
+            var tab: Dictionary = _tab_state(bridge, res_path)
+            if bool(tab.get("dirty", false)):
+                _refuse(report, res_path, "is open in the script editor with unsaved changes, and the move changes it. Save or close the script first")
+            elif str(tab.get("editor_state", "")) == "unknown":
+                report["warnings"].append("The script editor's tabs could not be matched to %s (%s); a tab of it may show the old text." % [res_path, str(tab.get("reason", ""))])
+    return report
+
+## The editor's part of a move after the server moved the files and rewrote the text references,
+## as the FileSystem dock does after its own move: cached resources, uids and open scene tabs
+## follow the new paths, the project settings in memory are rewritten and saved, binary resources
+## that named an old path are saved again (their uids found the moved files, so they are saved with
+## the new paths), open scenes and scripts whose text changed are reloaded, the dock's files_moved
+## and folder_moved signals are sent, and the editor rescans.
+## params: files (Array of {from, to, uid}), folders (Array of {from, to}), rewritten and binary
+## (Arrays of res:// paths after the move), pairs (Array of {old, new, prefix}, longest first).
+func move_apply(bridge: Object, params: Dictionary) -> Dictionary:
+    var report: Dictionary = {"resaved": [], "reloaded_scenes": [], "reloaded_scripts": [], "project_settings": [], "warnings": []}
+    var pairs: Array[Dictionary] = []
+    for item: Variant in params.get("pairs", []):
+        if item is Dictionary and str((item as Dictionary).get("old", "")).begins_with("res://"):
+            pairs.append(item as Dictionary)
+    var renames: Dictionary = {}
+    for item: Variant in params.get("files", []):
+        if not item is Dictionary:
+            continue
+        var entry: Dictionary = item as Dictionary
+        var from: String = str(entry.get("from", ""))
+        var to: String = str(entry.get("to", ""))
+        if not from.begins_with("res://") or not to.begins_with("res://"):
+            continue
+        renames[from] = to
+        var uid_text: String = str(entry.get("uid", ""))
+        if uid_text.begins_with("uid://"):
+            var id: int = ResourceUID.text_to_id(uid_text)
+            if id != ResourceUID.INVALID_ID:
+                if ResourceUID.has_id(id):
+                    ResourceUID.set_id(id, to)
+                else:
+                    ResourceUID.add_id(id, to)
+        if ResourceLoader.has_cached(from):
+            var cached: Resource = ResourceLoader.get_cached_ref(from)
+            if cached != null:
+                cached.take_over_path(to)
+    # The scene tabs follow the new paths; a tab of a moved scene is reloaded below, so the
+    # editor's own record of the tab's path is the new one too.
+    var open_scenes: PackedStringArray = PackedStringArray()
+    var to_reload: Array[String] = []
+    for root: Node in EditorInterface.get_open_scene_roots():
+        if renames.has(root.scene_file_path):
+            root.scene_file_path = str(renames[root.scene_file_path])
+            to_reload.append(root.scene_file_path)
+        open_scenes.append(root.scene_file_path)
+
+    var settings: Array[String] = _move_project_settings(pairs)
+    report["project_settings"] = settings
+    if not settings.is_empty():
+        var save_err: Error = ProjectSettings.save()
+        if save_err != OK:
+            report["warnings"].append("The project settings could not be saved (%s); project.godot on disk already names the new paths, but the editor may write the old ones back. Restart the editor." % error_string(save_err))
+
+    for item: Variant in params.get("binary", []):
+        var res_path: String = str(item)
+        if not res_path.begins_with("res://") or not FileAccess.file_exists(res_path):
+            continue
+        var resource: Resource = ResourceLoader.load(res_path, "", ResourceLoader.CACHE_MODE_IGNORE)
+        if resource == null:
+            report["warnings"].append("%s could not be loaded, so it still names the old paths; open it in the editor and save it." % res_path)
+            continue
+        var err: Error = ResourceSaver.save(resource, res_path)
+        if err != OK:
+            report["warnings"].append("%s could not be saved again (%s), so it still names the old paths." % [res_path, error_string(err)])
+            continue
+        report["resaved"].append(res_path)
+        if open_scenes.has(res_path) and not to_reload.has(res_path):
+            to_reload.append(res_path)
+    for item: Variant in params.get("rewritten", []):
+        var res_path: String = str(item)
+        if not res_path.begins_with("res://"):
+            continue
+        if open_scenes.has(res_path):
+            if not to_reload.has(res_path):
+                to_reload.append(res_path)
+        elif res_path.get_extension() == "gd":
+            var ops: Object = bridge.call("_script_ops")
+            var tab: Dictionary = ops.call("tab_state", res_path, true)
+            if bool(tab.get("reloaded", false)):
+                report["reloaded_scripts"].append(res_path)
+    for scene_path: String in to_reload:
+        EditorInterface.reload_scene_from_path(scene_path)
+        report["reloaded_scenes"].append(scene_path)
+
+    var dock: Object = EditorInterface.get_file_system_dock()
+    if dock != null:
+        for from: String in renames:
+            dock.emit_signal("files_moved", from, str(renames[from]))
+        for item: Variant in params.get("folders", []):
+            if item is Dictionary:
+                var folder: Dictionary = item as Dictionary
+                dock.emit_signal("folder_moved", str(folder.get("from", "")) + "/", str(folder.get("to", "")))
+    EditorInterface.get_resource_filesystem().scan()
+    report["rescanned"] = true
+    return report
+
+## Rewrites the moved paths in the project settings the editor holds in memory, as the dock does
+## after a move (autoloads, the main scene, any setting naming a moved file). Returns the names of
+## the settings that changed.
+func _move_project_settings(pairs: Array[Dictionary]) -> Array[String]:
+    var changed: Array[String] = []
+    if pairs.is_empty():
+        return changed
+    for property: Dictionary in ProjectSettings.get_property_list():
+        var name: String = str(property.get("name", ""))
+        if name.is_empty() or not ProjectSettings.has_setting(name):
+            continue
+        var value: Variant = ProjectSettings.get_setting(name)
+        var moved: Variant = value
+        match typeof(value):
+            TYPE_STRING, TYPE_STRING_NAME:
+                var text: String = str(value)
+                if not text.contains("res://"):
+                    continue
+                var rewritten: String = rewrite_paths(text, pairs)
+                if rewritten == text:
+                    continue
+                if value is StringName:
+                    moved = StringName(rewritten)
+                else:
+                    moved = rewritten
+            TYPE_ARRAY, TYPE_DICTIONARY, TYPE_PACKED_STRING_ARRAY:
+                var text: String = var_to_str(value)
+                if not text.contains("res://"):
+                    continue
+                var rewritten: String = rewrite_paths(text, pairs)
+                if rewritten == text:
+                    continue
+                moved = str_to_var(rewritten)
+                if typeof(moved) != typeof(value):
+                    continue
+            _:
+                continue
+        ProjectSettings.set_setting(name, moved)
+        changed.append(name)
+    return changed
+
+## text with every old path of pairs replaced by its new path, in one pass from left to right; the
+## first matching pair wins (the server sends them longest first). The server rewrites files the
+## same way (rewrite in src/tools/file_move.rs).
+func rewrite_paths(text: String, pairs: Array[Dictionary]) -> String:
+    var out: String = ""
+    var copied: int = 0
+    var at: int = text.find("res://")
+    while at != -1:
+        var matched: Dictionary = {}
+        for pair: Dictionary in pairs:
+            var old: String = str(pair.get("old", ""))
+            if old.is_empty() or text.substr(at, old.length()) != old:
+                continue
+            var after: int = at + old.length()
+            if bool(pair.get("prefix", false)) or after >= text.length() or not PATH_CHARS.contains(text[after]):
+                matched = pair
+                break
+        if matched.is_empty():
+            at = text.find("res://", at + 6)
+            continue
+        out += text.substr(copied, at - copied) + str(matched.get("new", ""))
+        copied = at + str(matched.get("old", "")).length()
+        at = text.find("res://", copied)
+    if copied == 0:
+        return text
+    return out + text.substr(copied)

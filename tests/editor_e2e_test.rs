@@ -3377,6 +3377,231 @@ async fn files_are_deleted_through_the_editor_with_companions_and_tabs() {
     assert!(project.join("used.gd").is_file() && project.join("dirty.tscn").is_file());
 }
 
+/// Test commands for the move: save a binary scene whose node uses a script, and report what the
+/// editor knows about a path (file system, open scene and script tabs, a setting, a uid's path).
+const MOVE_PROBE_HOOK: &str = r#"        "__test_save_binary":
+            var holder := Node.new()
+            holder.name = "Holder"
+            holder.set_script(load(str(params.get("script", ""))))
+            var packed := PackedScene.new()
+            packed.pack(holder)
+            holder.free()
+            var target: String = str(params.get("path", ""))
+            var saved: Error = ResourceSaver.save(packed, target)
+            EditorInterface.get_resource_filesystem().update_file(target)
+            send_success(peer, cmd_id, {"saved": saved == OK})
+        "__test_move_probe":
+            var path: String = str(params.get("path", ""))
+            if bool(params.get("open_script", false)):
+                EditorInterface.edit_script(load(path))
+            var scripts: Array = EditorInterface.get_script_editor().get_open_scripts().map(func(s: Script) -> String: return s.resource_path)
+            var uid_text: String = str(params.get("uid", ""))
+            var uid_path: String = ""
+            if not uid_text.is_empty() and ResourceUID.has_id(ResourceUID.text_to_id(uid_text)):
+                uid_path = ResourceUID.get_id_path(ResourceUID.text_to_id(uid_text))
+            send_success(peer, cmd_id, {"in_filesystem": _filesystem_has(EditorInterface.get_resource_filesystem(), path), "script_tabs": scripts, "open_scenes": EditorInterface.get_open_scenes(), "setting": str(ProjectSettings.get_setting(str(params.get("setting", "application/config/name")), "")), "uid_path": uid_path})
+"#;
+
+/// godot_move_file through the editor: a scene with unsaved changes is refused; a script and a
+/// folder (a scene, its script and an imported image) move with their companions; the text
+/// references are rewritten, a binary scene that uses the moved script is saved again by the
+/// editor with the new path, the open scene and script tabs follow the new paths, the autoload in
+/// the editor's project settings is rewritten, the uid points at the new path, and the image is
+/// not imported again.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn files_and_folders_are_moved_through_the_editor_with_references_and_tabs() {
+    use godot_mcp::cli_runner::CliRunner;
+    use godot_mcp::tools::ToolManager;
+    use std::sync::Arc;
+
+    let simple_scene = "[gd_scene format=3]\n\n[node name=\"Root\" type=\"Node2D\"]\n";
+    let hook = format!("{MOVE_PROBE_HOOK}{UNDO_HOOK}");
+    let editor = start_editor_with(
+        Some(&hook),
+        "",
+        &[
+            ("scripts/player.gd", "extends Node\n"),
+            ("levels/level_01/enemy.gd", "extends Node\n\nconst ICON := preload(\"res://levels/level_01/icon.svg\")\n"),
+            (
+                "levels/level_01/level.tscn",
+                "[gd_scene format=3 uid=\"uid://e2elevelone\"]\n\n[ext_resource type=\"Script\" path=\"res://levels/level_01/enemy.gd\" id=\"1\"]\n[ext_resource type=\"Script\" path=\"res://scripts/player.gd\" id=\"2\"]\n\n[node name=\"Level\" type=\"Node\"]\nscript = ExtResource(\"1\")\n\n[node name=\"Player\" type=\"Node\" parent=\".\"]\nscript = ExtResource(\"2\")\n",
+            ),
+            (
+                "levels/level_01/icon.svg",
+                "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"16\"><rect width=\"16\" height=\"16\" fill=\"#3a3\"/></svg>\n",
+            ),
+            (
+                "uses_level.tscn",
+                "[gd_scene format=3]\n\n[ext_resource type=\"PackedScene\" path=\"res://levels/level_01/level.tscn\" id=\"1\"]\n\n[node name=\"Uses\" type=\"Node\"]\n\n[node name=\"Level\" parent=\".\" instance=ExtResource(\"1\")]\n",
+            ),
+            ("dirty.tscn", simple_scene),
+        ],
+        "\n[autoload]\n\nPlayer=\"*res://scripts/player.gd\"\n",
+    )
+    .await;
+    let project = editor.project.clone();
+    let (godot, _) = godot_binaries();
+    let tools = Arc::new(
+        ToolManager::new(BridgeClient::new(editor.port), CliRunner::new(godot))
+            .with_working_dir(project.clone()),
+    );
+    let mv = |args: Value| {
+        let tools = Arc::clone(&tools);
+        async move { tools.call_tool("godot_move_file", args).await }
+    };
+    let send = |command: &'static str, params: Value| {
+        let bridge = editor.bridge.clone();
+        async move { bridge.send_command(command, params).await.expect(command) }
+    };
+    let read = |name: &str| std::fs::read_to_string(project.join(name)).expect("readable file");
+
+    send(
+        "__test_save_binary",
+        json!({"path": "res://levels/holder.scn", "script": "res://scripts/player.gd"}),
+    )
+    .await;
+    let holder = std::fs::read(project.join("levels/holder.scn")).expect("holder.scn");
+    assert!(
+        String::from_utf8_lossy(&holder).contains("res://scripts/player.gd"),
+        "the binary scene names the script"
+    );
+
+    // A scene with unsaved changes is refused, and nothing moves.
+    send("open_scene", json!({"scene_path": "res://dirty.tscn"})).await;
+    send("__test_hand_edit", json!({})).await;
+    let unsaved =
+        mv(json!({"moves": [{"from": "res://dirty.tscn", "to": "res://old/dirty.tscn"}]})).await;
+    assert!(unsaved.is_error, "{}", tool_text(&unsaved));
+    assert!(
+        tool_text(&unsaved).contains("unsaved changes"),
+        "{}",
+        tool_text(&unsaved)
+    );
+    assert!(project.join("dirty.tscn").is_file() && !project.join("old").exists());
+
+    send(
+        "open_scene",
+        json!({"scene_path": "res://levels/level_01/level.tscn"}),
+    )
+    .await;
+    send(
+        "__test_move_probe",
+        json!({"path": "res://scripts/player.gd", "open_script": true}),
+    )
+    .await;
+    let moves = json!([
+        {"from": "res://scripts/player.gd", "to": "res://scripts/actors/player.gd"},
+        {"from": "res://levels/level_01", "to": "res://legacy/"},
+    ]);
+    let dry = mv(json!({"moves": moves, "dry_run": true})).await;
+    assert!(!dry.is_error, "{}", tool_text(&dry));
+    assert!(project.join("scripts/player.gd").is_file());
+
+    let moved = mv(json!({"moves": moves})).await;
+    assert!(!moved.is_error, "{}", tool_text(&moved));
+    let report: Value = serde_json::from_str(&tool_text(&moved)).expect("JSON report");
+    assert_eq!(report["source"], "editor", "{report}");
+    assert_eq!(
+        report["resaved"],
+        json!(["res://levels/holder.scn"]),
+        "{report}"
+    );
+    assert!(
+        report["reloaded_scenes"]
+            .to_string()
+            .contains("res://legacy/level_01/level.tscn"),
+        "{report}"
+    );
+    assert!(
+        report["project_settings"]
+            .to_string()
+            .contains("autoload/Player"),
+        "{report}"
+    );
+    assert_eq!(report["rescan_needed"], false, "{report}");
+    assert!(read("scripts/actors/player.gd.uid").starts_with("uid://"));
+    assert!(
+        !project.join("scripts/player.gd").exists() && !project.join("levels/level_01").exists()
+    );
+    let level = read("legacy/level_01/level.tscn");
+    assert!(
+        level.contains("path=\"res://legacy/level_01/enemy.gd\""),
+        "{level}"
+    );
+    assert!(
+        level.contains("path=\"res://scripts/actors/player.gd\""),
+        "{level}"
+    );
+    assert!(read("uses_level.tscn").contains("res://legacy/level_01/level.tscn"));
+    assert!(
+        read("legacy/level_01/enemy.gd").contains("preload(\"res://legacy/level_01/icon.svg\")")
+    );
+    assert!(read("project.godot").contains("Player=\"*res://scripts/actors/player.gd\""));
+    let holder = String::from_utf8_lossy(
+        &std::fs::read(project.join("levels/holder.scn")).expect("holder.scn"),
+    )
+    .into_owned();
+    assert!(
+        holder.contains("res://scripts/actors/player.gd"),
+        "the editor saved the binary scene again"
+    );
+    assert!(!holder.contains("res://scripts/player.gd"), "{holder}");
+
+    // After the editor's scan: the moved files are where the editor looks, and nothing was
+    // imported again (the imported data was renamed for the new path).
+    let import_before = read("legacy/level_01/icon.svg.import");
+    send("resave_resources", json!({"wait": true})).await;
+    let probe = send(
+        "__test_move_probe",
+        json!({"path": "res://legacy/level_01/level.tscn", "setting": "autoload/Player", "uid": "uid://e2elevelone"}),
+    )
+    .await;
+    assert_eq!(probe["in_filesystem"], true, "{probe}");
+    assert!(
+        probe["open_scenes"]
+            .to_string()
+            .contains("res://legacy/level_01/level.tscn"),
+        "{probe}"
+    );
+    assert!(
+        !probe["open_scenes"]
+            .to_string()
+            .contains("res://levels/level_01/"),
+        "{probe}"
+    );
+    assert!(
+        probe["script_tabs"]
+            .to_string()
+            .contains("res://scripts/actors/player.gd"),
+        "{probe}"
+    );
+    assert_eq!(
+        probe["setting"], "*res://scripts/actors/player.gd",
+        "{probe}"
+    );
+    assert_eq!(
+        probe["uid_path"], "res://legacy/level_01/level.tscn",
+        "{probe}"
+    );
+    let import = read("legacy/level_01/icon.svg.import");
+    assert_eq!(import, import_before, "the image was imported again");
+    assert!(
+        import.contains("source_file=\"res://legacy/level_01/icon.svg\""),
+        "{import}"
+    );
+    for part in import
+        .split('"')
+        .filter(|part| part.starts_with("res://.godot/imported/"))
+    {
+        assert!(
+            project.join(&part["res://".len()..]).is_file(),
+            "{part} is missing"
+        );
+    }
+    assert!(project.join("dirty.tscn").is_file());
+}
+
 #[tokio::test]
 #[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
 async fn set_node_properties_adds_metadata_the_way_the_inspector_does() {

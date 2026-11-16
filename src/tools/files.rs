@@ -23,7 +23,7 @@ const MAX_PATHS: usize = 64;
 /// The editor searches every project file for references, which takes a while in a big project.
 const EDITOR_WAIT: Duration = Duration::from_secs(60);
 /// Text files searched for a path or UID of a file being deleted; the addon uses the same list.
-const TEXT_EXTENSIONS: &[&str] = &[
+pub(super) const TEXT_EXTENSIONS: &[&str] = &[
     "tscn",
     "tres",
     "gd",
@@ -36,8 +36,8 @@ const TEXT_EXTENSIONS: &[&str] = &[
     "json",
 ];
 /// Binary resources: only the editor can read their dependencies.
-const BINARY_EXTENSIONS: &[&str] = &["scn", "res"];
-const MAX_SCAN_BYTES: u64 = 16 * 1024 * 1024;
+pub(super) const BINARY_EXTENSIONS: &[&str] = &["scn", "res"];
+pub(super) const MAX_SCAN_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_LISTED_REFERENCES: usize = 50;
 const BRIDGE_ADDON: &str = "res://addons/godot_mcp/";
 const IMPORTED_PREFIX: &str = "res://.godot/imported/";
@@ -388,7 +388,7 @@ fn listing(project: &Path, target: &Target) -> Value {
 }
 
 /// Why a path may never be deleted through this tool, or `None`.
-fn protected(res_path: &str) -> Option<String> {
+pub(super) fn protected(res_path: &str) -> Option<String> {
     // Windows and macOS file systems ignore case, so res://Project.godot is project.godot there.
     let res_path = res_path.to_lowercase();
     let res_path = res_path.as_str();
@@ -432,7 +432,7 @@ fn is_alias(res_path: &str) -> bool {
 
 /// `protected` for the file a path really names: its canonical place inside the project, which
 /// sees through a short name, a link or a spelling in another case.
-fn protected_by_identity(project: &Path, file: &Path) -> Option<String> {
+pub(super) fn protected_by_identity(project: &Path, file: &Path) -> Option<String> {
     let real = file.canonicalize().ok()?;
     let root = project.canonicalize().ok()?;
     let relative = real.strip_prefix(&root).ok()?;
@@ -513,14 +513,14 @@ fn describe_file(project: &Path, res_path: String, file: PathBuf) -> Target {
 }
 
 /// The `uid="uid://..."` value of a scene or resource header, or of an `.import` file.
-fn header_uid(text: &str) -> Option<String> {
+pub(super) fn header_uid(text: &str) -> Option<String> {
     let start = text.find("uid=\"uid://")? + "uid=\"".len();
     let rest = &text[start..];
     let end = rest.find('"')?;
     Some(rest[..end].to_string())
 }
 
-fn extension(path: &Path) -> String {
+pub(super) fn extension(path: &Path) -> String {
     path.extension()
         .map(|ext| ext.to_string_lossy().to_lowercase())
         .unwrap_or_default()
@@ -614,7 +614,7 @@ fn reference_kind(extension: &str, text: &str, target: &Target, by: &[&str]) -> 
     }
 }
 
-fn collect(folder: &Path, into: &mut Vec<PathBuf>) {
+pub(super) fn collect(folder: &Path, into: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(folder) else {
         return;
     };

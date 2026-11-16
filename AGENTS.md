@@ -149,6 +149,7 @@ When interacting with a Godot project, agents must adhere to the following workf
    - Run `godot_validate_script` immediately after creating or altering any `.gd` file. Without `project_path`, `godot_create_script` uses the editor's project, else the project the server was started in; it refuses to overwrite without `overwrite: true`.
    - To change an existing script, read it with `godot_read_script` and replace one fragment with `godot_edit_script`, passing the `version` you read. Do not rewrite the file behind the editor's back. An edit is refused while the editor holds unsaved changes to the script: ask the person to save or discard them, then read again.
    - Catch and resolve syntax errors before attempting to run scenes.
+   - Move or rename project files and folders with `godot_move_file` (try `dry_run: true` first), never with shell commands: it moves the `.uid`, `.import` and imported data along and rewrites the `res://` references.
 
 3. **Visual Verification**:
    - Use `godot_capture_viewport` to visually inspect scene changes, layouts, and rendering quality when performing level design or UI assembly.

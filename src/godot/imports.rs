@@ -115,7 +115,8 @@ fn same_recorded_md5(source: &Path, name: &str, cache: &Path) -> bool {
     recorded.eq_ignore_ascii_case(&md5_hex(&bytes))
 }
 
-fn md5_hex(bytes: &[u8]) -> String {
+/// The lowercase hex md5 of `bytes`, as Godot's `md5_text`.
+pub fn md5_hex(bytes: &[u8]) -> String {
     Md5::digest(bytes)
         .iter()
         .map(|byte| format!("{byte:02x}"))

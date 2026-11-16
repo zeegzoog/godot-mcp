@@ -72,6 +72,8 @@ const PARAM_TYPES: Dictionary = {
     "get_input_map": {"action": TYPE_STRING, "include_builtin": TYPE_BOOL},
     "edit_input_action": {"action": TYPE_STRING, "add_events": TYPE_ARRAY, "remove_events": TYPE_ARRAY, "deadzone": TYPE_FLOAT, "create": TYPE_BOOL, "delete": TYPE_BOOL},
     "delete_files": {"paths": TYPE_ARRAY, "force": TYPE_BOOL, "allow_empty_dir": TYPE_BOOL, "dry_run": TYPE_BOOL, "trash": TYPE_BOOL},
+    "move_files_check": {"files": TYPE_ARRAY, "rewrite": TYPE_ARRAY, "binary": TYPE_ARRAY},
+    "move_files_apply": {"files": TYPE_ARRAY, "folders": TYPE_ARRAY, "rewritten": TYPE_ARRAY, "binary": TYPE_ARRAY, "pairs": TYPE_ARRAY},
     "game_send": {"command": TYPE_STRING},
     "close_editor": {"discard": TYPE_BOOL},
     "import_params": {"path": TYPE_STRING, "action": TYPE_STRING, "params": TYPE_DICTIONARY, "copy_from": TYPE_STRING, "reimport": TYPE_BOOL, "importer": TYPE_STRING},
@@ -394,6 +396,10 @@ func dispatch_command(peer: WebSocketPeer, cmd_id: String, cmd_type: String, par
             edit_input_action(peer, cmd_id, params)
         "delete_files":
             delete_files(peer, cmd_id, params)
+        "move_files_check":
+            _send_result(peer, cmd_id, _file_ops().call("move_check", self, params))
+        "move_files_apply":
+            _send_result(peer, cmd_id, _file_ops().call("move_apply", self, params))
         "game_send":
             game_send(peer, cmd_id, params)
         "game_status":
@@ -2265,13 +2271,13 @@ func _send_result(peer: WebSocketPeer, cmd_id: String, result: Dictionary) -> vo
 
 ## Deletes project files with their companions, closing their tabs; see editor/file_ops.gd.
 func delete_files(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
+    _send_result(peer, cmd_id, _file_ops().call("delete", self, params))
+
+## Moves and deletions of project files; see editor/file_ops.gd.
+func _file_ops() -> RefCounted:
     if _file_ops_instance == null:
         _file_ops_instance = (load(FILE_OPS_PATH) as GDScript).new() as RefCounted
-    var result: Dictionary = _file_ops_instance.call("delete", self, params)
-    if result.has("error"):
-        send_error(peer, cmd_id, str(result["error"]))
-        return
-    send_success(peer, cmd_id, result)
+    return _file_ops_instance
 
 func _shader_ops() -> RefCounted:
     if _shader_ops_instance == null:

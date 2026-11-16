@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use super::binary_resource::{BinaryUid, binary_uid, uid_text};
+use super::uid_cache::uids_by_path;
 use crate::paths::skipped_by_godot;
 
 /// Files larger than this are only fingerprinted, never read.
@@ -41,6 +42,11 @@ pub struct TextResourceSnapshot {
     files: BTreeMap<String, Before>,
     loaded: BTreeMap<String, (u64, Option<SystemTime>)>,
     binaries: BTreeMap<String, BinaryBefore>,
+    /// The uid the project's uid cache gives each path whose header carries no uid, unless
+    /// another file's header carries that uid. A file another run rewrote and left without its
+    /// uid (one that was stopped before its repair, or one in a parallel session) still has its
+    /// uid there, and every `uid://` reference to it uses that one.
+    cached: BTreeMap<String, String>,
 }
 
 /// One binary scene or resource before the run.
@@ -56,7 +62,8 @@ struct BinaryBefore {
 pub struct BinaryUidFix {
     /// `res://` path of the file.
     pub path: String,
-    /// The uid it had before the run, or a new one for a file that had none.
+    /// The uid it had before the run (its header's, or the project's uid cache's when the header
+    /// had none), or a new one for a file that had none.
     pub uid: String,
     /// Whether `uid` was created for a file that had none before the run.
     pub new_uid: bool,
@@ -129,11 +136,24 @@ impl TextResourceSnapshot {
                 );
             }
         });
+        let cached = cached_uids(project, &files, &binaries);
         Self {
             files,
             loaded,
             binaries,
+            cached,
         }
+    }
+
+    /// The uid `res` had before the run: its header's, or the uid cache's when the header had
+    /// none (or the file did not exist).
+    fn uid_before(&self, res: &str) -> Option<String> {
+        let header = match self.binaries.get(res).map(|old| &old.uid) {
+            Some(BinaryUid::Uid(uid)) => Some(uid.clone()),
+            Some(_) => None,
+            None => self.files.get(res).and_then(|old| old.uid.clone()),
+        };
+        header.or_else(|| self.cached.get(res).cloned())
     }
 
     /// The binary scenes and resources written or created since the snapshot, with their files.
@@ -165,14 +185,21 @@ impl TextResourceSnapshot {
             if now == BinaryUid::Unreadable {
                 continue;
             }
-            let fix = match self.binaries.get(&res).map(|old| &old.uid) {
-                Some(BinaryUid::Uid(old)) if now != BinaryUid::Uid(old.clone()) => BinaryUidFix {
+            if self
+                .binaries
+                .get(&res)
+                .is_some_and(|old| old.uid == BinaryUid::Unreadable)
+            {
+                continue;
+            }
+            let fix = match self.uid_before(&res) {
+                Some(old) if now != BinaryUid::Uid(old.clone()) => BinaryUidFix {
                     path: res,
-                    uid: old.clone(),
+                    uid: old,
                     new_uid: false,
                 },
-                Some(BinaryUid::Uid(_)) => continue,
-                _ if now == BinaryUid::Missing => BinaryUidFix {
+                Some(_) => continue,
+                None if now == BinaryUid::Missing => BinaryUidFix {
                     path: res,
                     uid: new_uid(),
                     new_uid: true,
@@ -236,12 +263,20 @@ impl TextResourceSnapshot {
     pub fn damage_since(&self, project: &Path) -> Vec<ResourceDamage> {
         let mut found = Vec::new();
         for (res, _, text) in self.changed_since(project) {
-            if let Some(damage) = inspect(project, &res, &text, self.files.get(&res)) {
+            let uid = self.uid_before(&res);
+            if let Some(damage) = inspect(project, &res, &text, self.files.get(&res), uid) {
                 found.push(damage);
             }
         }
         for (res, file) in self.binaries_changed_since(project) {
-            let Some(BinaryUid::Uid(old)) = self.binaries.get(&res).map(|old| &old.uid) else {
+            if self
+                .binaries
+                .get(&res)
+                .is_some_and(|old| old.uid == BinaryUid::Unreadable)
+            {
+                continue;
+            }
+            let Some(old) = self.uid_before(&res) else {
                 continue;
             };
             if binary_uid(&file) != BinaryUid::Uid(old.clone()) {
@@ -273,7 +308,7 @@ impl TextResourceSnapshot {
             if !is_resource_header(header) || attribute(header, "uid").is_some() {
                 continue;
             }
-            let entry = match self.files.get(res).and_then(|old| old.uid.clone()) {
+            let entry = match self.uid_before(res) {
                 Some(uid) => (uid, false),
                 None => (new_uid(), true),
             };
@@ -365,11 +400,10 @@ fn inspect(
     res: &str,
     text: &str,
     before: Option<&Before>,
+    uid_before: Option<String>,
 ) -> Option<ResourceDamage> {
     let header = text.lines().next().unwrap_or("");
-    let lost_uid = before
-        .and_then(|old| old.uid.clone())
-        .filter(|_| attribute(header, "uid").is_none());
+    let lost_uid = uid_before.filter(|_| attribute(header, "uid").is_none());
     let mut ext_resources_without_uid = Vec::new();
     let mut null_shader_parameters = Vec::new();
     for line in text.lines() {
@@ -442,6 +476,38 @@ fn uid_of(project: &Path, target: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// The uids the project's uid cache gives the paths whose header has none (or that do not exist
+/// yet), leaving out a uid another file's header carries: that file owns it now.
+fn cached_uids(
+    project: &Path,
+    files: &BTreeMap<String, Before>,
+    binaries: &BTreeMap<String, BinaryBefore>,
+) -> BTreeMap<String, String> {
+    let mut cached = uids_by_path(project);
+    if cached.is_empty() {
+        return cached;
+    }
+    let mut owners: BTreeMap<&str, &str> = BTreeMap::new();
+    for (res, old) in files {
+        if let Some(uid) = &old.uid {
+            owners.insert(uid, res);
+        }
+    }
+    for (res, old) in binaries {
+        if let BinaryUid::Uid(uid) = &old.uid {
+            owners.insert(uid, res);
+        }
+    }
+    cached.retain(|res, uid| {
+        let has_own = files.get(res).is_some_and(|old| old.uid.is_some())
+            || binaries
+                .get(res)
+                .is_some_and(|old| old.uid != BinaryUid::Missing);
+        !has_own && owners.get(uid.as_str()).is_none_or(|owner| owner == res)
+    });
+    cached
 }
 
 /// The file of a `res://` path inside `project`, refusing `..` and empty parts.
@@ -893,6 +959,85 @@ shader_parameter/speed = 3.0
         assert_eq!(repairs.len(), 1, "{repairs:?}");
         assert_eq!(repairs[0].path, "res://gate.scn");
         assert!(snapshot.damage_since(root).is_empty());
+    }
+
+    /// Writes `.godot/uid_cache.bin` with `(uid, res path)` entries, in Godot's format.
+    fn write_uid_cache(root: &Path, entries: &[(&str, &str)]) {
+        let mut bytes = (entries.len() as u32).to_le_bytes().to_vec();
+        for (uid, path) in entries {
+            let id = super::super::uid_cache::uid_id(uid).expect("uid");
+            bytes.extend_from_slice(&id.to_le_bytes());
+            bytes.extend_from_slice(&(path.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(path.as_bytes());
+        }
+        fs::create_dir_all(root.join(".godot")).expect("dir");
+        fs::write(root.join(".godot/uid_cache.bin"), bytes).expect("cache");
+    }
+
+    #[test]
+    fn a_file_left_without_its_uid_by_an_earlier_write_gets_the_cached_uid_back() {
+        use super::super::binary_resource::tests::rsrc;
+        let project = tempfile::tempdir().expect("project");
+        let root = project.path();
+        // An earlier headless write (a run stopped before its repair, or one in another session)
+        // left both files without their uid; the uid cache and every reference still use it.
+        fs::write(root.join("zone.tscn"), HEADLESS_SAVED).expect("zone");
+        fs::write(root.join("zone_mesh.res"), rsrc(None)).expect("mesh");
+        write_uid_cache(
+            root,
+            &[
+                ("uid://cpond", "res://zone.tscn"),
+                ("uid://dap714cpjw8pd", "res://zone_mesh.res"),
+            ],
+        );
+        let snapshot = TextResourceSnapshot::take(root);
+
+        fs::write(root.join("zone.tscn"), HEADLESS_SAVED.replace("3.0", "4.0")).expect("zone");
+        fs::write(
+            root.join("zone_mesh.res"),
+            [rsrc(None), vec![1; 50]].concat(),
+        )
+        .expect("mesh");
+        let plan = snapshot.binary_uid_plan(root);
+        assert_eq!(
+            plan,
+            vec![BinaryUidFix {
+                path: "res://zone_mesh.res".into(),
+                uid: "uid://dap714cpjw8pd".into(),
+                new_uid: false,
+            }]
+        );
+        let damage = snapshot.damage_since(root);
+        let lost: Vec<_> = damage.iter().map(|item| item.lost_uid.as_deref()).collect();
+        assert_eq!(lost, [Some("uid://cpond"), Some("uid://dap714cpjw8pd")]);
+        let repairs = snapshot.repair_since(root);
+        assert_eq!(repairs.len(), 1, "{repairs:?}");
+        assert_eq!(repairs[0].uid.as_deref(), Some("uid://cpond"));
+        assert!(!repairs[0].new_uid);
+        let text = fs::read_to_string(root.join("zone.tscn")).expect("zone");
+        assert!(
+            text.starts_with("[gd_scene format=3 uid=\"uid://cpond\"]"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_cached_uid_another_file_now_carries_is_not_reused() {
+        let project = tempfile::tempdir().expect("project");
+        let root = project.path();
+        fs::write(root.join("old.tscn"), HEADLESS_SAVED).expect("old");
+        fs::write(
+            root.join("other.tscn"),
+            "[gd_scene format=3 uid=\"uid://cpond\"]\n",
+        )
+        .expect("other");
+        write_uid_cache(root, &[("uid://cpond", "res://old.tscn")]);
+        let snapshot = TextResourceSnapshot::take(root);
+        fs::write(root.join("old.tscn"), HEADLESS_SAVED.replace("3.0", "4.0")).expect("old");
+        let repairs = snapshot.repair_since(root);
+        assert_eq!(repairs.len(), 1, "{repairs:?}");
+        assert!(repairs[0].new_uid, "{repairs:?}");
+        assert_ne!(repairs[0].uid.as_deref(), Some("uid://cpond"));
     }
 
     /// How long a snapshot of a large project takes: GODOT_MCP_TIME_SNAPSHOT=<project dir>.

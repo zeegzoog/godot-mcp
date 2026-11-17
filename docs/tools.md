@@ -86,6 +86,17 @@ Every tool takes only the parameters its schema lists (`additionalProperties: fa
 | `godot_draft_feedback` | — | Turns the notes into one report for the maintainers and shows it to you. Sends nothing. |
 | `godot_submit_feedback` | — | Publishes a draft as a GitHub issue, only after you said yes. Not available in `draft` mode. |
 
+## Calls at the same time
+
+The server runs every tool call as its own task, so calls a client sends together work at the same time. Each `godot_run_script` starts its own headless Godot, so a long job split into parts (`user_args` naming the part, each part writing its own files) takes about as long as its slowest part. In one project:
+
+- A run's uid repair, and its write to `.godot/uid_cache.bin`, waits until no other Godot process of this server works in the project: another run may still be writing its files. So a run whose process ends first answers when the others have finished too, and its `overlapped` says so; its `resource_repairs`, `editor_refresh` and `resource_damage` may then name files another run wrote.
+- Each run keeps its own output logs: `script-run.stdout.log` for the first, `script-run-2.stdout.log` for a second one at the same time, and so on.
+- `godot --import` (`godot_resave_resources` without an editor, `godot_set_import_params`, the import before `godot_export_project`) and the export itself wait for the running scripts and run alone; a script sent meanwhile waits for them.
+- `godot_run_project` (mode `process`) and `godot_run_pack` run alongside everything else; they only wait for an import or export already running in the project.
+
+Different projects never wait for each other. A client that sends calls one at a time, for example one that runs only read-only tools in parallel, gets the runs one after the other: send the parts from separate agents, or from one client that sends them together.
+
 ## Exporting
 
 The export tools run the Godot binary named by `GODOT_PATH`, headless; it must be an editor build. Presets live in `export_presets.cfg`, which Godot reads and writes (its `ConfigFile`), so a preset made here is the same as one made in Project > Export.

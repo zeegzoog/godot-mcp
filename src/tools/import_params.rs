@@ -84,7 +84,7 @@ pub fn catalog() -> Vec<Tool> {
         ),
         super::tool(
             SET,
-            "Changes a file's import parameters and, with importer, the importer itself (the Import dock's \"Import As\"), then reimports it: the given options in the [params] section of its .import sidecar are set, after copying every parameter of copy_from's .import when it is given (both files must use the same importer). An option keeps the type it holds: a whole number becomes an int unless the option holds a float, and a string such as \"Vector2(1, 1)\" becomes the option's type when it is a vector, color, rect or packed array. With the editor holding the project, the change goes through the editor's file system (the Import dock and the loaded resource follow); else Godot's ConfigFile edits the file and godot --headless --import reimports it. The importer keeps only the options it has, so check ignored_options (names it dropped: a typo or another importer's option) and new_options (names the file did not hold before). A new importer starts from its own default options, as in the dock (the old params are dropped, then copy_from and params apply); its name is checked against Godot's importers for the file type, and the answer gives importer, previous_importer and type (the resource class now imported). A file with no .import yet is refused: import it with godot_resave_resources first. Examples: path res://sky.png, params {\"compress/mode\": 2, \"compress/high_quality\": true} for VRAM-compressed textures; path res://lut.png, importer \"3d_texture\", params {\"slices/horizontal\": 33, \"slices/vertical\": 1} for a Texture3D from a strip of 33 slices.",
+            "Changes a file's import parameters and, with importer, the importer itself (the Import dock's \"Import As\"), then reimports it: the given options in the [params] section of its .import sidecar are set, after copying every parameter of copy_from's .import when it is given (both files must use the same importer). An option keeps the type it holds: a whole number becomes an int unless the option holds a float, and a string such as \"Vector2(1, 1)\" becomes the option's type when it is a vector, color, rect or packed array. With the editor holding the project, the change goes through the editor's file system (the Import dock and the loaded resource follow); else Godot's ConfigFile edits the file and godot --headless --import reimports it. The importer keeps only the options it has, so check ignored_options (names it dropped: a typo or another importer's option) and new_options (names the file did not hold before). A new importer starts from its own default options, as in the dock (the old params are dropped, then copy_from and params apply); its name is checked against Godot's importers for the file type, and the answer gives importer, previous_importer and type (the resource class now imported). A file with no .import yet is refused: import it with godot_resave_resources first. Examples: path res://sky.png, params {\"compress/mode\": 2, \"compress/high_quality\": true} for VRAM-compressed textures; path res://lut.png, importer \"3d_texture\", params {\"slices/horizontal\": 33, \"slices/vertical\": 1} for a Texture3D from a strip of 33 slices. The headless reimport waits for the godot_run_script calls working in the project to finish, and runs alone there.",
             json!({
                 "path": path,
                 "params": {
@@ -274,10 +274,13 @@ async fn set(tools: &ToolManager, args: &Value) -> ToolResult {
                     .and_then(Value::as_u64)
                     .unwrap_or(DEFAULT_TIMEOUT_SECONDS),
             );
+            // The import rewrites .godot: it waits for the script runs working in the project.
+            let alone = tools.gates.exclusive(&project).await;
             let run = match tools.cli.import_project_within(&project, limit).await {
                 Ok(run) => readable(run),
                 Err(error) => return godot_failed(&error),
             };
+            drop(alone);
             report["import"] = import_report(&run);
             report["reimported"] = json!(!run.timed_out && run.exit_code == Some(0));
             if run.timed_out || run.exit_code != Some(0) {

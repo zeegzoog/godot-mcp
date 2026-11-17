@@ -17,10 +17,56 @@ const SCRIPT_OUTPUT_CAP: usize = 64 * 1024;
 /// prints far more than a script before it is stopped.
 const PACK_OUTPUT_CAP: usize = 1024 * 1024;
 /// Where a `godot_run_script` stream that outgrew [`SCRIPT_OUTPUT_CAP`] is kept whole, inside the
-/// project's cache folder. The next run replaces the files.
+/// project's cache folder, in files of the run's [`LogSlot`]. The next run in the slot replaces
+/// them.
 const SCRIPT_LOG_DIR: &str = ".godot/godot-mcp";
-const SCRIPT_STDOUT_LOG: &str = "script-run.stdout.log";
-const SCRIPT_STDERR_LOG: &str = "script-run.stderr.log";
+
+/// The log slots in use, by log folder: script runs in one project that work at the same time
+/// each take the lowest free slot, so they never write or remove each other's logs.
+static LOG_SLOTS: Mutex<Vec<(PathBuf, usize)>> = Mutex::new(Vec::new());
+
+/// A running script's pair of log files: slot 1 is `script-run.stdout.log` and
+/// `script-run.stderr.log`, slot 2 `script-run-2.stdout.log` and so on. Freed when dropped.
+struct LogSlot {
+    dir: PathBuf,
+    slot: usize,
+}
+
+impl LogSlot {
+    fn take(dir: PathBuf) -> Self {
+        let mut slots = lock_ignoring_poison(&LOG_SLOTS);
+        let slot = (1..)
+            .find(|candidate| {
+                !slots
+                    .iter()
+                    .any(|(used_dir, used)| used_dir == &dir && used == candidate)
+            })
+            .unwrap_or(1);
+        slots.push((dir.clone(), slot));
+        Self { dir, slot }
+    }
+
+    fn file(&self, stream: &str) -> PathBuf {
+        let name = if self.slot == 1 {
+            format!("script-run.{stream}.log")
+        } else {
+            format!("script-run-{}.{stream}.log", self.slot)
+        };
+        self.dir.join(name)
+    }
+}
+
+impl Drop for LogSlot {
+    fn drop(&mut self) {
+        let mut slots = lock_ignoring_poison(&LOG_SLOTS);
+        if let Some(index) = slots
+            .iter()
+            .position(|(dir, slot)| dir == &self.dir && *slot == self.slot)
+        {
+            slots.swap_remove(index);
+        }
+    }
+}
 /// A script printing without end must not fill the disk: its log stops here.
 const SCRIPT_LOG_CAP: u64 = 256 * 1024 * 1024;
 /// Output reaches the MCP client at most this often; the answer holds every line anyway.
@@ -905,9 +951,10 @@ impl CliRunner {
         timeout_seconds: u64,
         fixed_fps: Option<u32>,
     ) -> Result<ScriptRun> {
-        let log_dir = project_path.join(SCRIPT_LOG_DIR);
-        for name in [SCRIPT_STDOUT_LOG, SCRIPT_STDERR_LOG] {
-            let _ = std::fs::remove_file(log_dir.join(name));
+        let slot = LogSlot::take(project_path.join(SCRIPT_LOG_DIR));
+        let logs = [slot.file("stdout"), slot.file("stderr")];
+        for file in &logs {
+            let _ = std::fs::remove_file(file);
         }
         let fixed_fps = fixed_fps.map(|fps| fps.to_string());
         let mut options = vec!["--headless"];
@@ -921,7 +968,7 @@ impl CliRunner {
                 script_path,
                 user_args,
                 timeout_seconds,
-                Some(&log_dir),
+                Some(logs),
             )
             .await?;
         run.stdout_buffered = project_buffers_stdout(project_path);
@@ -973,7 +1020,7 @@ impl CliRunner {
         script_path: &Path,
         user_args: &[String],
         timeout_seconds: u64,
-        log_dir: Option<&Path>,
+        logs: Option<[PathBuf; 2]>,
     ) -> Result<ScriptRun> {
         let mut cmd = Command::new(&self.godot_binary);
         cmd.args(options)
@@ -1010,17 +1057,19 @@ impl CliRunner {
         let stderr_buf = Arc::new(Mutex::new(Vec::new()));
         let stdout_stream: Arc<Mutex<StreamRecord>> = Arc::default();
         let stderr_stream: Arc<Mutex<StreamRecord>> = Arc::default();
+        let [stdout_log, stderr_log] =
+            logs.map_or([None, None], |[out, err]| [Some(out), Some(err)]);
         let stdout_task = tokio::spawn(read_stream(
             child.stdout.take(),
             Arc::clone(&stdout_buf),
             Arc::clone(&stdout_stream),
-            log_dir.map(|dir| (dir.to_path_buf(), SCRIPT_STDOUT_LOG)),
+            stdout_log,
         ));
         let stderr_task = tokio::spawn(read_stream(
             child.stderr.take(),
             Arc::clone(&stderr_buf),
             Arc::clone(&stderr_stream),
-            log_dir.map(|dir| (dir.to_path_buf(), SCRIPT_STDERR_LOG)),
+            stderr_log,
         ));
         let mut progress = progress::current().map(ScriptProgress::new);
 
@@ -1697,13 +1746,13 @@ fn lock_ignoring_poison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// Reads a script's stream as it is written, keeping the last [`SCRIPT_OUTPUT_CAP`] bytes in
-/// memory. Once the stream outgrows them and `log` names a directory and a file, everything it
-/// carried goes there, up to [`SCRIPT_LOG_CAP`]: an ordinary run writes no file.
+/// memory. Once the stream outgrows them and `log` names a file, everything it carried goes
+/// there, up to [`SCRIPT_LOG_CAP`]: an ordinary run writes no file.
 async fn read_stream<R>(
     pipe: Option<R>,
     into: Arc<Mutex<Vec<u8>>>,
     record: Arc<Mutex<StreamRecord>>,
-    log: Option<(PathBuf, &'static str)>,
+    log: Option<PathBuf>,
 ) where
     R: AsyncRead + Unpin,
 {
@@ -1734,18 +1783,15 @@ async fn read_stream<R>(
             continue;
         }
         let written = match (first_part, &log, &mut file) {
-            (Some(first_part), Some((dir, name)), _) => {
-                let path = dir.join(name);
-                match open_log(dir, &path).await {
-                    Ok(mut opened) => {
-                        let result = write_log(&mut opened, &first_part, &mut logged).await;
-                        file = Some(opened);
-                        lock_ignoring_poison(&record).log = Some(path);
-                        result
-                    }
-                    Err(err) => Err(err),
+            (Some(first_part), Some(path), _) => match open_log(path).await {
+                Ok(mut opened) => {
+                    let result = write_log(&mut opened, &first_part, &mut logged).await;
+                    file = Some(opened);
+                    lock_ignoring_poison(&record).log = Some(path.clone());
+                    result
                 }
-            }
+                Err(err) => Err(err),
+            },
             (None, _, Some(open)) => write_log(open, &chunk[..n], &mut logged).await,
             _ => Ok(()),
         };
@@ -1757,8 +1803,10 @@ async fn read_stream<R>(
     }
 }
 
-async fn open_log(dir: &Path, path: &Path) -> std::io::Result<tokio::fs::File> {
-    tokio::fs::create_dir_all(dir).await?;
+async fn open_log(path: &Path) -> std::io::Result<tokio::fs::File> {
+    if let Some(dir) = path.parent() {
+        tokio::fs::create_dir_all(dir).await?;
+    }
     tokio::fs::File::create(path).await
 }
 

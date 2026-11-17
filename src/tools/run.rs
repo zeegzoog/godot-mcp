@@ -138,6 +138,7 @@ impl ToolManager {
             .unwrap_or(false);
         let held = args.get("held").and_then(Value::as_bool).unwrap_or(false);
         let notice = self.import_notice(&path).await;
+        self.gates.settle(&path).await;
         match self
             .games
             .start(

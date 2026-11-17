@@ -65,6 +65,8 @@ AI client <-stdio JSON-RPC-> godot-mcp <-WebSocket :<bridge port>-> addons/godot
                                  +-> Godot binary (headless fallback)
 ```
 
+Tool calls run concurrently: several `godot_run_script` calls sent together each start their own headless Godot, and only the steps that rewrite shared project files (the uid repair, `godot --import`, exports) wait for each other within one project ([docs/tools.md](docs/tools.md#calls-at-the-same-time)).
+
 Game tools reach a game through Godot's remote debugger: a managed process connects to this server on loopback, and the plugin relays editor Play.
 
 ## Contributing

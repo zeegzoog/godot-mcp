@@ -38,7 +38,7 @@ pub fn handles(name: &str) -> bool {
 pub fn catalog() -> Vec<Tool> {
     vec![super::tool(
         RUN_PACK,
-        "Smoke-runs an exported pack (.pck or .zip, as godot_export_project writes it) with the configured Godot binary: godot --main-pack <pack>, headless by default, from an empty temporary folder, and stops it after seconds (default 10). Use it to check a trimmed export (export_filter resources or scenes) for files the game loads by a path no scene names, which the pack then lacks. Returns ok, ran_full_time (true when the game was still running and was stopped), the exit code, the duration, missing_resources (the res:// or uid:// paths of failed loads such as \"Resource file not found\" and \"Can't open file from path\", each once), the ERROR and WARNING lines, and the last part of stdout and stderr. ok is false, and the answer an error, when a file was missing, Godot logged an error, or the game quit early with a non-zero exit code or crashed. A game that quits on its own with exit code 0 before seconds is ok. The game's user:// folder is the one its project settings name, as for any run of the game. Not a managed run: godot_get_run_status does not list it, and it cannot be inspected while it runs; use godot_run_project for that.",
+        "Smoke-runs an exported pack (.pck or .zip, as godot_export_project writes it) with the configured Godot binary: godot --main-pack <pack>, headless by default, from an empty temporary folder, and stops it after seconds (default 10). Use it to check a trimmed export (export_filter resources or scenes) for files the game loads by a path no scene names, which the pack then lacks. Returns ok, ran_full_time (true when the game was still running and was stopped), the exit code, the duration, missing_resources (the res:// or uid:// paths of failed loads such as \"Resource file not found\" and \"Can't open file from path\", each once), the ERROR and WARNING lines, and the last part of stdout and stderr. ok is false, and the answer an error, when a file was missing, Godot logged an error, or the game quit early with a non-zero exit code or crashed. A game that quits on its own with exit code 0 before seconds is ok. The game's user:// folder is the one its project settings name, as for any run of the game. Not a managed run: godot_get_run_status does not list it, and it cannot be inspected while it runs; use godot_run_project for that. It runs alongside other calls; it starts once an export running in the same project has finished.",
         json!({
             "pack_path": {"type": "string", "description": "The pack to run, inside the project, as a res:// path or relative to the project, such as build/game.pck. Must end in .pck or .zip."},
             "scene": {"type": "string", "description": "res:// path of a scene in the pack to start instead of the main scene (--scene)."},
@@ -124,6 +124,8 @@ pub async fn call(tools: &ToolManager, args: Value) -> ToolResult {
     }
     // Godot gets an absolute path, which never starts with '-'.
     let pack = std::path::absolute(&pack).unwrap_or(pack);
+    // An export writing this pack finishes first; the run itself holds nothing.
+    tools.gates.settle(&project).await;
 
     let run = match tools
         .cli

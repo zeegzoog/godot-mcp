@@ -3,6 +3,7 @@
 
 use super::exit_leaks::{EXIT_LEAK_HINT, collapse_exit_leaks};
 use super::main_loop::main_loop_problem;
+use super::project_gate::ScriptTurn;
 use super::run::StaleImports;
 use super::{ToolManager, bridge_error_result, code, missing_argument, str_arg, user_args_of};
 use crate::cli_runner::{ScriptErrorLoc, ScriptRun, binary_uid_limit, script_load_failure};
@@ -156,6 +157,9 @@ struct RepairReport {
     uid_cache_recorded: Option<usize>,
     /// Why `.godot/uid_cache.bin` may still lack the repaired uids, with the remedy.
     uid_cache_stale: Option<String>,
+    /// Whether another script run worked in the project at the same time, so the repair waited
+    /// for it and the lists may name its files.
+    overlapped: bool,
 }
 
 impl RepairReport {
@@ -342,6 +346,9 @@ fn plural(count: usize, noun: &str) -> String {
     }
 }
 
+/// Said when another script run worked in the same project at the same time.
+const OVERLAP_NOTE: &str = "another godot_run_script worked in this project at the same time: this run's repair waited for it to finish writing, and resource_repairs, editor_refresh and resource_damage may name files that run wrote";
+
 fn script_run_result(
     report: &ScriptRun,
     script_res: &str,
@@ -462,6 +469,7 @@ fn script_run_result(
             "reimported": stale.reimported(),
         })),
         "import_warning": import_warning,
+        "overlapped": repair.overlapped.then_some(OVERLAP_NOTE),
     });
     let mut text = serde_json::to_string_pretty(&body).unwrap_or(summary);
     if let Some(warning) = import_warning {
@@ -1021,6 +1029,9 @@ impl ToolManager {
             );
         }
         let force = args.get("force").and_then(Value::as_bool) == Some(true);
+        // The import rewrites .godot and the imported files: it waits for the script runs working
+        // in the project and keeps new ones from starting until it is done.
+        let alone = self.gates.exclusive(&project).await;
         let mut forced = Vec::new();
         if force {
             for path in &wanted {
@@ -1057,6 +1068,7 @@ impl ToolManager {
             }
         };
         let imported = changed_imports(&before, &import_fingerprints(&project));
+        drop(alone);
         let mut not_scanned = Vec::new();
         for path in &wanted {
             if imported.iter().any(|item| item == path) {
@@ -1114,11 +1126,57 @@ impl ToolManager {
     /// every scene, resource, script and shader the script wrote when it holds the same project,
     /// so its file system, uid cache and loaded resources follow the files: a material that uses
     /// a rewritten shader sees its new uniforms and defaults before the next scene save.
-    async fn repair_resources(
-        &self,
-        project: &Path,
-        snapshot: &TextResourceSnapshot,
-    ) -> RepairReport {
+    ///
+    /// The files are repaired and the uid cache written while no other Godot process works in
+    /// the project (another script run may still be writing its files); the editor is asked with
+    /// no guard held.
+    async fn repair_resources(&self, project: &Path, turn: &ScriptTurn) -> RepairReport {
+        let snapshot = turn.snapshot();
+        let mut report = {
+            let _alone = turn.exclusive().await;
+            self.repair_files(project, snapshot).await
+        };
+        if report.written.is_empty() {
+            return report;
+        }
+        let holds_project = match self
+            .bridge
+            .send_command("get_project_info", json!({}))
+            .await
+        {
+            Ok(info) => info
+                .get("project_dir")
+                .and_then(Value::as_str)
+                .is_some_and(|dir| same_directory(project, Path::new(dir))),
+            Err(_) => false,
+        };
+        if !holds_project {
+            let _alone = turn.exclusive().await;
+            (report.uid_cache_recorded, report.uid_cache_stale) =
+                record_repaired_uids(project, &report.repairs);
+            return report;
+        }
+        let bridge = self.bridge.clone().with_timeout(Self::RESAVE_BRIDGE_WAIT);
+        match bridge
+            .send_command("resave_resources", json!({"paths": report.written}))
+            .await
+        {
+            Ok(answer) => report.editor = Some(answer),
+            Err(error) => {
+                report.editor_error = Some(error.to_string());
+                if report.repairs.iter().any(|item| item.uid.is_some()) {
+                    report.uid_cache_stale = Some(format!(
+                        "uid_cache_stale: the editor holding the project did not refresh the repaired files, so its uid cache may lack their uids. {UID_CACHE_REMEDY}"
+                    ));
+                }
+            }
+        }
+        report
+    }
+
+    /// The file part of [`Self::repair_resources`]: binary uids first, so a rewritten text scene
+    /// that refers to one finds its uid again, then the text scenes and resources.
+    async fn repair_files(&self, project: &Path, snapshot: &TextResourceSnapshot) -> RepairReport {
         // Binary files first, so a rewritten text scene that refers to one finds its uid again.
         let plan = snapshot.binary_uid_plan(project);
         let mut binary_error = None;
@@ -1149,7 +1207,7 @@ impl ToolManager {
         }
         repairs.extend(snapshot.repair_since(project));
         repairs.sort_by(|a, b| a.path.cmp(&b.path));
-        let mut report = RepairReport {
+        RepairReport {
             repairs,
             written: snapshot.written_since(project),
             editor: None,
@@ -1157,42 +1215,8 @@ impl ToolManager {
             binary_error,
             uid_cache_recorded: None,
             uid_cache_stale: None,
-        };
-        if report.written.is_empty() {
-            return report;
+            overlapped: false,
         }
-        let holds_project = match self
-            .bridge
-            .send_command("get_project_info", json!({}))
-            .await
-        {
-            Ok(info) => info
-                .get("project_dir")
-                .and_then(Value::as_str)
-                .is_some_and(|dir| same_directory(project, Path::new(dir))),
-            Err(_) => false,
-        };
-        if !holds_project {
-            (report.uid_cache_recorded, report.uid_cache_stale) =
-                record_repaired_uids(project, &report.repairs);
-            return report;
-        }
-        let bridge = self.bridge.clone().with_timeout(Self::RESAVE_BRIDGE_WAIT);
-        match bridge
-            .send_command("resave_resources", json!({"paths": report.written}))
-            .await
-        {
-            Ok(answer) => report.editor = Some(answer),
-            Err(error) => {
-                report.editor_error = Some(error.to_string());
-                if report.repairs.iter().any(|item| item.uid.is_some()) {
-                    report.uid_cache_stale = Some(format!(
-                        "uid_cache_stale: the editor holding the project did not refresh the repaired files, so its uid cache may lack their uids. {UID_CACHE_REMEDY}"
-                    ));
-                }
-            }
-        }
-        report
     }
 
     pub(super) async fn handle_run_script(&self, args: Value) -> ToolResult {
@@ -1253,15 +1277,22 @@ impl ToolManager {
         // reimported (or reported) before it starts, and before the snapshot, so a reimport is
         // not taken for the script's own writes.
         let imports = self.check_imports(&project.dir).await;
-        let snapshot = TextResourceSnapshot::take(&project.dir);
-        match self
+        // Other script runs in the project may work at the same time; a repair or an import
+        // waits for them, and they wait for it.
+        let (turn, running) = self.gates.begin_script(&project.dir).await;
+        let run = self
             .cli
             .run_script(&project.dir, &file, &user_args, timeout_seconds, fixed_fps)
-            .await
-        {
+            .await;
+        drop(running);
+        match run {
             Ok(report) => {
-                let repair = self.repair_resources(&project.dir, &snapshot).await;
-                let damage = snapshot.damage_since(&project.dir);
+                let mut repair = self.repair_resources(&project.dir, &turn).await;
+                repair.overlapped = turn.overlapped();
+                let damage = {
+                    let _alone = turn.exclusive().await;
+                    turn.snapshot().damage_since(&project.dir)
+                };
                 script_run_result(
                     &report,
                     &script_res,
@@ -1301,6 +1332,7 @@ mod tests {
             binary_error: None,
             uid_cache_recorded: None,
             uid_cache_stale: None,
+            overlapped: false,
         };
         let answer = report.editor_refresh().expect("answer");
         assert_eq!(answer["mode"], "refresh");

@@ -100,7 +100,7 @@ pub fn catalog() -> Vec<Tool> {
         ),
         super::tool(
             EXPORT,
-            "Exports the project headless with one of its presets: mode pack runs godot --export-pack (a .pck or .zip of the project data, no export template needed), release runs --export-release and debug runs --export-debug (both need the platform's export templates, or the preset's custom_template options). Runs godot --headless --import first (import false skips it; it is skipped while the editor has the project open, since that editor keeps the imports current). Returns ok, the output path and size_bytes, the exit code, the duration, the ERROR and WARNING lines, and the last lines of Godot's output. A missing preset, a missing export template, a failed import, an export that wrote no file or a timeout is an error with the log. output_path defaults to the preset's export_path and must resolve inside the project (such as build/game.pck); its folder is created. An existing file there is replaced.",
+            "Exports the project headless with one of its presets: mode pack runs godot --export-pack (a .pck or .zip of the project data, no export template needed), release runs --export-release and debug runs --export-debug (both need the platform's export templates, or the preset's custom_template options). Runs godot --headless --import first (import false skips it; it is skipped while the editor has the project open, since that editor keeps the imports current). Returns ok, the output path and size_bytes, the exit code, the duration, the ERROR and WARNING lines, and the last lines of Godot's output. A missing preset, a missing export template, a failed import, an export that wrote no file or a timeout is an error with the log. output_path defaults to the preset's export_path and must resolve inside the project (such as build/game.pck); its folder is created. An existing file there is replaced. The import and the export wait for the godot_run_script calls working in the project to finish, and run alone there until the file is written: a script started meanwhile waits. Other projects never wait.",
             json!({
                 "preset": {"type": "string", "description": "Name of the export preset; godot_list_export_presets lists them."},
                 "mode": {"type": "string", "enum": ["pack", "release", "debug"], "description": "pack (default): .pck or .zip data only. release or debug: the exported game with an export template."},
@@ -371,9 +371,13 @@ async fn export(tools: &ToolManager, args: &Value) -> ToolResult {
     });
 
     let wants_import = args.get("import").and_then(Value::as_bool).unwrap_or(true);
+    let editor_imports = wants_import && editor_has_project(tools, &project).await;
+    // The import rewrites .godot and the export packs every file, so both wait for the script
+    // runs working in the project and keep new ones from starting until the pack is written.
+    let _alone = tools.gates.exclusive(&project).await;
     if !wants_import {
         report["import"] = json!({"ran": false, "reason": "import false was passed"});
-    } else if editor_has_project(tools, &project).await {
+    } else if editor_imports {
         report["import"] = json!({
             "ran": false,
             "reason": "the editor has the project open and keeps its imports current"

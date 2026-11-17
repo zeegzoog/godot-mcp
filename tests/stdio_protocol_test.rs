@@ -491,3 +491,265 @@ async fn initialize_carries_short_guidance_that_names_the_tools_of_the_mode() {
 
     assert!(guidance(Some("off")).await.is_none());
 }
+
+/// A stand-in for Godot that prints the arguments after `--`, waits two seconds and prints them
+/// again, so overlapping runs are seen by their total time.
+#[cfg(unix)]
+fn echoing_slow_godot(dir: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("echoing_slow_godot.sh");
+    std::fs::write(
+        &path,
+        "#!/bin/sh\nwhile [ \"$1\" != \"--\" ] && [ $# -gt 0 ]; do shift; done\nshift\necho \"start $*\"\nsleep 2\necho \"end $*\"\necho \"err $*\" >&2\n",
+    )
+    .expect("write echoing godot");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod echoing godot");
+    path
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn two_script_runs_sent_together_overlap_and_each_reports_its_own_output() {
+    let project = project_dir();
+    std::fs::write(project.path().join("zones.gd"), "extends SceneTree\n").expect("script");
+    let godot = echoing_slow_godot(project.path());
+    let mut session = Session::start(free_port(), &godot).await;
+    let started = std::time::Instant::now();
+    for (id, part) in [(41, "part-a"), (42, "part-b")] {
+        session
+            .send(&json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{
+                "name": "godot_run_script",
+                "arguments": {"script": "zones.gd", "project_path": project.path(), "user_args": [part]},
+            }}))
+            .await;
+    }
+    let mut answers = std::collections::HashMap::new();
+    while answers.len() < 2 {
+        let frame = session
+            .recv(Duration::from_secs(30))
+            .await
+            .expect("both runs answer");
+        if let Some(id) = frame["id"].as_i64() {
+            answers.insert(id, frame);
+        }
+    }
+    let elapsed = started.elapsed();
+    // Each run takes two seconds; one after the other they would take four.
+    assert!(
+        elapsed < Duration::from_millis(3500),
+        "the runs did not overlap: {elapsed:?}"
+    );
+    for (id, part, other) in [(41, "part-a", "part-b"), (42, "part-b", "part-a")] {
+        let answer = &answers[&id];
+        assert!(!is_tool_error(answer), "{answer}");
+        let text = common::tool_text(answer);
+        assert!(text.contains(&format!("start {part}")), "{text}");
+        assert!(text.contains(&format!("end {part}")), "{text}");
+        assert!(text.contains(&format!("err {part}")), "{text}");
+        assert!(!text.contains(other), "run {part} reports {other}: {text}");
+    }
+}
+
+/// A stand-in for headless Godot that saves `<name>.tscn` in the project without its uid, as a
+/// headless save does, prints `lines` lines naming it, waits `seconds` and exits. The arguments
+/// after `--` are the name, the seconds and the line count.
+#[cfg(unix)]
+fn saving_godot(dir: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("saving_godot.sh");
+    std::fs::write(
+        &path,
+        "#!/bin/sh
+project=.
+while [ \"$1\" != \"--\" ] && [ $# -gt 0 ]; do
+  if [ \"$1\" = \"--path\" ]; then project=\"$2\"; fi
+  shift
+done
+shift
+printf '[gd_scene format=3]\\n\\n[node name=\"%s\" type=\"Node\"]\\n' \"$1\" > \"$project/$1.tscn\"
+i=0
+while [ $i -lt \"$3\" ]; do echo \"line $i of $1 ................................................................\"; i=$((i+1)); done
+sleep \"$2\"
+",
+    )
+    .expect("write saving godot");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod saving godot");
+    path
+}
+
+#[cfg(unix)]
+fn call_run(id: i64, project: &std::path::Path, user_args: &[&str]) -> serde_json::Value {
+    json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{
+        "name": "godot_run_script",
+        "arguments": {"script": "zones.gd", "project_path": project, "user_args": user_args},
+    }})
+}
+
+#[cfg(unix)]
+async fn answers(
+    session: &mut Session,
+    count: usize,
+) -> std::collections::HashMap<i64, (serde_json::Value, std::time::Instant)> {
+    let mut answers = std::collections::HashMap::new();
+    while answers.len() < count {
+        let frame = session
+            .recv(Duration::from_secs(30))
+            .await
+            .expect("every run answers");
+        if let Some(id) = frame["id"].as_i64() {
+            answers.insert(id, (frame, std::time::Instant::now()));
+        }
+    }
+    answers
+}
+
+#[cfg(unix)]
+fn body_of(answer: &serde_json::Value) -> serde_json::Value {
+    let text = common::tool_text(answer);
+    let start = text.find('{').expect("json body");
+    serde_json::from_str(&text[start..]).unwrap_or_else(|_| panic!("{text}"))
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_run_that_ends_first_does_not_repair_the_files_a_parallel_run_is_writing() {
+    let project = project_dir();
+    std::fs::write(project.path().join("zones.gd"), "extends SceneTree\n").expect("script");
+    for (name, uid) in [
+        ("slow", "uid://b1slowzone0aa"),
+        ("fast", "uid://b2fastzone0aa"),
+    ] {
+        std::fs::write(
+            project.path().join(format!("{name}.tscn")),
+            format!("[gd_scene format=3 uid=\"{uid}\"]\n\n[node name=\"{name}\" type=\"Node\"]\n"),
+        )
+        .expect("scene");
+    }
+    let godot = saving_godot(project.path());
+    let mut session = Session::start(free_port(), &godot).await;
+    let started = std::time::Instant::now();
+    session
+        .send(&call_run(51, project.path(), &["slow", "3", "1"]))
+        .await;
+    // Late enough that the slow run has already saved its scene without the uid.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    session
+        .send(&call_run(52, project.path(), &["fast", "1", "1"]))
+        .await;
+    let answers = answers(&mut session, 2).await;
+    let total = started.elapsed();
+    assert!(
+        total < Duration::from_millis(5500),
+        "the runs did not overlap: {total:?}"
+    );
+    // The fast run's process ended first, but its repair waited for the slow one to finish.
+    let fast_answered = answers[&52].1.duration_since(started);
+    assert!(
+        fast_answered >= Duration::from_millis(2900),
+        "{fast_answered:?}"
+    );
+    for id in [51, 52] {
+        let answer = &answers[&id].0;
+        assert!(!is_tool_error(answer), "{answer}");
+        let body = body_of(answer);
+        assert!(
+            body["overlapped"]
+                .as_str()
+                .is_some_and(|note| note.contains("same time")),
+            "{body}"
+        );
+    }
+    for (name, uid) in [
+        ("slow", "uid://b1slowzone0aa"),
+        ("fast", "uid://b2fastzone0aa"),
+    ] {
+        let text =
+            std::fs::read_to_string(project.path().join(format!("{name}.tscn"))).expect("scene");
+        assert!(text.contains(uid), "{name}.tscn lost its uid: {text}");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn parallel_runs_keep_their_output_logs_apart() {
+    let project = project_dir();
+    std::fs::write(project.path().join("zones.gd"), "extends SceneTree\n").expect("script");
+    let godot = saving_godot(project.path());
+    let mut session = Session::start(free_port(), &godot).await;
+    // About 100 bytes a line: 1500 lines outgrow the 64 KiB the answer holds.
+    session
+        .send(&call_run(61, project.path(), &["one", "1", "1500"]))
+        .await;
+    session
+        .send(&call_run(62, project.path(), &["two", "1", "1500"]))
+        .await;
+    let answers = answers(&mut session, 2).await;
+    let mut logs = Vec::new();
+    for (id, name, other) in [(61, "one", "two"), (62, "two", "one")] {
+        let body = body_of(&answers[&id].0);
+        let log = body["stdout_log"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{body}"))
+            .to_string();
+        let text = std::fs::read_to_string(&log).expect("log");
+        assert!(text.contains(&format!("line 0 of {name} ")), "{log}");
+        assert!(text.contains(&format!("line 1499 of {name} ")), "{log}");
+        assert!(
+            !text.contains(&format!(" of {other} ")),
+            "{log} holds the other run's output"
+        );
+        logs.push(log);
+    }
+    assert_ne!(logs[0], logs[1]);
+    assert!(
+        logs.iter()
+            .any(|log| log.ends_with("script-run.stdout.log")),
+        "{logs:?}"
+    );
+    assert!(
+        logs.iter()
+            .any(|log| log.ends_with("script-run-2.stdout.log")),
+        "{logs:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_headless_import_waits_for_the_script_runs_in_its_project() {
+    use std::os::unix::fs::PermissionsExt;
+    let project = project_dir();
+    std::fs::write(project.path().join("zones.gd"), "extends SceneTree\n").expect("script");
+    let godot = project.path().join("import_or_sleep.sh");
+    std::fs::write(
+        &godot,
+        "#!/bin/sh\nfor a in \"$@\"; do if [ \"$a\" = \"--import\" ]; then exit 0; fi; done\nsleep 2\n",
+    )
+    .expect("write fake godot");
+    std::fs::set_permissions(&godot, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let other = project_dir();
+    let mut session = Session::start(free_port(), &godot).await;
+    let started = std::time::Instant::now();
+    session.send(&call_run(71, project.path(), &[])).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for (id, dir) in [(72, project.path()), (73, other.path())] {
+        session
+            .send(
+                &json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{
+                    "name": "godot_resave_resources",
+                    "arguments": {"project_path": dir},
+                }}),
+            )
+            .await;
+    }
+    let answers = answers(&mut session, 3).await;
+    for id in [71, 72, 73] {
+        assert!(!is_tool_error(&answers[&id].0), "{}", answers[&id].0);
+    }
+    let at = |id: i64| answers[&id].1.duration_since(started);
+    // The import in the same project starts once the script's process has ended.
+    assert!(at(72) >= Duration::from_millis(1900), "{:?}", at(72));
+    // Another project's import does not wait.
+    assert!(at(73) < Duration::from_millis(1500), "{:?}", at(73));
+}

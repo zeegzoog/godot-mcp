@@ -4005,6 +4005,138 @@ async fn typed_container_properties_convert_each_element_or_refuse() {
     }
 }
 
+/// Node-reference exports: native node types, a class_name type and a plain Node. Not a tool
+/// script, so the editor holds its values in a placeholder instance as it does in a game project.
+const HOLDER_SCRIPT: &str = r#"class_name Holder
+extends Node
+
+@export var target: Node2D
+@export var sprite: Sprite2D
+@export var marker: Marker
+@export var any: Node
+"#;
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn node_reference_exports_take_a_node_path_like_the_node_picker() {
+    // The editor cannot create a node of a script class that is not a tool script, so the Marker
+    // stands in the scene and the Holder comes as an instanced scene.
+    let main_with_marker = MAIN_SCENE.replacen(
+        "[node name=\"Main\"",
+        "[ext_resource type=\"Script\" path=\"res://marker.gd\" id=\"1_marker\"]\n\n[node name=\"Main\"",
+        1,
+    ) + "\n[node name=\"Marker\" type=\"Node2D\" parent=\".\"]\nscript = ExtResource(\"1_marker\")\n";
+    let editor = start_editor_with(
+        Some(UNDO_HOOK),
+        "",
+        &[
+            ("holder.gd", HOLDER_SCRIPT),
+            ("marker.gd", "class_name Marker\nextends Node2D\n"),
+            (
+                "holder.tscn",
+                "[gd_scene format=3]\n\n\
+                 [ext_resource type=\"Script\" path=\"res://holder.gd\" id=\"1_holder\"]\n\n\
+                 [node name=\"Holder\" type=\"Node\"]\nscript = ExtResource(\"1_holder\")\n",
+            ),
+            ("main.tscn", &main_with_marker),
+        ],
+        "",
+    )
+    .await;
+    let bridge = &editor.bridge;
+    let call = |command: &'static str, params: Value| async move {
+        bridge.send_command(command, params).await
+    };
+    let props = || async {
+        call("get_node_properties", json!({"node_path": "Holder"}))
+            .await
+            .expect("props")["properties"]
+            .clone()
+    };
+    call("open_scene", json!({"scene_path": "res://main.tscn"}))
+        .await
+        .expect("open main");
+    // add_node resolves the path from the place the new node gets, here under the root.
+    let added = call(
+        "add_node",
+        json!({"parent_node_path": ".", "scene": "res://holder.tscn",
+               "properties": {"target": "../Player"}}),
+    )
+    .await
+    .expect("add holder");
+    assert_eq!(
+        added["applied"]["target"], "<Node2D at \"Player\">",
+        "{added}"
+    );
+
+    let set = call(
+        "set_node_properties",
+        json!({"node_path": "Holder", "properties": {
+            "sprite": "../Player/Body",
+            "marker": "../Marker",
+            "any": ".."
+        }}),
+    )
+    .await
+    .expect("set node references");
+    let applied = &set["applied"];
+    assert_eq!(applied["sprite"], "<Sprite2D at \"Player/Body\">", "{set}");
+    assert_eq!(applied["marker"], "<Node2D at \"Marker\">", "{set}");
+    assert_eq!(applied["any"], "<Node2D at \".\">", "{set}");
+    assert_eq!(props().await["target"]["value"], "<Node2D at \"Player\">");
+
+    // A path that does not resolve, a node of the wrong type and other shapes are refused, and the
+    // valid value beside them is not set.
+    for (key, value, needle) in [
+        ("target", json!("../Missing"), "no node at '../Missing'"),
+        (
+            "target",
+            json!("../UI"),
+            "the node 'UI' is a Control, not a Node2D",
+        ),
+        ("sprite", json!("../Player"), "is a Node2D, not a Sprite2D"),
+        ("marker", json!("../Player"), "not a Marker"),
+        ("target", json!("../.."), "in the edited scene"),
+        ("target", json!("/root/Main/Player"), "absolute path"),
+        ("target", json!("../Player:position"), "names a property"),
+        ("target", json!(5), "expected a node path"),
+    ] {
+        expect_error(
+            call(
+                "set_node_properties",
+                json!({"node_path": "Holder", "properties": {key: value, "any": "../UI"}}),
+            )
+            .await,
+            needle,
+        );
+    }
+    assert_eq!(props().await["any"]["value"], "<Node2D at \".\">");
+
+    // Godot saves the nodes as node_paths references relative to the holder.
+    call("save_scene", json!({})).await.expect("save");
+    let saved = std::fs::read_to_string(editor.project.join("main.tscn")).expect("saved scene");
+    for needle in [
+        "node_paths=PackedStringArray(",
+        "target = NodePath(\"../Player\")",
+        "sprite = NodePath(\"../Player/Body\")",
+        "marker = NodePath(\"../Marker\")",
+        "any = NodePath(\"..\")",
+    ] {
+        assert!(saved.contains(needle), "{needle} in {saved}");
+    }
+
+    // null clears a reference, and undo brings it back.
+    call(
+        "set_node_properties",
+        json!({"node_path": "Holder", "properties": {"target": null}}),
+    )
+    .await
+    .expect("clear target");
+    assert_eq!(props().await["target"]["value"], "null");
+    call("__test_undo", json!({})).await.expect("undo clear");
+    assert_eq!(props().await["target"]["value"], "<Node2D at \"Player\">");
+}
+
 const SNAG_SCENE: &str = r#"[gd_scene format=3 uid="uid://snagfixture"]
 
 [node name="Snag" type="Node2D"]

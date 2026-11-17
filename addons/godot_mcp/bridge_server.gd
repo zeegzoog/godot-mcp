@@ -531,6 +531,13 @@ func property_type_name(info: Dictionary) -> String:
             return "Dictionary[%s, %s]" % [key_name, value_name]
     return type_string(type_id)
 
+## Path of a node from the edited scene's root ("." for the root), or "" when it is not in that scene.
+func edited_scene_path_of(node: Node) -> String:
+    var scene_root: Node = EditorInterface.get_edited_scene_root()
+    if scene_root == null or not (node == scene_root or scene_root.is_ancestor_of(node)):
+        return ""
+    return String(scene_root.get_path_to(node))
+
 ## Text form of a value in Godot's own syntax, shortened if it is huge.
 func describe_value(value: Variant) -> String:
     var text: String
@@ -541,6 +548,8 @@ func describe_value(value: Variant) -> String:
             text = "<freed object>"
         elif value is Resource and not (value as Resource).resource_path.is_empty():
             text = 'Resource("%s")' % (value as Resource).resource_path
+        elif value is Node and edited_scene_path_of(value as Node) != "":
+            text = '<%s at "%s">' % [value.get_class(), edited_scene_path_of(value as Node)]
         else:
             text = "<%s>" % value.get_class()
     else:
@@ -929,7 +938,7 @@ func add_node(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
         new_node.name = node_name
 
     # The node is not in the scene yet, so initial values are set directly; undo removes the node.
-    var initial: Dictionary = convert_properties(new_node, properties)
+    var initial: Dictionary = convert_properties(new_node, properties, root, parent_node)
     var problems: PackedStringArray = initial["problems"]
     if not problems.is_empty():
         new_node.free()
@@ -1389,6 +1398,55 @@ func convert_property_value(info: Dictionary, raw: Variant) -> Dictionary:
 
     return {"error": "expected %s but got %s (%s)" % [property_type_name(info), type_string(typeof(raw)), describe_value(raw)]}
 
+## Whether a property holds a node: an Object exported with a node type (`@export var x: Node3D`
+## or a class_name type), which the inspector fills with its node picker.
+func is_node_reference(info: Dictionary) -> bool:
+    return int(info.get("type", TYPE_NIL)) == TYPE_OBJECT and int(info.get("hint", PROPERTY_HINT_NONE)) == PROPERTY_HINT_NODE_TYPE
+
+## The node a node path string names for a node-reference property of holder, resolved relative to
+## holder as the inspector's node picker does; Godot then saves it as a node_paths reference. A node
+## not added yet (add_node) resolves a leading "../" from parent, the parent it will get. The node
+## must be in the edited scene. Returns {"value": Node or null} or {"error": String}.
+func node_reference_from(holder: Node, parent: Node, root: Node, raw: Variant) -> Dictionary:
+    if raw == null:
+        return {"value": null}
+    var example: String = "a path relative to this node, as the inspector stores it, such as \"../Sibling\" or \"Child\"; null clears it"
+    if not raw is String or str(raw).strip_edges().is_empty():
+        return {"error": "expected a node path (%s) but got %s (%s)" % [example, type_string(typeof(raw)), describe_value(raw)]}
+    var text: String = str(raw).strip_edges()
+    var path: NodePath = NodePath(text)
+    if path.is_absolute():
+        return {"error": "'%s' is an absolute path; pass %s" % [text, example]}
+    if path.get_subname_count() > 0:
+        return {"error": "'%s' names a property (after ':'); a node reference takes a path to the node itself" % text}
+    var node: Node = null
+    if parent != null and not holder.is_inside_tree() and (text == ".." or text.begins_with("../")):
+        node = parent if text == ".." else parent.get_node_or_null(NodePath(text.substr(3)))
+    else:
+        node = holder.get_node_or_null(path)
+    var in_scene: bool = node != null and (node == root or root.is_ancestor_of(node) or node == holder or holder.is_ancestor_of(node))
+    if not in_scene:
+        return {"error": "no node at '%s' relative to %s in the edited scene; paths start at the node whose property it is (\"../Sibling\" for a sibling, \"..\" for its parent): read the paths with godot_get_scene_tree" % [text, String(holder.name)]}
+    return {"value": node}
+
+## Checks that a resolved node reference is of the property's node type (hint_string, a native
+## class or a class_name). Returns the result, or {"error": String}.
+func checked_node_reference(info: Dictionary, result: Dictionary) -> Dictionary:
+    var node: Node = result["value"]
+    if node == null:
+        return result
+    var wanted: PackedStringArray = str(info.get("hint_string", "")).split(",", false)
+    if wanted.is_empty():
+        return result
+    for class_id: String in wanted:
+        if object_is_class(node, class_id.strip_edges()):
+            return result
+    var script: Script = node.get_script() as Script
+    var kind: String = node.get_class()
+    if script != null and not String(script.get_global_name()).is_empty():
+        kind = String(script.get_global_name())
+    return {"error": "the node '%s' is a %s, not a %s" % [String(node.name), kind, " or ".join(wanted)]}
+
 const META_PREFIX: String = "metadata/"
 
 ## The value of a metadata entry the node does not have yet: the JSON value as it is, except that
@@ -1410,8 +1468,9 @@ func new_meta_value(meta_name: String, raw: Variant) -> Dictionary:
 ## Returns {"converted": Dictionary, "new_meta": Dictionary, "stepped": Dictionary,
 ## "problems": PackedStringArray}; new_meta holds metadata/<name> entries the node does not have
 ## yet, and stepped holds the properties of the node's own resources named with ':' steps
-## (name -> [resource, property, value]).
-func convert_properties(target_node: Node, properties: Dictionary) -> Dictionary:
+## (name -> [resource, property, value]). A node-reference property takes a node path relative to
+## target_node, resolved inside the scene of root; parent is the parent of a node not added yet.
+func convert_properties(target_node: Node, properties: Dictionary, root: Node, parent: Node = null) -> Dictionary:
     var known: Dictionary = {}
     for prop: Dictionary in target_node.get_property_list():
         known[prop["name"]] = prop
@@ -1444,7 +1503,13 @@ func convert_properties(target_node: Node, properties: Dictionary) -> Dictionary
         if not known.has(prop_name):
             problems.append("Unknown property '%s' on %s" % [prop_name, target_node.get_class()])
             continue
-        var result: Dictionary = convert_property_value(known[prop_name], properties[key])
+        var result: Dictionary
+        if is_node_reference(known[prop_name]):
+            result = node_reference_from(target_node, parent, root, properties[key])
+            if not result.has("error"):
+                result = checked_node_reference(known[prop_name], result)
+        else:
+            result = convert_property_value(known[prop_name], properties[key])
         if result.has("error"):
             problems.append("%s: %s" % [prop_name, result["error"]])
         else:
@@ -1544,7 +1609,7 @@ func set_node_properties(peer: WebSocketPeer, cmd_id: String, params: Dictionary
     var locked: Array[Node] = guard["locked"]
 
     # Validate and convert everything first so a bad value never leaves a half-applied change.
-    var checked: Dictionary = convert_properties(target_node, properties)
+    var checked: Dictionary = convert_properties(target_node, properties, root)
     var converted: Dictionary = checked["converted"]
     # metadata/<name> entries the node does not have yet, created as the inspector's Add Metadata does.
     var new_meta: Dictionary = checked["new_meta"]

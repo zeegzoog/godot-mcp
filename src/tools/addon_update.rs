@@ -7,6 +7,7 @@ use crate::addon::{self, Installed, SERVER_VERSION};
 use crate::error::McpError;
 use crate::paths::same_directory;
 use crate::protocol::{Tool, ToolContent, ToolResult};
+use crate::util::lock;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
@@ -77,7 +78,7 @@ pub async fn call(tools: &ToolManager, args: Value) -> ToolResult {
 
     let mut restarted = false;
     if let Some(loaded) = &loaded {
-        let loaded_current = loaded.as_deref() == Some(SERVER_VERSION);
+        let loaded_current = loaded.is_current();
         if current && loaded_current {
             return report(
                 &project,
@@ -88,7 +89,7 @@ pub async fn call(tools: &ToolManager, args: Value) -> ToolResult {
             );
         }
         if !restart {
-            let running = loaded.clone().unwrap_or_else(|| previous.describe());
+            let running = loaded.describe(&previous);
             let what = if current {
                 format!(
                     "The addon files on disk are already this server's ({SERVER_VERSION}), but the editor that has the project open still runs the addon it loaded before ({running})"
@@ -181,12 +182,56 @@ fn install_failed(project: &Path, error: &std::io::Error) -> ToolResult {
     )
 }
 
-/// The addon version the connected editor of `project` runs (`Some(None)` for an addon too old
-/// to say), or `None` when no editor of that project is connected.
-async fn editor_of(
-    tools: &ToolManager,
-    project: &Path,
-) -> Result<Option<Option<String>>, ToolResult> {
+/// The addon a connected editor loaded, as `get_project_info` reports it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct Loaded {
+    /// `None` for an addon too old to say.
+    pub version: Option<String>,
+    /// The fingerprint of its scripts (`addon::build_fingerprint`); `None` for an addon too old
+    /// to say.
+    pub build: Option<String>,
+}
+
+impl Loaded {
+    pub fn from_info(info: &Value) -> Self {
+        let field = |key: &str| {
+            str_arg(info, key)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        };
+        Self {
+            version: field("addon_version"),
+            build: field("addon_build"),
+        }
+    }
+
+    /// Whether it is this server's own build: the same version and the same scripts.
+    pub fn is_current(&self) -> bool {
+        self.version.as_deref() == Some(SERVER_VERSION) && !self.is_other_build()
+    }
+
+    /// The same version as this server, but scripts of another build (a `-dev` version stays the
+    /// same while the addon changes). An addon too old to report its build is not counted.
+    pub fn is_other_build(&self) -> bool {
+        self.version.as_deref() == Some(SERVER_VERSION)
+            && self
+                .build
+                .as_deref()
+                .is_some_and(|build| build != addon::server_build())
+    }
+
+    fn describe(&self, previous: &Installed) -> String {
+        match (&self.version, self.is_other_build()) {
+            (Some(version), true) => format!("{version} of another build"),
+            (Some(version), false) => version.clone(),
+            (None, _) => previous.describe(),
+        }
+    }
+}
+
+/// The addon the connected editor of `project` loaded, or `None` when no editor of that project
+/// is connected.
+async fn editor_of(tools: &ToolManager, project: &Path) -> Result<Option<Loaded>, ToolResult> {
     match tools
         .bridge
         .send_command("get_project_info", json!({}))
@@ -197,11 +242,7 @@ async fn editor_of(
                 .get("project_dir")
                 .and_then(Value::as_str)
                 .is_some_and(|dir| same_directory(project, Path::new(dir)));
-            Ok(same.then(|| {
-                str_arg(&info, "addon_version")
-                    .filter(|version| !version.is_empty())
-                    .map(str::to_string)
-            }))
+            Ok(same.then(|| Loaded::from_info(&info)))
         }
         Err(McpError::BridgeUnavailable(_)) => Ok(None),
         Err(error) => Err(super::bridge_error_result(&error)),
@@ -343,6 +384,63 @@ pub(super) async fn explain_unknown_command(
             "Or close the editor: tools that work without it then use the project files",
         ],
     )
+}
+
+/// Tools whose failures say nothing about the addon's behaviour, or that manage the addon or
+/// the editor themselves.
+const NOT_FLAGGED: &[&str] = &[
+    UPDATE,
+    "godot_launch_editor",
+    "godot_close_editor",
+    "godot_get_project_info",
+    "godot_get_version",
+];
+
+/// A failed call while the editor runs an addon of this server's version but of another build
+/// (a `-dev` version stays the same while the addon changes): the editor answered with code
+/// this server was not made for, so the error gets that said, with the update call. The editor's
+/// addon is read once per bridge connection, and only while one is open.
+pub(super) async fn flag_other_build(
+    tools: &ToolManager,
+    tool: &str,
+    mut result: ToolResult,
+) -> ToolResult {
+    if !result.is_error || NOT_FLAGGED.contains(&tool) {
+        return result;
+    }
+    let Some(generation) = tools.bridge.open_connection() else {
+        return result;
+    };
+    let known = lock(&tools.loaded_addon)
+        .as_ref()
+        .filter(|(seen, _)| *seen == generation)
+        .map(|(_, loaded)| loaded.clone());
+    let (loaded, dir) = match known {
+        Some(loaded) => (loaded, None),
+        None => {
+            let Ok(info) = tools
+                .bridge
+                .send_command("get_project_info", json!({}))
+                .await
+            else {
+                return result;
+            };
+            let loaded = Loaded::from_info(&info);
+            *lock(&tools.loaded_addon) = Some((generation, loaded.clone()));
+            (loaded, str_arg(&info, "project_dir").map(PathBuf::from))
+        }
+    };
+    if !loaded.is_other_build() {
+        return result;
+    }
+    let note = format!(
+        "\n\nNote: the editor runs Godot MCP addon {SERVER_VERSION} of another build than this server's (same version, other scripts), so this answer may come from older addon code. {}, then call again.",
+        update_hint(dir.as_deref())
+    );
+    if let Some(ToolContent::Text { text }) = result.content.first_mut() {
+        text.push_str(&note);
+    }
+    result
 }
 
 /// The note a tool adds when it worked on the file because the editor's addon is too old.

@@ -120,6 +120,9 @@ var _token: String = ""
 ## The addon version this editor loaded (plugin.cfg when the bridge started). An update on disk
 ## shows only after the plugin is enabled again, so the server compares this one with its own.
 var _addon_version: String = ""
+## Fingerprint of the addon scripts this editor loaded (see addon_build_of), so the server tells an
+## older build apart from its own while both carry the same -dev version.
+var _addon_build: String = ""
 var _token_files: PackedStringArray = []
 ## The bridge listens while the editor is still starting: plugins are enabled during the first
 ## scan of the project's files, and only when that scan ends does the editor open its scenes (the
@@ -137,8 +140,38 @@ func _ready() -> void:
     var manifest: ConfigFile = ConfigFile.new()
     if manifest.load("res://addons/godot_mcp/plugin.cfg") == OK:
         _addon_version = str(manifest.get_value("plugin", "version", ""))
+    _addon_build = addon_build_of("res://addons/godot_mcp")
     read_configuration()
     start_server()
+
+## MD5 (hex) over the addon's .gd files sorted by their path inside dir: for each one the path, a
+## newline, the MD5 of its bytes in hex and a newline. The server computes the same over the addon
+## it embeds (src/addon.rs, build_fingerprint). "" when no script could be read.
+func addon_build_of(dir: String) -> String:
+    var paths: PackedStringArray = PackedStringArray()
+    _collect_scripts(dir, "", paths)
+    if paths.is_empty():
+        return ""
+    paths.sort()
+    var context: HashingContext = HashingContext.new()
+    context.start(HashingContext.HASH_MD5)
+    for relative: String in paths:
+        var digest: String = FileAccess.get_md5(dir.path_join(relative))
+        if digest.is_empty():
+            return ""
+        context.update(("%s\n%s\n" % [relative, digest]).to_utf8_buffer())
+    return context.finish().hex_encode()
+
+func _collect_scripts(dir: String, prefix: String, paths: PackedStringArray) -> void:
+    var access: DirAccess = DirAccess.open(dir.path_join(prefix))
+    if access == null:
+        return
+    access.include_hidden = false
+    for file_name: String in access.get_files():
+        if file_name.get_extension() == "gd":
+            paths.append(prefix.path_join(file_name) if not prefix.is_empty() else file_name)
+    for sub: String in access.get_directories():
+        _collect_scripts(dir, prefix.path_join(sub) if not prefix.is_empty() else sub, paths)
 
 func read_configuration() -> void:
     verbose = bool(ProjectSettings.get_setting("godot_mcp/verbose", false))
@@ -579,6 +612,7 @@ func get_project_info(peer: WebSocketPeer, cmd_id: String) -> void:
         "features": ProjectSettings.get_setting("application/config/features", []),
         "project_dir": ProjectSettings.globalize_path("res://").trim_suffix("/"),
         "addon_version": _addon_version,
+        "addon_build": _addon_build,
     })
 
 ## Quits this editor without saving anything. Unsaved scenes or scripts keep it open and are
@@ -871,8 +905,10 @@ func instantiate_node(type_name: String) -> Dictionary:
         if entry["class"] != type_name:
             continue
         var script: Script = load(entry["path"]) as Script
-        if script == null or not script.can_instantiate():
-            return {"error": "Script class '%s' cannot be instantiated" % type_name}
+        if script == null:
+            return {"error": "Script class '%s' cannot be loaded from %s" % [type_name, entry["path"]]}
+        if not script.can_instantiate():
+            return node_of_script_class(type_name, script)
         var instance: Variant = script.new()
         if not instance is Node:
             if instance is Object and not instance is RefCounted:
@@ -881,6 +917,24 @@ func instantiate_node(type_name: String) -> Dictionary:
         return {"node": instance as Node}
 
     return {"error": "Unknown Godot node type: " + type_name}
+
+## A node of a script class the editor does not run (not a @tool script), made as the editor's
+## Create Node dialog makes it: the script's native base class with the script attached, so the
+## editor holds its exported values in a placeholder. Returns {"node": Node} or {"error": String}.
+func node_of_script_class(type_name: String, script: Script) -> Dictionary:
+    var base: StringName = script.get_instance_base_type()
+    if base == &"":
+        return {"error": "Script class '%s' cannot be instantiated: its script does not compile; check it with godot_validate_script" % type_name}
+    if not ClassDB.is_parent_class(base, "Node"):
+        return {"error": "Script class '%s' does not extend Node" % type_name}
+    if not ClassDB.can_instantiate(base):
+        return {"error": "Script class '%s' cannot be instantiated: its base class %s is abstract" % [type_name, base]}
+    var node: Node = ClassDB.instantiate(base) as Node
+    node.set_script(script)
+    if node.get_script() != script:
+        node.free()
+        return {"error": "Script class '%s' cannot be instantiated: the script could not be attached; check it with godot_validate_script" % type_name}
+    return {"node": node}
 
 ## Instances a saved scene for the edited scene the way the editor's Instantiate Child Scene does.
 ## Returns {"node": Node, "path": String} or {"error": String}.

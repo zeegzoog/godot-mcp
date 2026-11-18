@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
@@ -52,7 +52,12 @@ struct Connection {
     pending: Pending,
     alive: Arc<AtomicBool>,
     token: Option<String>,
+    /// Tells this connection apart from the ones before it (each editor start is a new one).
+    generation: u64,
 }
+
+/// Numbers the connections this process opens.
+static GENERATIONS: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Default)]
 struct State {
@@ -146,6 +151,17 @@ impl BridgeClient {
         }
     }
 
+    /// The number of the open connection to the editor, without opening one: `None` when none
+    /// is open (or another call is opening one right now).
+    pub fn open_connection(&self) -> Option<u64> {
+        let state = self.state.try_lock().ok()?;
+        state
+            .connection
+            .as_ref()
+            .filter(|connection| connection.alive.load(Ordering::Acquire))
+            .map(|connection| connection.generation)
+    }
+
     async fn connection(&self) -> Result<Arc<Connection>> {
         let mut state = self.state.lock().await;
 
@@ -212,6 +228,7 @@ impl BridgeClient {
             pending,
             alive,
             token: read_token(port),
+            generation: GENERATIONS.fetch_add(1, Ordering::Relaxed),
         }))
     }
 }

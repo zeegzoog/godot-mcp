@@ -6956,6 +6956,97 @@ async fn an_update_passes_discard_to_the_editor_it_closes() {
     );
 }
 
+/// A fake editor of `project` whose addon has this server's version and the given build
+/// fingerprint, and that refuses set_node_properties as an older addon did.
+async fn editor_with_addon_build(project: &Path, build: String) -> common::MockBridge {
+    use common::{MockBridge, Reply};
+    let dir = project.to_string_lossy().replace('\\', "/");
+    MockBridge::start(move |command| match command["type"].as_str() {
+        Some("get_project_info") => Reply::Ok(json!({
+            "project_dir": dir,
+            "addon_version": env!("CARGO_PKG_VERSION"),
+            "addon_build": build,
+        })),
+        Some("set_node_properties") => {
+            Reply::Err("Invalid property values: outpost: expected Object but got String".into())
+        }
+        _ => Reply::Ok(json!({})),
+    })
+    .await
+}
+
+#[tokio::test]
+async fn an_error_from_an_addon_of_the_same_version_but_another_build_says_to_update_it() {
+    let project = project_dir();
+    let bridge = editor_with_addon_build(project.path(), "0123456789abcdef".into()).await;
+    let tools = editor_manager(&bridge);
+    let set = || {
+        Arc::clone(&tools).call_tool(
+            "godot_set_node_properties",
+            json!({"node_path": "Slice", "properties": {"outpost": "../Outpost"}}),
+        )
+    };
+    let result = set().await;
+    assert!(result.is_error);
+    let message = text(&result);
+    assert!(
+        message.contains("expected Object but got String"),
+        "{message}"
+    );
+    assert!(message.contains("another build"), "{message}");
+    assert!(message.contains("godot_update_addon"), "{message}");
+    assert!(
+        message.contains(&project.path().to_string_lossy().replace('\\', "/")),
+        "the project to update: {message}"
+    );
+
+    // The editor's addon is read once per connection.
+    let again = set().await;
+    assert!(text(&again).contains("another build"), "{}", text(&again));
+    let infos = bridge
+        .received()
+        .iter()
+        .filter(|command| command["type"] == "get_project_info")
+        .count();
+    assert_eq!(infos, 1);
+}
+
+#[tokio::test]
+async fn an_error_from_the_servers_own_addon_build_is_left_as_it_is() {
+    let project = project_dir();
+    let bridge =
+        editor_with_addon_build(project.path(), godot_mcp::addon::server_build().into()).await;
+    let result = editor_manager(&bridge)
+        .call_tool(
+            "godot_set_node_properties",
+            json!({"node_path": "Slice", "properties": {"outpost": "../Outpost"}}),
+        )
+        .await;
+    assert!(result.is_error);
+    assert!(
+        !text(&result).contains("another build"),
+        "{}",
+        text(&result)
+    );
+}
+
+#[tokio::test]
+async fn an_update_restarts_an_editor_that_loaded_another_build_of_the_same_version() {
+    let project = project_dir();
+    godot_mcp::addon::install(project.path()).expect("current addon on disk");
+    let bridge = editor_with_addon_build(project.path(), "0123456789abcdef".into()).await;
+    let result = editor_manager(&bridge)
+        .call_tool(
+            "godot_update_addon",
+            json!({"project_path": project.path()}),
+        )
+        .await;
+    assert!(result.is_error, "{}", text(&result));
+    let message = text(&result);
+    assert!(message.contains("another build"), "{message}");
+    assert!(message.contains("restart_editor: true"), "{message}");
+}
+
 /// godot_run_script keeps the leak reports Godot prints while it shuts down (leaked instance
 /// dependencies, RID allocations, ObjectDB instances...) but shows a repeated one once with its
 /// count, counts them by kind in exit_leaks, says in hint what causes them, and leaves every

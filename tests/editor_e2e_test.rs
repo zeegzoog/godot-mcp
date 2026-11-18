@@ -4137,6 +4137,141 @@ async fn node_reference_exports_take_a_node_path_like_the_node_picker() {
     assert_eq!(props().await["target"]["value"], "<Node2D at \"Player\">");
 }
 
+/// A slice of a 3D level: its script is not a tool script and is attached to a node of the scene
+/// itself (not an instanced one), with node exports of a class_name type and of a native type.
+const SLICE_SCRIPT: &str = r#"class_name DemoSlice
+extends Node3D
+
+@export var outpost: ToadOutpost
+@export var anchor: Node3D
+"#;
+
+const SLICE_WORLD: &str = r#"[gd_scene format=3]
+
+[ext_resource type="Script" path="res://outpost.gd" id="1_outpost"]
+[ext_resource type="Script" path="res://slice.gd" id="2_slice"]
+
+[node name="World" type="Node3D"]
+
+[node name="Toads" type="Node3D" parent="."]
+
+[node name="FallenTreeOutpost" type="Node3D" parent="Toads"]
+script = ExtResource("1_outpost")
+
+[node name="Rock" type="Node3D" parent="Toads"]
+
+[node name="Slice" type="Node3D" parent="."]
+script = ExtResource("2_slice")
+"#;
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn node_exports_of_a_scripted_node_in_the_scene_and_of_a_new_script_class_node_take_paths() {
+    let editor = start_editor_with(
+        Some(UNDO_HOOK),
+        "",
+        &[
+            ("outpost.gd", "class_name ToadOutpost\nextends Node3D\n"),
+            ("slice.gd", SLICE_SCRIPT),
+            ("world.tscn", SLICE_WORLD),
+        ],
+        "",
+    )
+    .await;
+    let bridge = &editor.bridge;
+    let call = |command: &'static str, params: Value| async move {
+        bridge.send_command(command, params).await
+    };
+    call("open_scene", json!({"scene_path": "res://world.tscn"}))
+        .await
+        .expect("open world");
+    let props = call("get_node_properties", json!({"node_path": "Slice"}))
+        .await
+        .expect("props")["properties"]
+        .clone();
+    assert_eq!(props["outpost"]["value"], "null", "{props}");
+
+    let set = call(
+        "set_node_properties",
+        json!({"node_path": "Slice", "properties": {
+            "outpost": "../Toads/FallenTreeOutpost",
+            "anchor": "../Toads"
+        }}),
+    )
+    .await
+    .expect("set node references");
+    assert_eq!(
+        set["applied"]["outpost"], "<Node3D at \"Toads/FallenTreeOutpost\">",
+        "{set}"
+    );
+    assert_eq!(set["applied"]["anchor"], "<Node3D at \"Toads\">", "{set}");
+    expect_error(
+        call(
+            "set_node_properties",
+            json!({"node_path": "Slice", "properties": {"outpost": "../Toads/Rock"}}),
+        )
+        .await,
+        "not a ToadOutpost",
+    );
+
+    // A node of a script class that is not a tool script is made as the Create Node dialog makes
+    // it: its native base with the script attached, and its node exports take paths at once.
+    let added = call(
+        "add_node",
+        json!({"parent_node_path": ".", "node_type": "DemoSlice", "node_name": "Second",
+               "properties": {"outpost": "../Toads/FallenTreeOutpost"}}),
+    )
+    .await
+    .expect("add a DemoSlice");
+    assert_eq!(
+        added["applied"]["outpost"], "<Node3D at \"Toads/FallenTreeOutpost\">",
+        "{added}"
+    );
+    expect_error(
+        call(
+            "add_node",
+            json!({"parent_node_path": ".", "node_type": "DemoSlice", "node_name": "Third",
+                   "properties": {"outpost": "../Toads/Rock"}}),
+        )
+        .await,
+        "not a ToadOutpost",
+    );
+
+    call("save_scene", json!({})).await.expect("save");
+    let saved = std::fs::read_to_string(editor.project.join("world.tscn")).expect("saved scene");
+    for needle in [
+        "outpost = NodePath(\"../Toads/FallenTreeOutpost\")",
+        "anchor = NodePath(\"../Toads\")",
+        "[node name=\"Second\" type=\"Node3D\" parent=\".\"",
+    ] {
+        assert!(saved.contains(needle), "{needle} in {saved}");
+    }
+    let second = &saved[saved.find("[node name=\"Second\"").expect("Second saved")..];
+    assert!(
+        second.contains("script = ExtResource(\"2_slice\")"),
+        "{second}"
+    );
+    assert!(!saved.contains("\"Third\""), "{saved}");
+}
+
+/// The editor reports the fingerprint of the addon scripts it loaded, computed as the server
+/// computes it over the addon it embeds, so a stale build of the same -dev version shows.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn the_editor_reports_the_build_of_the_addon_it_loaded() {
+    let editor = start_editor_with(None, "", &[], "").await;
+    let info = editor
+        .bridge
+        .send_command("get_project_info", json!({}))
+        .await
+        .expect("project info");
+    assert_eq!(
+        info["addon_build"],
+        godot_mcp::addon::server_build(),
+        "{info}"
+    );
+}
+
 const SNAG_SCENE: &str = r#"[gd_scene format=3 uid="uid://snagfixture"]
 
 [node name="Snag" type="Node2D"]

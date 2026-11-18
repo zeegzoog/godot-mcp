@@ -11,7 +11,7 @@ use crate::validation::validate_arguments;
 use serde_json::{Value, json};
 use std::io::ErrorKind;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
@@ -56,6 +56,9 @@ pub struct ToolManager {
     editors: editor::LaunchedEditors,
     /// Orders the headless Godot processes that work in the same project.
     gates: project_gate::ProjectGates,
+    /// The addon the editor of one bridge connection loaded, by the connection's number: read
+    /// once per connection, when a call first fails.
+    loaded_addon: StdMutex<Option<(u64, addon_update::Loaded)>>,
 }
 
 impl ToolManager {
@@ -70,6 +73,7 @@ impl ToolManager {
             lsp: LspHub::new(godot),
             editors: editor::LaunchedEditors::default(),
             gates: project_gate::ProjectGates::default(),
+            loaded_addon: StdMutex::default(),
         }
     }
 
@@ -171,6 +175,7 @@ impl ToolManager {
             ),
         };
         let result = addon_update::explain_unknown_command(&self, name, result).await;
+        let result = addon_update::flag_other_build(&self, name, result).await;
         self.observe(name, &result, EvidenceKind::Error);
         result
     }
@@ -1025,7 +1030,7 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
         ),
         tool(
             "godot_add_node",
-            "Adds a node to the active scene in Godot Editor as one undoable action. Pass exactly one of node_type (any instantiable Node class or global script class_name) or scene (a saved .tscn/.scn added as an instance of that scene, as the editor's Instantiate Child Scene does: it saves as an instance=ExtResource node that keeps the scene's uid, and its own nodes stay inside the scene file). A scene that is missing, is not a PackedScene, or contains the scene being edited is refused. properties sets initial values (such as position or transform) the way godot_set_node_properties converts them and checks them the same way; a bad one, or one Godot does not keep, rejects the whole call. The answer lists each value as read back in applied.",
+            "Adds a node to the active scene in Godot Editor as one undoable action. Pass exactly one of node_type (any instantiable Node class or global script class_name; a script that is not a @tool script gets its native base class with the script attached, as the Create Node dialog does) or scene (a saved .tscn/.scn added as an instance of that scene, as the editor's Instantiate Child Scene does: it saves as an instance=ExtResource node that keeps the scene's uid, and its own nodes stay inside the scene file). A scene that is missing, is not a PackedScene, or contains the scene being edited is refused. properties sets initial values (such as position or transform) the way godot_set_node_properties converts them and checks them the same way; a bad one, or one Godot does not keep, rejects the whole call. The answer lists each value as read back in applied.",
             json!({
                 "parent_node_path": {
                     "type": "string",

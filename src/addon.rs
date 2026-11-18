@@ -8,6 +8,9 @@
 use std::collections::BTreeMap;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+use crate::godot::md5_hex;
 
 /// Every file of the addon: its path inside `addons/godot_mcp` and its bytes.
 pub const FILES: &[(&str, &[u8])] = include!(concat!(env!("OUT_DIR"), "/addon_files.rs"));
@@ -48,6 +51,33 @@ pub fn manifest_version(text: &str) -> Option<String> {
         .find_map(|line| line.strip_prefix("version="))
         .map(|value| value.trim().trim_matches('"').to_string())
         .filter(|value| !value.is_empty())
+}
+
+/// Fingerprint of the addon scripts in `files` (paths inside `addons/godot_mcp`): the MD5 in hex
+/// of, for each `.gd` file sorted by path, the path, a newline, the MD5 of its bytes in hex and a
+/// newline. The addon reports the same over the scripts it loaded (`addon_build` in
+/// `get_project_info`, `addon_build_of` in `bridge_server.gd`), which tells an older build apart
+/// from this one while both carry the same `-dev` version.
+pub fn build_fingerprint<'a>(files: impl IntoIterator<Item = (&'a str, &'a [u8])>) -> String {
+    let mut scripts: Vec<(&str, &[u8])> = files
+        .into_iter()
+        .filter(|(path, _)| path.ends_with(".gd"))
+        .collect();
+    scripts.sort_by(|a, b| a.0.cmp(b.0));
+    let mut listing = String::new();
+    for (path, bytes) in scripts {
+        listing.push_str(path);
+        listing.push('\n');
+        listing.push_str(&md5_hex(bytes));
+        listing.push('\n');
+    }
+    md5_hex(listing.as_bytes())
+}
+
+/// The fingerprint of the embedded addon, this server's own build.
+pub fn server_build() -> &'static str {
+    static BUILD: OnceLock<String> = OnceLock::new();
+    BUILD.get_or_init(|| build_fingerprint(FILES.iter().map(|(path, bytes)| (*path, *bytes))))
 }
 
 /// The addon version installed in `project`.
@@ -228,6 +258,27 @@ mod tests {
         assert_eq!(manifest_version(&manifest).as_deref(), Some(SERVER_VERSION));
         assert!(FILES.iter().any(|(path, _)| *path == "bridge_server.gd"));
         assert!(FILES.iter().all(|(path, _)| !path.contains('\\')));
+    }
+
+    #[test]
+    fn the_build_fingerprint_covers_the_scripts_in_path_order() {
+        let fingerprint = build_fingerprint([
+            ("plugin.gd", b"extends EditorPlugin\n".as_slice()),
+            ("core/a.gd", b"extends RefCounted\n".as_slice()),
+            ("plugin.cfg", b"version=\"1\"\n".as_slice()),
+            ("core/a.gd.uid", b"uid://abc\n".as_slice()),
+        ]);
+        let listing = format!(
+            "core/a.gd\n{}\nplugin.gd\n{}\n",
+            md5_hex(b"extends RefCounted\n"),
+            md5_hex(b"extends EditorPlugin\n")
+        );
+        assert_eq!(fingerprint, md5_hex(listing.as_bytes()));
+        assert_eq!(server_build().len(), 32);
+        assert_ne!(
+            server_build(),
+            build_fingerprint([("plugin.gd", b"extends EditorPlugin\n".as_slice())])
+        );
     }
 
     #[test]

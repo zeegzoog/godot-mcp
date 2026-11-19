@@ -968,8 +968,8 @@ fn disk_caches(plan: &Plan, warnings: &mut Vec<String>) {
         && let Err(error) = std::fs::write(&cache, text)
     {
         warnings.push(format!(
-                    "The global class cache could not be updated ({error}); the editor rebuilds it on its next scan."
-                ));
+            "The global class cache could not be updated ({error}); the editor rebuilds it on its next scan."
+        ));
     }
 }
 

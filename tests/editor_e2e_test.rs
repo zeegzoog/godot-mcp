@@ -1404,6 +1404,124 @@ async fn project_settings_store_arrays_and_objects_like_the_file_fallback() {
     );
 }
 
+/// The frog-world case through a real editor, with the rules of the file fallback (its
+/// real-engine test has the same steps): a global shader uniform given as value_text becomes a
+/// Dictionary holding a Vector4; over a String stored by an earlier call it needs replace_type;
+/// an engine setting keeps its type; remove erases a project's setting and returns an engine
+/// setting to its default, which is then not saved.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn project_settings_take_a_value_text_and_remove_like_the_file_fallback() {
+    let editor = start_editor(false).await;
+    let bridge = &editor.bridge;
+    let project_file = editor.project.join("project.godot");
+    let key = "shader_globals/frog_push";
+    let frog = r#"{"type": "vec4", "value": Vector4(0, -1000, 0, 0)}"#;
+
+    let string = bridge
+        .send_command("set_project_setting", json!({"key": key, "value": frog}))
+        .await
+        .expect("a string");
+    assert_eq!(string["type"], "String", "{string}");
+    expect_error(
+        bridge
+            .send_command(
+                "set_project_setting",
+                json!({"key": key, "value_text": frog}),
+            )
+            .await,
+        "replace_type",
+    );
+    let replaced = bridge
+        .send_command(
+            "set_project_setting",
+            json!({"key": key, "value_text": frog, "replace_type": true}),
+        )
+        .await
+        .expect("replaced");
+    assert_eq!(replaced["type"], "Dictionary", "{replaced}");
+    let written = std::fs::read_to_string(&project_file).expect("project.godot");
+    assert!(
+        written.contains("\n[shader_globals]\n\nfrog_push={\n\"type\": \"vec4\",\n\"value\": Vector4(0, -1000, 0, 0)\n}\n"),
+        "{written}"
+    );
+
+    let before = std::fs::read_to_string(&project_file).expect("project.godot");
+    for (args, needle) in [
+        (
+            json!({"key": key, "value_text": "{\"a\": Object(Node)}"}),
+            "built-in",
+        ),
+        (
+            json!({"key": key, "value_text": "Vector4(0, "}),
+            "not a value",
+        ),
+        (
+            json!({"key": "physics/2d/default_gravity_vector", "value_text": "Vector3(0, 1, 0)", "replace_type": true}),
+            "setting of the engine",
+        ),
+        (
+            json!({"key": key, "value": 1, "remove": true}),
+            "exactly one",
+        ),
+    ] {
+        expect_error(
+            bridge.send_command("set_project_setting", args).await,
+            needle,
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(&project_file).expect("project.godot"),
+        before,
+        "a refused value changed project.godot"
+    );
+
+    bridge
+        .send_command(
+            "set_project_setting",
+            json!({"key": "physics/2d/default_gravity_vector", "value_text": "Vector2(0, 2)"}),
+        )
+        .await
+        .expect("an engine setting from its text");
+    let written = std::fs::read_to_string(&project_file).expect("project.godot");
+    assert!(
+        written.contains("\n2d/default_gravity_vector=Vector2(0, 2)\n"),
+        "{written}"
+    );
+
+    for removed_key in [key, "physics/2d/default_gravity_vector"] {
+        let removed = bridge
+            .send_command(
+                "set_project_setting",
+                json!({"key": removed_key, "remove": true}),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{removed_key}: {error}"));
+        assert_eq!(removed["removed"], true, "{removed}");
+    }
+    let written = std::fs::read_to_string(&project_file).expect("project.godot");
+    assert!(
+        !written.contains("frog_push") && !written.contains("default_gravity_vector"),
+        "{written}"
+    );
+    let gravity = bridge
+        .send_command(
+            "get_project_settings",
+            json!({"prefix": "physics/2d/default_gravity_vector"}),
+        )
+        .await
+        .expect("gravity");
+    assert_eq!(
+        gravity["settings"]["physics/2d/default_gravity_vector"], "(0.0, 1.0)",
+        "{gravity}"
+    );
+    let again = bridge
+        .send_command("set_project_setting", json!({"key": key, "remove": true}))
+        .await
+        .expect("remove again");
+    assert_eq!(again["removed"], false, "{again}");
+}
+
 fn tool_text(result: &godot_mcp::protocol::ToolResult) -> String {
     result
         .content

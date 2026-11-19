@@ -1,6 +1,6 @@
 # MCP Server Core
 
-**Version:** 1.4.1
+**Version:** 1.5.0
 **Status:** Stable
 **Layer:** concept
 
@@ -87,6 +87,7 @@ sequenceDiagram
 | `GODOT_CONSOLE_PATH` | Windows console wrapper; reserved, read only by the editor end-to-end tests | unset |
 | `GODOT_MCP_FEEDBACK` | Agent feedback channel: `off`, `draft` (notes and drafts only) or `full` (adds submission after the human's approval) | `full` |
 | `GODOT_MCP_GH_PATH` | GitHub command-line client used for submission | `gh` on `PATH` |
+| `GODOT_MCP_MOVIE_DIR` | A folder outside the project that Movie Maker recordings may be written to; the `--movie-dir` option wins over it, and an empty value means unset | unset: recordings stay inside the project |
 
 ## 6. Implementation Notes
 
@@ -118,3 +119,4 @@ sequenceDiagram
 | 1.3.0 | 2026-11-02 | Agent (magic.spec) | [MODIFIED] The `GODOT_DEBUG_PORT` default: derived from the project path since pull request 75, `9333` only outside a project. Found by ventilation. Stable → RFC → Stable after Post-Update Review. |
 | 1.4.0 | 2026-11-02 | Agent (magic.spec) | [REMOVED] The configuration key for an external exporter program, with the tool that used it. Stable → RFC → Stable after Post-Update Review. |
 | 1.4.1 | 2026-11-05 | Agent (magic.spec) | Removed the `[ADDED]` and `[MODIFIED]` markers from the body: the history rows carry what changed. No requirement changed. |
+| 1.5.0 | 2026-11-19 | Agent (magic.spec) | [ADDED] `GODOT_MCP_MOVIE_DIR` in the configuration table. Source: pull request 160. Stable → RFC → Stable after Post-Update Review. |

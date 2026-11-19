@@ -1,6 +1,6 @@
 # Tool Catalog
 
-**Version:** 1.21.0
+**Version:** 1.22.0
 **Status:** Stable
 **Layer:** concept
 
@@ -61,7 +61,7 @@ Agents call tools without seeing the implementation; a tool's contract has to be
 | `godot_launch_editor` | host | process | Starts the editor for the resolved project; the server keeps the process handle |
 | `godot_close_editor` | live-first | process | Quits the project's editor without saving and waits for its process to exit; unsaved scenes or scripts refuse unless `discard`; never an editor of another project; without a bridge, stops only an editor the server launched, with `discard` |
 | `godot_update_addon` | host (asks the editor for its project and addon version) | disk (`addons/godot_mcp`, `project.godot`); process with `restart_editor` | Installs the addon built into the server, keeps the plugin enabled, and with `restart_editor` closes and reopens a connected editor (TL-14) |
-| `godot_run_project` | live-first | process / play state | Editor Play mode; without an editor (or with `mode: "process"`) a managed game with the remote debugger attached; `user_args` (managed run only) go to the game after `--` |
+| `godot_run_project` | live-first | process / play state | Editor Play mode; without an editor (or with `mode: "process"`) a managed game with the remote debugger attached; `user_args` (managed run only) go to the game after `--`; `movie` (managed run only, not held or headless) records the run with Godot's Movie Maker, inside the project or the folder the person allows, and the run status reports the file |
 | `godot_stop_project` | live-first | play state | Stops editor Play mode and managed runs, and says which |
 | `godot_get_run_status` | live-first | no | Whether a scene plays, and the managed runs |
 | `godot_get_open_scenes` | editor | no | Open tabs, active tab |
@@ -175,3 +175,4 @@ graph TD
 | 1.19.0 | 2026-11-05 | Agent (magic.spec) | [ADDED] `godot_game_run_script` in the catalog. Stable → RFC → Stable after Post-Update Review. |
 | 1.20.0 | 2026-11-09 | Agent (magic.spec) | [MODIFIED] TL-11: the stop and status answers say how ended runs ended, and the output of the run that ended last stays readable. Source: pull requests 130 and 131. Stable → RFC → Stable after Post-Update Review. |
 | 1.21.0 | 2026-11-19 | Agent (magic.spec) | [ADDED] `godot_set_resource_properties` in the catalog. Source: pull request 158. Stable → RFC → Stable after Post-Update Review. |
+| 1.22.0 | 2026-11-19 | Agent (magic.spec) | [MODIFIED] `godot_run_project`: the `movie` option and the recording in the run status. Source: pull request 160. Stable → RFC → Stable after Post-Update Review. |

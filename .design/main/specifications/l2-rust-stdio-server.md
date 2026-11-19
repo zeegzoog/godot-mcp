@@ -1,6 +1,6 @@
 # Rust Stdio Server
 
-**Version:** 1.5.1
+**Version:** 1.6.0
 **Status:** Stable
 **Layer:** implementation
 **Implements:** l1-mcp-server.md
@@ -51,7 +51,7 @@ src/
 ├── server.rs      session loop, message classification, task registry, writer, initialize answer (with feedback guidance)
 ├── protocol.rs    JsonRpcResponse/Error, Tool, ToolResult, ToolContent (text, image)
 ├── progress.rs    `notifications/progress` for a call that carried `_meta.progressToken`: the newest line of a running script at most four times a second, a heartbeat every 5 s without output, `progress` in seconds since the start so it only grows; a call without a token sends no extra frame
-├── config.rs      flags + env + .env, Godot binary auto-detection per OS, feedback mode and gh path, the bridge port and its origin
+├── config.rs      flags + env + .env, Godot binary auto-detection per OS, feedback mode, gh path and movie folder, the bridge port and its origin
 ├── version.rs     the reported version: the manifest version plus the commit the build names (see l2-ci-release-pipeline.md, DS-9)
 ├── bridge_port.rs the port derived from a project path, the same function as the addon's (see l2-bridge-client-rust.md)
 ├── feedback.rs    scrubber, fingerprint, link builder of the agent feedback channel (see l2-agent-feedback-rust.md)
@@ -116,3 +116,4 @@ src/
 | 1.4.3 | 2026-11-05 | Agent (magic.spec) | Removed the `[ADDED]` and `[MODIFIED]` markers from the body: the history rows carry what changed. No requirement changed. |
 | 1.5.0 | 2026-11-05 | Agent (magic.spec) | The module map gains `progress.rs`, and MCP-1 names notifications among the frames the one writer owns: a call with a progress token gets `notifications/progress` while a script runs. Source: pull request 128. Stable → RFC → Stable after Post-Update Review. |
 | 1.5.1 | 2026-11-19 | Agent (magic.spec) | Minimum toolchain 1.89 after the uuid update. No requirement changed. |
+| 1.6.0 | 2026-11-19 | Agent (magic.spec) | [MODIFIED] `config.rs` also reads the folder for Movie Maker recordings (`--movie-dir`, `GODOT_MCP_MOVIE_DIR`). Source: pull request 160. Stable → RFC → Stable after Post-Update Review. |

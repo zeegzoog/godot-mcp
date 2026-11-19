@@ -1,6 +1,6 @@
 # Tool Catalog
 
-**Version:** 1.20.0
+**Version:** 1.21.0
 **Status:** Stable
 **Layer:** concept
 
@@ -92,6 +92,7 @@ Agents call tools without seeing the implementation; a tool's contract has to be
 | `godot_connect_signal` | editor | scene (undoable) | Persistent connection inside the edited scene |
 | `godot_list_signals` | editor | no | Signals of a node and their connections |
 | `godot_create_resource` | live-first | disk | `.tres` of a built-in Resource class; never replaces a file |
+| `godot_set_resource_properties` | live-first | disk, editor state (undoable) | Properties of a resource saved in its own `.tres` or `.res` file; all or nothing, each value before and after (CA-19) |
 | `godot_get_project_settings` | live-first | no | Settings from the editor, else from `project.godot` |
 | `godot_set_project_setting` | live-first | disk | One setting, type-checked and escaped |
 | `godot_get_input_map` | editor | no | InputMap actions with their deadzone and events; Godot's built-in `ui_` actions on request |
@@ -173,3 +174,4 @@ graph TD
 | 1.18.0 | 2026-11-05 | Agent (magic.spec) | `godot_delete_file`: a file that a script only writes no longer refuses the deletion (CA-17). Stable → RFC → Stable after Post-Update Review. Removed the `[ADDED]` and `[MODIFIED]` markers from the body: the history rows carry what changed. No requirement changed. |
 | 1.19.0 | 2026-11-05 | Agent (magic.spec) | [ADDED] `godot_game_run_script` in the catalog. Stable → RFC → Stable after Post-Update Review. |
 | 1.20.0 | 2026-11-09 | Agent (magic.spec) | [MODIFIED] TL-11: the stop and status answers say how ended runs ended, and the output of the run that ended last stays readable. Source: pull requests 130 and 131. Stable → RFC → Stable after Post-Update Review. |
+| 1.21.0 | 2026-11-19 | Agent (magic.spec) | [ADDED] `godot_set_resource_properties` in the catalog. Source: pull request 158. Stable → RFC → Stable after Post-Update Review. |

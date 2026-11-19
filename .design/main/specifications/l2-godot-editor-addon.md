@@ -1,6 +1,6 @@
 # Godot Editor Addon
 
-**Version:** 1.13.1
+**Version:** 1.14.0
 **Status:** Stable
 **Layer:** implementation
 **Implements:** l1-editor-bridge.md
@@ -68,6 +68,7 @@ addons/godot_mcp/
 ├── editor/file_ops.gd         delete files the way the FileSystem dock does (see §5.4)
 ├── core/bridge_port.gd        the port derived from the project path (BR-13)
 ├── core/runtime_override.gd   override.cfg for editor Play, restored afterwards
+├── core/property_values.gd    value conversion and the changes to a saved resource file, shared with the headless runner
 ├── editor/game_relay.gd       EditorDebuggerPlugin relaying mcp:* messages of a played game
 ├── runtime/            in-game component loaded only while a debugger is attached (see l2-game-runtime.md)
 └── *.gd.uid            Godot UID sidecars (committed)
@@ -152,6 +153,7 @@ Each lives in its own file under `editor/`, loaded by path with no `class_name`;
 | `[DEVPROJ]` | `project.godot` | Development project enabling the addon |
 | `[OVERRIDE]` | `addons/godot_mcp/core/runtime_override.gd` | override.cfg for editor Play, restored afterwards |
 | `[PORT]` | `addons/godot_mcp/core/bridge_port.gd` | Port derived from the project path |
+| `[VALUES]` | `addons/godot_mcp/core/property_values.gd` | Property value conversion and the changes to a saved resource file, shared with the headless path |
 | `[SHADERS]` | `addons/godot_mcp/editor/shader_ops.gd` | Shader commands |
 | `[IMPORT]` | `addons/godot_mcp/editor/import_ops.gd` | Import parameter edits, shared with the headless path |
 | `[FILES]` | `addons/godot_mcp/editor/file_ops.gd` | File deletion |
@@ -180,3 +182,4 @@ Each lives in its own file under `editor/`, loaded by path with no `class_name`;
 | 1.12.0 | 2026-11-02 | Agent (magic.spec) | [ADDED] `addon_version` in the `get_project_info` handler note: the `version` of `plugin.cfg` read when the bridge starts, the version the editor runs (TL-14). Source: pull request 102. Stable → RFC → Stable after Post-Update Review. |
 | 1.13.0 | 2026-11-04 | Agent (magic.spec) | [ADDED] The startup gate of the bridge; [MODIFIED] the deletion note: written and used references. Source: pull requests 115 and 113. Stable → RFC → Stable after Post-Update Review. |
 | 1.13.1 | 2026-11-05 | Agent (magic.spec) | Removed the `[ADDED]` and `[MODIFIED]` markers from the body: the history rows carry what changed. No requirement changed. |
+| 1.14.0 | 2026-11-19 | Agent (magic.spec) | [ADDED] `core/property_values.gd`: the value conversion of the editor bridge, now shared with the server's headless runner, and the `set_resource_properties` command. Source: pull request 158. Stable → RFC → Stable after Post-Update Review. |

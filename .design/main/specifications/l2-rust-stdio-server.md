@@ -1,6 +1,6 @@
 # Rust Stdio Server
 
-**Version:** 1.5.0
+**Version:** 1.5.1
 **Status:** Stable
 **Layer:** implementation
 **Implements:** l1-mcp-server.md
@@ -22,7 +22,7 @@ Records how the concept's guarantees map onto this crate so a change to the sess
 
 ## 2. Constraints & Assumptions
 
-- Rust edition 2024, minimum toolchain 1.87; async runtime Tokio (multi-threaded).
+- Rust edition 2024, minimum toolchain 1.89; async runtime Tokio (multi-threaded).
 - Command-line parsing with `clap` (flags with `env` fallbacks); `.env` loading with `dotenvy`; diagnostics with `tracing` written to standard error, filter `godot_mcp=info,warn` unless `RUST_LOG` overrides it; colour codes are written only when standard error is a terminal, so a client that stores the log gets plain text.
 - Observed conventions: `unwrap()` / `expect()` appear only in tests; mutexes are locked through a helper that recovers from poisoning; no lock is held across an `await` on the editor.
 
@@ -115,3 +115,4 @@ src/
 | 1.4.2 | 2026-11-02 | Agent (magic.run) | [ADDED] `version.rs` in the module map; the initialize answer reports the build's version. No other requirement changed. |
 | 1.4.3 | 2026-11-05 | Agent (magic.spec) | Removed the `[ADDED]` and `[MODIFIED]` markers from the body: the history rows carry what changed. No requirement changed. |
 | 1.5.0 | 2026-11-05 | Agent (magic.spec) | The module map gains `progress.rs`, and MCP-1 names notifications among the frames the one writer owns: a call with a progress token gets `notifications/progress` while a script runs. Source: pull request 128. Stable → RFC → Stable after Post-Update Review. |
+| 1.5.1 | 2026-11-19 | Agent (magic.spec) | Minimum toolchain 1.89 after the uuid update. No requirement changed. |

@@ -20,7 +20,7 @@ The Rust realization of the tool catalog: the static catalog with input schemas,
 - [l2-held-stepping.md](l2-held-stepping.md) - The scenario tool routed to `tools/scenario.rs` (§5.8 there).
 - [l1-content-authoring.md](l1-content-authoring.md) - CA-7 to CA-10: the script read and edit tools (§5.4); CA-11: the authoring fallbacks (§5.5); CA-12: project creation (§5.6); CA-14 to CA-17: shaders, import parameters, InputMap actions and deletion (§5.8 to §5.10).
 - [l1-project-export.md](l1-project-export.md) - EX-1 to EX-7: the export tools (§5.12).
-- [l2-content-authoring-tools.md](l2-content-authoring-tools.md) - Where each authoring invariant (CA-1 to CA-18) is kept and tested.
+- [l2-content-authoring-tools.md](l2-content-authoring-tools.md) - Where each authoring invariant (CA-1 to CA-19) is kept and tested.
 - [l2-project-export-tools.md](l2-project-export-tools.md) - Where each export invariant (EX-1 to EX-7) is kept and tested.
 
 ## 1. Motivation

@@ -731,6 +731,33 @@ async fn create_resource_without_an_editor_never_replaces_a_file() {
     );
 }
 
+/// godot_set_resource_properties refuses a path that is not a resource file, an empty change and
+/// a missing file before any engine is started.
+#[tokio::test]
+async fn set_resource_properties_refuses_before_starting_godot() {
+    let project = project_dir();
+    std::fs::write(project.path().join("icon.png"), b"not really").expect("png");
+    for (path, properties, needle) in [
+        ("res://icon.png", json!({"a": 1}), ".tres or .res"),
+        ("res://water.tres", json!({}), "non-empty object"),
+        ("res://missing.tres", json!({"roughness": 0.5}), "not found"),
+        ("res://../outside.tres", json!({"roughness": 0.5}), ""),
+    ] {
+        let result = call(
+            "godot_set_resource_properties",
+            json!({"resource_path": path, "properties": properties, "project_path": project.path()}),
+        )
+        .await;
+        assert!(result.is_error, "{path}: {}", text(&result));
+        assert!(text(&result).contains(needle), "{path}: {}", text(&result));
+        assert!(
+            !text(&result).contains("Godot executable"),
+            "{path}: the engine was started: {}",
+            text(&result)
+        );
+    }
+}
+
 #[tokio::test]
 async fn project_setting_without_an_editor_cannot_add_lines_to_project_godot() {
     let project = project_dir();

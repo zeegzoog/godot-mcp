@@ -394,6 +394,50 @@ func _answer() -> Dictionary:
 
 const IMPORT_OPS_SOURCE: &str = include_str!("../addons/godot_mcp/editor/import_ops.gd");
 
+/// The main script of a resource property change without the editor. Fixed text: the request
+/// reaches it as a JSON file named after `--`, and the work is done by the addon's
+/// `core/property_values.gd`, the code the editor bridge uses, copied next to the request.
+const SET_RESOURCE_SCRIPT: &str = r#"extends SceneTree
+
+
+func _initialize() -> void:
+	print("GODOT_MCP_RESOURCE=", JSON.stringify(_answer()))
+	quit()
+
+
+func _answer() -> Dictionary:
+	var args: PackedStringArray = OS.get_cmdline_user_args()
+	if args.is_empty():
+		return {"error": "the request file was not named"}
+	var request: Variant = JSON.parse_string(FileAccess.get_file_as_string(args[0]))
+	if typeof(request) != TYPE_DICTIONARY:
+		return {"error": "the request could not be read"}
+	var ops: GDScript = load(args[0].get_base_dir().path_join("property_values.gd"))
+	if ops == null:
+		return {"error": "the property conversion script could not be loaded"}
+	var properties: Variant = request.get("properties", {})
+	if typeof(properties) != TYPE_DICTIONARY:
+		return {"error": "properties must be an object"}
+	var plan: Dictionary = ops.call("plan_resource_change", str(request.get("resource_path", "")), properties)
+	if plan.has("error"):
+		return {"error": str(plan["error"])}
+	var resource: Resource = plan["resource"]
+	var saved: Error = ops.call("store_resource_values", resource, plan["values"], plan["before"])
+	if saved != OK:
+		return {"error": "No properties were changed: saving %s failed (%s). Check that the file is writable." % [resource.resource_path, error_string(saved)]}
+	return {
+		"resource_path": resource.resource_path,
+		"class": resource.get_class(),
+		"changed": ops.call("resource_change_report", resource, plan["values"], plan["before"]),
+		"saved": true,
+	}
+"#;
+
+const PROPERTY_VALUES_SOURCE: &str = include_str!("../addons/godot_mcp/core/property_values.gd");
+
+/// What [`CliRunner::set_resource_properties`] printed before the marker line holds its answer.
+pub const SET_RESOURCE_MARKER: &str = "GODOT_MCP_RESOURCE=";
+
 /// What the engine knows about a project setting, from [`CliRunner::setting_type`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SettingType {
@@ -1343,6 +1387,41 @@ impl CliRunner {
             "the import parameters",
         )
         .await
+    }
+
+    /// Changes properties of the resource file `resource_path` of `project` and saves it, in a
+    /// headless Godot that runs a fixed script outside the project: the request (`resource_path`
+    /// and `properties`) reaches it as a JSON file named after `--`, never on the command line or
+    /// inside the source. The answer is the line after [`SET_RESOURCE_MARKER`] in the run's
+    /// stdout. Godot saves headless without uids and with null unset shader parameters, so the
+    /// caller repairs the file afterwards.
+    pub async fn set_resource_properties(
+        &self,
+        project: &Path,
+        request: &serde_json::Value,
+        timeout_seconds: u64,
+    ) -> Result<ScriptRun> {
+        let dir = create_scratch_dir("resource-properties")?;
+        let outcome = async {
+            let request_file = dir.join("request.json");
+            std::fs::write(&request_file, request.to_string())?;
+            std::fs::write(dir.join("property_values.gd"), PROPERTY_VALUES_SOURCE)?;
+            let script = dir.join("set_resource_properties.gd");
+            std::fs::write(&script, SET_RESOURCE_SCRIPT)?;
+            let argument = request_file.to_string_lossy().into_owned();
+            self.run_script_with(
+                &["--headless"],
+                project,
+                &script,
+                &[argument],
+                timeout_seconds,
+                None,
+            )
+            .await
+        }
+        .await;
+        let _ = std::fs::remove_dir_all(&dir);
+        outcome
     }
 
     /// Runs the first of `files` as the main script of a new throw-away project holding `files`

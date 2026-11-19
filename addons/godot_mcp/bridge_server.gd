@@ -34,6 +34,8 @@ const ImportOps: GDScript = preload("res://addons/godot_mcp/editor/import_ops.gd
 ## The running game's property ops. The editor reuses their ':' resource-step resolver, so a
 ## property path means the same in godot_set_node_properties as in godot_game_set.
 const RtLive: GDScript = preload("res://addons/godot_mcp/runtime/ops/rt_live.gd")
+## Value conversion and resource file changes, shared with the server's headless runner.
+const PropertyValues: GDScript = preload("res://addons/godot_mcp/core/property_values.gd")
 const SHADER_OPS_PATH: String = "res://addons/godot_mcp/editor/shader_ops.gd"
 const MAX_CAPTURE_DIMENSION: int = 1568
 const MIN_CAPTURE_SIZE: int = 16
@@ -67,6 +69,7 @@ const PARAM_TYPES: Dictionary = {
     "connect_signal": {"node_path": TYPE_STRING, "signal_name": TYPE_STRING, "method": TYPE_STRING, "target_path": TYPE_STRING, "make_editable": TYPE_BOOL},
     "list_signals": {"node_path": TYPE_STRING},
     "create_resource": {"resource_path": TYPE_STRING, "class_name": TYPE_STRING},
+    "set_resource_properties": {"resource_path": TYPE_STRING, "properties": TYPE_DICTIONARY},
     "set_project_setting": {"key": TYPE_STRING, "value_text": TYPE_STRING, "replace_type": TYPE_BOOL, "remove": TYPE_BOOL},
     "get_project_settings": {"prefix": TYPE_STRING},
     "get_input_map": {"action": TYPE_STRING, "include_builtin": TYPE_BOOL},
@@ -77,18 +80,6 @@ const PARAM_TYPES: Dictionary = {
     "game_send": {"command": TYPE_STRING},
     "close_editor": {"discard": TYPE_BOOL},
     "import_params": {"path": TYPE_STRING, "action": TYPE_STRING, "params": TYPE_DICTIONARY, "copy_from": TYPE_STRING, "reimport": TYPE_BOOL, "importer": TYPE_STRING},
-}
-
-## Fields accepted when a vector-like value is given as a JSON object.
-const OBJECT_FIELDS: Dictionary = {
-    TYPE_VECTOR2: ["x", "y"],
-    TYPE_VECTOR2I: ["x", "y"],
-    TYPE_VECTOR3: ["x", "y", "z"],
-    TYPE_VECTOR3I: ["x", "y", "z"],
-    TYPE_VECTOR4: ["x", "y", "z", "w"],
-    TYPE_VECTOR4I: ["x", "y", "z", "w"],
-    TYPE_QUATERNION: ["x", "y", "z", "w"],
-    TYPE_COLOR: ["r", "g", "b", "a"],
 }
 
 var server: TCPServer = TCPServer.new()
@@ -419,6 +410,8 @@ func dispatch_command(peer: WebSocketPeer, cmd_id: String, cmd_type: String, par
             list_signals(peer, cmd_id, params)
         "create_resource":
             create_resource(peer, cmd_id, params)
+        "set_resource_properties":
+            set_resource_properties(peer, cmd_id, params)
         "set_project_setting":
             set_project_setting(peer, cmd_id, params)
         "get_project_settings":
@@ -546,23 +539,6 @@ func editable_paths(root: Node, locked: Array[Node]) -> Array[String]:
     for instance: Node in locked:
         paths.append(String(root.get_path_to(instance)))
     return paths
-
-func property_type_name(info: Dictionary) -> String:
-    var type_id: int = info["type"]
-    if type_id == TYPE_OBJECT:
-        var object_class: String = info.get("class_name", "")
-        return object_class if not object_class.is_empty() else "Object"
-    if type_id == TYPE_ARRAY:
-        var element: Dictionary = array_element_info(info)
-        if not element.is_empty() and not element.has("error"):
-            return "Array[%s]" % property_type_name(element)
-    if type_id == TYPE_DICTIONARY:
-        var entries: Dictionary = dictionary_entry_info(info)
-        if not entries.is_empty() and not entries.has("error"):
-            var key_name: String = "Variant" if entries["key"].is_empty() else property_type_name(entries["key"])
-            var value_name: String = "Variant" if entries["value"].is_empty() else property_type_name(entries["value"])
-            return "Dictionary[%s, %s]" % [key_name, value_name]
-    return type_string(type_id)
 
 ## Path of a node from the edited scene's root ("." for the root), or "" when it is not in that scene.
 func edited_scene_path_of(node: Node) -> String:
@@ -1134,7 +1110,7 @@ func get_node_properties(peer: WebSocketPeer, cmd_id: String, params: Dictionary
             elif not resolved.has("skip"):
                 var holder: Object = resolved["object"]
                 props[prop_path] = {
-                    "type": property_type_name(resolved["info"]),
+                    "type": PropertyValues.property_type_name(resolved["info"]),
                     "value": describe_value(holder.get(str(resolved["property"]))),
                 }
         var answer: Dictionary = {"node_path": node_path, "class": target_node.get_class(), "properties": props}
@@ -1148,7 +1124,7 @@ func get_node_properties(peer: WebSocketPeer, cmd_id: String, params: Dictionary
             continue
         var prop_name: String = prop["name"]
         props[prop_name] = {
-            "type": property_type_name(prop),
+            "type": PropertyValues.property_type_name(prop),
             "value": describe_value(target_node.get(prop_name)),
         }
 
@@ -1197,270 +1173,7 @@ func foreign_resource_problem(resource: Resource) -> String:
         return ""
     if path.contains("::"):
         return "goes through a %s built into %s, not into this scene, so changing it here would change every scene that uses that file. Open %s and change it there, or give this node its own copy of the resource first." % [resource.get_class(), file, file]
-    return "goes through the resource file %s (%s), which every scene that uses it shares. Change that file instead, or give this node its own copy of the resource first." % [path, resource.get_class()]
-
-## Builds a vector-like value from a list of numbers; returns null if the count is wrong.
-func build_numeric_value(expected: int, n: Array) -> Variant:
-    match expected:
-        TYPE_VECTOR2:
-            if n.size() == 2: return Vector2(n[0], n[1])
-        TYPE_VECTOR2I:
-            if n.size() == 2: return Vector2i(int(n[0]), int(n[1]))
-        TYPE_VECTOR3:
-            if n.size() == 3: return Vector3(n[0], n[1], n[2])
-        TYPE_VECTOR3I:
-            if n.size() == 3: return Vector3i(int(n[0]), int(n[1]), int(n[2]))
-        TYPE_VECTOR4:
-            if n.size() == 4: return Vector4(n[0], n[1], n[2], n[3])
-        TYPE_VECTOR4I:
-            if n.size() == 4: return Vector4i(int(n[0]), int(n[1]), int(n[2]), int(n[3]))
-        TYPE_QUATERNION:
-            if n.size() == 4: return Quaternion(n[0], n[1], n[2], n[3])
-        TYPE_COLOR:
-            if n.size() == 3: return Color(n[0], n[1], n[2])
-            if n.size() == 4: return Color(n[0], n[1], n[2], n[3])
-        TYPE_RECT2:
-            if n.size() == 4: return Rect2(n[0], n[1], n[2], n[3])
-        TYPE_RECT2I:
-            if n.size() == 4: return Rect2i(int(n[0]), int(n[1]), int(n[2]), int(n[3]))
-    return null
-
-## Reads a JSON array or object of numbers; returns [] if anything is not a number.
-func numbers_from(value: Variant, fields: Array) -> Array:
-    var numbers: Array = []
-    if value is Array:
-        for item: Variant in value:
-            if not (item is float or item is int):
-                return []
-            numbers.append(float(item))
-    elif value is Dictionary:
-        for field: String in fields:
-            if not value.has(field):
-                break
-            var item: Variant = value[field]
-            if not (item is float or item is int):
-                return []
-            numbers.append(float(item))
-    return numbers
-
-## The property info of one element type from a typed container's hint: "type/hint:hint_string"
-## (PROPERTY_HINT_TYPE_STRING, exported containers) or a type or class name
-## (PROPERTY_HINT_ARRAY_TYPE). Returns {} for a Variant element, else {"type", "hint",
-## "hint_string", "class_name"} or {"error": String}.
-func element_info(description: String) -> Dictionary:
-    if description.is_empty() or description == "Variant":
-        return {}
-    var colon: int = description.find(":")
-    var head: String = description if colon < 0 else description.substr(0, colon)
-    var head_parts: PackedStringArray = head.split("/")
-    if head_parts[0].is_valid_int() and (head_parts.size() == 1 or head_parts[1].is_valid_int()):
-        var type_id: int = head_parts[0].to_int()
-        if type_id == TYPE_NIL:
-            return {}
-        var hint: int = head_parts[1].to_int() if head_parts.size() > 1 else PROPERTY_HINT_NONE
-        var hint_string: String = "" if colon < 0 else description.substr(colon + 1)
-        var object_class: String = ""
-        if type_id == TYPE_OBJECT:
-            var names_class: bool = hint in [PROPERTY_HINT_RESOURCE_TYPE, PROPERTY_HINT_NODE_TYPE] and not hint_string.is_empty()
-            object_class = hint_string if names_class else "Object"
-        return {"type": type_id, "hint": hint, "hint_string": hint_string, "class_name": object_class}
-    for type_id: int in range(TYPE_NIL + 1, TYPE_MAX):
-        if type_id != TYPE_OBJECT and type_string(type_id) == description:
-            return {"type": type_id, "hint": PROPERTY_HINT_NONE, "hint_string": "", "class_name": ""}
-    if ClassDB.class_exists(description) or not global_class_script(description).is_empty():
-        return {"type": TYPE_OBJECT, "hint": PROPERTY_HINT_NONE, "hint_string": description, "class_name": description}
-    return {"error": "cannot read the element type '%s' of this typed container" % description}
-
-## The element type of a typed array property ({} for an untyped one); see element_info.
-func array_element_info(info: Dictionary) -> Dictionary:
-    var hint: int = info.get("hint", PROPERTY_HINT_NONE)
-    if hint != PROPERTY_HINT_TYPE_STRING and hint != PROPERTY_HINT_ARRAY_TYPE:
-        return {}
-    return element_info(str(info.get("hint_string", "")))
-
-## The key and value types of a typed dictionary property: {} for an untyped one, else
-## {"key": Dictionary, "value": Dictionary} (each as element_info) or {"error": String}.
-func dictionary_entry_info(info: Dictionary) -> Dictionary:
-    var hint: int = info.get("hint", PROPERTY_HINT_NONE)
-    var hint_string: String = str(info.get("hint_string", ""))
-    if (hint != PROPERTY_HINT_TYPE_STRING and hint != PROPERTY_HINT_DICTIONARY_TYPE) or not hint_string.contains(";"):
-        return {}
-    var key: Dictionary = element_info(hint_string.get_slice(";", 0))
-    if key.has("error"):
-        return key
-    var value: Dictionary = element_info(hint_string.substr(hint_string.find(";") + 1))
-    if value.has("error"):
-        return value
-    if key.is_empty() and value.is_empty():
-        return {}
-    return {"key": key, "value": value}
-
-## res:// path of the script of a global class_name, or "".
-func global_class_script(global_name: String) -> String:
-    for entry: Dictionary in ProjectSettings.get_global_class_list():
-        if entry["class"] == global_name:
-            return str(entry["path"])
-    return ""
-
-## Whether an object is of a native class or a global script class (or extends it).
-func object_is_class(object: Object, wanted: String) -> bool:
-    if wanted.is_empty() or wanted == "Object":
-        return true
-    if ClassDB.class_exists(wanted):
-        return object.is_class(wanted)
-    var script: Script = object.get_script() as Script
-    while script != null:
-        if String(script.get_global_name()) == wanted:
-            return true
-        script = script.get_base_script()
-    return false
-
-## Converts one element of a typed container. A value already of the element type (from a
-## parsed Godot literal) is kept. Returns {"value": Variant} or {"error": String}.
-func convert_element(element: Dictionary, raw: Variant) -> Dictionary:
-    if element.is_empty():
-        return {"value": raw}
-    var expected: int = element["type"]
-    if expected != TYPE_OBJECT:
-        if typeof(raw) == expected:
-            return {"value": raw}
-        return convert_property_value(element, raw)
-    var result: Dictionary = {"value": raw} if raw == null or raw is Object else convert_property_value(element, raw)
-    if result.has("error") or result["value"] == null:
-        return result
-    var object: Object = result["value"]
-    var wanted: String = element["class_name"]
-    if not object_is_class(object, wanted):
-        return {"error": "%s is a %s, not a %s" % [describe_value(object), object.get_class(), wanted]}
-    return result
-
-## The arguments that type a container's elements: [type, native class, script].
-func container_typing(element: Dictionary) -> Array:
-    if element.is_empty():
-        return [TYPE_NIL, &"", null]
-    if element["type"] != TYPE_OBJECT:
-        return [element["type"], &"", null]
-    var wanted: String = element["class_name"]
-    if ClassDB.class_exists(wanted):
-        return [TYPE_OBJECT, StringName(wanted), null]
-    var script: Script = load(global_class_script(wanted)) as Script
-    if script == null:
-        return [TYPE_OBJECT, &"Object", null]
-    return [TYPE_OBJECT, script.get_instance_base_type(), script]
-
-## Builds a typed array from JSON or parsed items. Returns {"value": Array} or {"error": String}
-## naming the first element that does not convert.
-func typed_array_from(element: Dictionary, items: Array) -> Dictionary:
-    var values: Array = []
-    for index: int in items.size():
-        var converted: Dictionary = convert_element(element, items[index])
-        if converted.has("error"):
-            return {"error": "element %d: %s" % [index, converted["error"]]}
-        values.append(converted["value"])
-    var typing: Array = container_typing(element)
-    return {"value": Array(values, typing[0], typing[1], typing[2])}
-
-## Builds a typed dictionary from JSON or parsed entries. JSON keys are always strings, so a key
-## is converted like an element. Returns {"value": Dictionary} or {"error": String}.
-func typed_dictionary_from(key_element: Dictionary, value_element: Dictionary, items: Dictionary) -> Dictionary:
-    var values: Dictionary = {}
-    for raw_key: Variant in items:
-        var key: Dictionary = convert_element(key_element, raw_key)
-        if key.has("error"):
-            return {"error": "key %s: %s" % [describe_value(raw_key), key["error"]]}
-        var value: Dictionary = convert_element(value_element, items[raw_key])
-        if value.has("error"):
-            return {"error": "value of %s: %s" % [describe_value(raw_key), value["error"]]}
-        values[key["value"]] = value["value"]
-    var key_typing: Array = container_typing(key_element)
-    var value_typing: Array = container_typing(value_element)
-    return {"value": Dictionary(values, key_typing[0], key_typing[1], key_typing[2], value_typing[0], value_typing[1], value_typing[2])}
-
-## Converts a JSON value to what the property expects. Returns {"value": Variant} or
-## {"error": String}.
-func convert_property_value(info: Dictionary, raw: Variant) -> Dictionary:
-    var expected: int = info["type"]
-
-    match expected:
-        TYPE_NIL:
-            return {"value": raw}
-        TYPE_BOOL:
-            if raw is bool:
-                return {"value": raw}
-        TYPE_INT:
-            if raw is int:
-                return {"value": raw}
-            if raw is float and raw == floorf(raw):
-                return {"value": int(raw)}
-        TYPE_FLOAT:
-            if raw is float or raw is int:
-                return {"value": float(raw)}
-        TYPE_STRING:
-            if raw is String:
-                return {"value": raw}
-        TYPE_STRING_NAME:
-            if raw is String:
-                return {"value": StringName(raw)}
-        TYPE_NODE_PATH:
-            if raw is String:
-                return {"value": NodePath(raw)}
-        TYPE_VECTOR2, TYPE_VECTOR2I, TYPE_VECTOR3, TYPE_VECTOR3I, TYPE_VECTOR4, TYPE_VECTOR4I, TYPE_QUATERNION, TYPE_COLOR, TYPE_RECT2, TYPE_RECT2I:
-            if expected == TYPE_COLOR and raw is String:
-                var sentinel: Color = Color(-1.0, -1.0, -1.0, -1.0)
-                var parsed_color: Color = Color.from_string(raw, sentinel)
-                if parsed_color != sentinel:
-                    return {"value": parsed_color}
-            if raw is Array or raw is Dictionary:
-                var built: Variant = build_numeric_value(expected, numbers_from(raw, OBJECT_FIELDS.get(expected, [])))
-                if built != null:
-                    return {"value": built}
-        TYPE_OBJECT:
-            if raw == null:
-                return {"value": null}
-            if raw is String and raw.begins_with("res://"):
-                if not ResourceLoader.exists(raw):
-                    return {"error": "Resource not found: " + raw}
-                return {"value": load(raw)}
-        TYPE_ARRAY:
-            var element: Dictionary = array_element_info(info)
-            if element.has("error"):
-                return element
-            if not element.is_empty():
-                # A typed array keeps only elements of its type, so assigning a mismatched array
-                # leaves it empty without an error; convert every element or refuse.
-                var items: Variant = str_to_var(raw) if raw is String else raw
-                if not items is Array:
-                    return {"error": "expected %s (a JSON array) but got %s (%s)" % [property_type_name(info), type_string(typeof(raw)), describe_value(raw)]}
-                return typed_array_from(element, items)
-            if raw is Array:
-                return {"value": raw}
-        TYPE_DICTIONARY:
-            var entries: Dictionary = dictionary_entry_info(info)
-            if entries.has("error"):
-                return entries
-            if not entries.is_empty():
-                var items: Variant = str_to_var(raw) if raw is String else raw
-                if not items is Dictionary:
-                    return {"error": "expected %s (a JSON object) but got %s (%s)" % [property_type_name(info), type_string(typeof(raw)), describe_value(raw)]}
-                return typed_dictionary_from(entries["key"], entries["value"], items)
-            if raw is Dictionary:
-                return {"value": raw}
-        TYPE_PACKED_BYTE_ARRAY, TYPE_PACKED_INT32_ARRAY, TYPE_PACKED_INT64_ARRAY, TYPE_PACKED_FLOAT32_ARRAY, TYPE_PACKED_FLOAT64_ARRAY, TYPE_PACKED_STRING_ARRAY, TYPE_PACKED_VECTOR2_ARRAY, TYPE_PACKED_VECTOR3_ARRAY, TYPE_PACKED_COLOR_ARRAY, TYPE_PACKED_VECTOR4_ARRAY:
-            if raw is Array:
-                var packed: Variant = type_convert(raw, expected)
-                if typeof(packed) == expected:
-                    return {"value": packed}
-        _:
-            if typeof(raw) == expected:
-                return {"value": raw}
-
-    # Anything else may be a Godot literal such as "Transform2D(...)".
-    if raw is String:
-        var parsed: Variant = str_to_var(raw)
-        if parsed != null and typeof(parsed) == expected:
-            return {"value": parsed}
-
-    return {"error": "expected %s but got %s (%s)" % [property_type_name(info), type_string(typeof(raw)), describe_value(raw)]}
+    return "goes through the resource file %s (%s), which every scene that uses it shares. Change that file with godot_set_resource_properties instead, or give this node its own copy of the resource first." % [path, resource.get_class()]
 
 ## Whether a property holds a node: an Object exported with a node type (`@export var x: Node3D`
 ## or a class_name type), which the inspector fills with its node picker.
@@ -1503,7 +1216,7 @@ func checked_node_reference(info: Dictionary, result: Dictionary) -> Dictionary:
     if wanted.is_empty():
         return result
     for class_id: String in wanted:
-        if object_is_class(node, class_id.strip_edges()):
+        if PropertyValues.object_is_class(node, class_id.strip_edges()):
             return result
     var script: Script = node.get_script() as Script
     var kind: String = node.get_class()
@@ -1551,7 +1264,7 @@ func convert_properties(target_node: Node, properties: Dictionary, root: Node, p
             if resolved.has("error"):
                 problems.append(str(resolved["error"]))
                 continue
-            var stepped_value: Dictionary = convert_property_value(resolved["info"], properties[key])
+            var stepped_value: Dictionary = PropertyValues.convert_property_value(resolved["info"], properties[key])
             if stepped_value.has("error"):
                 problems.append("%s: %s" % [prop_name, stepped_value["error"]])
             else:
@@ -1573,31 +1286,12 @@ func convert_properties(target_node: Node, properties: Dictionary, root: Node, p
             if not result.has("error"):
                 result = checked_node_reference(known[prop_name], result)
         else:
-            result = convert_property_value(known[prop_name], properties[key])
+            result = PropertyValues.convert_property_value(known[prop_name], properties[key])
         if result.has("error"):
             problems.append("%s: %s" % [prop_name, result["error"]])
         else:
             converted[prop_name] = result["value"]
     return {"converted": converted, "new_meta": new_meta, "stepped": stepped, "problems": problems}
-
-## Types whose components are floats, compared with their own is_equal_approx.
-const APPROX_TYPES: Array[int] = [
-    TYPE_VECTOR2, TYPE_VECTOR3, TYPE_VECTOR4, TYPE_RECT2, TYPE_COLOR, TYPE_QUATERNION,
-    TYPE_PLANE, TYPE_AABB, TYPE_BASIS, TYPE_TRANSFORM2D, TYPE_TRANSFORM3D,
-]
-
-## Whether a value read back is the one that was set. A float property stored in single precision
-## reads back slightly off, so floats compare approximately.
-func same_value(read: Variant, wanted: Variant) -> bool:
-    var read_type: int = typeof(read)
-    var wanted_type: int = typeof(wanted)
-    if (read_type == TYPE_FLOAT or wanted_type == TYPE_FLOAT) \
-            and (read_type == TYPE_FLOAT or read_type == TYPE_INT) \
-            and (wanted_type == TYPE_FLOAT or wanted_type == TYPE_INT):
-        return is_equal_approx(float(read), float(wanted))
-    if read_type == wanted_type and APPROX_TYPES.has(read_type):
-        return read.is_equal_approx(wanted)
-    return read == wanted
 
 ## Why a property reads back differently from the value it was given. A setter may clamp the value,
 ## refuse it, or (an audio bus) keep a name the editor's AudioServer lacks while the getter answers
@@ -1652,7 +1346,7 @@ func check_property_values(probes: Array) -> PackedStringArray:
         if holder is Node and probe[1] == "name":
             continue
         var read: Variant = holder.get(probe[1])
-        if not same_value(read, probe[3]):
+        if not PropertyValues.same_value(read, probe[3]):
             kept.append(describe_kept_value(holder, probe[1], probe[2], probe[3], read))
     return kept
 
@@ -2501,6 +2195,50 @@ func create_resource(peer: WebSocketPeer, cmd_id: String, params: Dictionary) ->
         return
     EditorInterface.get_resource_filesystem().update_file(resource_path)
     send_success(peer, cmd_id, {"resource_path": resource_path, "class_name": resource_class})
+
+## Changes properties of a resource saved in its own .tres or .res file and saves it, as one
+## undoable action: the loaded copy every open scene uses changes with it, and undo and redo save
+## the file again. Every value is converted and tried first, so a refused one changes nothing.
+func set_resource_properties(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
+    var resource_path: String = to_res_path(str(params.get("resource_path", "")))
+    if resource_path.is_empty():
+        send_error(peer, cmd_id, "resource_path must be a res:// path inside the project")
+        return
+    var properties: Dictionary = params.get("properties", {})
+    var plan: Dictionary = PropertyValues.plan_resource_change(resource_path, properties)
+    if plan.has("error"):
+        send_error(peer, cmd_id, str(plan["error"]))
+        return
+    var resource: Resource = plan["resource"]
+    var values: Dictionary = plan["values"]
+    var before: Dictionary = plan["before"]
+    var saved: Error = _store_resource_values(resource, values, before)
+    if saved != OK:
+        send_error(peer, cmd_id, "No properties were changed: saving %s failed (%s). Check that the file is writable." % [resource_path, error_string(saved)])
+        return
+    if undo_redo != null:
+        # Already applied and saved above, so the action is registered without running it again.
+        undo_redo.create_action("Set Properties on " + resource_path.get_file(), UndoRedo.MERGE_DISABLE, resource)
+        undo_redo.add_do_method(self, "_store_resource_values", resource, values, before)
+        undo_redo.add_undo_method(self, "_store_resource_values", resource, before, values)
+        undo_redo.commit_action(false)
+    send_success(peer, cmd_id, {
+        "resource_path": resource_path,
+        "class": resource.get_class(),
+        "changed": PropertyValues.resource_change_report(resource, values, before),
+        "saved": true,
+        "undoable": undo_redo != null,
+    })
+
+## Sets values on a resource file's loaded copy and saves the file (also for undo and redo); the
+## old values come back when the save fails.
+func _store_resource_values(resource: Resource, values: Dictionary, before: Dictionary) -> Error:
+    var saved: Error = PropertyValues.store_resource_values(resource, values, before)
+    if saved == OK:
+        EditorInterface.get_resource_filesystem().update_file(resource.resource_path)
+    else:
+        push_error("Godot MCP: saving %s failed: %s" % [resource.resource_path, error_string(saved)])
+    return saved
 
 const SETTING_KEY_CHARS: String = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_/.-"
 

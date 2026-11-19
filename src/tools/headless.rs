@@ -6,7 +6,9 @@ use super::main_loop::main_loop_problem;
 use super::project_gate::ScriptTurn;
 use super::run::StaleImports;
 use super::{ToolManager, bridge_error_result, code, missing_argument, str_arg, user_args_of};
-use crate::cli_runner::{ScriptErrorLoc, ScriptRun, binary_uid_limit, script_load_failure};
+use crate::cli_runner::{
+    SET_RESOURCE_MARKER, ScriptErrorLoc, ScriptRun, binary_uid_limit, script_load_failure,
+};
 use crate::error::McpError;
 use crate::godot::class_cache;
 use crate::godot::{
@@ -1216,6 +1218,107 @@ impl ToolManager {
             uid_cache_recorded: None,
             uid_cache_stale: None,
             overlapped: false,
+        }
+    }
+
+    /// Changes and saves a resource file without the editor (`godot_set_resource_properties`),
+    /// in one headless Godot run ordered with the project's script runs, then repairs the file
+    /// the way a `godot_run_script` save is repaired: its uid, its ext_resource uids, no null
+    /// shader parameters, and the uid cache or the connected editor told about it.
+    pub(super) async fn set_resource_without_editor(
+        &self,
+        project: &Path,
+        res_path: &str,
+        properties: &Value,
+    ) -> ToolResult {
+        let request = json!({"resource_path": res_path, "properties": properties});
+        let (turn, running) = self.gates.begin_script(project).await;
+        let run = self
+            .cli
+            .set_resource_properties(project, &request, DEFAULT_SCRIPT_TIMEOUT)
+            .await;
+        drop(running);
+        let run = match run {
+            Ok(run) => run,
+            Err(error) => {
+                return ToolResult::error(
+                    format!("Failed to run Godot to change {res_path}: {error}"),
+                    &["Verify GODOT_PATH points to a working Godot executable"],
+                );
+            }
+        };
+        let mut repair = self.repair_resources(project, &turn).await;
+        repair.overlapped = turn.overlapped();
+        let damage = {
+            let _alone = turn.exclusive().await;
+            turn.snapshot().damage_since(project)
+        };
+        let answer = run
+            .stdout
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(SET_RESOURCE_MARKER))
+            .and_then(|text| serde_json::from_str::<Value>(text).ok());
+        let Some(mut answer) = answer else {
+            let tail = last_output_lines(&run.stdout, &run.stderr, 20)
+                .unwrap_or_else(|| "(no output)".to_string());
+            return ToolResult::error(
+                format!(
+                    "Godot gave no answer about {res_path} (exit {:?}{}), so it may not have been changed.\n{tail}",
+                    run.exit_code,
+                    if run.timed_out { ", timed out" } else { "" }
+                ),
+                &[
+                    "Check that the file and the resources it uses load without errors",
+                    "Or open the project in the editor with the Godot MCP Bridge plugin and call the tool again",
+                ],
+            );
+        };
+        if let Some(problem) = answer.get("error").and_then(Value::as_str) {
+            return ToolResult::error(
+                problem.to_string(),
+                &[
+                    "Read the resource with godot_run_script or open it in the editor to see its property names and types",
+                    "A shader parameter is named shader_parameter/<uniform>, as the inspector lists it",
+                ],
+            );
+        }
+        let (damage_entries, warning) = damage_report(&damage);
+        if let Some(fields) = answer.as_object_mut() {
+            fields.insert("mode".into(), json!("headless"));
+            fields.insert("undoable".into(), json!(false));
+            fields.insert("resource_repairs".into(), json!(repair.entries()));
+            if let Some(sentence) = repair.sentence() {
+                fields.insert("repair_summary".into(), json!(sentence));
+            }
+            if let Some(refresh) = repair.editor_refresh() {
+                fields.insert("editor_refresh".into(), refresh);
+            }
+            if let Some(error) = &repair.editor_error {
+                fields.insert("editor_refresh_error".into(), json!(error));
+            }
+            if let Some(error) = &repair.binary_error {
+                fields.insert("binary_uid_error".into(), json!(error));
+            }
+            if let Some(cache) = repair.uid_cache() {
+                fields.insert("uid_cache".into(), cache);
+            }
+            if let Some(stale) = &repair.uid_cache_stale {
+                fields.insert("uid_cache_stale".into(), json!(stale));
+            }
+            if repair.overlapped {
+                fields.insert("overlapped".into(), json!(OVERLAP_NOTE));
+            }
+            if !damage_entries.is_empty() {
+                fields.insert("resource_damage".into(), json!(damage_entries));
+            }
+        }
+        let text = serde_json::to_string_pretty(&answer).unwrap_or_default();
+        match warning {
+            Some(warning) => ToolResult::error(
+                format!("{text}\n{warning}"),
+                &["Restore the file from version control, or put the listed uids back"],
+            ),
+            None => ToolResult::text(text),
         }
     }
 

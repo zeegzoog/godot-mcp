@@ -33,6 +33,7 @@ mod pack_run;
 mod project;
 mod project_gate;
 mod reference_kind;
+mod resource_props;
 mod review;
 mod run;
 mod scenario;
@@ -165,6 +166,7 @@ impl ToolManager {
             name if addon_update::handles(name) => addon_update::call(&self, args).await,
             name if import_params::handles(name) => import_params::call(&self, name, args).await,
             name if review::handles(name) => review::call(&self, args).await,
+            name if resource_props::handles(name) => resource_props::call(&self, args).await,
             name if world_map::handles(name) => world_map::call(&self, args).await,
             feedback::NOTE => self.handle_note_feedback(args).await,
             feedback::DRAFT => self.handle_draft_feedback(args).await,
@@ -870,6 +872,7 @@ fn annotations(name: &str) -> Option<ToolAnnotations> {
         "godot_stop_project"
         | "godot_remove_node"
         | "godot_set_node_properties"
+        | "godot_set_resource_properties"
         | "godot_open_scene"
         | "godot_save_scene"
         | "godot_create_script"
@@ -1078,7 +1081,7 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
         ),
         tool(
             "godot_set_node_properties",
-            "Modifies properties of a node in the active scene with undo/redo support. Values are converted to the property's type: vectors, rects and colors accept arrays ([10, 20]) or objects ({\"x\": 10, \"y\": 20}), colors also accept '#rrggbb' or names, resources accept res:// paths, a node reference (an exported Object of a node type: @export var target: Node3D, or a class_name type) accepts a node path relative to the edited node as the inspector's node picker stores it ('../Toads/King', '..' for the parent, null to clear), which must name a node of that type in the edited scene and is saved as Godot's node_paths reference, typed arrays and dictionaries (Array[NodePath], Dictionary[String, int]) accept a JSON array or object whose every element is converted to the element type the same way (a bad element is refused with its index), and any Godot literal string (e.g. 'Vector2(1, 2)') is parsed. 'metadata/<name>' sets node metadata: an existing entry keeps its type, a missing one is created (as the inspector's Add Metadata does) with the JSON value's own type, a whole number as int; the name must be an identifier and the value not null. ':' steps through a resource the way godot_game_set does (material_override:shader_parameter/glow_amount); the last segment is a property of that resource, converted the same way, and the change is part of the same undo action. Only a resource built into the edited scene (or not saved yet) is changed this way: one saved in a .tres file or built into another scene is shared, so it is refused and the message names the file. Refuses script and a private segment after ':', and a ':' step through a value that is not a resource. Unknown properties or unconvertible values reject the whole call without changing anything, and so does a value that reads back differently from the one set (a setter that clamps or refuses it, or an audio bus the editor's AudioServer does not have, which Godot answers and saves as Master): the message names the property, both values and, for a bus, the bus layout to add it to. The answer lists each value as read back in applied. A node inside an instanced scene whose children are not editable is refused, since Godot would drop the change on save; make_editable turns Editable Children on, and the answer lists them in made_editable.",
+            "Modifies properties of a node in the active scene with undo/redo support. Values are converted to the property's type: vectors, rects and colors accept arrays ([10, 20]) or objects ({\"x\": 10, \"y\": 20}), colors also accept '#rrggbb' or names, resources accept res:// paths, a node reference (an exported Object of a node type: @export var target: Node3D, or a class_name type) accepts a node path relative to the edited node as the inspector's node picker stores it ('../Toads/King', '..' for the parent, null to clear), which must name a node of that type in the edited scene and is saved as Godot's node_paths reference, typed arrays and dictionaries (Array[NodePath], Dictionary[String, int]) accept a JSON array or object whose every element is converted to the element type the same way (a bad element is refused with its index), and any Godot literal string (e.g. 'Vector2(1, 2)') is parsed. 'metadata/<name>' sets node metadata: an existing entry keeps its type, a missing one is created (as the inspector's Add Metadata does) with the JSON value's own type, a whole number as int; the name must be an identifier and the value not null. ':' steps through a resource the way godot_game_set does (material_override:shader_parameter/glow_amount); the last segment is a property of that resource, converted the same way, and the change is part of the same undo action. Only a resource built into the edited scene (or not saved yet) is changed this way: one saved in a .tres file or built into another scene is shared, so it is refused and the message names the file; change a .tres or .res file with godot_set_resource_properties. Refuses script and a private segment after ':', and a ':' step through a value that is not a resource. Unknown properties or unconvertible values reject the whole call without changing anything, and so does a value that reads back differently from the one set (a setter that clamps or refuses it, or an audio bus the editor's AudioServer does not have, which Godot answers and saves as Master): the message names the property, both values and, for a bus, the bus layout to add it to. The answer lists each value as read back in applied. A node inside an instanced scene whose children are not editable is refused, since Godot would drop the change on save; make_editable turns Editable Children on, and the answer lists them in made_editable.",
             json!({
                 "node_path": {
                     "type": "string",
@@ -1241,6 +1244,7 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
         ),
     ];
     tools.extend(authoring::catalog());
+    tools.extend(resource_props::catalog());
     tools.extend(input_map::catalog());
     tools.extend(files::catalog());
     tools.extend(file_move::catalog());

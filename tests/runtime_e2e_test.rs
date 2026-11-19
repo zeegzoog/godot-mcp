@@ -4992,6 +4992,99 @@ async fn run_script_writes_back_the_uids_and_shader_parameters_a_headless_save_d
     );
 }
 
+/// godot_set_resource_properties without an editor changes a ShaderMaterial saved in its own .tres
+/// and saves it with its uid, its ext_resource uid and no null lines for the uniforms it never
+/// set; a refused value changes nothing.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn set_resource_properties_without_an_editor_keeps_uids_and_unset_uniforms_out() {
+    let _ = IGNORE;
+    let project = project_dir_with_scripts();
+    let root = project.path();
+    std::fs::write(
+        root.join("water.gdshader"),
+        "shader_type spatial;\nuniform vec4 tint : source_color = vec4(0.2, 0.5, 0.8, 1.0);\nuniform float speed = 1.5;\nuniform vec2 flow = vec2(1.0, 0.0);\nvoid fragment() { ALBEDO = tint.rgb * speed; }\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("water.gdshader.uid"), "uid://dlh0ah0opc20e\n").unwrap();
+    let original = "[gd_resource type=\"ShaderMaterial\" load_steps=2 format=3 uid=\"uid://bwaterlevel01\"]\n\n[ext_resource type=\"Shader\" uid=\"uid://dlh0ah0opc20e\" path=\"res://water.gdshader\" id=\"1_abcde\"]\n\n[resource]\nrender_priority = 0\nshader = ExtResource(\"1_abcde\")\nshader_parameter/speed = 2.0\n";
+    std::fs::write(root.join("pond_water.tres"), original).unwrap();
+    let tools = manager(root);
+    let set = |properties: Value| {
+        let tools = Arc::clone(&tools);
+        async move {
+            call(
+                &tools,
+                "godot_set_resource_properties",
+                json!({"resource_path": "res://pond_water.tres", "properties": properties, "project_path": root}),
+            )
+            .await
+        }
+    };
+
+    for (properties, needle) in [
+        (
+            json!({"shader_parameter/speed": 3.0, "shader_parameter/missing": 1}),
+            "no uniform 'missing'",
+        ),
+        (json!({"shader_parameter/speed": "fast"}), "float"),
+        (json!({"shader_parameter/flow": [1, 2, 3]}), "Vector2"),
+        (json!({"resource_path": "res://elsewhere.tres"}), "Refusing"),
+        (json!({"shader": "res://pond_water.tres"}), "not a Shader"),
+    ] {
+        let refused = set(properties.clone()).await;
+        let answer = text_of(&refused);
+        assert!(refused.is_error, "{properties}: {answer}");
+        assert!(answer.contains(needle), "{properties}: {answer}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("pond_water.tres")).unwrap(),
+            original,
+            "{properties}: a refused call changed the file"
+        );
+    }
+    let missing = text_of(&set(json!({"shader_parameter/missing": 1})).await);
+    assert!(
+        missing.contains("tint") && missing.contains("speed") && missing.contains("flow"),
+        "the error must name the shader's uniforms: {missing}"
+    );
+
+    let result = set(json!({
+        "shader_parameter/speed": 3.5,
+        "shader_parameter/flow": {"x": 0.5, "y": 0.25},
+        "render_priority": 2
+    }))
+    .await;
+    let answer_text = text_of(&result);
+    assert!(!result.is_error, "{answer_text}");
+    let answer: Value = serde_json::from_str(&answer_text).expect("json answer");
+    assert_eq!(answer["mode"], "headless", "{answer}");
+    assert_eq!(
+        answer["changed"]["shader_parameter/speed"],
+        json!({"before": "2.0", "after": "3.5"}),
+        "{answer}"
+    );
+    assert_eq!(
+        answer["changed"]["shader_parameter/flow"],
+        json!({"before": "null", "after": "Vector2(0.5, 0.25)"}),
+        "{answer}"
+    );
+    assert_eq!(
+        answer["changed"]["render_priority"]["after"], "2",
+        "{answer}"
+    );
+    let saved = std::fs::read_to_string(root.join("pond_water.tres")).unwrap();
+    assert!(
+        saved.starts_with("[gd_resource type=\"ShaderMaterial\"")
+            && saved.contains("uid=\"uid://bwaterlevel01\"")
+            && saved.contains("[ext_resource type=\"Shader\" uid=\"uid://dlh0ah0opc20e\" path=\"res://water.gdshader\"")
+            && saved.contains("shader_parameter/speed = 3.5")
+            && saved.contains("shader_parameter/flow = Vector2(0.5, 0.25)")
+            && saved.contains("render_priority = 2")
+            && !saved.contains("= null"),
+        "the file lost its uids or kept null uniforms:\n{saved}\n{answer}"
+    );
+}
+
 fn project_dir_with_scripts() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("script project");
     let root = dir.path();

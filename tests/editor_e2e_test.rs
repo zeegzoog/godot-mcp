@@ -101,6 +101,10 @@ const UNDO_HOOK: &str = r#"        "__test_undo":
             var history_id: int = undo_redo.get_object_history_id(EditorInterface.get_edited_scene_root())
             undo_redo.get_history_undo_redo(history_id).undo()
             send_success(peer, cmd_id, {"undone": true})
+        "__test_undo_resource":
+            var undone_resource: Resource = load(str(params.get("resource_path", "")))
+            undo_redo.get_history_undo_redo(undo_redo.get_object_history_id(undone_resource)).undo()
+            send_success(peer, cmd_id, {"undone": true})
         "__test_hand_edit":
             var root: Node = EditorInterface.get_edited_scene_root()
             var node := Node.new()
@@ -4776,6 +4780,113 @@ async fn node_properties_step_through_the_scenes_own_resources() {
     assert_eq!(
         std::fs::read_to_string(editor.project.join("shared_glow.tres")).expect("tres"),
         shared_before
+    );
+}
+
+/// A material saved in its own .tres is changed through the editor's loaded copy, so a scene that
+/// uses it follows, and saved; undo puts the value back in the file. A refused value changes
+/// nothing.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn resource_file_properties_are_set_saved_and_undone_through_the_editor() {
+    let editor = start_editor_with(
+        Some(UNDO_HOOK),
+        "",
+        &[
+            ("glow.gdshader", GLOW_SHADER),
+            ("shared_glow.tres", SHARED_GLOW),
+            ("lamp.tscn", LAMP_SCENE),
+            ("pond.tscn", POND_SCENE),
+        ],
+        "",
+    )
+    .await;
+    let bridge = &editor.bridge;
+    let call = |command: &'static str, params: Value| async move {
+        bridge.send_command(command, params).await
+    };
+    let glow = "material_override:shader_parameter/glow_amount";
+    let shared_glow = || async {
+        call(
+            "get_node_properties",
+            json!({"node_path": "Shared", "properties": [glow]}),
+        )
+        .await
+        .expect("read shared")["properties"][glow]["value"]
+            .clone()
+    };
+    let file = || std::fs::read_to_string(editor.project.join("shared_glow.tres")).expect("tres");
+    call("open_scene", json!({"scene_path": "res://pond.tscn"}))
+        .await
+        .expect("open pond");
+    let original = file();
+
+    for (properties, needle) in [
+        (
+            json!({"shader_parameter/glow_amount": 0.9, "shader_parameter/missing": 1}),
+            "no uniform 'missing'",
+        ),
+        (json!({"shader_parameter/glow_amount": "bright"}), "float"),
+        (json!({"script": null}), "Refusing"),
+        (json!({"shader:code": "x"}), "':' steps"),
+    ] {
+        expect_error(
+            call(
+                "set_resource_properties",
+                json!({"resource_path": "res://shared_glow.tres", "properties": properties}),
+            )
+            .await,
+            needle,
+        );
+        assert_eq!(
+            file(),
+            original,
+            "{properties}: a refused call changed the file"
+        );
+    }
+    expect_error(
+        call(
+            "set_resource_properties",
+            json!({"resource_path": "res://pond.tscn", "properties": {"a": 1}}),
+        )
+        .await,
+        ".tres or .res",
+    );
+
+    let set = call(
+        "set_resource_properties",
+        json!({"resource_path": "res://shared_glow.tres", "properties": {"shader_parameter/glow_amount": 0.8}}),
+    )
+    .await
+    .expect("set the shared material");
+    assert_eq!(
+        set["changed"]["shader_parameter/glow_amount"],
+        json!({"before": "0.5", "after": "0.8"}),
+        "{set}"
+    );
+    assert_eq!(set["undoable"], true, "{set}");
+    assert_eq!(shared_glow().await, "0.8", "the loaded copy did not follow");
+    let saved = file();
+    assert!(
+        saved.contains("shader_parameter/glow_amount = 0.8") && !saved.contains("= null"),
+        "{saved}"
+    );
+
+    call(
+        "__test_undo_resource",
+        json!({"resource_path": "res://shared_glow.tres"}),
+    )
+    .await
+    .expect("undo");
+    assert_eq!(
+        shared_glow().await,
+        "0.5",
+        "undo did not restore the loaded copy"
+    );
+    assert!(
+        file().contains("shader_parameter/glow_amount = 0.5"),
+        "undo did not save the file: {}",
+        file()
     );
 }
 

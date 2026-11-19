@@ -348,10 +348,10 @@ pub async fn call(tools: &ToolManager, args: &Value) -> ToolResult {
                 .is_some_and(|errors| !errors.is_empty())
             {
                 report["ok"] = json!(false);
-                if let Some(errors) = report["errors"].as_array_mut() {
-                    if let Some(found) = snapshot.get("errors").and_then(Value::as_array) {
-                        errors.extend(found.iter().cloned());
-                    }
+                if let Some(errors) = report["errors"].as_array_mut()
+                    && let Some(found) = snapshot.get("errors").and_then(Value::as_array)
+                {
+                    errors.extend(found.iter().cloned());
                 }
             }
             if let Some(steps) = report["steps"].as_array_mut() {

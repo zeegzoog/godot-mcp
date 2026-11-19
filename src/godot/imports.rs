@@ -192,10 +192,10 @@ fn import_state(project: &Path, source: &Path) -> Vec<u8> {
                 .map_or(0, |since| since.as_nanos());
             state.extend(nanos.to_le_bytes());
         }
-        if let Ok(bytes) = fs::read(&file) {
-            if bytes.len() <= 64 * 1024 {
-                state.extend(fnv_hash(&bytes).to_le_bytes());
-            }
+        if let Ok(bytes) = fs::read(&file)
+            && bytes.len() <= 64 * 1024
+        {
+            state.extend(fnv_hash(&bytes).to_le_bytes());
         }
     }
     state
@@ -363,10 +363,10 @@ fn read_sidecar(path: &Path) -> Option<String> {
 fn cache_path(project: &Path, text: &str) -> Option<PathBuf> {
     let mut dest = None;
     for line in text.lines() {
-        if let Some(value) = assignment(line, "path") {
-            if let Some(path) = res_to_file(project, &value) {
-                return Some(path);
-            }
+        if let Some(value) = assignment(line, "path")
+            && let Some(path) = res_to_file(project, &value)
+        {
+            return Some(path);
         }
         if dest.is_none() && line.trim().starts_with("dest_files") {
             dest = first_res(line).and_then(|value| res_to_file(project, &value));

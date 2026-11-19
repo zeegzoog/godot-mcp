@@ -470,10 +470,10 @@ fn uid_of(project: &Path, target: &str) -> Option<String> {
     if is_text_resource(&name) {
         return read_head(&file).and_then(|(uid, _)| uid);
     }
-    if is_binary_resource(&name) {
-        if let BinaryUid::Uid(uid) = binary_uid(&file) {
-            return Some(uid);
-        }
+    if is_binary_resource(&name)
+        && let BinaryUid::Uid(uid) = binary_uid(&file)
+    {
+        return Some(uid);
     }
     None
 }

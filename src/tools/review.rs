@@ -374,10 +374,10 @@ fn environment_request(project: &Path, value: &Value) -> Result<Value, String> {
                 );
             }
         }
-        if let Some(energy) = sun.get("energy").and_then(Value::as_f64) {
-            if !(0.0..=16.0).contains(&energy) {
-                return Err("environment.light.energy must be from 0 to 16".into());
-            }
+        if let Some(energy) = sun.get("energy").and_then(Value::as_f64)
+            && !(0.0..=16.0).contains(&energy)
+        {
+            return Err("environment.light.energy must be from 0 to 16".into());
         }
         if let Some(color) = light.get("color") {
             sun.insert(

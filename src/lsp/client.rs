@@ -483,10 +483,8 @@ async fn connect_or_start(
     external_ok: bool,
     port: u16,
 ) -> Result<(Arc<ClientInner>, Option<Child>)> {
-    if external_ok {
-        if let Ok(client) = connect_client(port, project).await {
-            return Ok((client, None));
-        }
+    if external_ok && let Ok(client) = connect_client(port, project).await {
+        return Ok((client, None));
     }
     if !godot.exists() {
         return Err(McpError::Process(format!(

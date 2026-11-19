@@ -174,16 +174,15 @@ pub async fn call(tools: &ToolManager, args: Value) -> ToolResult {
     }
     let text = compact_answer(map, reply.detail, files, REPLY_LIMIT);
     let mut content = vec![ToolContent::Text { text }];
-    if reply.output.is_none() {
-        if let Some(preview) = outcome
+    if reply.output.is_none()
+        && let Some(preview) = outcome
             .preview
             .filter(|bytes| bytes.starts_with(&[0xff, 0xd8]))
-        {
-            content.push(ToolContent::Image {
-                data: base64_encode(&preview),
-                mime_type: "image/jpeg".into(),
-            });
-        }
+    {
+        content.push(ToolContent::Image {
+            data: base64_encode(&preview),
+            mime_type: "image/jpeg".into(),
+        });
     }
     ToolResult {
         content,

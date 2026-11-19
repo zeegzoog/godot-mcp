@@ -67,7 +67,7 @@ const PARAM_TYPES: Dictionary = {
     "connect_signal": {"node_path": TYPE_STRING, "signal_name": TYPE_STRING, "method": TYPE_STRING, "target_path": TYPE_STRING, "make_editable": TYPE_BOOL},
     "list_signals": {"node_path": TYPE_STRING},
     "create_resource": {"resource_path": TYPE_STRING, "class_name": TYPE_STRING},
-    "set_project_setting": {"key": TYPE_STRING},
+    "set_project_setting": {"key": TYPE_STRING, "value_text": TYPE_STRING, "replace_type": TYPE_BOOL, "remove": TYPE_BOOL},
     "get_project_settings": {"prefix": TYPE_STRING},
     "get_input_map": {"action": TYPE_STRING, "include_builtin": TYPE_BOOL},
     "edit_input_action": {"action": TYPE_STRING, "add_events": TYPE_ARRAY, "remove_events": TYPE_ARRAY, "deadzone": TYPE_FLOAT, "create": TYPE_BOOL, "delete": TYPE_BOOL},
@@ -2657,42 +2657,111 @@ func _coerce_setting(current: Variant, value: Variant) -> Dictionary:
             return {"error": _setting_type_refusal(type)}
     return {"error": "This setting expects a %s; a value of another type is not stored. Change settings of other types in the editor's Project Settings." % type_string(type).to_lower()}
 
+## Whether the engine (or a plugin, with an initial value) defines `key` itself, so its type is
+## fixed whatever project.godot stores. A project's own setting, such as shader_globals/<name>,
+## has no default. The server's file fallback asks the same (`defined` in SETTING_TYPE_SCRIPT).
+func _setting_has_default(key: String) -> bool:
+    if key.begins_with(IMPORTER_DEFAULTS):
+        return true
+    var governing: String = _defined_setting_key(key)
+    if governing.is_empty():
+        return false
+    return ProjectSettings.property_get_revert(governing) != null
+
+## A value text as project.godot holds one, parsed: {"value"}, or {"error"} when it uses a
+## constructor that is not a built-in type (no Object is created, no Resource loaded), does not
+## parse, or is null. The server's file fallback runs the same rules (`_parse_text`).
+func _setting_from_text(raw: String) -> Dictionary:
+    var text: String = raw.strip_edges()
+    if text.is_empty():
+        return {"error": "value_text is empty: give a value as project.godot stores it, such as Vector2i(1152, 648) or {\"key\": 1}"}
+    if text.begins_with("Object(") or not _setting_text_builds_no_object(text):
+        return {"error": "value_text uses a constructor that is not a built-in type (an Object or a Resource); only built-in types such as Vector4(0, 1, 0, 0) or Color(1, 1, 1, 1) are parsed"}
+    var parsed: Variant = str_to_var(text)
+    if parsed == null:
+        return {"error": "value_text is not a value Godot can read: give it as project.godot stores it, such as Vector2i(1152, 648), \"text\" or {\"key\": Vector4(0, 1, 0, 0)}; to remove the setting pass remove: true"}
+    return {"value": parsed}
+
+func _reported_setting(value: Variant) -> Variant:
+    if value != null and not (value is String or value is bool or value is int or value is float):
+        return str(value)
+    return value
+
 func set_project_setting(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
     var key: String = str(params.get("key", ""))
     if not _is_setting_key(key):
         send_error(peer, cmd_id, "key must start with a section and use only letters, digits and _ / . -, like application/config/name")
         return
+    var remove: bool = params.get("remove", false) == true
+    var replace_type: bool = params.get("replace_type", false) == true
+    var has_text: bool = params.get("value_text") != null
     var value: Variant = params.get("value")
-    if not (value is String or value is bool or value is int or value is float or value is Array or value is Dictionary):
-        send_error(peer, cmd_id, "value must be a string, number, boolean, array or object")
+    if int(remove) + int(has_text) + int(value != null) != 1:
+        send_error(peer, cmd_id, "Pass exactly one of value, value_text and remove: true")
         return
     var previous: Variant = null
     if ProjectSettings.has_setting(key):
         previous = ProjectSettings.get_setting(key)
+    if remove:
+        if previous == null:
+            send_success(peer, cmd_id, {"key": key, "removed": false, "previous": null})
+            return
+        # A setting with a default returns to it (and is no longer saved); any other is erased.
+        ProjectSettings.set_setting(key, ProjectSettings.property_get_revert(key))
+        var removed_err: Error = ProjectSettings.save()
+        if removed_err != OK:
+            ProjectSettings.set_setting(key, previous)
+            send_error(peer, cmd_id, "Failed to save project settings: " + error_string(removed_err))
+            return
+        send_success(peer, cmd_id, {"key": key, "removed": true, "previous": _reported_setting(previous)})
+        return
     var governing: String = _defined_setting_key(key)
     var current: Variant = null
     if not governing.is_empty():
         current = ProjectSettings.get_setting(governing)
     elif key.begins_with(IMPORTER_DEFAULTS):
         current = {}
-    if current != null:
+    # With replace_type a setting without a default takes the type of the new value.
+    if replace_type and not _setting_has_default(key):
+        current = null
+    if has_text:
+        var parsed: Dictionary = _setting_from_text(str(params["value_text"]))
+        if parsed.has("error"):
+            send_error(peer, cmd_id, "'%s' was not changed: %s" % [key, parsed["error"]])
+            return
+        value = parsed["value"]
+        if current != null and typeof(current) == TYPE_FLOAT and typeof(value) == TYPE_INT:
+            value = float(value)
+        if current != null and typeof(value) != typeof(current):
+            if _setting_has_default(key):
+                send_error(peer, cmd_id, "'%s' is a %s setting of the engine; value_text gives a %s, which is not stored. Give value_text as a %s, as project.godot stores one." % [key, type_string(typeof(current)), type_string(typeof(value)), type_string(typeof(current))])
+            else:
+                send_error(peer, cmd_id, "'%s' holds a %s; value_text gives a %s, which is not stored without replace_type. Pass replace_type: true to replace the stored value (the engine does not define this setting), or remove it with remove: true." % [key, type_string(typeof(current)), type_string(typeof(value))])
+            return
+    elif current != null:
+        if not (value is String or value is bool or value is int or value is float or value is Array or value is Dictionary):
+            send_error(peer, cmd_id, "value must be a string, number, boolean, array or object")
+            return
         var coerced: Dictionary = _coerce_setting(current, value)
         if coerced.has("error"):
-            send_error(peer, cmd_id, "'%s': %s" % [key, coerced["error"]])
+            var hint: String = ""
+            if not _setting_has_default(key):
+                hint = " For a Godot value such as a Vector4 pass value_text; pass replace_type: true to store a value of another type, or remove: true to remove the setting."
+            send_error(peer, cmd_id, "'%s': %s%s" % [key, coerced["error"], hint])
             return
         value = coerced["value"]
     elif value is Array or value is Dictionary:
         value = _setting_from_json(value)
+    elif not (value is String or value is bool or value is int or value is float):
+        send_error(peer, cmd_id, "value must be a string, number, boolean, array or object")
+        return
     ProjectSettings.set_setting(key, value)
     var err: Error = ProjectSettings.save()
     if err != OK:
         ProjectSettings.set_setting(key, previous)
         send_error(peer, cmd_id, "Failed to save project settings: " + error_string(err))
         return
-    var reported: Variant = previous
-    if previous != null and not (previous is String or previous is bool or previous is int or previous is float):
-        reported = str(previous)
-    send_success(peer, cmd_id, {"key": key, "saved": true, "previous": reported})
+    send_success(peer, cmd_id, {"key": key, "saved": true, "type": type_string(typeof(value)), "previous": _reported_setting(previous)})
 
 func get_project_settings(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
     var prefix: String = str(params.get("prefix", ""))

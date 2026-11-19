@@ -60,6 +60,8 @@ pub struct ToolManager {
     /// The addon the editor of one bridge connection loaded, by the connection's number: read
     /// once per connection, when a call first fails.
     loaded_addon: StdMutex<Option<(u64, addon_update::Loaded)>>,
+    /// The folder outside the project that Movie Maker recordings may go to, set by the person.
+    movie_dir: Option<PathBuf>,
 }
 
 impl ToolManager {
@@ -75,6 +77,7 @@ impl ToolManager {
             editors: editor::LaunchedEditors::default(),
             gates: project_gate::ProjectGates::default(),
             loaded_addon: StdMutex::default(),
+            movie_dir: None,
         }
     }
 
@@ -87,6 +90,12 @@ impl ToolManager {
     /// Sets how much of the agent feedback channel is active and where the GitHub client is.
     pub fn with_feedback(mut self, mode: FeedbackMode, gh_path: Option<PathBuf>) -> Self {
         self.feedback = feedback::FeedbackState::new(mode, gh_path);
+        self
+    }
+
+    /// Lets Movie Maker recordings be written inside `dir` as well as inside the project.
+    pub fn with_movie_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.movie_dir = dir.filter(|dir| !dir.as_os_str().is_empty());
         self
     }
 
@@ -959,7 +968,7 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
         ),
         tool(
             "godot_run_project",
-            "Runs the Godot project or a specific scene. Uses the live editor's Play mode when the bridge is connected. Otherwise starts a managed process (debugger attached) that godot_stop_project can stop. held true (with mode process) starts the game held at its first physics tick at a fixed frame rate equal to the project's tick rate, so godot_game_physics steps are exact. user_args (mode process only) are strings placed after --, so the game reads them with OS.get_cmdline_user_args() and Godot does not treat them as engine options. mode auto and editor Play reject user_args instead of dropping them. Before the run, files with a .import sidecar are compared with their .godot/imported cache. When the editor bridge is connected to this project, stale imports are reimported first, the same way godot_resave_resources does. Otherwise the result warns, lists the res:// paths, and names godot_resave_resources. A managed process runs alongside other calls, script runs and other games included; it starts once an import or export running in the same project has finished.",
+            "Runs the Godot project or a specific scene. Uses the live editor's Play mode when the bridge is connected. Otherwise starts a managed process (debugger attached) that godot_stop_project can stop. held true (with mode process) starts the game held at its first physics tick at a fixed frame rate equal to the project's tick rate, so godot_game_physics steps are exact. user_args (mode process only) are strings placed after --, so the game reads them with OS.get_cmdline_user_args() and Godot does not treat them as engine options. mode auto and editor Play reject user_args instead of dropping them. movie (mode process only) records the run with Godot's Movie Maker: it adds --write-movie <path>, --fixed-fps <fps> and, with quit_after_frames, --quit-after <frames> to the engine options before --, so user_args still reach the game. path ending in .avi writes MJPEG video with the game's audio; .png writes one image per frame (name00000000.png, name00000001.png, ...) and the audio in name.wav. The path is a res:// or project-relative path, or an absolute path inside the project; outside it only inside the folder the person set with GODOT_MCP_MOVIE_DIR (or --movie-dir). Its folder is created, and a folder created inside the project gets a .gdignore so the editor does not import the frames. An earlier recording at the same path is refused unless overwrite is true, which deletes it first. Movie Maker is deterministic and not real time: every frame advances game time by exactly 1/fps however long it takes to draw and encode, so the run is usually slower than real time on screen, timers, physics and animations follow game time, and the same input gives the same frames. The game's input and inspection tools (godot_game_input, godot_game_scenario, godot_game_tree, godot_game_call and the rest) still work during the recording; timed input follows game time. movie cannot be combined with held (a held game draws no frames) or headless (nothing is rendered). The recording ends when the game quits: after quit_after_frames, by itself, or through godot_stop_project, which asks the game to quit first so Godot finishes the file (a killed .avi lacks its frame count and index). godot_get_run_status and godot_stop_project report movie: the path, size_bytes, frames, duration_seconds and finished. Sound is recorded unless the game is started with its own option to mute it (do not pass --no-sound in user_args for a clip that must be heard). Quality, audio mix rate and vsync are project settings (editor/movie_writer/mjpeg_quality, editor/movie_writer/mix_rate, editor/movie_writer/disable_vsync), set with godot_set_project_setting. Before the run, files with a .import sidecar are compared with their .godot/imported cache. When the editor bridge is connected to this project, stale imports are reimported first, the same way godot_resave_resources does. Otherwise the result warns, lists the res:// paths, and names godot_resave_resources. A managed process runs alongside other calls, script runs and other games included; it starts once an import or export running in the same project has finished.",
             json!({
                 "project_path": {
                     "type": "string",
@@ -996,6 +1005,17 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
                     "items": {"type": "string"},
                     "maxItems": 32,
                     "description": "Process mode only. Up to 32 strings, each at most 256 characters, passed to the game after --. They are never Godot engine options. Refused unless mode is process."
+                },
+                "movie": {
+                    "type": "object",
+                    "description": "Process mode only. Record the run with Godot's Movie Maker. Not with held or headless.",
+                    "properties": {
+                        "path": {"type": "string", "description": "Output file: .avi (MJPEG video with audio) or .png (an image sequence name########.png with audio in name.wav). res://, project-relative, or absolute inside the project or inside GODOT_MCP_MOVIE_DIR."},
+                        "fps": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Frames per second of the recording and of the game (--fixed-fps). Default 60."},
+                        "quit_after_frames": {"type": "integer", "minimum": 1, "maximum": 10000000, "description": "The game quits after this many frames (--quit-after), which finishes the file. Seconds times fps. Omit to record until the game quits or godot_stop_project stops it."},
+                        "overwrite": {"type": "boolean", "description": "Replace an earlier recording at the same path (its .avi, or its frames and .wav). Default false."}
+                    },
+                    "required": ["path"]
                 }
             }),
             &[],
@@ -1010,7 +1030,7 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
         ),
         tool(
             "godot_get_run_status",
-            "Reports whether a scene is playing in the editor and lists managed process runs, including each run's user_args.",
+            "Reports whether a scene is playing in the editor and lists managed process runs, including each run's user_args and, for a Movie Maker run, movie: its path, size_bytes, frames, duration_seconds and whether Godot finished the file.",
             json!({}),
             &[],
         ),

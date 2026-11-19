@@ -7962,3 +7962,226 @@ async fn project_setting_without_an_editor_reads_value_text_with_the_real_engine
         "{written}"
     );
 }
+
+#[tokio::test]
+async fn a_movie_run_puts_movie_maker_before_the_separator_and_user_args_after_it() {
+    let project = project_dir();
+    let (godot, record) = recording_godot(project.path());
+    let tools = manager_in(project.path(), godot);
+    let result = Arc::clone(&tools)
+        .call_tool(
+            "godot_run_project",
+            json!({
+                "mode": "process",
+                "user_args": ["--save-profile=trailer"],
+                "movie": {"path": "res://movies/clip.avi", "fps": 30, "quit_after_frames": 90}
+            }),
+        )
+        .await;
+    assert!(!result.is_error, "{}", text(&result));
+    assert!(
+        text(&result).contains("Movie Maker records"),
+        "{}",
+        text(&result)
+    );
+    assert!(
+        text(&result).contains("90 frames (3.00 s"),
+        "{}",
+        text(&result)
+    );
+
+    // Windows quotes each argument of a batch file; compare the paths without the quotes.
+    let arguments = wait_for_file(&record).await.replace('"', "");
+    let (engine, game) = arguments.split_once(" -- ").unwrap_or((&arguments, ""));
+    assert_eq!(arguments.matches(" -- ").count(), 1, "{arguments}");
+    let output = project.path().join("movies").join("clip.avi");
+    assert!(
+        engine.contains(&format!("--write-movie {}", output.display())),
+        "{arguments}"
+    );
+    assert!(engine.contains("--fixed-fps 30"), "{arguments}");
+    assert!(engine.contains("--quit-after 90"), "{arguments}");
+    assert!(game.contains("--save-profile=trailer"), "{arguments}");
+    assert!(!game.contains("--write-movie"), "{arguments}");
+    // The folder is made, and hidden from the editor's import.
+    assert!(project.path().join("movies/.gdignore").is_file());
+
+    let status = Arc::clone(&tools)
+        .call_tool("godot_get_run_status", json!({}))
+        .await;
+    let status: Value = serde_json::from_str(&text(&status)).expect("status json");
+    let movie = &status["process_runs"][0]["movie"];
+    assert_eq!(movie["format"], "avi", "{status}");
+    assert_eq!(movie["fps"], 30, "{status}");
+    assert_eq!(movie["quit_after_frames"], 90, "{status}");
+}
+
+#[tokio::test]
+async fn a_movie_run_defaults_to_sixty_frames_a_second_without_a_frame_limit() {
+    let project = project_dir();
+    let (godot, record) = recording_godot(project.path());
+    let tools = manager_in(project.path(), godot);
+    let result = Arc::clone(&tools)
+        .call_tool(
+            "godot_run_project",
+            json!({"mode": "process", "movie": {"path": "frames/shot.png"}}),
+        )
+        .await;
+    assert!(!result.is_error, "{}", text(&result));
+    assert!(text(&result).contains("PNG sequence"), "{}", text(&result));
+    // Windows quotes each argument of a batch file; compare the paths without the quotes.
+    let arguments = wait_for_file(&record).await.replace('"', "");
+    assert!(arguments.contains("--fixed-fps 60"), "{arguments}");
+    assert!(!arguments.contains("--quit-after"), "{arguments}");
+    assert!(!arguments.contains(" -- "), "{arguments}");
+}
+
+#[tokio::test]
+async fn a_movie_request_that_cannot_be_recorded_is_refused_before_godot_starts() {
+    let project = project_dir();
+    let outside = tempfile::tempdir().expect("outside");
+    let (godot, record) = recording_godot(project.path());
+    let tools = manager_in(project.path(), godot);
+    let outside_path = outside.path().join("clip.avi").display().to_string();
+    let cases = [
+        (json!({"movie": {"path": "res://clip.avi"}}), "process"),
+        (
+            json!({"mode": "auto", "movie": {"path": "res://clip.avi"}}),
+            "process",
+        ),
+        (
+            json!({"mode": "process", "held": true, "movie": {"path": "res://clip.avi"}}),
+            "held",
+        ),
+        (
+            json!({"mode": "process", "headless": true, "movie": {"path": "res://clip.avi"}}),
+            "headless",
+        ),
+        (
+            json!({"mode": "process", "movie": {"path": "res://clip.mp4"}}),
+            ".avi or .png",
+        ),
+        (
+            json!({"mode": "process", "movie": {"path": "res://movies/.avi"}}),
+            ".avi or .png",
+        ),
+        (
+            json!({"mode": "process", "movie": {"path": "res://../clip.avi"}}),
+            "cannot be used",
+        ),
+        (
+            json!({"mode": "process", "movie": {"path": outside_path}}),
+            "GODOT_MCP_MOVIE_DIR",
+        ),
+        (
+            json!({"mode": "process", "movie": {}}),
+            "movie.path is required",
+        ),
+        (
+            json!({"mode": "process", "movie": "res://clip.avi"}),
+            "must be an object",
+        ),
+        (
+            json!({"mode": "process", "movie": {"path": "res://clip.avi", "fps": 0}}),
+            "movie.fps",
+        ),
+        (
+            json!({"mode": "process", "movie": {"path": "res://clip.avi", "fps": 30.5}}),
+            "movie.fps",
+        ),
+        (
+            json!({"mode": "process", "movie": {"path": "res://clip.avi", "quit_after_frames": -1}}),
+            "quit_after_frames",
+        ),
+        (
+            json!({"mode": "process", "movie": {"path": "res://clip.avi", "quality": 1}}),
+            "no field 'quality'",
+        ),
+    ];
+    for (args, needle) in cases {
+        let result = Arc::clone(&tools)
+            .call_tool("godot_run_project", args.clone())
+            .await;
+        assert!(result.is_error, "{args}: {}", text(&result));
+        assert!(text(&result).contains(needle), "{args}: {}", text(&result));
+    }
+    assert!(
+        !record.exists(),
+        "a refused movie request still launched Godot"
+    );
+    assert!(!outside.path().join("clip.avi").exists());
+}
+
+#[tokio::test]
+async fn a_movie_outside_the_project_needs_the_folder_the_person_allowed() {
+    let project = project_dir();
+    let allowed = tempfile::tempdir().expect("allowed");
+    let (godot, record) = recording_godot(project.path());
+    let tools = Arc::new(
+        ToolManager::new(BridgeClient::new(free_port()), CliRunner::new(godot))
+            .with_working_dir(project.path().to_path_buf())
+            .with_movie_dir(Some(allowed.path().to_path_buf())),
+    );
+    let output = allowed.path().join("trailer").join("take1.avi");
+    let result = Arc::clone(&tools)
+        .call_tool(
+            "godot_run_project",
+            json!({"mode": "process", "movie": {"path": output.display().to_string()}}),
+        )
+        .await;
+    assert!(!result.is_error, "{}", text(&result));
+    // Windows quotes each argument of a batch file; compare the paths without the quotes.
+    let arguments = wait_for_file(&record).await.replace('"', "");
+    assert!(
+        arguments.contains(&format!("--write-movie {}", output.display())),
+        "{arguments}"
+    );
+    assert!(allowed.path().join("trailer").is_dir());
+    // A folder outside the project is not the editor's, so it gets no .gdignore.
+    assert!(!allowed.path().join("trailer/.gdignore").exists());
+
+    let elsewhere = tempfile::tempdir().expect("elsewhere");
+    let refused = Arc::clone(&tools)
+        .call_tool(
+            "godot_run_project",
+            json!({"mode": "process", "movie": {"path": elsewhere.path().join("x.avi").display().to_string()}}),
+        )
+        .await;
+    assert!(refused.is_error, "{}", text(&refused));
+    assert!(
+        text(&refused).contains(&allowed.path().display().to_string()),
+        "{}",
+        text(&refused)
+    );
+}
+
+#[tokio::test]
+async fn an_earlier_recording_is_replaced_only_when_asked() {
+    let project = project_dir();
+    let (godot, record) = recording_godot(project.path());
+    let tools = manager_in(project.path(), godot);
+    std::fs::create_dir_all(project.path().join("movies")).unwrap();
+    std::fs::write(project.path().join("movies/clip00000000.png"), b"old").unwrap();
+    std::fs::write(project.path().join("movies/clip.wav"), b"old").unwrap();
+    let movie = json!({"path": "res://movies/clip.png"});
+    let refused = Arc::clone(&tools)
+        .call_tool(
+            "godot_run_project",
+            json!({"mode": "process", "movie": movie}),
+        )
+        .await;
+    assert!(refused.is_error, "{}", text(&refused));
+    assert!(text(&refused).contains("overwrite"), "{}", text(&refused));
+    assert!(!record.exists());
+
+    let replaced = Arc::clone(&tools)
+        .call_tool(
+            "godot_run_project",
+            json!({"mode": "process", "movie": {"path": "res://movies/clip.png", "overwrite": true}}),
+        )
+        .await;
+    assert!(!replaced.is_error, "{}", text(&replaced));
+    assert!(!project.path().join("movies/clip00000000.png").exists());
+    assert!(!project.path().join("movies/clip.wav").exists());
+    wait_for_file(&record).await;
+}

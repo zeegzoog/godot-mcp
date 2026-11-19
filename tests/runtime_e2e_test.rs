@@ -8661,3 +8661,150 @@ async fn a_run_that_ends_while_another_starts_leaves_it_the_runtime() {
         "override.cfg stayed after the last run ended"
     );
 }
+
+/// A scene that draws a square crossing the window, so every frame of a recording differs.
+fn movie_project() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("project");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("scenes")).unwrap();
+    std::fs::write(
+        root.join("project.godot"),
+        "config_version=5\n\n[application]\n\nconfig/name=\"MovieProbe\"\nrun/main_scene=\"res://scenes/movie.tscn\"\nconfig/features=PackedStringArray(\"4.5\")\n\n[display]\n\nwindow/size/viewport_width=320\nwindow/size/viewport_height=180\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("scenes/movie.gd"),
+        "extends Node2D\nvar frames := 0\nfunc _process(_delta: float) -> void:\n\tframes += 1\n\tqueue_redraw()\nfunc _draw() -> void:\n\tdraw_rect(Rect2(0, 0, 320, 180), Color(0.1, 0.3, 0.2))\n\tdraw_rect(Rect2(float(frames * 8 % 320), 70.0, 40.0, 40.0), Color(1.0, 0.8, 0.1))\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("scenes/movie.tscn"),
+        "[gd_scene load_steps=2 format=3]\n\n[ext_resource type=\"Script\" path=\"res://scenes/movie.gd\" id=\"1\"]\n\n[node name=\"Movie\" type=\"Node2D\"]\nscript = ExtResource(\"1\")\n",
+    )
+    .unwrap();
+    dir
+}
+
+/// Waits for a run to end by itself and returns its status entry.
+async fn ended_run(tools: &Arc<ToolManager>, run_id: &str) -> Value {
+    for _ in 0..600 {
+        let run = process_run(tools, run_id).await;
+        if run["running"] == false {
+            return run;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("run {run_id} did not end within a minute");
+}
+
+async fn record_movie(path: &str, extra: Value) -> (tempfile::TempDir, Value) {
+    let project = movie_project();
+    let tools = manager(project.path());
+    let mut movie = json!({"path": path, "fps": 30, "quit_after_frames": 30});
+    if let (Some(movie), Some(extra)) = (movie.as_object_mut(), extra.as_object()) {
+        movie.extend(extra.clone());
+    }
+    let started = call(
+        &tools,
+        "godot_run_project",
+        json!({
+            "project_path": project.path(),
+            "mode": "process",
+            "user_args": ["--save-profile=movie"],
+            "movie": movie,
+        }),
+    )
+    .await;
+    assert!(!started.is_error, "{}", text_of(&started));
+    assert!(
+        text_of(&started).contains("Movie Maker records"),
+        "{}",
+        text_of(&started)
+    );
+    let run_id = run_id_of(&started);
+    let run = ended_run(&tools, &run_id).await;
+    (project, run)
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn movie_maker_records_thirty_frames_to_an_avi_and_the_game_quits() {
+    if !windowed_game_can_open() {
+        return;
+    }
+    let (project, run) = record_movie("res://movies/clip.avi", json!({})).await;
+    let movie = &run["movie"];
+    assert_eq!(run["exit_code"], 0, "{run}");
+    assert_eq!(movie["finished"], true, "{run}");
+    assert_eq!(movie["format"], "avi", "{run}");
+    let frames = movie["frames"].as_u64().unwrap_or(0);
+    assert!((29..=31).contains(&frames), "{run}");
+    let file = project.path().join("movies/clip.avi");
+    let size = std::fs::metadata(&file).expect("avi").len();
+    assert_eq!(movie["size_bytes"], size, "{run}");
+    assert!(size > 10_000, "{run}");
+    assert!(project.path().join("movies/.gdignore").is_file());
+    if let Ok(keep) = std::env::var("GODOT_MCP_KEEP_MOVIE") {
+        std::fs::copy(&file, keep).expect("keep the movie");
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn movie_maker_records_thirty_frames_to_a_png_sequence_with_audio() {
+    if !windowed_game_can_open() {
+        return;
+    }
+    let (project, run) = record_movie("res://frames/shot.png", json!({})).await;
+    let movie = &run["movie"];
+    assert_eq!(movie["finished"], true, "{run}");
+    let frames = movie["frames"].as_u64().unwrap_or(0);
+    assert!((29..=31).contains(&frames), "{run}");
+    let first = project.path().join("frames/shot00000000.png");
+    let bytes = std::fs::read(&first).expect("first frame");
+    assert_eq!(png_size(&bytes), Some((320, 180)), "{run}");
+    assert!(project.path().join("frames/shot.wav").is_file(), "{run}");
+    assert!(
+        movie["size_bytes"].as_u64().unwrap_or(0) > bytes.len() as u64,
+        "{run}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn stopping_a_movie_run_lets_godot_finish_the_avi() {
+    if !windowed_game_can_open() {
+        return;
+    }
+    let project = movie_project();
+    let tools = manager(project.path());
+    let started = call(
+        &tools,
+        "godot_run_project",
+        json!({
+            "project_path": project.path(),
+            "mode": "process",
+            "movie": {"path": "res://movies/open.avi", "fps": 30},
+        }),
+    )
+    .await;
+    assert!(!started.is_error, "{}", text_of(&started));
+    let run_id = run_id_of(&started);
+    // Let the game say hello and write some frames before it is stopped.
+    let waited = call(
+        &tools,
+        "godot_game_wait",
+        json!({"run_id": run_id, "frames": 20}),
+    )
+    .await;
+    assert!(!waited.is_error, "{}", text_of(&waited));
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+    let summary = json_of(&stopped);
+    assert_eq!(summary["ended_by"], "server", "{summary}");
+    assert_eq!(summary["movie"]["finished"], true, "{summary}");
+    assert!(
+        summary["movie"]["frames"].as_u64().unwrap_or(0) >= 20,
+        "{summary}"
+    );
+}

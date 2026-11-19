@@ -8,6 +8,7 @@ pub mod class_cache;
 mod debug_ctl;
 mod debug_session;
 mod imports;
+pub mod movie;
 mod resource_audit;
 mod runs;
 mod uid_cache;

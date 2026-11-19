@@ -59,15 +59,15 @@ pub async fn call(tools: &ToolManager, args: Value) -> ToolResult {
         );
     };
     let scene = str_arg(&args, "scene");
-    if let Some(scene) = scene {
-        if !scene.starts_with("res://") || scene.split(['/', '\\']).any(|part| part == "..") {
-            return ToolResult::error(
-                format!("Invalid scene '{scene}': scene must be a res:// path inside the pack"),
-                &[
-                    "Use a path such as res://scenes/main.tscn, or leave scene out to start the main scene",
-                ],
-            );
-        }
+    if let Some(scene) = scene
+        && (!scene.starts_with("res://") || scene.split(['/', '\\']).any(|part| part == ".."))
+    {
+        return ToolResult::error(
+            format!("Invalid scene '{scene}': scene must be a res:// path inside the pack"),
+            &[
+                "Use a path such as res://scenes/main.tscn, or leave scene out to start the main scene",
+            ],
+        );
     }
     let seconds = match args.get("seconds").filter(|value| !value.is_null()) {
         None => DEFAULT_SECONDS,
@@ -234,10 +234,10 @@ fn missing_resources(text: &str) -> Vec<String> {
         if !MISSING_PHRASES.iter().any(|phrase| line.contains(phrase)) {
             continue;
         }
-        if let Some(path) = first_path(line) {
-            if !found.contains(&path) {
-                found.push(path);
-            }
+        if let Some(path) = first_path(line)
+            && !found.contains(&path)
+        {
+            found.push(path);
         }
     }
     found
@@ -262,10 +262,11 @@ fn first_path(line: &str) -> Option<String> {
         }
     }
     let mut path = rest[..end].trim_end().trim_end_matches(['.', ':']);
-    if let Some((before, number)) = path.rsplit_once(':') {
-        if !before.ends_with(':') && number.chars().all(|c| c.is_ascii_digit()) {
-            path = before;
-        }
+    if let Some((before, number)) = path.rsplit_once(':')
+        && !before.ends_with(':')
+        && number.chars().all(|c| c.is_ascii_digit())
+    {
+        path = before;
     }
     let scheme_only = path == "res://" || path == "uid://";
     (!scheme_only).then(|| path.to_string())

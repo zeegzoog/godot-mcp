@@ -63,13 +63,11 @@ impl LaunchedEditors {
             return;
         }
         #[cfg(unix)]
-        if !force {
-            if let Ok(id) = i32::try_from(pid) {
-                // SAFETY: kill only sends a signal to the editor this server spawned and still
-                // holds unreaped, so the id cannot belong to another process.
-                unsafe { libc::kill(id, libc::SIGTERM) };
-                return;
-            }
+        if !force && let Ok(id) = i32::try_from(pid) {
+            // SAFETY: kill only sends a signal to the editor this server spawned and still
+            // holds unreaped, so the id cannot belong to another process.
+            unsafe { libc::kill(id, libc::SIGTERM) };
+            return;
         }
         #[cfg(windows)]
         let _ = force;

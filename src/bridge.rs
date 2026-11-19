@@ -165,17 +165,17 @@ impl BridgeClient {
     async fn connection(&self) -> Result<Arc<Connection>> {
         let mut state = self.state.lock().await;
 
-        if let Some(existing) = &state.connection {
-            if existing.alive.load(Ordering::Acquire) {
-                return Ok(existing.clone());
-            }
+        if let Some(existing) = &state.connection
+            && existing.alive.load(Ordering::Acquire)
+        {
+            return Ok(existing.clone());
         }
         state.connection = None;
 
-        if let Some((failed_at, message)) = &state.last_failure {
-            if failed_at.elapsed() < RETRY_AFTER_FAILURE {
-                return Err(McpError::BridgeUnavailable(message.clone()));
-            }
+        if let Some((failed_at, message)) = &state.last_failure
+            && failed_at.elapsed() < RETRY_AFTER_FAILURE
+        {
+            return Err(McpError::BridgeUnavailable(message.clone()));
         }
 
         match self.connect().await {
@@ -298,11 +298,11 @@ async fn run_connection(
 }
 
 fn deliver(pending: &Pending, events: &EventSubs, text: &str) {
-    if let Ok(value) = serde_json::from_str::<Value>(text) {
-        if value.get("type").and_then(Value::as_str) == Some("event") {
-            lock(events).retain(|subscriber| subscriber.send(value.clone()).is_ok());
-            return;
-        }
+    if let Ok(value) = serde_json::from_str::<Value>(text)
+        && value.get("type").and_then(Value::as_str) == Some("event")
+    {
+        lock(events).retain(|subscriber| subscriber.send(value.clone()).is_ok());
+        return;
     }
     let response: BridgeResponse = match serde_json::from_str(text) {
         Ok(response) => response,

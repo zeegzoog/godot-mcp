@@ -224,13 +224,13 @@ async fn create_file(tools: &ToolManager, args: &Value, code: &str) -> ToolResul
             );
         }
     }
-    if let Some(parent) = file.parent() {
-        if let Err(error) = tokio::fs::create_dir_all(parent).await {
-            return ToolResult::error(
-                format!("Could not create the folder for {res_path}: {error}"),
-                &["Check that the project directory is writable"],
-            );
-        }
+    if let Some(parent) = file.parent()
+        && let Err(error) = tokio::fs::create_dir_all(parent).await
+    {
+        return ToolResult::error(
+            format!("Could not create the folder for {res_path}: {error}"),
+            &["Check that the project directory is writable"],
+        );
     }
 
     if existing.is_some() {

@@ -99,15 +99,14 @@ async fn held_aware_call(
         Duration::from_secs(20)
     };
     let outcome = run.runtime(method, params, wait).await;
-    if physics {
-        if let Some(held) = outcome
+    if physics
+        && let Some(held) = outcome
             .as_ref()
             .ok()
             .and_then(|value| value.get("held"))
             .and_then(Value::as_bool)
-        {
-            run.set_held(held);
-        }
+    {
+        run.set_held(held);
     }
     outcome.map_err(|error| {
         if script {
@@ -170,20 +169,16 @@ async fn ready_editor_session(tools: &ToolManager) -> Result<i64, McpError> {
                 .get("sessions")
                 .and_then(Value::as_array)
                 .and_then(|sessions| sessions.first())
-            {
-                if session
+                && session
                     .get("hello")
                     .and_then(Value::as_str)
                     .is_some_and(|hello| !hello.is_empty())
-                {
-                    if let Some(id) = session
-                        .get("session")
-                        .and_then(Value::as_i64)
-                        .filter(|id| *id >= 0)
-                    {
-                        return Ok(id);
-                    }
-                }
+                && let Some(id) = session
+                    .get("session")
+                    .and_then(Value::as_i64)
+                    .filter(|id| *id >= 0)
+            {
+                return Ok(id);
             }
             let state = tools
                 .bridge

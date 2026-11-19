@@ -10,6 +10,7 @@
 use crate::error::{McpError, Result};
 use crate::godot::debug_ctl::DebugCtl;
 use crate::godot::debug_session::{DebugSession, GameMessage};
+use crate::godot::movie::Movie;
 use crate::util::{lock, process_runs};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
@@ -32,6 +33,8 @@ const STDERR_TAIL_CHARS: usize = 500;
 const WATCH_INTERVAL: Duration = Duration::from_millis(250);
 /// How long a process that closed its debugger connection may take to exit.
 const EXIT_GRACE: Duration = Duration::from_secs(5);
+/// How long a Movie Maker run that was asked to quit may take to finish its file and exit.
+const MOVIE_FINISH_GRACE: Duration = Duration::from_secs(20);
 /// How long a report waits for the last output of a process that has ended.
 const PIPE_DRAIN: Duration = Duration::from_millis(300);
 static NEXT_REQUEST: AtomicI64 = AtomicI64::new(1);
@@ -242,6 +245,10 @@ pub struct Run {
     /// Arguments placed after `--`, so the game reads them and Godot does not.
     user_args: Vec<String>,
     headless: bool,
+    /// The Movie Maker recording this run writes, when it was started with one.
+    movie: Option<Movie>,
+    /// Set when this server asked the game to quit, so an exit that follows is its stop.
+    quit_requested: AtomicBool,
     pid: AtomicU32,
     session: Arc<DebugSession>,
     debug: Arc<DebugCtl>,
@@ -274,6 +281,8 @@ pub struct ProcessStart<'a> {
     pub break_on_errors: bool,
     pub held: bool,
     pub user_args: &'a [String],
+    /// Movie Maker: its engine options go before the `--`.
+    pub movie: Option<&'a Movie>,
 }
 
 impl GameHub {
@@ -303,6 +312,7 @@ impl GameHub {
             break_on_errors,
             held,
             user_args,
+            movie,
         } = launch;
         session.set_ignore_error_breaks(!break_on_errors);
         let debug = DebugCtl::new(Arc::clone(&session));
@@ -313,6 +323,8 @@ impl GameHub {
             scene: scene.unwrap_or("").to_string(),
             user_args: user_args.to_vec(),
             headless,
+            movie: movie.cloned(),
+            quit_requested: AtomicBool::new(false),
             pid: AtomicU32::new(0),
             session: Arc::clone(&session),
             debug,
@@ -344,6 +356,9 @@ impl GameHub {
         }
         if let Some(scene) = scene {
             command.arg("--scene").arg(scene);
+        }
+        if let Some(movie) = movie {
+            command.args(movie.engine_args());
         }
         if held {
             // Exact steps need one frame per tick, so the engine's frame rate is fixed to the tick
@@ -563,6 +578,7 @@ impl Run {
             "scene": self.scene,
             "user_args": self.user_args,
             "headless": self.headless,
+            "movie": self.movie_report(),
             "running": self.is_alive(),
             "held": self.is_held(),
             "debugger_connected": self.session.is_connected(),
@@ -596,7 +612,15 @@ impl Run {
             "ended_at": ended.map(|ended| ended.at),
             "how_ended": ended.map(|ended| ended.describe()),
             "last_stderr": self.last_stderr(),
+            "movie": self.movie_report(),
         })
+    }
+
+    /// What the Movie Maker recording holds now; null for a run without one.
+    fn movie_report(&self) -> Value {
+        self.movie
+            .as_ref()
+            .map_or(Value::Null, |movie| movie.report(!self.is_alive()))
     }
 
     fn last_stderr(&self) -> Vec<String> {
@@ -658,6 +682,9 @@ impl Run {
     }
 
     async fn kill(&self) {
+        if self.movie.is_some() {
+            self.finish_movie().await;
+        }
         let child = lock(&self.child).take();
         if let Some(mut child) = child {
             // A process that already exited ended by itself, whether or not the watcher saw it.
@@ -675,10 +702,44 @@ impl Run {
         self.drain_pipes().await;
     }
 
+    /// Asks a Movie Maker run to quit and waits for it to exit: Godot writes the frame count and
+    /// the index of an `.avi` only when the game quits, so a killed recording is left unfinished.
+    /// A game that cannot answer (an older runtime, a breakpoint, a hang) is killed by the caller.
+    async fn finish_movie(&self) {
+        if !self.is_alive() || !self.session.is_connected() {
+            return;
+        }
+        self.quit_requested.store(true, Ordering::Release);
+        if let Err(error) = self
+            .runtime("run.end", json!({}), Duration::from_secs(3))
+            .await
+        {
+            tracing::warn!("run {} did not take the request to quit: {error}", self.id);
+            return;
+        }
+        let deadline = tokio::time::Instant::now() + MOVIE_FINISH_GRACE;
+        while tokio::time::Instant::now() < deadline {
+            let exited = match lock(&self.child).as_mut() {
+                Some(child) => !matches!(child.try_wait(), Ok(None)),
+                None => true,
+            };
+            if exited || !self.is_alive() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     /// Records how the process ended, once: the first writer (the watcher for a game that quit by
     /// itself, `kill` for a stop) wins. `exit_code` reports a process without one (killed by a
     /// signal) as -1, and `signal` says which.
     fn record_end(&self, who: &'static str, status: Option<ExitStatus>) {
+        // A game that quits because this server asked it to was stopped by this server.
+        let who = if self.quit_requested.load(Ordering::Acquire) {
+            "server"
+        } else {
+            who
+        };
         let mut ended = lock(&self.ended);
         if ended.is_some() {
             return;

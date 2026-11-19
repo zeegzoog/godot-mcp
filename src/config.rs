@@ -43,6 +43,11 @@ pub struct Config {
     #[arg(long = "gh-path", env = "GODOT_MCP_GH_PATH", value_parser = parse_path)]
     pub gh_path: Option<PathBuf>,
 
+    /// A folder outside the project that Movie Maker recordings (`godot_run_project` `movie`) may
+    /// be written to. Without it, recordings stay inside the project
+    #[arg(long = "movie-dir", env = "GODOT_MCP_MOVIE_DIR", value_parser = parse_path)]
+    pub movie_dir: Option<PathBuf>,
+
     /// Where `debug_port` came from. Empty until `load`; tests that parse arguments directly
     /// leave it empty.
     #[arg(skip)]

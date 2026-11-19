@@ -313,15 +313,15 @@ impl Journal {
                 "State the suggestion in a few sentences",
             )?;
         }
-        if let Some(tool) = &note.tool {
-            if !is_tool_name(tool) {
-                return Err(Refusal::new(
-                    format!(
-                        "tool {tool:?} is not a tool name: use 1 to {TOOL_LIMIT} characters of a-z, 0-9 and underscore"
-                    ),
-                    "Pass the tool's name such as godot_add_node, or leave tool out",
-                ));
-            }
+        if let Some(tool) = &note.tool
+            && !is_tool_name(tool)
+        {
+            return Err(Refusal::new(
+                format!(
+                    "tool {tool:?} is not a tool name: use 1 to {TOOL_LIMIT} characters of a-z, 0-9 and underscore"
+                ),
+                "Pass the tool's name such as godot_add_node, or leave tool out",
+            ));
         }
 
         let mut state = lock(&self.state);
@@ -396,16 +396,15 @@ impl Journal {
             event.last_seen = sequence;
             return;
         }
-        if state.evidence.len() >= MAX_EVIDENCE {
-            if let Some(oldest) = state
+        if state.evidence.len() >= MAX_EVIDENCE
+            && let Some(oldest) = state
                 .evidence
                 .iter()
                 .enumerate()
                 .min_by_key(|(_, event)| event.last_seen)
                 .map(|(index, _)| index)
-            {
-                state.evidence.remove(oldest);
-            }
+        {
+            state.evidence.remove(oldest);
         }
         state.evidence.push(Evidence {
             kind,

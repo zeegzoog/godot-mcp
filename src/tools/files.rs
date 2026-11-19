@@ -446,12 +446,13 @@ pub(super) fn protected_by_identity(project: &Path, file: &Path) -> Option<Strin
 fn companion_owner(file: &Path) -> Option<String> {
     let name = file.file_name()?.to_string_lossy().into_owned();
     for suffix in [".uid", ".import"] {
-        if let Some(owner) = name.strip_suffix(suffix) {
-            if !owner.is_empty() && file.with_file_name(owner).is_file() {
-                return Some(format!(
-                    "belongs to {owner} and is removed with it; delete {owner} instead"
-                ));
-            }
+        if let Some(owner) = name.strip_suffix(suffix)
+            && !owner.is_empty()
+            && file.with_file_name(owner).is_file()
+        {
+            return Some(format!(
+                "belongs to {owner} and is removed with it; delete {owner} instead"
+            ));
         }
     }
     None
@@ -489,10 +490,11 @@ fn describe_file(project: &Path, res_path: String, file: PathBuf) -> Target {
                 .to_string_lossy()
                 .into_owned();
             for item in [part.to_string(), md5] {
-                if let Ok(path) = resolve_in_project(project, &item) {
-                    if path.is_file() && !companions.contains(&path) {
-                        companions.push(path);
-                    }
+                if let Ok(path) = resolve_in_project(project, &item)
+                    && path.is_file()
+                    && !companions.contains(&path)
+                {
+                    companions.push(path);
                 }
             }
         }

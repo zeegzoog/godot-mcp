@@ -95,10 +95,10 @@ pub fn recording_godot(dir: &Path) -> (PathBuf, PathBuf) {
 /// Waits for a file a stand-in process writes, then returns what it holds.
 pub async fn wait_for_file(path: &Path) -> String {
     for _ in 0..100 {
-        if let Ok(text) = std::fs::read_to_string(path) {
-            if !text.trim().is_empty() {
-                return text;
-            }
+        if let Ok(text) = std::fs::read_to_string(path)
+            && !text.trim().is_empty()
+        {
+            return text;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

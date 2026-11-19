@@ -310,20 +310,19 @@ impl ToolManager {
         }
 
         let given = str_arg(&args, "content");
-        if given.is_some() {
-            if let Some(header) = ["extends_class", "class_name"]
+        if given.is_some()
+            && let Some(header) = ["extends_class", "class_name"]
                 .into_iter()
                 .find(|key| str_arg(&args, key).is_some())
-            {
-                return ToolResult::error(
-                    format!(
-                        "Pass either content or {header}, not both: content is written as given, without the standard header"
-                    ),
-                    &[&format!(
-                        "Put the extends and class_name lines in content and drop {header}"
-                    )],
-                );
-            }
+        {
+            return ToolResult::error(
+                format!(
+                    "Pass either content or {header}, not both: content is written as given, without the standard header"
+                ),
+                &[&format!(
+                    "Put the extends and class_name lines in content and drop {header}"
+                )],
+            );
         }
         if given.is_some_and(|text| text.len() as u64 > scripts::MAX_BYTES) {
             return ToolResult::error(
@@ -337,10 +336,10 @@ impl ToolManager {
             return invalid_identifier("extends_class", extends_class);
         }
         let class_name = str_arg(&args, "class_name");
-        if let Some(name) = class_name {
-            if !is_valid_identifier(name) {
-                return invalid_identifier("class_name", name);
-            }
+        if let Some(name) = class_name
+            && !is_valid_identifier(name)
+        {
+            return invalid_identifier("class_name", name);
         }
         let overwrite = args
             .get("overwrite")
@@ -391,13 +390,13 @@ impl ToolManager {
             }
         };
 
-        if let Some(parent) = target.parent() {
-            if let Err(err) = fs::create_dir_all(parent).await {
-                return ToolResult::error(
-                    format!("Failed to create directory {}: {err}", parent.display()),
-                    &["Check that the project directory is writable"],
-                );
-            }
+        if let Some(parent) = target.parent()
+            && let Err(err) = fs::create_dir_all(parent).await
+        {
+            return ToolResult::error(
+                format!("Failed to create directory {}: {err}", parent.display()),
+                &["Check that the project directory is writable"],
+            );
         }
         let mut options = fs::OpenOptions::new();
         options.write(true);
@@ -438,44 +437,38 @@ impl ToolManager {
         let mut reload_note = String::new();
         // Whether an editor took the file in; its scan then registers the class_name.
         let mut editor_scanned = false;
-        if editor_holds_project {
-            if let Some(res_path) = &res_path {
-                // Let the editor pick the file up (and give it a .uid) right away.
-                editor_scanned = self
-                    .bridge
-                    .send_command("resave_resources", json!({ "paths": [res_path] }))
-                    .await
-                    .is_ok();
-                if open_tab.is_some() {
-                    // The refresh above already reloads a clean tab; this call catches an
-                    // older addon or a tab the refresh did not reach.
-                    reload_note = match self.script_tab(res_path, true).await {
-                        Ok(Some(tab))
-                            if tab.get("stale").and_then(Value::as_bool) == Some(true) =>
-                        {
-                            format!(
-                                " Warning: the open script tab still shows the old text; call godot_resave_resources with paths [\"{res_path}\"] to reload it."
-                            )
-                        }
-                        Ok(Some(_)) => {
-                            " The open script tab was reloaded with the new text.".to_string()
-                        }
-                        _ => String::new(),
-                    };
-                }
+        if editor_holds_project && let Some(res_path) = &res_path {
+            // Let the editor pick the file up (and give it a .uid) right away.
+            editor_scanned = self
+                .bridge
+                .send_command("resave_resources", json!({ "paths": [res_path] }))
+                .await
+                .is_ok();
+            if open_tab.is_some() {
+                // The refresh above already reloads a clean tab; this call catches an
+                // older addon or a tab the refresh did not reach.
+                reload_note = match self.script_tab(res_path, true).await {
+                    Ok(Some(tab)) if tab.get("stale").and_then(Value::as_bool) == Some(true) => {
+                        format!(
+                            " Warning: the open script tab still shows the old text; call godot_resave_resources with paths [\"{res_path}\"] to reload it."
+                        )
+                    }
+                    Ok(Some(_)) => {
+                        " The open script tab was reloaded with the new text.".to_string()
+                    }
+                    _ => String::new(),
+                };
             }
         }
 
         // The editor registers a class_name when its scan sees the file; without the editor,
         // nothing would, and every run would fail to find the class.
-        if !editor_scanned {
-            if let Some(res_path) = &res_path {
-                let registration =
-                    crate::godot::class_cache::register(&project.dir, res_path, &content);
-                if let Some(note) = registration.note(res_path) {
-                    reload_note.push(' ');
-                    reload_note.push_str(&note);
-                }
+        if !editor_scanned && let Some(res_path) = &res_path {
+            let registration =
+                crate::godot::class_cache::register(&project.dir, res_path, &content);
+            if let Some(note) = registration.note(res_path) {
+                reload_note.push(' ');
+                reload_note.push_str(&note);
             }
         }
 

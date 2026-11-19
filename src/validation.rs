@@ -97,50 +97,49 @@ fn check_value(name: &str, value: &Value, property: &Value) -> Result<(), String
                 type_name(value)
             ));
         }
-        if expected == "array" {
-            if let (Some(items), Some(item_type)) = (
+        if expected == "array"
+            && let (Some(items), Some(item_type)) = (
                 value.as_array(),
                 property
                     .get("items")
                     .and_then(|items| items.get("type"))
                     .and_then(Value::as_str),
-            ) {
-                if let Some(bad) = items.iter().find(|item| !matches_type(item, item_type)) {
-                    return Err(format!(
-                        "Every item of '{name}' must be {} {item_type}, got {}",
-                        article(item_type),
-                        type_name(bad)
-                    ));
-                }
-            }
+            )
+            && let Some(bad) = items.iter().find(|item| !matches_type(item, item_type))
+        {
+            return Err(format!(
+                "Every item of '{name}' must be {} {item_type}, got {}",
+                article(item_type),
+                type_name(bad)
+            ));
         }
     }
 
     if let Some(number) = value.as_f64() {
-        if let Some(minimum) = property.get("minimum").and_then(Value::as_f64) {
-            if number < minimum {
-                return Err(format!(
-                    "Parameter '{name}' must be at least {minimum}, got {number}"
-                ));
-            }
+        if let Some(minimum) = property.get("minimum").and_then(Value::as_f64)
+            && number < minimum
+        {
+            return Err(format!(
+                "Parameter '{name}' must be at least {minimum}, got {number}"
+            ));
         }
-        if let Some(maximum) = property.get("maximum").and_then(Value::as_f64) {
-            if number > maximum {
-                return Err(format!(
-                    "Parameter '{name}' must be at most {maximum}, got {number}"
-                ));
-            }
+        if let Some(maximum) = property.get("maximum").and_then(Value::as_f64)
+            && number > maximum
+        {
+            return Err(format!(
+                "Parameter '{name}' must be at most {maximum}, got {number}"
+            ));
         }
     }
 
-    if let Some(allowed) = property.get("enum").and_then(Value::as_array) {
-        if !allowed.contains(value) {
-            let options: Vec<String> = allowed.iter().map(Value::to_string).collect();
-            return Err(format!(
-                "Parameter '{name}' must be one of {}",
-                options.join(", ")
-            ));
-        }
+    if let Some(allowed) = property.get("enum").and_then(Value::as_array)
+        && !allowed.contains(value)
+    {
+        let options: Vec<String> = allowed.iter().map(Value::to_string).collect();
+        return Err(format!(
+            "Parameter '{name}' must be one of {}",
+            options.join(", ")
+        ));
     }
     Ok(())
 }

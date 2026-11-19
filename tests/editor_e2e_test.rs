@@ -242,10 +242,10 @@ async fn start_editor_with_args(
 async fn wait_until_started(bridge: &BridgeClient, log: &Path, port: &str) {
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
-        if let Ok(pong) = bridge.send_command("ping", json!({})).await {
-            if pong["starting"] != true {
-                return;
-            }
+        if let Ok(pong) = bridge.send_command("ping", json!({})).await
+            && pong["starting"] != true
+        {
+            return;
         }
         assert!(
             Instant::now() < deadline,

@@ -898,10 +898,10 @@ fn render_typed(value: &Value, found: &SettingType) -> Result<String, String> {
     let Some(type_name) = found.type_name.as_deref() else {
         // A setting the engine does not define keeps the type of the value; an array or object
         // is written as the engine converted it.
-        if value.is_array() || value.is_object() {
-            if let Some(text) = one_line {
-                return Ok(text.to_string());
-            }
+        if (value.is_array() || value.is_object())
+            && let Some(text) = one_line
+        {
+            return Ok(text.to_string());
         }
         return render_setting(value, None);
     };

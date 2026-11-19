@@ -504,14 +504,12 @@ fn check_move(plan: &mut Plan, project: &Path, request: &Request) -> Option<Move
         return None;
     };
     let directory = metadata.is_dir();
-    if !directory {
-        if let Some(owner) = companion_owner(&from) {
-            plan.refuse(
-                &from_res,
-                format!("belongs to {owner} and moves with it; move {owner} instead"),
-            );
-            return None;
-        }
+    if !directory && let Some(owner) = companion_owner(&from) {
+        plan.refuse(
+            &from_res,
+            format!("belongs to {owner} and moves with it; move {owner} instead"),
+        );
+        return None;
     }
 
     let mut to_text = request.to.trim().replace('\\', "/");
@@ -707,10 +705,10 @@ fn file_uid(file: &Path) -> Option<String> {
             return Some(text.to_string());
         }
     }
-    if let Ok(text) = std::fs::read_to_string(sidecar(file, ".import")) {
-        if let Some(uid) = header_uid(&text) {
-            return Some(uid);
-        }
+    if let Ok(text) = std::fs::read_to_string(sidecar(file, ".import"))
+        && let Some(uid) = header_uid(&text)
+    {
+        return Some(uid);
     }
     if matches!(extension(file).as_str(), "tscn" | "tres") {
         let text = std::fs::read_to_string(file).ok()?;
@@ -762,10 +760,10 @@ fn moved_path(plan: &Plan, res: &str) -> String {
                 return format!("{}{suffix}", item.to_res);
             }
         }
-        if item.directory {
-            if let Some(rest) = res.strip_prefix(&format!("{}/", item.from_res)) {
-                return format!("{}/{rest}", item.to_res);
-            }
+        if item.directory
+            && let Some(rest) = res.strip_prefix(&format!("{}/", item.from_res))
+        {
+            return format!("{}/{rest}", item.to_res);
         }
     }
     res.to_string()
@@ -957,22 +955,21 @@ fn disk_caches(plan: &Plan, warnings: &mut Vec<String>) {
         .iter()
         .filter_map(|file| Some((file.to_res.clone(), file.uid.clone()?)))
         .collect();
-    if !entries.is_empty() {
-        if let Err(error) = record_uids(&plan.project, &entries) {
-            warnings.push(format!(
-                "The uid cache could not be updated ({error}); the editor rebuilds it on its next scan."
-            ));
-        }
+    if !entries.is_empty()
+        && let Err(error) = record_uids(&plan.project, &entries)
+    {
+        warnings.push(format!(
+            "The uid cache could not be updated ({error}); the editor rebuilds it on its next scan."
+        ));
     }
     let cache = plan.project.join(CLASS_CACHE);
-    if let Ok(text) = std::fs::read_to_string(&cache) {
-        if let Some((text, _)) = rewrite(&text, &plan.pairs) {
-            if let Err(error) = std::fs::write(&cache, text) {
-                warnings.push(format!(
+    if let Ok(text) = std::fs::read_to_string(&cache)
+        && let Some((text, _)) = rewrite(&text, &plan.pairs)
+        && let Err(error) = std::fs::write(&cache, text)
+    {
+        warnings.push(format!(
                     "The global class cache could not be updated ({error}); the editor rebuilds it on its next scan."
                 ));
-            }
-        }
     }
 }
 

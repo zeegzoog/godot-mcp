@@ -258,13 +258,13 @@ async fn set(tools: &ToolManager, args: &Value) -> ToolResult {
             }
         ));
     }
-    if let Some(platform) = str_arg(args, "platform") {
-        if !BUILT_IN_PLATFORMS.contains(&platform) {
-            report["warning"] = json!(format!(
-                "{platform:?} is not a platform the Godot editor provides ({}); Godot skips a preset whose platform no export plugin adds",
-                BUILT_IN_PLATFORMS.join(", ")
-            ));
-        }
+    if let Some(platform) = str_arg(args, "platform")
+        && !BUILT_IN_PLATFORMS.contains(&platform)
+    {
+        report["warning"] = json!(format!(
+            "{platform:?} is not a platform the Godot editor provides ({}); Godot skips a preset whose platform no export plugin adds",
+            BUILT_IN_PLATFORMS.join(", ")
+        ));
     }
     ToolResult::text(serde_json::to_string_pretty(&report).unwrap_or_default())
 }
@@ -353,13 +353,13 @@ async fn export(tools: &ToolManager, args: &Value) -> ToolResult {
             );
         }
     };
-    if let Some(parent) = output.parent() {
-        if let Err(err) = std::fs::create_dir_all(parent) {
-            return ToolResult::error(
-                format!("Cannot create the folder {}: {err}", parent.display()),
-                &["Check that the project directory is writable"],
-            );
-        }
+    if let Some(parent) = output.parent()
+        && let Err(err) = std::fs::create_dir_all(parent)
+    {
+        return ToolResult::error(
+            format!("Cannot create the folder {}: {err}", parent.display()),
+            &["Check that the project directory is writable"],
+        );
     }
 
     let mut report = json!({
@@ -514,13 +514,13 @@ fn set_request(args: &Value) -> Result<Value, String> {
             request.insert(field.into(), json!(text));
         }
     }
-    if let Some(filter) = str_arg(args, "export_filter") {
-        if !EXPORT_FILTERS.contains(&filter) {
-            return Err(format!(
-                "export_filter {filter:?} is not one of Godot's filters: {}",
-                EXPORT_FILTERS.join(", ")
-            ));
-        }
+    if let Some(filter) = str_arg(args, "export_filter")
+        && !EXPORT_FILTERS.contains(&filter)
+    {
+        return Err(format!(
+            "export_filter {filter:?} is not one of Godot's filters: {}",
+            EXPORT_FILTERS.join(", ")
+        ));
     }
     if let Some(files) = args.get("export_files").filter(|value| !value.is_null()) {
         request.insert("export_files".into(), json!(export_files(files)?));
@@ -816,11 +816,11 @@ pub(super) fn messages(run: &HeadlessRun, prefix: &str) -> Vec<String> {
                 if trimmed.starts_with(prefix) {
                     current = Some(trimmed.to_string());
                 }
-            } else if let Some(message) = current.as_mut() {
-                if !trimmed.is_empty() {
-                    message.push('\n');
-                    message.push_str(trimmed);
-                }
+            } else if let Some(message) = current.as_mut()
+                && !trimmed.is_empty()
+            {
+                message.push('\n');
+                message.push_str(trimmed);
             }
         }
         found.extend(current);

@@ -8,12 +8,11 @@ use serde_json::{Value, json};
 use std::time::Duration;
 
 pub(super) async fn breakpoints(tools: &ToolManager, args: &Value) -> ToolResult {
-    if matches!(str_arg(args, "action"), Some("add" | "remove")) {
-        if let Some(spec) = str_arg(args, "breakpoint") {
-            if let Err(result) = check_breakpoint(spec) {
-                return result;
-            }
-        }
+    if matches!(str_arg(args, "action"), Some("add" | "remove"))
+        && let Some(spec) = str_arg(args, "breakpoint")
+        && let Err(result) = check_breakpoint(spec)
+    {
+        return result;
     }
     let run = match tools.games.debug(str_arg(args, "run_id")) {
         Ok(run) => run,
@@ -25,10 +24,10 @@ pub(super) async fn breakpoints(tools: &ToolManager, args: &Value) -> ToolResult
         "list" => Ok(json!({"breakpoints": debug.list_breakpoints()})),
         "clear" => {
             for spec in debug.list_breakpoints() {
-                if let Some((file, line)) = crate::godot::split_breakpoint(&spec) {
-                    if let Err(error) = debug.set_breakpoint(&file, line, false) {
-                        return runtime_error(&error);
-                    }
+                if let Some((file, line)) = crate::godot::split_breakpoint(&spec)
+                    && let Err(error) = debug.set_breakpoint(&file, line, false)
+                {
+                    return runtime_error(&error);
                 }
             }
             Ok(json!({"breakpoints": []}))

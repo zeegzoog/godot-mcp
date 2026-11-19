@@ -795,15 +795,13 @@ impl ToolManager {
                     if !unregistered.is_empty()
                         && external_ok
                         && self.register_scripts(&unregistered).await
-                    {
-                        if let Ok(Some(again)) = self
+                        && let Ok(Some(again)) = self
                             .lsp
                             .diagnostics_if_reachable(dir, external_ok, &file)
                             .await
-                        {
-                            value = again;
-                            unregistered = code::unregistered_classes(dir, &file, &value);
-                        }
+                    {
+                        value = again;
+                        unregistered = code::unregistered_classes(dir, &file, &value);
                     }
                     // The class cache is what headless runs and process runs know; the language
                     // server scans the project itself, so it can know classes they do not.
@@ -903,27 +901,29 @@ impl ToolManager {
     const RESAVE_BRIDGE_WAIT: std::time::Duration = std::time::Duration::from_secs(90);
 
     pub(super) async fn handle_resave_resources(&self, args: Value) -> ToolResult {
-        if let Some(wait) = args.get("wait") {
-            if !wait.is_null() && !wait.is_boolean() {
-                return ToolResult::error(
-                    "wait must be a boolean",
-                    &["Use wait: true to block until the scan and import finish"],
-                );
-            }
+        if let Some(wait) = args.get("wait")
+            && !wait.is_null()
+            && !wait.is_boolean()
+        {
+            return ToolResult::error(
+                "wait must be a boolean",
+                &["Use wait: true to block until the scan and import finish"],
+            );
         }
-        if let Some(force) = args.get("force") {
-            if !force.is_null() && !force.is_boolean() {
-                return ToolResult::error(
-                    "force must be a boolean",
-                    &["Use force: true with paths to reimport them whatever Godot's cache says"],
-                );
-            }
+        if let Some(force) = args.get("force")
+            && !force.is_null()
+            && !force.is_boolean()
+        {
+            return ToolResult::error(
+                "force must be a boolean",
+                &["Use force: true with paths to reimport them whatever Godot's cache says"],
+            );
         }
         let named = str_arg(&args, "project_path");
-        if let Some(named) = named {
-            if !self.editor_may_serve(Path::new(named)).await {
-                return self.import_headless(&args).await;
-            }
+        if let Some(named) = named
+            && !self.editor_may_serve(Path::new(named)).await
+        {
+            return self.import_headless(&args).await;
         }
         let bridge = self.bridge.clone().with_timeout(Self::RESAVE_BRIDGE_WAIT);
         match bridge.send_command("resave_resources", args.clone()).await {

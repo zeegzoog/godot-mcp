@@ -45,15 +45,13 @@ impl StaleImports {
 impl ToolManager {
     pub(super) async fn handle_run_project(&self, args: Value) -> ToolResult {
         let scene = str_arg(&args, "scene");
-        if let Some(scene) = scene {
-            if !scene.starts_with("res://") || scene.split(['/', '\\']).any(|part| part == "..") {
-                return ToolResult::error(
-                    format!(
-                        "Invalid scene '{scene}': scene must be a res:// path inside the project"
-                    ),
-                    &["Use a path such as res://scenes/Main.tscn"],
-                );
-            }
+        if let Some(scene) = scene
+            && (!scene.starts_with("res://") || scene.split(['/', '\\']).any(|part| part == ".."))
+        {
+            return ToolResult::error(
+                format!("Invalid scene '{scene}': scene must be a res:// path inside the project"),
+                &["Use a path such as res://scenes/Main.tscn"],
+            );
         }
         for spec in string_list(args.get("breakpoints")) {
             if let Err(result) = game::check_breakpoint(&spec) {

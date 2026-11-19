@@ -298,10 +298,10 @@ fn report_value(
 }
 
 fn prefixed(mut result: ToolResult, prefix: &str) -> ToolResult {
-    if let Some(ToolContent::Text { text }) = result.content.first_mut() {
-        if let Some(rest) = text.strip_prefix("Error: ") {
-            *text = format!("Error: {prefix}{rest}");
-        }
+    if let Some(ToolContent::Text { text }) = result.content.first_mut()
+        && let Some(rest) = text.strip_prefix("Error: ")
+    {
+        *text = format!("Error: {prefix}{rest}");
     }
     result
 }

@@ -397,12 +397,11 @@ impl GameHub {
 
         let mut runs = lock(&self.runs);
         runs.push(Arc::clone(&run));
-        if runs.len() > 8 {
-            if let Some(old) = runs.first().cloned() {
-                if !old.running.load(Ordering::Acquire) {
-                    runs.remove(0);
-                }
-            }
+        if runs.len() > 8
+            && let Some(old) = runs.first().cloned()
+            && !old.running.load(Ordering::Acquire)
+        {
+            runs.remove(0);
         }
         Ok(RunInfo {
             id,
@@ -498,10 +497,11 @@ impl GameHub {
         since: u64,
         level: &str,
     ) -> Result<Value> {
-        if run_id.is_none() && self.select(None)?.is_none() {
-            if let Some(run) = self.last_ended() {
-                return Ok(run.page_logs(since, level));
-            }
+        if run_id.is_none()
+            && self.select(None)?.is_none()
+            && let Some(run) = self.last_ended()
+        {
+            return Ok(run.page_logs(since, level));
         }
         self.logs(run_id, since, level)
     }
@@ -955,10 +955,10 @@ pub fn json_id_eq(value: Option<&Value>, id: i64) -> bool {
 fn ingest(run: &Run, message: &GameMessage) {
     match message.message.as_str() {
         "mcp:hello" => {
-            if let Some(text) = message.data.first().and_then(Value::as_str) {
-                if let Ok(payload) = serde_json::from_str::<Value>(text) {
-                    run.note_hello(payload);
-                }
+            if let Some(text) = message.data.first().and_then(Value::as_str)
+                && let Ok(payload) = serde_json::from_str::<Value>(text)
+            {
+                run.note_hello(payload);
             }
         }
         "output" => {

@@ -183,10 +183,14 @@ async fn a_preset_is_created_changed_and_used_for_a_pack_export() {
 async fn a_resources_filter_exports_only_the_listed_files_and_their_dependencies() {
     let dir = project();
     let root = dir.path();
-    std::fs::write(root.join("unused.gd"), "extends Node\n").expect("unused.gd");
+    std::fs::write(
+        root.join("unused.gd"),
+        "extends Node\n\nvar left_out_marker_qx7: int = 0\n",
+    )
+    .expect("unused.gd");
     std::fs::write(
         root.join("unused.tscn"),
-        "[gd_scene format=3]\n\n[node name=\"Unused\" type=\"Node\"]\n",
+        "[gd_scene format=3]\n\n[node name=\"LeftOutNodeQx7\" type=\"Node\"]\n",
     )
     .expect("unused.tscn");
     let tools = manager();
@@ -265,8 +269,10 @@ async fn a_resources_filter_exports_only_the_listed_files_and_their_dependencies
         "the listed scene is in the pack"
     );
     assert!(names.contains("main.gd"), "its dependency is in the pack");
+    // Some engines list every project path in the pack's uid cache, so the file names say
+    // nothing: the content of the files nothing lists must be missing.
     assert!(
-        !names.contains("unused.tscn") && !names.contains("unused.gd"),
+        !names.contains("LeftOutNodeQx7") && !names.contains("left_out_marker_qx7"),
         "files nothing lists stay out"
     );
 

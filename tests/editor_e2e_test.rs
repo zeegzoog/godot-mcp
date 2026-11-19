@@ -1339,6 +1339,14 @@ async fn project_settings_store_arrays_and_objects_like_the_file_fallback() {
     let editor = start_editor(false).await;
     let bridge = &editor.bridge;
     let project_file = editor.project.join("project.godot");
+    // The editor keeps its own version in the features list, so the test names the version of the
+    // line it runs on, as the repository's development project does.
+    let version = include_str!("../project.godot")
+        .lines()
+        .find_map(|line| line.strip_prefix("config/features=PackedStringArray(\""))
+        .and_then(|rest| rest.split('"').next())
+        .unwrap_or("4.8")
+        .to_string();
 
     for (key, value) in [
         (
@@ -1350,7 +1358,7 @@ async fn project_settings_store_arrays_and_objects_like_the_file_fallback() {
             json!(" {\"meshes/generate_lods\": false}"),
         ),
         ("custom/tuning/table", json!({"speeds": [1, 2.5]})),
-        ("application/config/features", json!(["4.8", "Mobile"])),
+        ("application/config/features", json!([version, "Mobile"])),
     ] {
         bridge
             .send_command("set_project_setting", json!({"key": key, "value": value}))
@@ -1359,13 +1367,13 @@ async fn project_settings_store_arrays_and_objects_like_the_file_fallback() {
     }
     let written = std::fs::read_to_string(&project_file).expect("project.godot");
     for part in [
-        "\n[importer_defaults]\n",
-        "\ntexture={\n\"detect_3d/compress_to\": 0\n}\n",
-        "\nscene={\n\"meshes/generate_lods\": false\n}\n",
-        "\ntuning/table={\n\"speeds\": [1, 2.5]\n}\n",
-        "\nconfig/features=PackedStringArray(\"4.8\", \"Mobile\")\n",
+        "\n[importer_defaults]\n".to_string(),
+        "\ntexture={\n\"detect_3d/compress_to\": 0\n}\n".to_string(),
+        "\nscene={\n\"meshes/generate_lods\": false\n}\n".to_string(),
+        "\ntuning/table={\n\"speeds\": [1, 2.5]\n}\n".to_string(),
+        format!("\nconfig/features=PackedStringArray(\"{version}\", \"Mobile\")\n"),
     ] {
-        assert!(written.contains(part), "{part:?} missing from:\n{written}");
+        assert!(written.contains(&part), "{part:?} missing from:\n{written}");
     }
 
     let before = std::fs::read_to_string(&project_file).expect("project.godot");

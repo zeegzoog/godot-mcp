@@ -402,8 +402,16 @@ pub struct SettingType {
     pub type_name: Option<String>,
     /// The value converted to that type, as `project.godot` stores it. Only given for a type
     /// that is not a string, number or boolean, and only when the value could be converted; also
-    /// given without a type for an array or object value of a setting nobody defines.
+    /// given without a type for an array or object value of a setting nobody defines. For a
+    /// value text ([`CliRunner::setting_from_text`]) it is the parsed value, on one line.
     pub text: Option<String>,
+    /// The type of the value a value text parsed to (`Dictionary`, `Vector4`, ...); only given
+    /// by [`CliRunner::setting_from_text`].
+    pub value_type: Option<String>,
+    /// Whether the engine defines the setting itself (a feature override counts as its base, and
+    /// `importer_defaults/<name>` as defined), so its type is fixed whatever `project.godot`
+    /// stores. A project's own setting, such as `shader_globals/<name>`, is not defined.
+    pub defined: bool,
 }
 
 /// The script the setting type check runs. Fixed text: the request reaches it as
@@ -413,7 +421,9 @@ pub struct SettingType {
 /// and a text with any constructor that is not a built-in type is refused before it is parsed.
 /// A JSON array or object becomes an Array, a Dictionary or a packed array, a whole number in it
 /// an int. The text it answers is one line: strings in it are escaped. `importer_defaults/<name>`
-/// with nothing stored is a Dictionary. The editor runs the same rules (`_setting_from_value` in
+/// with nothing stored is a Dictionary. A request with `text` instead of `value` is a value text
+/// parsed as project.godot is (`str_to_var`, built-in constructors only), answered with the
+/// value's own type and its text beside the setting's type. The editor runs the same rules (`_setting_from_value` in
 /// `addons/godot_mcp/bridge_server.gd`).
 const SETTING_TYPE_SCRIPT: &str = r#"extends SceneTree
 
@@ -434,6 +444,7 @@ func _answer() -> Dictionary:
 		return {"error": "the request could not be read"}
 	var key: String = str(request.get("key", ""))
 	var value: Variant = request.get("value")
+	var defined: bool = not _defined_key(key).is_empty() or key.begins_with(IMPORTER_DEFAULTS)
 	var type: int = TYPE_NIL
 	if request.has("stored"):
 		var stored: String = str(request["stored"]).strip_edges()
@@ -444,23 +455,49 @@ func _answer() -> Dictionary:
 			return {"error": "the value stored in project.godot could not be read"}
 		type = typeof(current)
 	else:
-		var defined: String = _defined_key(key)
-		if not defined.is_empty():
-			type = typeof(ProjectSettings.get_setting(defined))
+		var definition: String = _defined_key(key)
+		if not definition.is_empty():
+			type = typeof(ProjectSettings.get_setting(definition))
 		elif key.begins_with(IMPORTER_DEFAULTS):
 			type = TYPE_DICTIONARY
+	if request.has("text"):
+		var parsed: Dictionary = _parse_text(str(request["text"]))
+		if parsed.has("error"):
+			return parsed
+		var literal: Variant = parsed["value"]
+		if type == TYPE_FLOAT and typeof(literal) == TYPE_INT:
+			literal = float(literal)
+		var read: Dictionary = {"value_type": type_string(typeof(literal)), "text": _text(literal), "defined": defined}
+		if type != TYPE_NIL:
+			read["type"] = type_string(type)
+		return read
 	if type == TYPE_NIL:
 		# A setting nobody defines keeps the type of the value; an array or object is converted.
 		if value is Array or value is Dictionary:
-			return {"text": _text(_from_json(value))}
-		return {}
-	var answer: Dictionary = {"type": type_string(type)}
+			return {"text": _text(_from_json(value)), "defined": defined}
+		return {"defined": defined}
+	var answer: Dictionary = {"type": type_string(type), "defined": defined}
 	if type in PLAIN_TYPES:
 		return answer
 	var converted: Variant = _convert(value, type)
 	if converted != null:
 		answer["text"] = _text(converted)
 	return answer
+
+
+## A value text as project.godot holds one, parsed: {"value"}, or {"error"} when it uses a
+## constructor that is not a built-in type (so no Object is created and no Resource loaded), does
+## not parse, or is null.
+func _parse_text(raw: String) -> Dictionary:
+	var text: String = raw.strip_edges()
+	if text.is_empty():
+		return {"error": "value_text is empty: give a value as project.godot stores it, such as Vector2i(1152, 648) or {\"key\": 1}"}
+	if text.begins_with("Object(") or not _builds_no_object(text):
+		return {"error": "value_text uses a constructor that is not a built-in type (an Object or a Resource); only built-in types such as Vector4(0, 1, 0, 0) or Color(1, 1, 1, 1) are parsed"}
+	var parsed: Variant = str_to_var(text)
+	if parsed == null:
+		return {"error": "value_text is not a value Godot can read: give it as project.godot stores it, such as Vector2i(1152, 648), \"text\" or {\"key\": Vector4(0, 1, 0, 0)}; to remove the setting pass remove: true"}
+	return {"value": parsed}
 
 
 ## The setting the engine defines for key; a feature override (`name.mobile`) has the type of
@@ -791,6 +828,27 @@ impl CliRunner {
         outcome
     }
 
+    /// The type a project setting has and the value text `text` parsed the way `project.godot`
+    /// is read (see [`SettingType`]): `type_name` is the setting's type (the stored one, else the
+    /// engine's definition), `value_type` and `text` the parsed value's. A text with an Object,
+    /// a Resource or a constructor that is not a built-in type is refused as a
+    /// [`McpError::Validation`], as is one that does not parse.
+    pub async fn setting_from_text(
+        &self,
+        key: &str,
+        text: &str,
+        stored: Option<&str>,
+    ) -> Result<SettingType> {
+        let mut request = serde_json::json!({"key": key, "text": text});
+        if let Some(stored) = stored {
+            request["stored"] = serde_json::Value::String(stored.to_string());
+        }
+        let dir = create_scratch_dir("setting-type")?;
+        let outcome = self.run_setting_type(&dir, &request).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        outcome
+    }
+
     /// Compiles the shader at `res_path` with the engine's shader compiler in a headless Godot
     /// on the project, and returns what the check script printed after its marker: a JSON
     /// object `{loaded, errors: [{file, line, message}], other: [message]}`.
@@ -857,6 +915,8 @@ impl CliRunner {
         Ok(SettingType {
             type_name: field("type"),
             text: field("text"),
+            value_type: field("value_type"),
+            defined: answer.get("defined").and_then(serde_json::Value::as_bool) == Some(true),
         })
     }
 

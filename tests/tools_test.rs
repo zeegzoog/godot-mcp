@@ -7707,3 +7707,231 @@ async fn output_that_is_not_utf8_does_not_kill_the_game() {
     let tail = stopped["last_stderr"].to_string();
     assert!(tail.contains("still-here"), "{tail}");
 }
+
+/// The frog-world case without an editor: a global shader uniform is a Dictionary holding a
+/// Vector4, given as value_text; the engine reads it and its one-line text is written.
+#[tokio::test]
+async fn project_setting_without_an_editor_stores_a_value_text() {
+    let project = project_dir();
+    let project_file = project.path().join("project.godot");
+    std::fs::write(&project_file, FROG_PROJECT).expect("project.godot");
+    let engine = tempfile::tempdir().expect("engine dir");
+    let frog = r#"{"type": "vec4", "value": Vector4(0, -1000, 0, 0)}"#;
+    let answer = json!({"value_type": "Dictionary", "text": frog, "defined": false}).to_string();
+    let (godot, request) = common::setting_godot(engine.path(), &answer);
+
+    let result = set_with_engine(
+        godot,
+        json!({"key": "shader_globals/frog_push", "value_text": frog,
+               "project_path": project.path()}),
+    )
+    .await;
+
+    assert!(!result.is_error, "{}", text(&result));
+    let asked: Value =
+        serde_json::from_str(&std::fs::read_to_string(&request).expect("request")).expect("json");
+    assert_eq!(
+        asked,
+        json!({"key": "shader_globals/frog_push", "text": frog})
+    );
+    assert_eq!(
+        std::fs::read_to_string(&project_file).expect("project.godot"),
+        format!("{FROG_PROJECT}\n[shader_globals]\n\nfrog_push={frog}\n")
+    );
+}
+
+/// A String stored by an earlier call is not replaced by a value of another type without
+/// replace_type, is with it, and the answer says what to do.
+#[tokio::test]
+async fn project_setting_without_an_editor_replaces_a_stored_string_only_with_replace_type() {
+    let project = project_dir();
+    let project_file = project.path().join("project.godot");
+    let wrong = format!(
+        "{FROG_PROJECT}\n[shader_globals]\n\nfrog_push=\"{{\\\"type\\\": \\\"vec4\\\"}}\"\n"
+    );
+    std::fs::write(&project_file, &wrong).expect("project.godot");
+    let engine = tempfile::tempdir().expect("engine dir");
+    let frog = r#"{"type": "vec4", "value": Vector4(0, -1000, 0, 0)}"#;
+    let answer =
+        json!({"type": "String", "value_type": "Dictionary", "text": frog, "defined": false})
+            .to_string();
+    let set = |replace_type: bool| {
+        let (godot, _) = common::setting_godot(engine.path(), &answer);
+        set_with_engine(
+            godot,
+            json!({"key": "shader_globals/frog_push", "value_text": frog,
+                   "replace_type": replace_type, "project_path": project.path()}),
+        )
+    };
+
+    let refused = set(false).await;
+    assert!(refused.is_error, "{}", text(&refused));
+    assert!(
+        text(&refused).contains("replace_type"),
+        "{}",
+        text(&refused)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&project_file).expect("project.godot"),
+        wrong
+    );
+    let replaced = set(true).await;
+    assert!(!replaced.is_error, "{}", text(&replaced));
+    assert_eq!(
+        std::fs::read_to_string(&project_file).expect("project.godot"),
+        format!("{FROG_PROJECT}\n[shader_globals]\n\nfrog_push={frog}\n")
+    );
+}
+
+#[tokio::test]
+async fn project_setting_without_an_editor_removes_a_setting() {
+    let project = project_dir();
+    let project_file = project.path().join("project.godot");
+    let wrong = format!("{FROG_PROJECT}\n[shader_globals]\n\nfrog_push=\"{{}}\"\n");
+    std::fs::write(&project_file, &wrong).expect("project.godot");
+
+    let removed = call(
+        "godot_set_project_setting",
+        json!({"key": "shader_globals/frog_push", "remove": true, "project_path": project.path()}),
+    )
+    .await;
+    assert!(!removed.is_error, "{}", text(&removed));
+    assert!(text(&removed).contains("Removed"), "{}", text(&removed));
+    assert_eq!(
+        std::fs::read_to_string(&project_file).expect("project.godot"),
+        FROG_PROJECT
+    );
+    // Removing what is not stored changes nothing and says so.
+    let again = call(
+        "godot_set_project_setting",
+        json!({"key": "shader_globals/frog_push", "remove": true, "project_path": project.path()}),
+    )
+    .await;
+    assert!(!again.is_error, "{}", text(&again));
+    assert!(text(&again).contains("not stored"), "{}", text(&again));
+    assert_eq!(
+        std::fs::read_to_string(&project_file).expect("project.godot"),
+        FROG_PROJECT
+    );
+}
+
+#[tokio::test]
+async fn project_setting_takes_exactly_one_of_value_value_text_and_remove() {
+    let project = project_dir();
+    let project_file = project.path().join("project.godot");
+    std::fs::write(&project_file, FROG_PROJECT).expect("project.godot");
+    for (args, needle) in [
+        (json!({"value": 1, "value_text": "1"}), "only one"),
+        (json!({"value": 1, "remove": true}), "only one"),
+        (json!({}), "Missing value"),
+        (json!({"value": null}), "remove: true"),
+        (json!({"value_text": 5}), "string"),
+        (json!({"remove": "yes"}), "boolean"),
+    ] {
+        let mut args = args;
+        args["key"] = json!("custom/x/y");
+        args["project_path"] = json!(project.path());
+        let result = call("godot_set_project_setting", args.clone()).await;
+        assert!(result.is_error, "{args}: {}", text(&result));
+        assert!(text(&result).contains(needle), "{args}: {}", text(&result));
+    }
+    assert_eq!(
+        std::fs::read_to_string(&project_file).expect("project.godot"),
+        FROG_PROJECT
+    );
+}
+
+/// The frog-world case with the real engine and no editor: a String stored first (with a note
+/// that points to value_text), a value text refused over it, replaced with replace_type, read
+/// back by Godot as a Dictionary holding a Vector4, then removed. A text with an Object or one
+/// that does not parse is refused, and an engine setting keeps its type with replace_type.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn project_setting_without_an_editor_reads_value_text_with_the_real_engine() {
+    let godot = PathBuf::from(std::env::var("GODOT_PATH").expect("set GODOT_PATH"));
+    let project = project_dir();
+    let project_file = project.path().join("project.godot");
+    std::fs::write(&project_file, FROG_PROJECT).expect("project.godot");
+    let key = "shader_globals/frog_push";
+    let frog = r#"{"type": "vec4", "value": Vector4(0, -1000, 0, 0)}"#;
+    let set = |args: Value| {
+        let mut args = args;
+        args["project_path"] = json!(project.path());
+        set_with_engine(godot.clone(), args)
+    };
+
+    let string = set(json!({"key": key, "value": frog})).await;
+    assert!(!string.is_error, "{}", text(&string));
+    assert!(text(&string).contains("value_text"), "{}", text(&string));
+    let refused = set(json!({"key": key, "value_text": frog})).await;
+    assert!(refused.is_error, "{}", text(&refused));
+    assert!(
+        text(&refused).contains("replace_type"),
+        "{}",
+        text(&refused)
+    );
+    let replaced = set(json!({"key": key, "value_text": frog, "replace_type": true})).await;
+    assert!(!replaced.is_error, "{}", text(&replaced));
+    let written = std::fs::read_to_string(&project_file).expect("project.godot");
+    assert!(
+        written.ends_with(&format!("\n[shader_globals]\n\nfrog_push={frog}\n")),
+        "{written}"
+    );
+
+    // Godot reads it back as a Dictionary holding a Vector4.
+    let check = project.path().join("check.gd");
+    std::fs::write(
+        &check,
+        "extends SceneTree\nfunc _init() -> void:\n\tvar v: Variant = ProjectSettings.get_setting(\"shader_globals/frog_push\")\n\tprint(\"FROG=\", type_string(typeof(v)), \" \", type_string(typeof(v[\"value\"])), \" \", v[\"value\"])\n\tquit()\n",
+    )
+    .expect("check script");
+    let output = std::process::Command::new(&godot)
+        .args(["--headless", "--path"])
+        .arg(project.path())
+        .arg("--script")
+        .arg(&check)
+        .output()
+        .expect("run godot");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("FROG=Dictionary Vector4 (0.0, -1000.0, 0.0, 0.0)"),
+        "{stdout}"
+    );
+    std::fs::remove_file(&check).expect("remove check");
+
+    for (args, needle) in [
+        (
+            json!({"key": key, "value_text": "{\"a\": Object(Node)}"}),
+            "built-in",
+        ),
+        (
+            json!({"key": key, "value_text": "Resource(\"res://x.tres\")"}),
+            "built-in",
+        ),
+        (
+            json!({"key": key, "value_text": "Vector4(0, "}),
+            "not a value",
+        ),
+        (
+            json!({"key": "physics/2d/default_gravity_vector", "value_text": "Vector3(0, 1, 0)", "replace_type": true}),
+            "setting of the engine",
+        ),
+    ] {
+        let result = set(args.clone()).await;
+        assert!(result.is_error, "{args}: {}", text(&result));
+        assert!(text(&result).contains(needle), "{args}: {}", text(&result));
+    }
+    let vector =
+        set(json!({"key": "physics/2d/default_gravity_vector", "value_text": "Vector2(0, 2)"}))
+            .await;
+    assert!(!vector.is_error, "{}", text(&vector));
+
+    let removed = set(json!({"key": key, "remove": true})).await;
+    assert!(!removed.is_error, "{}", text(&removed));
+    let written = std::fs::read_to_string(&project_file).expect("project.godot");
+    assert!(!written.contains("shader_globals"), "{written}");
+    assert!(
+        written.contains("\n2d/default_gravity_vector=Vector2(0, 2)\n"),
+        "{written}"
+    );
+}

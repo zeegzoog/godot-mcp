@@ -72,9 +72,16 @@ pub fn catalog() -> Vec<Tool> {
         ),
         tool(
             "godot_set_project_setting",
-            "Sets one project setting and saves it. Uses the live editor when connected. The value is a string, number, boolean, array or object, of the type the setting has: the stored one, else the engine's definition of the setting (a feature override such as name.mobile has the type of name); importer_defaults/<importer> (the Import dock's defaults) is a Dictionary of import options, such as {\"detect_3d/compress_to\": 0} for importer_defaults/texture. A JSON object becomes a Dictionary and an array an Array or a packed array, nested values kept as JSON gives them except that a whole number becomes an int. A setting of another type takes a string, with and without the editor: an HTML color or color name (\"#102b38\", \"white\") for a Color, otherwise the text project.godot stores (\"Vector2i(1152, 648)\", \"{\\\"key\\\": 1}\"); an Object is never created. Without the editor, project.godot is written and the engine is asked for the type of a setting that is not stored yet. InputMap actions (input/...) are changed with godot_edit_input_action.",
-            json!({"key": s("For example application/config/name."), "value": {"description": "String, number, boolean, array or object."}, "project_path": s("")}),
-            &["key", "value"],
+            "Sets one project setting and saves it, or removes it. Uses the live editor when connected. Pass exactly one of value, value_text and remove: true. value is a string, number, boolean, array or object, of the type the setting has: the stored one, else the engine's definition of the setting (a feature override such as name.mobile has the type of name); importer_defaults/<importer> (the Import dock's defaults) is a Dictionary of import options, such as {\"detect_3d/compress_to\": 0} for importer_defaults/texture. A JSON object becomes a Dictionary and an array an Array or a packed array; nested values keep their JSON type (a nested string stays a String, never a Vector4 or a Color) except that a whole number becomes an int. A setting of another type takes a string, with and without the editor: an HTML color or color name (\"#102b38\", \"white\") for a Color, otherwise the text project.godot stores (\"Vector2i(1152, 648)\"). A setting that is neither stored nor defined by the engine takes the type of value, so a string is stored as a String. value_text is a value as project.godot stores it, parsed as Godot reads project.godot, with and without the editor: {\"type\": \"vec4\", \"value\": Vector4(0, -1000, 0, 0)} becomes a Dictionary holding a Vector4 (a global shader uniform under shader_globals/<name>), \"text\" a String; only built-in types are built, an Object or Resource never. A value of another type than the setting's is refused; replace_type: true lets a setting the engine does not define (a project's own, such as shader_globals/<name>) take it. remove: true removes the setting from project.godot (one the engine defines returns to its default). Without the editor, project.godot is written and the engine is asked for the type of a setting and to read value_text. InputMap actions (input/...) are changed with godot_edit_input_action.",
+            json!({
+                "key": s("For example application/config/name."),
+                "value": {"description": "String, number, boolean, array or object."},
+                "value_text": s("A value as project.godot stores it, such as Vector2i(1152, 648) or {\"type\": \"vec4\", \"value\": Vector4(0, -1000, 0, 0)}. Instead of value."),
+                "replace_type": {"type": "boolean", "description": "Store a value of another type than the stored one, for a setting the engine does not define. Default false."},
+                "remove": {"type": "boolean", "description": "Remove the setting instead of setting it. Default false."},
+                "project_path": s("")
+            }),
+            &["key"],
         ),
     ]
 }
@@ -384,6 +391,55 @@ async fn editor_or_error(tools: &ToolManager, command: &str, args: &Value) -> To
     }
 }
 
+/// What a `godot_set_project_setting` call asks for: exactly one of `value`, `value_text` and
+/// `remove: true`.
+enum SettingChange<'a> {
+    Value(&'a Value),
+    Text(&'a str),
+    Remove,
+}
+
+/// The change a call asks for, or the error that names what is missing or doubled.
+fn setting_change(args: &Value) -> Result<SettingChange<'_>, ToolResult> {
+    let recovery = &[
+        "Pass exactly one of: value (a string, number, boolean, array or object), value_text (a value as project.godot stores it, such as {\"type\": \"vec4\", \"value\": Vector4(0, -1000, 0, 0)}), or remove: true",
+    ];
+    for flag in ["remove", "replace_type"] {
+        if args
+            .get(flag)
+            .is_some_and(|v| !v.is_null() && !v.is_boolean())
+        {
+            return Err(ToolResult::error(
+                format!("{flag} must be true or false"),
+                recovery,
+            ));
+        }
+    }
+    let remove = args.get("remove").and_then(Value::as_bool) == Some(true);
+    let value = args.get("value").filter(|v| !v.is_null());
+    let text = args.get("value_text").filter(|v| !v.is_null());
+    if text.is_some_and(|text| !text.is_string()) {
+        return Err(ToolResult::error(
+            "value_text must be a string: a value as project.godot stores it",
+            recovery,
+        ));
+    }
+    match (value, text.and_then(Value::as_str), remove) {
+        (Some(value), None, false) => Ok(SettingChange::Value(value)),
+        (None, Some(text), false) => Ok(SettingChange::Text(text)),
+        (None, None, true) => Ok(SettingChange::Remove),
+        (None, None, false) if args.get("value").is_some() => Err(ToolResult::error(
+            "value is null; a setting is removed with remove: true",
+            recovery,
+        )),
+        (None, None, false) => Err(ToolResult::error("Missing value", recovery)),
+        _ => Err(ToolResult::error(
+            "Pass only one of value, value_text and remove: true",
+            recovery,
+        )),
+    }
+}
+
 async fn set_setting(tools: &ToolManager, args: &Value) -> ToolResult {
     if str_arg(args, "key").is_some_and(|key| key.starts_with("input/")) {
         return ToolResult::error(
@@ -393,6 +449,11 @@ async fn set_setting(tools: &ToolManager, args: &Value) -> ToolResult {
             ],
         );
     }
+    let change = match setting_change(args) {
+        Ok(change) => change,
+        Err(result) => return result,
+    };
+    let replace_type = args.get("replace_type").and_then(Value::as_bool) == Some(true);
     let choice = match tools.editor_choice(args, true).await {
         Ok(choice) => choice,
         Err(result) => return result,
@@ -408,7 +469,15 @@ async fn set_setting(tools: &ToolManager, args: &Value) -> ToolResult {
             .await
     };
     match sent {
-        Ok(value) => editor_answer(&choice, value),
+        Ok(mut value) => {
+            let as_text = matches!(change, SettingChange::Value(Value::String(text)) if looks_like_value_text(text));
+            if as_text && value.get("type").and_then(Value::as_str) == Some("String") {
+                value["note"] = json!(
+                    "It is stored as a String; for the Godot value this text describes, set it again with value_text and replace_type: true."
+                );
+            }
+            editor_answer(&choice, value)
+        }
         Err(McpError::BridgeUnavailable(_)) => {
             let Some(key) = str_arg(args, "key") else {
                 return ToolResult::error(
@@ -416,17 +485,20 @@ async fn set_setting(tools: &ToolManager, args: &Value) -> ToolResult {
                     &["Pass key: a setting such as application/config/name"],
                 );
             };
-            let Some(value) = args.get("value") else {
-                return ToolResult::error(
-                    "Missing value",
-                    &["Pass value: a string, number, boolean, array or object"],
-                );
-            };
             let project = match tools.host_project(args) {
                 Ok(path) => path,
                 Err(result) => return result,
             };
-            write_setting_on_disk(tools, &project.join("project.godot"), key, value).await
+            let file = project.join("project.godot");
+            match change {
+                SettingChange::Value(value) => {
+                    write_setting_on_disk(tools, &file, key, value, replace_type).await
+                }
+                SettingChange::Text(text) => {
+                    write_setting_text_on_disk(tools, &file, key, text, replace_type).await
+                }
+                SettingChange::Remove => remove_setting_on_disk(&file, key),
+            }
         }
         Err(error) => super::bridge_error_result(&error),
     }
@@ -606,26 +678,24 @@ async fn write_setting_on_disk(
     path: &Path,
     key: &str,
     value: &Value,
+    replace_type: bool,
 ) -> ToolResult {
     let wrong_type = |problem: String| {
         ToolResult::error(
             problem,
             &[
                 "Send a value of the type the setting already has, or change it in the editor's Project Settings",
+                "For a Godot value such as a Vector4 or a Dictionary holding one, pass value_text: the value as project.godot stores it",
+                "For a setting the engine does not define (such as shader_globals/<name>), pass replace_type: true to store a value of another type, or remove: true to remove it",
             ],
         )
     };
     if !is_setting_key(key) {
-        return ToolResult::error(
-            "key must start with a section and use only letters, digits and _ / . -, like application/config/name",
-            &["Use a key like application/config/name"],
-        );
-    }
-    if value.is_null() {
-        return wrong_type("value must be a string, number, boolean, array or object".to_string());
+        return bad_key();
     }
     let original = std::fs::read_to_string(path).unwrap_or_default();
-    let stored = stored_setting(&original, key);
+    // With replace_type the stored value does not count: only the engine's definition does.
+    let stored = stored_setting(&original, key).filter(|_| !replace_type);
     let rendered = match stored.as_deref().map(StoredKind::of) {
         Some(kind) if kind != StoredKind::Structured => render_setting(value, Some(kind)),
         _ => match tools.cli.setting_type(key, value, stored.as_deref()).await {
@@ -650,9 +720,166 @@ async fn write_setting_on_disk(
         Ok(rendered) => rendered,
         Err(problem) => return wrong_type(problem),
     };
-    match std::fs::write(path, put_setting(&original, key, &rendered)) {
+    let mut note = String::new();
+    if value.as_str().is_some_and(looks_like_value_text) && rendered.starts_with('"') {
+        note = " It is stored as a String; for the Godot value this text describes, set it again with value_text and replace_type: true.".to_string();
+    }
+    save_setting(
+        path,
+        &put_setting(&original, key, &rendered),
+        key,
+        &rendered,
+        &note,
+    )
+}
+
+fn bad_key() -> ToolResult {
+    ToolResult::error(
+        "key must start with a section and use only letters, digits and _ / . -, like application/config/name",
+        &["Use a key like application/config/name"],
+    )
+}
+
+/// Whether a string looks like a Godot value text (`{...}`, `[...]`, `Vector4(...)`), which a
+/// caller may have meant as that value rather than as a String.
+fn looks_like_value_text(text: &str) -> bool {
+    let text = text.trim();
+    if text.starts_with('{') || text.starts_with('[') {
+        return true;
+    }
+    let name: String = text
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    !name.is_empty()
+        && name.starts_with(|c: char| c.is_ascii_uppercase())
+        && text[name.len()..].starts_with('(')
+        && text.ends_with(')')
+}
+
+fn save_setting(path: &Path, text: &str, key: &str, rendered: &str, note: &str) -> ToolResult {
+    match std::fs::write(path, text) {
         Ok(()) => ToolResult::text(format!(
-            "Set {key} = {rendered} in {}. Reopen the project in the editor to pick it up.",
+            "Set {key} = {rendered} in {}.{note} Reopen the project in the editor to pick it up.",
+            path.display()
+        )),
+        Err(error) => ToolResult::error(
+            format!("Failed to write {}: {error}", path.display()),
+            &["Check that project.godot is writable"],
+        ),
+    }
+}
+
+/// Sets `key` to the value text `text` without an editor: the engine parses it as project.godot
+/// is read, and the setting keeps its type (the stored one, else the engine's definition) unless
+/// `replace_type` is given for a setting the engine does not define.
+async fn write_setting_text_on_disk(
+    tools: &ToolManager,
+    path: &Path,
+    key: &str,
+    text: &str,
+    replace_type: bool,
+) -> ToolResult {
+    if !is_setting_key(key) {
+        return bad_key();
+    }
+    let original = std::fs::read_to_string(path).unwrap_or_default();
+    let stored = stored_setting(&original, key);
+    let found = match tools
+        .cli
+        .setting_from_text(key, text, stored.as_deref())
+        .await
+    {
+        Ok(found) => found,
+        Err(McpError::Validation(problem)) => {
+            return ToolResult::error(
+                format!("{key} was not changed: {problem}"),
+                &[
+                    "Give value_text as project.godot stores the value, such as {\"type\": \"vec4\", \"value\": Vector4(0, -1000, 0, 0)}",
+                ],
+            );
+        }
+        Err(error) => {
+            return ToolResult::error(
+                format!(
+                    "value_text for {key} could not be read with the engine, so project.godot was not changed: {error}"
+                ),
+                &[
+                    "Verify GODOT_PATH points to a working Godot executable",
+                    "Or open the project in the editor with the Godot MCP Bridge plugin, which reads the text itself",
+                ],
+            );
+        }
+    };
+    let rendered = match text_setting(key, &found, replace_type) {
+        Ok(rendered) => rendered,
+        Err(problem) => return problem,
+    };
+    save_setting(
+        path,
+        &put_setting(&original, key, &rendered),
+        key,
+        &rendered,
+        "",
+    )
+}
+
+/// The text to store for a parsed value text, or the refusal: a value of another type than the
+/// setting's is stored only with `replace_type`, and never for a setting the engine defines.
+fn text_setting(key: &str, found: &SettingType, replace_type: bool) -> Result<String, ToolResult> {
+    let Some(text) = found
+        .text
+        .as_deref()
+        .filter(|text| !text.is_empty() && !text.contains(['\n', '\r']))
+    else {
+        return Err(ToolResult::error(
+            format!(
+                "The engine gave no one-line text for value_text of {key}, so project.godot was not changed"
+            ),
+            &["Give a value of a built-in type, such as Vector4(0, 1, 0, 0) or {\"key\": 1}"],
+        ));
+    };
+    let value_type = found.value_type.as_deref().unwrap_or("unknown");
+    match found.type_name.as_deref() {
+        None => Ok(text.to_string()),
+        Some(type_name) if type_name == value_type => Ok(text.to_string()),
+        Some(_) if replace_type && !found.defined => Ok(text.to_string()),
+        Some(type_name) if found.defined => Err(ToolResult::error(
+            format!(
+                "{key} is a {type_name} setting of the engine; value_text gives a {value_type}, which is not stored"
+            ),
+            &[&format!(
+                "Give value_text as a {type_name}, as project.godot stores one"
+            )],
+        )),
+        Some(type_name) => Err(ToolResult::error(
+            format!(
+                "{key} holds a {type_name}; value_text gives a {value_type}, which is not stored without replace_type"
+            ),
+            &[
+                "Pass replace_type: true to replace the stored value with this one (the engine does not define this setting)",
+                "Or remove the setting with remove: true",
+            ],
+        )),
+    }
+}
+
+/// Removes `key` from `project.godot` without an editor; a setting the engine defines then has
+/// its default again. A key that is not stored changes nothing.
+fn remove_setting_on_disk(path: &Path, key: &str) -> ToolResult {
+    if !is_setting_key(key) {
+        return bad_key();
+    }
+    let original = std::fs::read_to_string(path).unwrap_or_default();
+    let Some(previous) = stored_setting(&original, key) else {
+        return ToolResult::text(format!(
+            "{key} is not stored in {}; nothing was removed.",
+            path.display()
+        ));
+    };
+    match std::fs::write(path, drop_setting(&original, key)) {
+        Ok(()) => ToolResult::text(format!(
+            "Removed {key} (it was {previous}) from {}. Reopen the project in the editor to pick it up.",
             path.display()
         )),
         Err(error) => ToolResult::error(
@@ -879,6 +1106,50 @@ fn put_setting(text: &str, key: &str, rendered: &str) -> String {
     lines.join("\n") + "\n"
 }
 
+/// `text` without the entry of `key` (all its lines). A section left without entries goes too,
+/// with the blank line before it, the way Godot writes a project without that section.
+fn drop_setting(text: &str, key: &str) -> String {
+    let Some((section, name)) = setting_parts(key) else {
+        return text.to_string();
+    };
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let borrowed: Vec<&str> = lines.iter().map(String::as_str).collect();
+    let (headers, entries) = layout(&borrowed);
+    let Some((first, end)) = entries
+        .iter()
+        .find(|entry| entry.section == section && entry.name == name)
+        .map(|entry| (entry.first, entry.end))
+    else {
+        return text.to_string();
+    };
+    let emptied = !entries
+        .iter()
+        .any(|entry| entry.section == section && entry.name != name);
+    let range = section_range(&headers, borrowed.len(), section);
+    let line_count = borrowed.len();
+    match range {
+        Some((start, section_end)) if emptied => {
+            // The header, the entry and the blank lines of the section go, with the blank lines
+            // before the header; one blank line is kept before the next section.
+            let mut from = start;
+            while from > 0 && lines[from - 1].trim().is_empty() {
+                from -= 1;
+            }
+            lines.drain(from..section_end);
+            if from > 0 && section_end < line_count {
+                lines.insert(from, String::new());
+            }
+        }
+        _ => {
+            lines.drain(first..end);
+        }
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    lines.join("\n") + "\n"
+}
+
 /// A stored value as the editor reports it: a quoted string without its quotes and escapes, any
 /// other value as its text.
 fn plain_value(stored: &str) -> String {
@@ -932,6 +1203,81 @@ mod tests {
         ] {
             assert!(!is_setting_key(bad), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_removed_setting_takes_its_lines_and_an_emptied_section_with_it() {
+        let text = "config_version=5\n\n[application]\n\nconfig/name=\"Frog\"\nrun/x=1\n\n[shader_globals]\n\nfrog_push=\"{\\\"type\\\": 1}\"\n\n[rendering]\n\nr=1\n";
+        // Another entry stays in its section.
+        assert_eq!(
+            drop_setting(text, "application/run/x"),
+            text.replace("run/x=1\n", "")
+        );
+        // The only entry of a section in the middle: the section goes, one blank line stays.
+        assert_eq!(
+            drop_setting(text, "shader_globals/frog_push"),
+            "config_version=5\n\n[application]\n\nconfig/name=\"Frog\"\nrun/x=1\n\n[rendering]\n\nr=1\n"
+        );
+        // The last section goes without leaving blank lines at the end.
+        assert_eq!(
+            drop_setting(text, "rendering/r"),
+            "config_version=5\n\n[application]\n\nconfig/name=\"Frog\"\nrun/x=1\n\n[shader_globals]\n\nfrog_push=\"{\\\"type\\\": 1}\"\n"
+        );
+        // A value over several lines goes whole.
+        let multi = "[a]\n\nd={\n\"k\": 1\n}\ne=2\n";
+        assert_eq!(drop_setting(multi, "a/d"), "[a]\n\ne=2\n");
+        assert_eq!(drop_setting(multi, "a/missing"), multi);
+        assert_eq!(drop_setting("[a]\n\nk=1\n", "a/k"), "");
+    }
+
+    #[test]
+    fn a_string_that_looks_like_a_godot_value_is_noticed() {
+        for text in [
+            "{\"type\": \"vec4\"}",
+            " [1, 2]",
+            "Vector4(0, -1000, 0, 0)",
+            "Color(1, 1, 1, 1)",
+        ] {
+            assert!(looks_like_value_text(text), "{text}");
+        }
+        for text in ["Frog", "res://main.tscn", "hello (world)", "f(x)", ""] {
+            assert!(!looks_like_value_text(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_value_text_keeps_the_setting_type_unless_replace_type_is_given() {
+        let parsed = |type_name: Option<&str>, value_type: &str, defined: bool| SettingType {
+            type_name: type_name.map(str::to_string),
+            text: Some("{\"type\": \"vec4\", \"value\": Vector4(0, -1000, 0, 0)}".to_string()),
+            value_type: Some(value_type.to_string()),
+            defined,
+        };
+        let key = "shader_globals/frog_push";
+        let frog = "{\"type\": \"vec4\", \"value\": Vector4(0, -1000, 0, 0)}";
+        // A new setting, and one of the same type.
+        for found in [
+            parsed(None, "Dictionary", false),
+            parsed(Some("Dictionary"), "Dictionary", false),
+        ] {
+            assert_eq!(text_setting(key, &found, false).ok().as_deref(), Some(frog));
+        }
+        // A String stored by an earlier call: refused, then replaced with replace_type.
+        let wrong = parsed(Some("String"), "Dictionary", false);
+        let refused = text_setting(key, &wrong, false).expect_err("refused");
+        let message = format!("{refused:?}");
+        assert!(
+            message.contains("replace_type") && message.contains("remove"),
+            "{message}"
+        );
+        assert_eq!(text_setting(key, &wrong, true).ok().as_deref(), Some(frog));
+        // A setting the engine defines keeps its type even with replace_type.
+        let defined = parsed(Some("Vector2"), "Dictionary", true);
+        assert!(text_setting("physics/2d/default_gravity_vector", &defined, true).is_err());
+        // A text that would add lines is never written.
+        let mut multi = parsed(None, "Dictionary", false);
+        multi.text = Some("{\n}".to_string());
+        assert!(text_setting(key, &multi, false).is_err());
     }
 
     #[test]
@@ -1019,6 +1365,7 @@ mod tests {
         let typed = |type_name: Option<&str>, text: Option<&str>| SettingType {
             type_name: type_name.map(str::to_string),
             text: text.map(str::to_string),
+            ..SettingType::default()
         };
         let value = json!({"detect_3d/compress_to": 0});
         assert_eq!(
@@ -1059,6 +1406,7 @@ mod tests {
         let typed = |type_name: &str, text: Option<&str>| SettingType {
             type_name: Some(type_name.to_string()),
             text: text.map(str::to_string),
+            ..SettingType::default()
         };
         assert_eq!(
             render_typed(

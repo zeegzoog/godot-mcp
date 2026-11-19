@@ -42,6 +42,22 @@ A named baseline is the returned image, so `roi` uses that image's pixels (`roi_
 
 `user_args` on `godot_run_project` is only for `mode: "process"`. The server places them after `--`, so `--caustics` is a game flag and not a Godot option. `godot_get_run_status` lists them on the process run.
 
+### Recording a video with Movie Maker
+
+`godot_run_project` with `mode: "process"` and `movie` records the run with Godot's [Movie Maker](https://docs.godotengine.org/en/stable/tutorials/animation/creating_movies.html):
+
+```json
+{"mode": "process", "user_args": ["--save-profile=trailer"], "movie": {"path": "res://movies/take1.avi", "fps": 60, "quit_after_frames": 900}}
+```
+
+- `.avi` writes MJPEG video with the game's audio in one file; `.png` writes `take1########.png`, one image per frame, with the audio in `take1.wav`.
+- The game runs at a fixed frame rate: every frame advances game time by exactly `1/fps`, however long it takes to draw and encode. The run is usually slower than real time on screen, but physics, timers and animations follow game time, so the same input gives the same frames.
+- The running-game tools still work: drive the player with `godot_game_input` or `godot_game_scenario`, read with `godot_game_tree`. Timed input follows game time.
+- `quit_after_frames` (seconds times `fps`) quits the game, which finishes the file. Without it the recording runs until the game quits; `godot_stop_project` asks the game to quit first, so Godot still writes the frame count and index of the `.avi`. A recording killed some other way is reported with `finished: false`.
+- `godot_get_run_status` reports `movie` on the run: `path`, `size_bytes`, `frames`, `duration_seconds` and `finished` (and for a PNG sequence the first and last frame and the `.wav`).
+- The path stays inside the project, or inside the folder set with `GODOT_MCP_MOVIE_DIR`. A new folder inside the project gets a `.gdignore`, so the editor does not import the frames. An earlier recording at the same path is replaced only with `overwrite: true`.
+- Not with `held` (a held game draws no frames) or `headless` (nothing is rendered). Quality, audio mix rate and vsync are project settings (`editor/movie_writer/mjpeg_quality`, `editor/movie_writer/mix_rate`, `editor/movie_writer/disable_vsync`), set with `godot_set_project_setting`.
+
 `godot_game_physics` with `{"action": "step", "ticks": 4}` advances four real engine physics iterations and then pauses the tree. `{"action": "resume"}` continues. Each tick has the normal physics delta, so four ticks are four times `1 / physics_ticks_per_second` seconds of game time, multiplied by `Engine.time_scale`. The step allows at most one physics iteration per process frame while it runs, then restores `max_physics_steps_per_frame`; the tick rate and the time scale are not changed. It does not call `_physics_process` on your nodes. It does not step idle `_process`, nodes with `process_mode` `ALWAYS` (those keep running while the tree is paused), custom threads, or GPU compute, and it does not make the game deterministic. The engine physics-frame counter also keeps moving while the tree is paused, so it is not a count of pausable game physics. If the step fails, or the runtime is removed while a step is still in flight, `max_physics_steps_per_frame` is restored and the tree is left paused.
 
 `godot_game_probe` measures the level without moving anything. A ray straight down at a point, a ray between two points, or a grid of ground heights over an area:

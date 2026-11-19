@@ -53,7 +53,9 @@ impl McpServer {
         let bridge = BridgeClient::with_port_origin(config.debug_port, config.bridge_port_origin());
         let cli = CliRunner::new(godot_bin).with_bridge_port(config.debug_port);
         let tool_manager = Arc::new(
-            ToolManager::new(bridge, cli).with_feedback(config.feedback, config.gh_path.clone()),
+            ToolManager::new(bridge, cli)
+                .with_feedback(config.feedback, config.gh_path.clone())
+                .with_movie_dir(config.movie_dir.clone()),
         );
 
         Self { tool_manager }

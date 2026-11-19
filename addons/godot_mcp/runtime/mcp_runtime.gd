@@ -43,6 +43,7 @@ func _enter_tree() -> void:
     process_mode = Node.PROCESS_MODE_ALWAYS
     for module: Variant in MODULES:
         _methods.merge((module as GDScript).call("methods"), true)
+    _methods["run.end"] = {"fn": _end_run}
     EngineDebugger.register_message_capture("mcp", _on_message)
     _registered = true
     if not get_tree().node_added.is_connected(_on_node_added):
@@ -93,6 +94,14 @@ func _exit_tree() -> void:
         Project.unload()
         preload("ops/rt_output.gd").uninstall()
     _registered = false
+
+
+## Quits the game the way a script's get_tree().quit() does, after this reply has gone out, so
+## the engine shuts down in order: a Movie Maker recording writes its frame count and index then.
+## The server asks for it before it stops a Movie Maker run, instead of killing the process.
+func _end_run(_rt: Node, _params: Dictionary) -> Dictionary:
+    get_tree().quit.call_deferred()
+    return R.ok({"quitting": true})
 
 
 func on_physics_frame() -> void:

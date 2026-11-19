@@ -10,6 +10,7 @@ The server reads its settings from CLI flags, the environment (e.g. the MCP clie
 | `GODOT_MCP_TOKEN` | | generated | Shared secret for the bridge. Normally unnecessary, see [Security](security.md). |
 | `GODOT_CONSOLE_PATH` | `--godot-console-path` | | Windows console wrapper. Unused by the server; the editor end-to-end tests use it for editor logs. |
 | `GODOT_MCP_FEEDBACK` | `--feedback` | `full` | Feedback channel for the maintainers: `off`, `draft` (the AI can write a report but never send one) or `full`. A value the server does not recognize gives `draft`. See [Feedback](tools.md#feedback-to-the-maintainers). |
+| `GODOT_MCP_MOVIE_DIR` | `--movie-dir` | | A folder outside the project that Movie Maker recordings (`godot_run_project` `movie`) may be written to. Without it, a recording must go inside the project. |
 | `GODOT_MCP_GH_PATH` | `--gh-path` | `gh` on `PATH` | The [GitHub CLI](https://cli.github.com) used when you let the AI submit a report. Set it when your MCP client does not see `gh` on its `PATH`. |
 
 An empty value counts as "not set", so placeholders in a copied `.env.example` or an MCP client's `env` block are harmless.

@@ -145,3 +145,20 @@ jobs:
 
       - name: Exports
         run: cargo test --test export_e2e_test -- --ignored --test-threads=1
+
+  # One check with a fixed name for the whole matrix, so that the branch ruleset requires this
+  # one and does not have to follow the Godot patch versions in the matrix names. `always()`: a
+  # matrix that failed or was cancelled must fail this job too, not skip it (a skipped required
+  # check counts as passed).
+  godot-versions-result:
+    name: Godot versions
+    needs: godot-versions
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Every older Godot version passed
+        env:
+          RESULT: ${{ needs.godot-versions.result }}
+        run: |
+          echo "godot-versions: $RESULT"
+          [ "$RESULT" = success ]

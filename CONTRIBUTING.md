@@ -27,6 +27,7 @@ Thank you for helping. This guide takes you from a first question to a merged ch
 
 - Open every pull request against `master`.
 - Write a change so that it works on every supported Godot version: what an older version lacks is called behind `has_method()` (see [AGENTS.md](AGENTS.md)), and an answer field that only newer versions have is optional. When a behaviour really differs, the test says which version it concerns (`godot_minor()` in `tests/runtime_e2e_test.rs` reads the running build).
+- The ruleset of `master` requires the four checks `Rust (<os>)` (three systems) and `Godot addon (headless editor)`, and the one check `Godot versions`, which stands for the whole matrix of older Godot builds so that its patch versions can change without touching the ruleset.
 - A branch is deleted automatically once its pull request is merged (`.github/workflows/branch-cleanup.yml`). The retired release lines, protected branches and branches with unmerged work are never deleted.
 - The branches `godot-v4.5`, `godot-v4.6` and `godot-v4.7` are the retired release lines of releases 0.5.1 to 0.15.0, which were built once per Godot version. They are kept as history and get no further commits.
 

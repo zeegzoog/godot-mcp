@@ -144,6 +144,45 @@ fn ci_runs_every_supported_godot_minor_version() {
 }
 
 #[test]
+fn one_check_with_a_fixed_name_stands_for_the_whole_matrix() {
+    // The branch ruleset requires this check instead of the matrix jobs, whose names carry the
+    // Godot patch versions. It must wait for the matrix and run `always()`: a skipped required
+    // check counts as passed, so a failed or cancelled matrix would otherwise let a pull
+    // request through.
+    let workflow = read(".github/workflows/ci.yml");
+    let job: String = workflow
+        .lines()
+        .skip_while(|line| line.trim_end() != "  godot-versions-result:")
+        .take_while(|line| {
+            line.trim_end() == "  godot-versions-result:"
+                || line.starts_with("    ")
+                || line.trim().is_empty()
+        })
+        .collect::<Vec<_>>()
+        .join(
+            "
+",
+        );
+    assert!(
+        !job.is_empty(),
+        "ci.yml has no godot-versions-result job for the matrix"
+    );
+    for needle in [
+        "name: Godot versions",
+        "needs: godot-versions",
+        "if: always()",
+        "needs.godot-versions.result",
+        "[ \"$RESULT\" = success ]",
+    ] {
+        assert!(
+            job.contains(needle),
+            "godot-versions-result must have {needle:?}:
+{job}"
+        );
+    }
+}
+
+#[test]
 fn release_workflow_starts_on_release_tags_only() {
     // A release is published from a plain `vX.Y.Z` tag.
     // In a GitHub Actions filter pattern `+` is a quantifier of the preceding character, so it is

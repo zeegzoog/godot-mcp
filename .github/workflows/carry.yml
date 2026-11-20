@@ -5,6 +5,10 @@ name: Carry
 # a maintainer or a merged pull request makes, and by hand. A pull request never starts it, so
 # nothing an outsider writes reaches it. The repository token pushes no workflow of its own, so
 # the script starts CI on the branches it pushes.
+# Needs the repository setting Settings > Actions > General > "Allow GitHub Actions to create and
+# approve pull requests"; without it `gh pr create` is refused and the run fails.
+# There is no concurrency group: GitHub keeps only one pending run per group, so quick merges would
+# lose a push, and the script is safe to run twice (it skips what a line or an open pull request holds).
 on:
   push:
     branches: [master]
@@ -20,13 +24,11 @@ permissions:
   issues: write # reports a conflict the script cannot settle
   actions: write # starts CI on a pushed branch
 
-concurrency:
-  group: carry
-  cancel-in-progress: false
-
 jobs:
   carry:
     name: Carry to the release lines
+    # A manual start from another ref would run that ref's copy of the script with write access.
+    if: github.ref == 'refs/heads/master'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7

@@ -199,7 +199,7 @@ An AI assistant, the repo steward, works the issue tracker and the pull requests
 
 A change that affects several lines lands on the newest of them first and is then carried to each older one, newest to oldest.
 
-A change that lands on `master` is carried by a workflow (`.github/workflows/carry.yml`, script `.github/scripts/carry.sh`): after the merge it opens one pull request per line, titled `[4.7] <original title>`, with `git cherry-pick -x`. The changelog and the planning files keep each line's own copy, and files a line does not have are not added. When a commit conflicts in a product file, the workflow opens an issue that names the commit instead, and a person carries it by hand. Other changes (to a line only) are carried by hand; you may do it yourself:
+A change that lands on `master` is carried by a workflow (`.github/workflows/carry.yml`, script `.github/scripts/carry.sh`): after the merge it opens one pull request per line, titled `[4.7] <original title>`, with `git cherry-pick -x`. The changelog and the planning files keep each line's own copy, and files a line does not have are not added. When a commit conflicts in a product file, the workflow opens an issue that names the commit instead, and a person carries it by hand. A commit that changes a workflow file is carried by hand too: the repository token may not push one. Merge a carry pull request with a squash that keeps the commit message (the repository default), because the "(cherry picked from commit …)" line is how a later run knows the line holds the commit. Other changes (to a line only) are carried by hand; you may do it yourself:
 
 ```bash
 git switch godot-v4.7

@@ -1340,13 +1340,19 @@ async fn project_settings_store_arrays_and_objects_like_the_file_fallback() {
     let bridge = &editor.bridge;
     let project_file = editor.project.join("project.godot");
     // The editor keeps its own version in the features list, so the test names the version of the
-    // line it runs on, as the repository's development project does.
-    let version = include_str!("../project.godot")
-        .lines()
-        .find_map(|line| line.strip_prefix("config/features=PackedStringArray(\""))
-        .and_then(|rest| rest.split('"').next())
-        .unwrap_or("4.8")
-        .to_string();
+    // Godot build it runs with (`4.7.2.stable.official.abc` is 4.7).
+    let (godot, _) = godot_binaries();
+    let reported = std::process::Command::new(&godot)
+        .arg("--version")
+        .output()
+        .expect("godot --version");
+    let reported = String::from_utf8_lossy(&reported.stdout).trim().to_string();
+    let mut parts = reported.split('.');
+    let version = format!(
+        "{}.{}",
+        parts.next().expect("the major version of Godot"),
+        parts.next().expect("the minor version of Godot")
+    );
 
     for (key, value) in [
         (

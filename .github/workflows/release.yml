@@ -3,9 +3,8 @@ name: Release
 on:
   push:
     tags:
-      # Plain release tags only (vX.Y.Z). The tags of the Godot lines (vX.Y.Z+godot.M.N) anchor
-      # the sources of each line and must not start a release. A "+" is valid here because it
-      # follows a character class; after "*" GitHub rejects the whole file.
+      # Plain release tags only (vX.Y.Z). A "+" is valid here because it follows a character
+      # class; after "*" GitHub rejects the whole file.
       - "v[0-9]+.[0-9]+.[0-9]+"
 
 permissions:
@@ -17,33 +16,26 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.set.outputs.version }}
-      lines: ${{ steps.set.outputs.lines }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
         with:
-          # The checks need every branch and tag.
+          # The checks need the history and the branches of origin.
           fetch-depth: 0
 
-      - name: Tag, changelog and the tag of every Godot line are in order
+      - name: The tag, the version and the changelog are in order
         id: set
         # An explicit bash shell runs with -o pipefail, so a failed check is not hidden by tee.
         shell: bash
         run: bash .github/scripts/release-set.sh "$GITHUB_REF_NAME" | tee -a "$GITHUB_OUTPUT"
 
   verify:
-    name: Verify Godot ${{ matrix.line }}
+    name: Verify
     needs: plan
     runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: true
-      matrix:
-        line: ${{ fromJSON(needs.plan.outputs.lines) }}
     steps:
-      - name: Checkout the line
+      - name: Checkout the tag
         uses: actions/checkout@v7
-        with:
-          ref: refs/tags/v${{ needs.plan.outputs.version }}+godot.${{ matrix.line }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
@@ -58,36 +50,30 @@ jobs:
           cargo test --all-targets
 
   addon:
-    name: Package addon (Godot ${{ matrix.line }})
+    name: Package the addon
     needs: [plan, verify]
     runs-on: ubuntu-24.04
-    strategy:
-      matrix:
-        line: ${{ fromJSON(needs.plan.outputs.lines) }}
     steps:
-      - name: Checkout the line
+      - name: Checkout the tag
         uses: actions/checkout@v7
-        with:
-          ref: refs/tags/v${{ needs.plan.outputs.version }}+godot.${{ matrix.line }}
 
       - name: Package addon archive
-        run: zip -r "godot-mcp-addon-godot${{ matrix.line }}.zip" addons/godot_mcp
+        run: zip -r godot-mcp-addon.zip addons/godot_mcp
 
       - name: Keep the archive for the release
         uses: actions/upload-artifact@v7
         with:
-          name: godot-mcp-addon-godot${{ matrix.line }}
-          path: godot-mcp-addon-godot${{ matrix.line }}.zip
+          name: godot-mcp-addon
+          path: godot-mcp-addon.zip
           if-no-files-found: error
 
   build:
-    name: Build ${{ matrix.config.target }} (Godot ${{ matrix.line }})
+    name: Build ${{ matrix.config.target }}
     needs: [plan, verify]
     runs-on: ${{ matrix.config.os }}
     strategy:
       fail-fast: false
       matrix:
-        line: ${{ fromJSON(needs.plan.outputs.lines) }}
         config:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
@@ -106,10 +92,8 @@ jobs:
             bin: godot-mcp
             archive_ext: tar.gz
     steps:
-      - name: Checkout the line
+      - name: Checkout the tag
         uses: actions/checkout@v7
-        with:
-          ref: refs/tags/v${{ needs.plan.outputs.version }}+godot.${{ matrix.line }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
@@ -125,19 +109,19 @@ jobs:
         shell: bash
         run: |
           cd target/${{ matrix.config.target }}/release
-          tar -czf "${{ github.workspace }}/godot-mcp-${{ matrix.config.target }}-godot${{ matrix.line }}.tar.gz" ${{ matrix.config.bin }}
+          tar -czf "${{ github.workspace }}/godot-mcp-${{ matrix.config.target }}.tar.gz" ${{ matrix.config.bin }}
 
       - name: Package archive (Windows)
         if: matrix.config.archive_ext == 'zip'
         shell: pwsh
         run: |
-          Compress-Archive -Path "target/${{ matrix.config.target }}/release/${{ matrix.config.bin }}" -DestinationPath "godot-mcp-${{ matrix.config.target }}-godot${{ matrix.line }}.zip"
+          Compress-Archive -Path "target/${{ matrix.config.target }}/release/${{ matrix.config.bin }}" -DestinationPath "godot-mcp-${{ matrix.config.target }}.zip"
 
       - name: Keep the archive for the release
         uses: actions/upload-artifact@v7
         with:
-          name: godot-mcp-${{ matrix.config.target }}-godot${{ matrix.line }}
-          path: godot-mcp-${{ matrix.config.target }}-godot${{ matrix.line }}.${{ matrix.config.archive_ext }}
+          name: godot-mcp-${{ matrix.config.target }}
+          path: godot-mcp-${{ matrix.config.target }}.${{ matrix.config.archive_ext }}
           if-no-files-found: error
 
   publish:
@@ -152,7 +136,7 @@ jobs:
         shell: bash
         run: bash .github/scripts/release-notes.sh "$GITHUB_REF_NAME" > release-notes.md
 
-      - name: Collect the archives of every line
+      - name: Collect the archives
         uses: actions/download-artifact@v8
         with:
           pattern: godot-mcp-*

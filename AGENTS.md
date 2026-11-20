@@ -52,8 +52,8 @@ Agents must treat the Godot Editor as a live, stateful environment while ensurin
 
 ### GDScript Standards (Editor Plugin)
 
-- Target the Godot minor version of the branch's release line (`godot-vM.N`; `master` targets the next version) with modern GDScript and strict typing (`var count: int = 0`, `func get_node_by_id(id: String) -> Node:`). `plugin.gd` refuses to start on an older editor and warns on a newer one. The line's identity (`MIN_MAJOR`/`MIN_MINOR`, the version string, `config/features` in the dev `project.godot`, `.github/godot-version`) is checked by `tests/version_sync_test.rs`; the list is in CONTRIBUTING.md.
-- Anything missing from the line's first Godot release (M.N.0) must be called through `has_method()` + `call()` (see `is_import_running` on lines before 4.7): an unguarded call to a method the running engine lacks is a script error that sends no reply, and the analyzer only warns about it. Run the e2e tests with the Godot build named in `.github/godot-version`; CI uses the same build.
+- One build serves every supported Godot minor version, from `MIN_MINOR` to `TESTED_MINOR` in `plugin.gd` (4.5 to 4.8 today). Write modern GDScript with strict typing (`var count: int = 0`, `func get_node_by_id(id: String) -> Node:`). `plugin.gd` refuses to start on an editor older than `MIN_MINOR` and warns on one newer than `TESTED_MINOR`. The supported versions (`MIN_MINOR`, `TESTED_MINOR`, `config/features` in the dev `project.godot`, `.github/godot-version`, the `godot-versions` matrix of `.github/workflows/ci.yml`) are checked against each other by `tests/version_sync_test.rs`.
+- Anything missing from the first release of the oldest supported Godot (4.5.0 today) must be called through `has_method()` + `call()` (see `is_import_running`): an unguarded call to a method the running engine lacks is a script error that sends no reply, and the analyzer only warns about it. An answer field that only newer versions can fill is optional. Run the e2e tests with the Godot build named in `.github/godot-version`; CI runs them on every older supported version too, and the test names the version when a behaviour really differs (`godot_minor()` in `tests/runtime_e2e_test.rs`).
 - Read command parameters untyped and validate them (see `PARAM_TYPES`): assigning a wrongly typed value to a typed variable is a script error that sends no reply and leaves the caller waiting for its timeout.
 - Utilize standard signals for asynchronous event handling.
 - Keep the plugin lightweight with zero external third-party dependencies outside the standard Godot API.
@@ -80,7 +80,7 @@ Before submitting or committing changes, agents must execute and pass the comple
    cargo test --all-targets
    ```
 
-   Includes `tests/version_sync_test.rs`: the version in `addons/godot_mcp/plugin.cfg` must always equal `Cargo.toml` — bump both together — and every file naming the line's Godot version must agree with the version's `+godot.M.N`. New behaviour needs a test first: protocol and tool behaviour in `tests/stdio_protocol_test.rs` / `tests/tools_test.rs` (helpers in `tests/common/`), the agent feedback channel in `tests/feedback_test.rs`, bridge client in `tests/bridge_client_test.rs`, editor commands in `tests/editor_e2e_test.rs`, the repo steward in `tests/steward_test.rs`, keeping the addon out of exports in `tests/addon_export_test.rs`, export presets and headless exports in `tests/export_e2e_test.rs`, launched processes staying independent of the server in `tests/detach_test.rs`, the version a build reports in `tests/version_test.rs`, a running game in `tests/runtime_e2e_test.rs`, and a played scenario in `tests/scenario_e2e_test.rs`.
+   Includes `tests/version_sync_test.rs`: the version in `addons/godot_mcp/plugin.cfg` must always equal `Cargo.toml` — bump both together — and the supported Godot versions (`MIN_MINOR`, `TESTED_MINOR`, the dev project, `.github/godot-version`, the CI matrix) must agree. New behaviour needs a test first: protocol and tool behaviour in `tests/stdio_protocol_test.rs` / `tests/tools_test.rs` (helpers in `tests/common/`), the agent feedback channel in `tests/feedback_test.rs`, bridge client in `tests/bridge_client_test.rs`, editor commands in `tests/editor_e2e_test.rs`, the repo steward in `tests/steward_test.rs`, keeping the addon out of exports in `tests/addon_export_test.rs`, export presets and headless exports in `tests/export_e2e_test.rs`, launched processes staying independent of the server in `tests/detach_test.rs`, the version a build reports in `tests/version_test.rs`, a running game in `tests/runtime_e2e_test.rs`, and a played scenario in `tests/scenario_e2e_test.rs`.
 
 4. **GDScript Syntax Check**:
 
@@ -190,7 +190,7 @@ Before concluding any development task, every agent MUST verify the following ch
 
 - [ ] **Technical Language**: All code, identifiers, comments, and technical docs are in English.
 - [ ] **Verification Pipeline**: `cargo clippy`, `cargo fmt --check`, and `cargo test --all-targets` pass; the GDScript syntax check passes for every addon script.
-- [ ] **Editor End-to-End Tests**: If `addons/godot_mcp/` changed, `editor_e2e_test` and `addon_export_test` pass with the Godot build named in `.github/godot-version`, on every branch the change lands on.
+- [ ] **Editor End-to-End Tests**: If `addons/godot_mcp/` changed, `editor_e2e_test` and `addon_export_test` pass with the Godot build named in `.github/godot-version`; CI runs them on every supported version.
 - [ ] **Export End-to-End Tests**: If the export tools or the headless runner changed, `export_e2e_test` passes with that same Godot build.
 - [ ] **Runtime End-to-End Tests**: If the running game, the scenario tool, the debugger client, or the GDScript language-server client changed, `runtime_e2e_test` and `scenario_e2e_test` pass with that same Godot build.
 - [ ] **Tests First**: New behaviour is covered by a test in the matching `tests/` file.
@@ -200,6 +200,6 @@ Before concluding any development task, every agent MUST verify the following ch
 - [ ] **Bridge Security**: The bridge still listens on loopback only, and no code path skips the token check.
 - [ ] **Rust Hygiene**: No `unwrap()` / `expect()` in production paths, diagnostics go to `stderr` only, and no lock is held across an editor round-trip.
 - [ ] **Error Responses**: Every error carries an informative message and at least one actionable recovery step.
-- [ ] **GDScript Hygiene**: Strict typing is used, parameters are read untyped and validated, methods missing from the line's M.N.0 are called through `has_method()` + `call()`, and the addon declares no `class_name`.
-- [ ] **Policy Documents**: `SECURITY.md` and `CONTRIBUTING.md` are still true after this change (supported lines, reporting channel, checks, branch model).
+- [ ] **GDScript Hygiene**: Strict typing is used, parameters are read untyped and validated, methods missing from the oldest supported Godot are called through `has_method()` + `call()`, and the addon declares no `class_name`.
+- [ ] **Policy Documents**: `SECURITY.md` and `CONTRIBUTING.md` are still true after this change (supported Godot versions, reporting channel, checks, branch model).
 - [ ] **Agent Workflow**: Scenes were inspected before mutation, `.gd` files were validated after changes, and any run started with `godot_run_project` was stopped.

@@ -12,7 +12,7 @@ body:
     attributes:
       label: godot-mcp version
       description: The `version=` line of `addons/godot_mcp/plugin.cfg` in your project.
-      placeholder: 0.5.1+godot.4.7
+      placeholder: 0.15.0
     validations:
       required: true
   - type: input

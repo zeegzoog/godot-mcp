@@ -1299,105 +1299,34 @@ fn the_planning_owed_text_names_no_planning_artifact() {
     }
 }
 
-#[test]
-fn carry_workflow_starts_only_from_master_and_by_hand() {
-    let file = ".github/workflows/carry.yml";
-    let workflow = read(file);
-    let found = triggers(&workflow);
-    assert!(
-        found.contains(&"push".to_string()),
-        "{file} carries on a push"
-    );
-    for trigger in &found {
-        assert!(
-            trigger == "push" || trigger == "workflow_dispatch",
-            "{file} must start only on a push to master or by hand, found {trigger}"
-        );
-    }
-    assert!(
-        workflow.contains("branches: [master]"),
-        "{file} must carry only what lands on master"
-    );
-    assert!(
-        !workflow.contains("pull_request:") && !workflow.contains("pull_request_target"),
-        "{file} must not start on a pull request: its token can write"
-    );
-    assert!(
-        !workflow.contains("workflow_run"),
-        "{file} must not start from another workflow's run"
-    );
-    assert!(
-        workflow.contains("if: github.ref == 'refs/heads/master'"),
-        "{file} must run only from master, also when started by hand"
-    );
-    let permissions: Vec<&str> = workflow
-        .lines()
-        .skip_while(|line| line.trim_end() != "permissions:")
-        .skip(1)
-        .take_while(|line| line.starts_with("  "))
-        .filter_map(|line| line.trim().split(':').next())
-        .collect();
-    assert_eq!(
-        permissions,
-        ["contents", "pull-requests", "issues", "actions"],
-        "{file} must hold exactly the four write permissions the script uses"
-    );
-    for line in workflow.lines() {
-        let in_env = line.starts_with("          ") && line.contains(": ${{");
-        assert!(
-            !line.contains("${{") || in_env || line.trim_start().starts_with('#'),
-            "{file}: event data may only be read in an env: entry, found {line:?}"
-        );
-    }
-    for step in steps(&workflow) {
-        if let Some(run) = step.split("run: |").nth(1) {
-            assert!(
-                !run.contains("${{"),
-                "{file}: a run block must read event data from env, never interpolate it:\n{run}"
-            );
-        }
-    }
-}
-
-/// The revision of `rev` in `dir`.
-fn revision(dir: &Path, rev: &str) -> String {
-    let (ok, text) = git_output(dir, &["rev-parse", rev]);
-    assert!(ok, "git rev-parse {rev} failed");
-    text.trim().to_string()
-}
-
-fn git_output(dir: &Path, args: &[&str]) -> (bool, String) {
-    let output = Command::new("git")
-        .current_dir(dir)
-        .args(args)
+/// Runs `.github/scripts/release-set.sh` for `tag` in `repo`; returns whether it passed and what it
+/// printed.
+fn release_set(bash: &Path, repo: &Path, tag: &str) -> (bool, String) {
+    let output = Command::new(bash)
+        .arg(root().join(".github/scripts/release-set.sh"))
+        .arg(tag)
+        .current_dir(repo)
         .output()
-        .unwrap_or_else(|err| panic!("cannot run git {args:?}: {err}"));
+        .expect("release-set.sh runs");
     (
         output.status.success(),
-        String::from_utf8_lossy(&output.stdout).to_string(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
     )
 }
 
-/// What a carry fixture holds: the work repository, and the commits the tests name.
-struct CarryFixture {
-    _base: tempfile::TempDir,
-    repo: PathBuf,
-    start: String,
-    fix: String,
-    clash: String,
-    later: String,
-    workflow: String,
-}
-
-/// A repository whose release line `4.7` keeps its own changelog, planning file and `b.txt` and has
-/// no steward workflow, and whose master then gets: a product fix that also touches the changelog
-/// (cleanly), a planning file with a space in its name (a conflict), a new planning file and the
-/// steward workflow; a release commit; a planning commit; a fix that conflicts with the line in
-/// `b.txt`; a fix after it; and a change to a workflow file. Everything is pushed to a bare origin.
-fn carry_fixture() -> Option<CarryFixture> {
-    if !git_available() || bash().is_none() {
-        eprintln!("skipped: no git or bash");
-        return None;
+#[test]
+fn a_release_tag_must_sit_on_master_with_the_version_and_the_notes() {
+    let Some(bash) = bash() else {
+        eprintln!("skipped: no bash found (Git for Windows' bash on Windows)");
+        return;
+    };
+    if !git_available() {
+        eprintln!("skipped: no git");
+        return;
     }
     let base = tempfile::tempdir().expect("temp dir");
     let origin = base.path().join("origin.git");
@@ -1412,334 +1341,87 @@ fn carry_fixture() -> Option<CarryFixture> {
         &["remote", "add", "origin", origin.to_str().expect("path")],
         day,
     );
-    let notes = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\n";
-    let spec = "s1\ns2\ns3\ns4\ns5\ns6\ns7\ns8\n";
-    // The real file starts with a comment.
-    write(&repo, ".github/lines", "# Godot lines\n4.7\n");
-    write(&repo, "a.txt", "one\n");
-    write(&repo, "b.txt", "base\n");
-    write(&repo, "c.txt", "c\n");
-    write(&repo, "CHANGELOG.md", notes);
-    write(&repo, ".design/my file.md", spec);
-    write(&repo, ".github/workflows/steward-agent.yml", "agent\n");
-    write(&repo, ".github/workflows/ci.yml", "ci\n");
-    git(&repo, &["add", "--all"], day);
-    git(&repo, &["commit", "--quiet", "-m", "chore: start"], day);
-    let start = revision(&repo, "HEAD");
-
-    git(&repo, &["switch", "--quiet", "-c", "godot-v4.7"], day);
-    git(
-        &repo,
-        &["rm", "--quiet", ".github/workflows/steward-agent.yml"],
-        day,
-    );
+    git(&repo, &["switch", "--quiet", "-c", "master"], day);
+    let manifests = |version: &str| {
+        write(
+            &repo,
+            "Cargo.toml",
+            &format!("[package]\nname = \"x\"\nversion = \"{version}\"\n"),
+        );
+        write(
+            &repo,
+            "addons/godot_mcp/plugin.cfg",
+            &format!("[plugin]\nversion=\"{version}\"\n"),
+        );
+    };
+    // A release commit whose manifests and notes agree, and one whose manifest says another version.
+    manifests("0.2.0");
     write(
         &repo,
         "CHANGELOG.md",
-        &notes.replacen("l1", "line notes", 1),
-    );
-    write(&repo, "b.txt", "line\n");
-    write(
-        &repo,
-        ".design/my file.md",
-        &spec.replacen("s1", "line spec", 1),
+        "# Changelog\n\n## [0.2.1] - 2026-11-01\n\n- Notes for a tag whose manifests say 0.2.0.\n\n## [0.2.0] - 2026-11-01\n\n- Something.\n\n## [0.1.0] - 2026-10-01\n\n- Before.\n",
     );
     git(&repo, &["add", "--all"], day);
     git(
         &repo,
-        &["commit", "--quiet", "-m", "chore(line): own files"],
+        &["commit", "--quiet", "-m", "chore(release): godot-mcp 0.2.0"],
         day,
     );
-    git(&repo, &["switch", "--quiet", "-c", "master", &start], day);
-
-    write(&repo, "a.txt", "two\n");
-    write(&repo, "CHANGELOG.md", &format!("{notes}l10\n"));
-    write(
+    git(&repo, &["tag", "-a", "v0.2.0", "-m", "0.2.0"], day);
+    git(
         &repo,
-        ".design/my file.md",
-        &spec.replacen("s1", "master spec", 1),
+        &[
+            "tag",
+            "-a",
+            "v0.2.1",
+            "-m",
+            "notes, but the manifests say 0.2.0",
+        ],
+        day,
     );
-    write(&repo, ".design/new.md", "new\n");
-    write(&repo, ".github/workflows/steward-agent.yml", "agent 2\n");
+    manifests("0.3.0");
     git(&repo, &["add", "--all"], day);
     git(
         &repo,
-        &["commit", "--quiet", "-m", "fix(x): change a (#1)"],
+        &["commit", "--quiet", "-m", "chore(release): godot-mcp 0.3.0"],
         day,
     );
-    let fix = revision(&repo, "HEAD");
-    commit(
+    git(
         &repo,
-        "v.txt",
-        "0.2.0\n",
-        "chore(release): godot-mcp 0.2.0",
+        &["tag", "-a", "v0.3.0", "-m", "manifests ahead, no notes"],
         day,
     );
-    commit(&repo, ".design/x.md", "x\n", "docs(spec): describe a", day);
-    commit(&repo, "b.txt", "master\n", "fix(y): change b (#2)", day);
-    let clash = revision(&repo, "HEAD");
-    commit(&repo, "c.txt", "c2\n", "fix(z): change c (#3)", day);
-    let later = revision(&repo, "HEAD");
-    commit(
+    git(
         &repo,
-        ".github/workflows/ci.yml",
-        "ci 2\n",
-        "ci: change a workflow",
+        &["push", "--quiet", "origin", "master", "--tags"],
         day,
     );
-    let workflow = revision(&repo, "HEAD");
-    git(&repo, &["push", "--quiet", "origin", "--all"], day);
     git(&repo, &["fetch", "--quiet", "origin"], day);
-    Some(CarryFixture {
-        _base: base,
-        repo,
-        start,
-        fix,
-        clash,
-        later,
-        workflow,
-    })
-}
+    // A tagged commit that is not on master.
+    git(&repo, &["switch", "--quiet", "-c", "side"], day);
+    commit(&repo, "side.txt", "side\n", "feat: aside", day);
+    git(&repo, &["tag", "-a", "v0.4.0", "-m", "not on master"], day);
 
-/// A `gh` that records its arguments in `$FAKE_GH_LOG` and fails `gh pr create` when
-/// `FAKE_GH_FAIL=pr`.
-fn recording_gh(dir: &Path) {
-    let script = "#!/usr/bin/env bash\n\
-        printf 'gh %s\\n' \"$*\" >> \"$FAKE_GH_LOG\"\n\
-        case \"$1 $2\" in\n\
-        'pr create') [ \"${FAKE_GH_FAIL:-}\" = pr ] && exit 1; echo https://example.invalid/pull/1 ;;\n\
-        'pr list') echo 0 ;;\n\
-        esac\n\
-        exit 0\n";
-    write(dir, "gh", script);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dir.join("gh"), std::fs::Permissions::from_mode(0o755))
-            .expect("make the recording gh executable");
-    }
-}
-
-/// Runs carry.sh in the fixture; returns the exit code and what it printed.
-fn carry(
-    fixture: &CarryFixture,
-    args: &[&str],
-    gh_dir: Option<&Path>,
-    fail: &str,
-) -> (i32, String) {
-    let bash = bash().expect("bash");
-    let mut command = Command::new(bash);
-    command
-        .arg(root().join(".github/scripts/carry.sh"))
-        .args(args)
-        .current_dir(&fixture.repo)
-        .env("GIT_AUTHOR_NAME", "Fixture")
-        .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
-        .env("GIT_COMMITTER_NAME", "Fixture")
-        .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
-        .env("GIT_CONFIG_COUNT", "2")
-        .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
-        .env("GIT_CONFIG_VALUE_0", "false")
-        .env("GIT_CONFIG_KEY_1", "core.hooksPath")
-        .env("GIT_CONFIG_VALUE_1", "no-hooks")
-        .env("FAKE_GH_FAIL", fail);
-    if let Some(dir) = gh_dir {
-        let path = std::env::join_paths(std::iter::once(dir.to_path_buf()).chain(
-            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
-        ))
-        .expect("PATH");
-        command
-            .env("PATH", path)
-            .env("FAKE_GH_LOG", dir.join("gh.log"));
-    }
-    let output = command.output().expect("carry.sh runs");
-    (
-        output.status.code().unwrap_or(-1),
-        format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        ),
-    )
-}
-
-#[test]
-fn carry_keeps_the_lines_own_files_and_stops_at_what_a_person_must_do() {
-    let Some(f) = carry_fixture() else { return };
-    let (code, text) = carry(
-        &f,
-        &[&format!("{}..{}", f.start, f.later), "--dry-run"],
-        None,
-        "",
-    );
-    assert_eq!(code, 0, "carry.sh failed:\n{text}");
-    let work = format!("carry/{}-4.7", &f.later[..9]);
-    assert!(
-        text.contains(&format!("READY {work} (1 commit(s)")),
-        "only the fix before the conflict is carried:\n{text}"
-    );
-    assert!(
-        text.contains(&format!("MANUAL 4.7 {}", &f.clash[..9])) && text.contains("b.txt"),
-        "a conflict in a product file is left to a person:\n{text}"
-    );
-
-    let show = |path: &str| git_output(&f.repo, &["show", &format!("{work}:{path}")]).1;
-    assert_eq!(show("a.txt"), "two\n", "the product change is on the line");
-    assert_eq!(
-        show("c.txt"),
-        "c\n",
-        "the commit after the conflict waits for it"
-    );
-    assert!(
-        show("CHANGELOG.md").starts_with("line notes\n") && !show("CHANGELOG.md").contains("l10"),
-        "a clean change to the notes is dropped as well:\n{}",
-        show("CHANGELOG.md")
-    );
-    assert!(
-        show(".design/my file.md").starts_with("line spec\n"),
-        "a planning file with a space in its name keeps the line's copy"
-    );
-    for absent in [".design/new.md", ".github/workflows/steward-agent.yml"] {
-        let (exists, _) = git_output(&f.repo, &["cat-file", "-e", &format!("{work}:{absent}")]);
-        assert!(!exists, "{absent} must not reach the line");
-    }
-    let (_, log) = git_output(
-        &f.repo,
-        &["log", "--format=%B", &format!("origin/godot-v4.7..{work}")],
-    );
-    assert!(
-        log.contains(&format!("(cherry picked from commit {})", f.fix)),
-        "the copy says where it came from:\n{log}"
-    );
-    assert!(
-        !log.contains("chore(release)") && !log.contains("docs(spec)"),
-        "release and planning commits are not carried:\n{log}"
-    );
-    let (_, worktrees) = git_output(&f.repo, &["worktree", "list", "--porcelain"]);
-    assert_eq!(
-        worktrees.matches("worktree ").count(),
-        1,
-        "no worktree is left:\n{worktrees}"
-    );
-    let (_, state) = git_output(&f.repo, &["status", "--porcelain"]);
-    assert!(
-        state.trim().is_empty(),
-        "the checkout is untouched:\n{state}"
-    );
-}
-
-#[test]
-fn carry_leaves_a_workflow_change_to_a_person() {
-    let Some(f) = carry_fixture() else { return };
-    let (code, text) = carry(&f, &[&f.workflow, "--dry-run"], None, "");
-    assert_eq!(code, 0, "{text}");
-    assert!(
-        text.contains(&format!("MANUAL 4.7 {}", &f.workflow[..9]))
-            && text.contains("workflow file"),
-        "the repository token may not push a workflow file:\n{text}"
-    );
-    assert!(!text.contains("READY"), "nothing is carried:\n{text}");
-    let (_, branches) = git_output(&f.repo, &["branch", "--list", "carry/*"]);
-    assert!(branches.trim().is_empty(), "no branch is left:\n{branches}");
-}
-
-#[test]
-fn carry_refuses_what_is_not_a_commit_of_master() {
-    let Some(f) = carry_fixture() else { return };
-    let day = "2026-11-02T10:00:00+00:00";
-    git(&f.repo, &["switch", "--quiet", "-c", "side", &f.start], day);
-    commit(
-        &f.repo,
-        "side.txt",
-        "side\n",
-        "fix(side): not on master",
-        day,
-    );
-    let side = revision(&f.repo, "HEAD");
-    git(&f.repo, &["switch", "--quiet", "master"], day);
-    for args in [
-        vec!["--upload-pack=touch-x".to_string()],
-        vec!["HEAD".to_string()],
-        vec![format!("{}..{}..{}", f.start, f.fix, f.later)],
-        vec![f.fix.clone(), "--dryrun".to_string()],
-        vec![f.fix.clone(), "--dry-run".to_string(), "extra".to_string()],
-        vec![side],
-        vec![],
+    let (ok, text) = release_set(&bash, &repo, "v0.2.0");
+    assert!(ok, "a tag with its version and notes must pass:\n{text}");
+    assert!(text.contains("version=0.2.0"), "{text}");
+    for (tag, why) in [
+        ("v0.2", "a tag that is not X.Y.Z"),
+        ("0.2.0", "a tag without the v"),
+        ("v0.4.0", "a tagged commit that is not on master"),
+        ("v0.3.0", "a version without changelog notes"),
     ] {
-        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let (code, text) = carry(&f, &refs, None, "");
-        assert_eq!(code, 2, "{args:?} must be refused:\n{text}");
-        assert!(text.contains("carry.sh:"), "{args:?} must say why:\n{text}");
+        let (ok, text) = release_set(&bash, &repo, tag);
+        assert!(!ok, "{why} ({tag}) must be refused:\n{text}");
+        assert!(
+            text.contains("cannot be released"),
+            "{tag} must say why:\n{text}"
+        );
     }
-    let (_, branches) = git_output(&f.repo, &["branch", "--list", "carry/*"]);
-    assert!(branches.trim().is_empty(), "no branch is made:\n{branches}");
-}
-
-#[test]
-fn carry_opens_one_pull_request_per_line_and_an_issue_for_the_rest() {
-    let Some(f) = carry_fixture() else { return };
-    let gh = tempfile::tempdir().expect("gh directory");
-    recording_gh(gh.path());
-    let range = format!("{}..{}", f.start, f.later);
-    let (code, text) = carry(&f, &[&range], Some(gh.path()), "");
-    assert_eq!(code, 0, "carry.sh failed:\n{text}");
-    let work = format!("carry/{}-4.7", &f.later[..9]);
-    let log = std::fs::read_to_string(gh.path().join("gh.log")).unwrap_or_default();
+    // v0.2.1 has the manifests of 0.2.0: the version the tag names is not the one they say.
+    let (ok, text) = release_set(&bash, &repo, "v0.2.1");
     assert!(
-        log.contains("pr create --base godot-v4.7 --head") && log.contains(&work),
-        "a pull request on the line from the carry branch:\n{log}"
-    );
-    assert!(
-        log.contains("--title [4.7] fix(x): change a (#1)"),
-        "titled with the line and the subject:\n{log}"
-    );
-    assert!(
-        log.contains(&format!("workflow run ci.yml --ref {work}")),
-        "CI is started on the branch by hand:\n{log}"
-    );
-    assert!(
-        log.contains("issue create") && log.contains(&f.clash[..9]) && log.contains(&f.later[..9]),
-        "the issue names the conflicting commit and the one after it:\n{log}"
-    );
-    assert!(
-        log.contains("repo-steward:v1 kind=carry state=in-review"),
-        "the pull request carries the marker the steward knows:\n{log}"
-    );
-    let (_, heads) = git_output(&f.repo, &["ls-remote", "--heads", "origin", "carry/*"]);
-    assert!(heads.contains(&work), "the branch is pushed:\n{heads}");
-
-    let (code, text) = carry(&f, &[&range], Some(gh.path()), "");
-    assert_eq!(code, 0, "{text}");
-    assert!(
-        text.contains("already pushed"),
-        "a second run does nothing:\n{text}"
-    );
-    let log = std::fs::read_to_string(gh.path().join("gh.log")).unwrap_or_default();
-    assert_eq!(
-        log.matches("pr create").count(),
-        1,
-        "one pull request only:\n{log}"
-    );
-}
-
-#[test]
-fn carry_takes_its_branch_back_when_the_pull_request_cannot_be_opened() {
-    let Some(f) = carry_fixture() else { return };
-    let gh = tempfile::tempdir().expect("gh directory");
-    recording_gh(gh.path());
-    let (code, text) = carry(
-        &f,
-        &[&format!("{}..{}", f.start, f.fix)],
-        Some(gh.path()),
-        "pr",
-    );
-    assert_eq!(
-        code, 1,
-        "a line that could not be opened fails the run:\n{text}"
-    );
-    let (_, heads) = git_output(&f.repo, &["ls-remote", "--heads", "origin", "carry/*"]);
-    assert!(
-        heads.trim().is_empty(),
-        "a pushed branch without a pull request would be skipped for good:\n{heads}"
+        !ok,
+        "a manifest that says another version must be refused:\n{text}"
     );
 }

@@ -21,35 +21,19 @@ Thank you for helping. This guide takes you from a first question to a merged ch
 - **Security vulnerabilities:** follow [SECURITY.md](SECURITY.md). Never open a public issue for them.
 - **Reports from your AI assistant:** paste a report drafted by `godot_draft_feedback` into a new issue with the "Feedback from an AI assistant" template, or let the assistant submit it with your approval.
 
-## Branches and Godot Versions
+## Branch and Godot Versions
 
-Each Godot minor version has its own release line on its own branch. `master` is the development line for the next Godot version, which has no stable release yet.
+`master` is the only branch you work on, and every release is made from it. One build serves every supported Godot minor version, 4.5 to 4.8 today: the addon refuses an older editor (`MIN_MINOR` in `addons/godot_mcp/plugin.gd`), `TESTED_MINOR` is the newest Godot the end-to-end tests run against, and CI runs them on every version in between (the main job on the build in `.github/godot-version`, the `godot-versions` matrix of `.github/workflows/ci.yml` on the older ones).
 
-| Godot | Branch | Status |
-| --- | --- | --- |
-| 4.7.x | `godot-v4.7` | Release line, newest stable |
-| 4.6.x | `godot-v4.6` | Release line |
-| 4.5.x | `godot-v4.5` | Release line |
-| 4.8 (pre-release) | `master` | Development line, no releases |
-
-Choose the branch for your pull request:
-
-| The change … | Open the pull request against |
-| --- | --- |
-| fixes a problem that exists on `master` | `master`; maintainers carry it to the older lines it affects |
-| fixes a problem that exists only on some release lines | the newest of those `godot-v*` branches |
-| exists only because of one Godot version | that version's `godot-v*` branch only |
-| adds a feature or an improvement | `master` |
-| changes shared documentation or CI | `master` |
-
-- A branch is deleted automatically once its pull request is merged (`.github/workflows/branch-cleanup.yml`). The release lines, protected branches and branches with unmerged work are never deleted.
-- Find out which lines a bug affects by running its test on each branch, not by reading the code.
-- Files that differ between lines on purpose: `Cargo.toml` and `Cargo.lock` (version), `addons/godot_mcp/plugin.cfg` (version), `addons/godot_mcp/plugin.gd` (`MIN_MAJOR`, `MIN_MINOR`), `project.godot` (`config/features`) and `.github/godot-version` (the Godot build the line is tested against). Keep every other file identical on all lines unless a Godot version forces a difference.
+- Open every pull request against `master`.
+- Write a change so that it works on every supported Godot version: what an older version lacks is called behind `has_method()` (see [AGENTS.md](AGENTS.md)), and an answer field that only newer versions have is optional. When a behaviour really differs, the test says which version it concerns (`godot_minor()` in `tests/runtime_e2e_test.rs` reads the running build).
+- A branch is deleted automatically once its pull request is merged (`.github/workflows/branch-cleanup.yml`). The retired release lines, protected branches and branches with unmerged work are never deleted.
+- The branches `godot-v4.5`, `godot-v4.6` and `godot-v4.7` are the retired release lines of releases 0.5.1 to 0.15.0, which were built once per Godot version. They are kept as history and get no further commits.
 
 ## Development Setup
 
 1. Install Rust 1.89 or newer: `rustup update stable`.
-2. Install the Godot build named in `.github/godot-version` of the branch you work on, from <https://github.com/godotengine/godot-builds/releases>. On Windows, also keep the `_console.exe` file that comes with it.
+2. Install a Godot build from <https://github.com/godotengine/godot-builds/releases>: the one named in `.github/godot-version` (the newest supported), and the older minor versions in the matrix of `.github/workflows/ci.yml` when you change the addon. On Windows, also keep the `_console.exe` file that comes with it.
 3. Clone and build:
 
    ```bash
@@ -92,9 +76,9 @@ The project does not integrate any other third-party product, service, program o
    | Launched processes staying independent of the server | `tests/detach_test.rs` |
    | Running game, input, screenshots, breakpoints, GDScript diagnostics | `tests/runtime_e2e_test.rs` |
    | A played input scenario (`godot_game_scenario`) with a real Godot | `tests/scenario_e2e_test.rs` |
-   | Version string and release line identity | `tests/version_sync_test.rs` |
+   | Version string and the supported Godot versions | `tests/version_sync_test.rs` |
    | The version a build reports, with its commit | `tests/version_test.rs` |
-   | Repo steward scripts and workflows, the carry script | `tests/steward_test.rs` |
+   | Repo steward scripts and workflows | `tests/steward_test.rs` |
 
    Unit tests live next to the code in `src/`.
 3. Follow the engineering standards in [AGENTS.md](AGENTS.md): no `unwrap()` or `expect()` in production code, logs to stderr only, every editor mutation undoable, every path checked against the project, strict typing in GDScript.
@@ -110,7 +94,7 @@ cargo fmt --all -- --check
 cargo test --all-targets
 ```
 
-When you changed anything in `addons/godot_mcp/`, also check the GDScript and run the editor tests with the Godot build of the branch (`.github/godot-version`). The `--ignored` end-to-end suites need `--test-threads=1`: windowed tests and process-heavy tests interfere when they run in parallel.
+When you changed anything in `addons/godot_mcp/`, also check the GDScript and run the editor tests with the Godot build named in `.github/godot-version`; CI runs them on the older supported versions too. The `--ignored` end-to-end suites need `--test-threads=1`: windowed tests and process-heavy tests interfere when they run in parallel.
 
 ```bash
 godot --headless --path . --import   # first run only, or after script changes
@@ -167,7 +151,7 @@ GODOT_PATH=/path/to/godot cargo test --test runtime_e2e_test addon_scripts_have_
 - Keep one logical change per pull request.
 - State in the pull request description:
   - what changed and why;
-  - which Godot lines the change affects, and how you checked (the test, run on each branch);
+  - which Godot versions the change concerns, if it behaves differently on some, and how you checked (CI runs every supported version);
   - which checks from [Verification](#verification) you ran.
 - Never commit `.env`, an MCP client config with real paths (`.mcp.json`), built binaries or the `.godot/` folder. Commit examples with placeholders instead, such as `.env.example`.
 - Leave version numbers and `CHANGELOG.md` sections alone: maintainers set them in release commits.
@@ -178,7 +162,7 @@ GODOT_PATH=/path/to/godot cargo test --test runtime_e2e_test addon_scripts_have_
 An AI assistant, the repo steward, works the issue tracker and the pull requests on behalf of the maintainers. Every message it writes says that an AI wrote it.
 
 - **What it does:** it gives each new issue a type and a priority, asks for missing details, answers questions, closes duplicates, reviews pull requests, fixes accepted issues through pull requests of its own, and keeps the project board "godot-mcp issues and pull requests" current.
-- **What the maintainers decide:** every release, and what the assistant cannot settle. The assistant decides the rest itself: whether a change or a feature fits the project, and it merges or declines a contributor's pull request (`autonomy.merge_external` in `.github/steward.yml`) after it has read the whole diff and run the checks of [Verification](#verification) on every Godot line the change affects. A change to a protected file is merged by the assistant only when the file is `ci.yml`, the release skill's `SKILL.md`, `Cargo.toml` or `Cargo.lock` and every changed line of it is a plain one: a syntax-check line or a `cargo test --test` step, a registry dependency, a package whose checksum crates.io confirms. A maintainer merges everything else that touches build scripts, `.github/`, `.agents/`, `.claude/` or the Cargo configuration, and any change to the assistant's own rules, scripts and workflows. A maintainer can step in at any time.
+- **What the maintainers decide:** every release, and what the assistant cannot settle. The assistant decides the rest itself: whether a change or a feature fits the project, and it merges or declines a contributor's pull request (`autonomy.merge_external` in `.github/steward.yml`) after it has read the whole diff and run the checks of [Verification](#verification) (CI runs them on every supported Godot version). A change to a protected file is merged by the assistant only when the file is `ci.yml`, the release skill's `SKILL.md`, `Cargo.toml` or `Cargo.lock` and every changed line of it is a plain one: a syntax-check line or a `cargo test --test` step, a registry dependency, a package whose checksum crates.io confirms. A maintainer merges everything else that touches build scripts, `.github/`, `.agents/`, `.claude/` or the Cargo configuration, and any change to the assistant's own rules, scripts and workflows. A maintainer can step in at any time.
 - **Priorities:**
 
   | Priority | Meaning |
@@ -195,34 +179,19 @@ An AI assistant, the repo steward, works the issue tracker and the pull requests
 - **Reach a person:** ask for a maintainer in a comment, and the assistant hands the issue or pull request over.
 - **Security problems:** never in an issue or pull request; follow [SECURITY.md](SECURITY.md).
 
-## Carrying Changes Between Lines
-
-A change that affects several lines lands on the newest of them first and is then carried to each older one, newest to oldest.
-
-A change that lands on `master` is carried by a workflow (`.github/workflows/carry.yml`, script `.github/scripts/carry.sh`): after the merge it opens one pull request per line, titled `[4.7] <original title>`, with `git cherry-pick -x`. The changelog and the planning files keep each line's own copy, and files a line does not have are not added. When a commit conflicts in a product file, the workflow opens an issue that names the commit instead, and a person carries it by hand. A commit that changes a workflow file is carried by hand too: the repository token may not push one. Merge a carry pull request with a squash that keeps the commit message (the repository default), because the "(cherry picked from commit …)" line is how a later run knows the line holds the commit. Other changes (to a line only) are carried by hand; you may do it yourself:
-
-```bash
-git switch godot-v4.7
-git cherry-pick -x <commit>    # -x records "(cherry picked from commit <commit>)"
-```
-
-- Open the carried copy as its own pull request titled `[4.7] <original title>`.
-- Resolve a conflict on that line, and make the test pass with that line's Godot build.
-- Skip a line on which the test does not reproduce the problem.
-
 ## Planning and Specifications
 
 - The `.design/` folder holds the project's specifications and plan. It is committed and shared, and it is maintained on `master` only; a release branch keeps the copy from the day it was created.
 - Maintainers plan and design through the Magic Spec workflow (`/magic.spec`, `/magic.task`, `/magic.run`, `/magic.analyze`), run by their AI agent. Its engine (`.magic/` and the `magic.*` workflow files) is installed locally from its release archive and is git-ignored.
 - You do not need the engine to contribute. If your change alters documented behaviour, say so in the pull request, and a maintainer updates the specifications.
-- Commit changes to `.design/` separately from product changes, so that product commits carry cleanly to the release lines.
+- Commit changes to `.design/` separately from product changes, so that a product commit never mixes with planning.
 - Never mention `.design/`, specification file names or task IDs in product files: code, tests, `README.md`, `CHANGELOG.md`, `SECURITY.md`.
 
 ## For AI Agents
 
 - In a fresh clone or git worktree, run the agents-init skill once ([.agents/skills/agents-init/SKILL.md](.agents/skills/agents-init/SKILL.md)): it links the agent folders such as `.claude/` to the canonical `.agents/` folder.
 - Read [AGENTS.md](AGENTS.md) first and follow it. It holds the engineering standards, the agent workflow and the completion checklist; the commands in [Verification](#verification) are the same as there.
-- Pick the target branch with the table in [Branches and Godot Versions](#branches-and-godot-versions).
+- Open pull requests against `master` ([Branch and Godot Versions](#branch-and-godot-versions)).
 - Stay inside the [Technology Scope](#technology-scope): never add an integration with a product outside it, and decline a request that asks for one.
 - Never push, tag or publish a release without the explicit approval of your user — except the actions the repo-steward skill's autonomy settings allow (its defaults, as adjusted in `.github/steward.yml`). Tagging and publishing a release are never among them.
 - Work issues and pull requests with the repo-steward skill: [.agents/skills/repo-steward/SKILL.md](.agents/skills/repo-steward/SKILL.md).
@@ -231,9 +200,9 @@ git cherry-pick -x <commit>    # -x records "(cherry picked from commit <commit>
 
 Maintainers publish releases with the agent skill in `.agents/skills/release/SKILL.md`. In short:
 
-- One release holds the files of every supported Godot line, named `vX.Y.Z` (for example `v0.5.1`). Every release takes the next version number; all lines take it together, and a line without a change of its own only advances its version.
-- Each line's version names the line: `0.5.1+godot.4.6` on branch `godot-v4.6`, with the line tag `v0.5.1+godot.4.6` marking its sources. The release notes are one `CHANGELOG.md` on `master`.
-- A person approves every tag before it is pushed. The release workflow then builds the files of every line and publishes the release.
+- One release is made from `master` and named `vX.Y.Z` (for example `v0.16.0`). It holds one server archive per platform and one addon archive, which serve every supported Godot version. Every release takes the next version number.
+- The release notes are one `CHANGELOG.md` on `master`.
+- A person approves every tag before it is pushed. The release workflow then builds the files and publishes the release.
 
 ## License
 

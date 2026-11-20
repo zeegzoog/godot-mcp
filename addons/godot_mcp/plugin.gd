@@ -2,7 +2,10 @@
 extends EditorPlugin
 
 const MIN_MAJOR: int = 4
-const MIN_MINOR: int = 8
+const MIN_MINOR: int = 5
+## The newest Godot minor version the end-to-end tests run against. A newer editor still starts the
+## bridge, with a warning.
+const TESTED_MINOR: int = 8
 const BRIDGE_SCRIPT_PATH: String = "res://addons/godot_mcp/bridge_server.gd"
 const EXPORT_PLUGIN_PATH: String = "res://addons/godot_mcp/export_plugin.gd"
 const RELAY_SCRIPT_PATH: String = "res://addons/godot_mcp/editor/game_relay.gd"
@@ -19,13 +22,14 @@ func _enter_tree() -> void:
     var version: Dictionary = Engine.get_version_info()
     var major: int = version["major"]
     var minor: int = version["minor"]
-    # Each godot-mcp release is built for one Godot minor version: an older editor may lack the
-    # APIs this build calls, a newer one usually still works but has a better-matching release.
+    # One godot-mcp build serves every Godot minor version from MIN_MINOR to TESTED_MINOR: what an
+    # older version lacks is called behind has_method(). An older editor may lack more than that,
+    # and a newer one has not been tested.
     if major < MIN_MAJOR or (major == MIN_MAJOR and minor < MIN_MINOR):
-        printerr("[Godot MCP] This godot-mcp build is for Godot %d.%d, but this is Godot %s. Install the godot-mcp release for your Godot version. The bridge was not started." % [MIN_MAJOR, MIN_MINOR, version["string"]])
+        printerr("[Godot MCP] This godot-mcp build needs Godot %d.%d or newer, but this is Godot %s. Use a godot-mcp release made for your Godot version, or update Godot. The bridge was not started." % [MIN_MAJOR, MIN_MINOR, version["string"]])
         return
-    if major > MIN_MAJOR or minor > MIN_MINOR:
-        push_warning("[Godot MCP] This godot-mcp build is for Godot %d.%d, but this is Godot %s. Install the godot-mcp release for Godot %d.%d." % [MIN_MAJOR, MIN_MINOR, version["string"], major, minor])
+    if major > MIN_MAJOR or minor > TESTED_MINOR:
+        push_warning("[Godot MCP] This godot-mcp build is tested with Godot %d.%d to %d.%d, but this is Godot %s. It should work; if something fails, update godot-mcp or report it." % [MIN_MAJOR, MIN_MINOR, MIN_MAJOR, TESTED_MINOR, version["string"]])
 
     # Registered before the bridge so that the addon stays out of exports even when the
     # bridge fails to start.

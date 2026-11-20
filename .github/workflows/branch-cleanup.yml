@@ -2,7 +2,7 @@ name: Branch cleanup
 
 # Deletes a branch once its pull request is merged, and sweeps weekly for finished branches that
 # were missed (see .github/scripts/prune-branches.sh for what is never deleted: the default
-# branch, the godot-v* release lines, protected branches, open or unmerged work).
+# branch, the godot-v* retired release lines, protected branches, open or unmerged work).
 
 on:
   pull_request:

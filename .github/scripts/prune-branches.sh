@@ -2,7 +2,7 @@
 # Deletes the branches of this repository whose work is finished: a pull request from the branch
 # was merged and the branch still points at the last commit that pull request merged.
 #
-# Never deleted: the default branch, the release lines (godot-v*), protected branches, a branch
+# Never deleted: the default branch, the retired release lines (godot-v*), protected branches, a branch
 # with an open pull request, a branch whose pull request was closed without a merge, a branch
 # that has no pull request, and a branch that got new commits after its merge. Branches from
 # forks are not touched: they are not in this repository.

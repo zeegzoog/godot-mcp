@@ -1,8 +1,8 @@
 # Feature parity
 
 A comparison of this Rust server with the three Godot MCP servers it was measured against.
-The Rust column describes `master` and the release lines `godot-v4.5` to `godot-v4.7`,
-which carry the same tools. The other columns describe the commits named below, so they
+The Rust column describes `master`, from which every release is made, and which serves
+Godot 4.5 to 4.8. The other columns describe the commits named below, so they
 can be out of date.
 
 A cell is **implemented** only when the behavior exists in this tree and a test or a
@@ -16,7 +16,7 @@ it and this server does not do it. **Unsupported** means it was left out on purp
 | --- | --- | --- | --- | --- |
 | Path / remote | `github.com/zeegzoog/godot-mcp` | `github.com/shin2344234/godot-mcp` `@shin2344234/godot-mcp` 0.1.2, commit `7116e47` | commit `1209744` | commit `6325306` |
 | Runtime | Native binary. No Node.js. | Node.js 22, TypeScript | Node.js, TypeScript | Node.js, TypeScript (fork of Coding-Solo plus a large interactive layer) |
-| Godot | One release line per Godot minor: 4.5, 4.6, 4.7, and 4.8 on `master`. The plugin refuses an older editor (`MIN_MINOR` in `plugin.gd`). | 4.7+ (docs say 4.7.2) | Godot 4 CLI | Godot 4 CLI, same operations script family as Coding-Solo |
+| Godot | One build for every Godot minor from 4.5 to 4.8, each tested by CI. The plugin refuses an older editor (`MIN_MINOR` in `plugin.gd`). | 4.7+ (docs say 4.7.2) | Godot 4 CLI | Godot 4 CLI, same operations script family as Coding-Solo |
 | Editor transport | WebSocket on `127.0.0.1`, port derived from the project path, shared token | WebSocket editor bridge | None. Each tool spawns `godot --headless --script` | TCP client to a long-lived Godot process, plus one-shot CLI |
 | Game transport | Godot remote debugger (`--remote-debug tcp://127.0.0.1:<port>`), `mcp:` messages. Editor Play is relayed by `EditorDebuggerPlugin` | Same debugger protocol. This is the architecture this server follows | stdout of the CLI process | Custom input receiver script inside the played scene, not `EngineDebugger` |
 | Edits | `EditorUndoRedoManager` while the editor is connected. Headless fallback writes `.tscn` / `.tres` / `project.godot` text for a few tools | Undoable editor ops, headless Godot for the rest | CLI script mutates files, no undo | CLI script, undo only where Godot's editor is actually open |
@@ -125,8 +125,8 @@ The tools below were added after the other columns were measured, so this table 
 - Debugger stepping works on process runs this server launched. Editor Play uses Godot's
   own debugger; the plugin only relays `mcp:*`.
 - LSP frames are `Content-Length` only. Godot rejects a `Content-Type` header.
-- Each release line's plugin requires its own Godot minor (`MIN_MINOR` in `plugin.gd`) and
-  is tested with that build (`.github/godot-version` on the line).
+- The plugin requires Godot 4.5 or newer (`MIN_MINOR` in `plugin.gd`) and is tested with
+  every minor version up to `TESTED_MINOR` (`.github/godot-version` and the CI matrix).
 - `get_method_argument_type` is not a Node method in 4.7. Argument types come from
   `get_method_list()`.
 

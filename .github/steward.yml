@@ -7,7 +7,8 @@ project:
 
 board:
   title: godot-mcp issues and pull requests
-  # The Godot lines an item affects, for example "4.8 4.7 4.6".
+  # The Godot versions an item affects, for example "4.5 4.6"; empty means all of them.
+  # (The project field kept its name from the time of the release lines.)
   text_fields: Lines
 
 triage:
@@ -22,16 +23,15 @@ limits:
 
 autonomy:
   # The steward merges or declines a contributor's pull request itself, after reading the whole
-  # diff and running the checks of CONTRIBUTING.md on every Godot line. It is the project's
+  # diff and running the checks of CONTRIBUTING.md; CI runs the end-to-end suites on every supported Godot
+  # version. It is the project's
   # choice for maximum automation: a single maintainer cannot answer every pull request. The
   # hard limits of the skill stay: no release, no force push, no settings or secrets.
   merge_external: allowed
 
 release:
-  procedure: .agents/skills/release/SKILL.md, procedure C
-  skip_subjects: chore(release) chore(line)
-  # Every release contains every Godot line listed here, each built from its own branch.
-  targets_file: .github/lines
+  procedure: .agents/skills/release/SKILL.md, procedure B
+  skip_subjects: chore(release)
+  # The branches of the retired release lines (godot-v4.5 to godot-v4.7) are never deleted. There is no
+  # targets_file any more: a release is one build made from master.
   target_branch: godot-v{t}
-  target_tag: v{version}+godot.{t}
-  target_build_file: .github/godot-version

@@ -2,11 +2,8 @@ name: CI
 
 on:
   push:
-    branches: [master, "godot-v*"]
+    branches: [master, "godot-v*"] # godot-v*: the retired release lines, which keep their own CI
   pull_request:
-  # The carry workflow pushes with the repository token, whose pushes start no workflow, so it
-  # starts this one on the branch it made.
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -44,8 +41,9 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
-      # Each release line is tested against its own Godot build, named in .github/godot-version.
-      - name: Install the line's Godot build
+      # The newest supported Godot, named in .github/godot-version (TESTED_MINOR in plugin.gd). The
+      # older minor versions run in the godot-versions job below.
+      - name: Install the newest supported Godot build
         run: |
           build=$(tr -d '[:space:]' < .github/godot-version)
           echo "Godot $build"
@@ -98,10 +96,10 @@ jobs:
       - name: Exports
         run: cargo test --test export_e2e_test -- --ignored --test-threads=1
 
-  # One codebase for several Godot versions: the same sources, with only the identity files of a
-  # line changed, run against each older stable build. Godot 4.8 is the job above.
+  # One codebase serves every supported Godot version: the same sources run against each older
+  # stable build, from MIN_MINOR in plugin.gd up. The newest version is the job above.
   godot-versions:
-    name: Godot ${{ matrix.godot }} (this codebase)
+    name: Godot ${{ matrix.godot }}
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -123,19 +121,15 @@ jobs:
           chmod +x "$RUNNER_TEMP/godot/Godot_v${BUILD}_linux.x86_64"
           echo "GODOT_PATH=$RUNNER_TEMP/godot/Godot_v${BUILD}_linux.x86_64" >> "$GITHUB_ENV"
 
-      # The addon refuses an editor older than MIN_MINOR, and the development project names the
-      # Godot version it was saved with: those two are what a line changes.
-      - name: Present the sources as this Godot version
-        env:
-          BUILD: ${{ matrix.godot }}
-        run: |
-          minor=$(echo "$BUILD" | cut -d. -f2)
-          sed -i "s/^const MIN_MINOR: int = .*/const MIN_MINOR: int = $minor/" addons/godot_mcp/plugin.gd
-          sed -i "s/^config\/features=.*/config\/features=PackedStringArray(\"4.$minor\")/" project.godot
-          git diff --stat
-
       - name: Import the addon dev project
         run: $GODOT_PATH --headless --path . --import
+
+      - name: GDScript syntax check
+        run: |
+          for script in $(find addons/godot_mcp -name '*.gd' | sort); do
+            echo "$script"
+            $GODOT_PATH --headless --check-only --path . --script "$script"
+          done
 
       - name: End-to-end tests against a real editor
         run: cargo test --test editor_e2e_test -- --ignored --test-threads=2

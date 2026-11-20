@@ -1,6 +1,6 @@
 ---
 name: release
-description: Release godot-mcp (one release holding the files for every supported Godot version), and move fixes and improvements between the Godot versions. Use when the user asks to release, cut, publish or ship a version ("ship v0.5.1", "release a fix for Godot 4.6"), to backport, carry or cherry-pick a change to other Godot versions, to create the branch for a new Godot version that became stable, to retire a Godot version, or to move a line to a new Godot patch release.
+description: Release godot-mcp (one release from master holding one server per platform and one addon, for every supported Godot version), and change which Godot versions are supported. Use when the user asks to release, cut, publish or ship a version ("ship v0.16.1"), to support a new Godot version that became stable, or to drop the oldest one.
 ---
 
 # Release godot-mcp
@@ -9,131 +9,45 @@ description: Release godot-mcp (one release holding the files for every supporte
 
 Read this first; every procedure below uses these terms.
 
-- **Line**: godot-mcp is built per Godot minor version `M.N` (for example `4.6`). Each supported version has a release line on the branch `godot-vM.N`. `master` is the development line: it targets the next Godot version, which has no stable release yet, and it is never released.
-- **Version string**: `X.Y.Z+godot.M.N` on a release line (`0.5.1+godot.4.6`), `X.Y.Z-dev+godot.M.N` on `master`. The same string is in `Cargo.toml` and `addons/godot_mcp/plugin.cfg`. The manifests change only in release commits (and when `master`'s `-dev` number moves, see "Between Releases"), never in a pull request, so the version a running server reports adds the commit it was built from as build metadata (`0.13.0-dev+godot.4.8.g6295b51ab`, `src/version.rs`): two builds between releases differ there. The addon's version, from `plugin.cfg`, has no commit.
-- **Release**: one GitHub Release per number `X.Y.Z`, named `vX.Y.Z`, holding the files of every supported line: for each line `M.N` four server archives and one addon archive, all with `-godotM.N` in the name. The supported lines are listed in `.github/lines` on `master`. A line without a change of its own still takes part: its release commit only advances its version.
-- **Tags**: a **line tag** `vX.Y.Z+godot.M.N` on each line's release commit anchors that line's sources and starts nothing. The **release tag** `vX.Y.Z` on the `master` release commit starts the release workflow; it builds every line from its line tag.
-- **Identity files**: the only files that differ between lines on purpose — `Cargo.toml` and `Cargo.lock` (version), `addons/godot_mcp/plugin.cfg` (version), `addons/godot_mcp/plugin.gd` (`MIN_MAJOR`, `MIN_MINOR`), `project.godot` (`config/features`), `.github/godot-version` (the exact Godot build the line is tested against). `cargo test --test version_sync_test` checks that they agree. The release notes are one `CHANGELOG.md` on `master`; the copies on the lines are frozen history.
-- **Carry**: apply a change that landed on a newer line to an older line as a new commit, with `git cherry-pick -x` (it appends `(cherry picked from commit <sha>)`).
-- **Numbering**: every release takes the next version number above the highest one released so far, including the releases from before the single release model (0.5.0 was released once per line). A fix bumps the patch number; a feature or a breaking change bumps the minor number (the project is before 1.0). All lines take the new number together.
-- **Line table**: `README.md` (Installation), `SECURITY.md` (Supported Versions) and `CONTRIBUTING.md` (Branches and Godot Versions) list the lines, like `.github/lines`. They change together, and the three documents are identical on every branch.
+- **One codebase**: `master` is the only line of development and the only source of releases. It serves every Godot minor version from `MIN_MINOR` (the addon refuses an older editor) to `TESTED_MINOR` (the newest Godot the end-to-end tests run against; a newer editor starts the bridge with a warning), both constants in `addons/godot_mcp/plugin.gd`. What an older Godot lacks is called behind `has_method()` (see AGENTS.md). CI runs the end-to-end suites on every supported minor version: the main job on the build in `.github/godot-version` (the newest), the `godot-versions` matrix of `.github/workflows/ci.yml` on the older ones.
+- **Version**: `X.Y.Z` in `Cargo.toml` and `addons/godot_mcp/plugin.cfg` (equal, checked by `tests/version_sync_test.rs`) in a release, `X.Y.Z-dev` on `master` between releases. A running server adds the commit it was built from as build metadata (`0.16.1-dev+g6295b51ab`, `src/version.rs`); the manifests carry none.
+- **Release**: one GitHub Release per `X.Y.Z`, named `vX.Y.Z`, with five files: `godot-mcp-<target>.zip` or `.tar.gz` for `x86_64-pc-windows-msvc`, `x86_64-unknown-linux-gnu`, `x86_64-apple-darwin` and `aarch64-apple-darwin`, and `godot-mcp-addon.zip`. The tag `vX.Y.Z` sits on the release commit on `master` and starts the release workflow.
+- **Numbering**: every release takes the next version number above the highest released so far. A fix bumps the patch number; a feature or a breaking change bumps the minor number (the project is before 1.0). The readiness script computes it (step 3).
+- **Retired lines**: releases up to 0.15.0 were built per Godot minor version, from the branches `godot-v4.5`, `godot-v4.6` and `godot-v4.7`, with the tags `vX.Y.Z+godot.M.N` and files ending in `-godotM.N`. The branches, the tags and those releases stay as they are and get no further commits or releases; a fix reaches every Godot version through the next release from `master`. Never delete them.
 
-Pushing a tag publishes a GitHub Release that cannot be taken back. Every step that pushes or tags stops for the user's explicit approval first.
+## A. Land a Change
 
-## A. Find the Affected Lines
+1. Land the change, with its test, on `master` through a pull request. CI must be green: the Rust job on three systems and every Godot version.
+2. A change that behaves differently on some Godot version is written to work on all of them (a call guarded by `has_method()`, an answer field that is optional) and its test says which version it concerns, as `godot_minor()` does in `tests/runtime_e2e_test.rs`.
+3. Commit changes to the planning files (`.design/`) separately from product changes.
 
-1. Take the test that reproduces the problem or exercises the change; write it first if it does not exist.
-2. Run it on every candidate branch with that branch's Godot build. A worktree per branch keeps `master`'s working tree untouched:
+## B. Release
 
-   ```bash
-   git worktree add ../godot-mcp-4.6 godot-v4.6
-   cd ../godot-mcp-4.6
-   cat .github/godot-version                     # the Godot build to test this line with
-   GODOT_PATH=/path/to/that/godot cargo test --test <test-file> <test-name> -- --ignored
-   ```
-
-3. A line on which the test fails is affected. A problem that exists only because of one Godot version affects only that line.
-
-## B. Land and Carry a Change
-
-1. Land the change, with its test, on the newest affected line: `master` when it is affected, else the newest affected `godot-v*` branch. CI must be green there.
-2. Commit changes to the planning files (`.design/`) separately from product changes; only product commits are carried.
-3. Carry the change to each older affected line, newest to oldest. After a merge to `master` the carry workflow (`.github/scripts/carry.sh`) has already opened `[M.N] <title>` pull requests for every line and reports a conflict as an issue; merge those when their CI is green, and carry by hand only what the workflow left (a change to one line, a conflict). By hand:
-
-   ```bash
-   git switch godot-v4.7
-   git cherry-pick -x <commit>
-   ```
-
-   - Resolve a conflict for that line, then make the test pass with that line's Godot build.
-   - When the carried copy goes through a pull request, title it `[4.7] <original title>`.
-4. Skip a line on which the test does not reproduce the problem.
-5. Never carry a release commit (a line's version bump, the changelog section on `master`): each release makes its own.
-
-## Between Releases: the Development Version
-
-After a release `master` says `X.Y.Z+1-dev`, which assumes the next release is a patch. The commits that follow usually say otherwise (every release since 0.5.1 held a `feat`, so every one took a minor number), and `master` then reports a number the release will not have. Keep it honest with one commit, whenever the readiness script's `version=` (see C step 3) is higher than the core of `master`'s `-dev` version:
-
-1. Set `Cargo.toml` and `addons/godot_mcp/plugin.cfg` on `master` to that number with `-dev`, for example `0.13.0-dev+godot.4.8` while `0.12.1-dev+godot.4.8` is there.
-2. `cargo build` (updates `Cargo.lock`), `cargo test --test version_sync_test`, then commit `chore(release): move master to 0.13.0-dev` on its own. It is a `master` commit only: never carry it to a line.
-
-A pull request does not do this (contributors leave versions alone); the maintainer or the steward's readiness notice, which names the number, prompts it. The number a release takes is still chosen in C step 3, not read from `-dev`.
-
-## C. Release
-
-A release covers every line in `.github/lines`. Work on the branches or on one worktree per line. The examples release 0.5.1 with the lines 4.5, 4.6 and 4.7.
-
-1. **Preflight, on every line.** CI already runs the whole preflight on each branch with that line's own Godot build (`.github/godot-version`): `cargo fmt`, `clippy` and the unit tests on Linux, Windows and macOS, the GDScript checks, and the editor, addon-export, running-game, scenario and export end-to-end suites. Do not repeat it by hand: check that CI is green on the tip of every line and of `master`, and stop and report on the first line that is not.
+1. **Preflight.** CI already runs the whole preflight on `master` with every supported Godot build: `cargo fmt`, `clippy` and the unit tests on Linux, Windows and macOS, the GDScript checks, and the editor, addon-export, running-game, scenario and export end-to-end suites. Do not repeat it by hand: check that CI is green on the tip of `master`, and stop and report if it is not.
 
    ```bash
    git status --porcelain                        # must print nothing
    git fetch origin --tags
-   for branch in master $(grep -E '^[0-9]' .github/lines | sed 's/^/godot-v/'); do
-       tip=$(git rev-parse "origin/$branch")
-       echo "$branch tip ${tip:0:7}: $(gh run list --branch "$branch" --workflow ci.yml -L 1 \
-           --json headSha,status,conclusion --jq '.[0] | "\(.headSha[0:7]) \(.status) \(.conclusion)"')"
-   done
+   gh run list --branch master --workflow ci.yml -L 1 --json headSha,status,conclusion --jq '.[0]'
+   git rev-parse origin/master                   # the run's headSha must be this commit, completed and success
    ```
 
-   The run's commit must be the tip and it must read `completed success`. A job that failed on the runner and not in the code (a network error while fetching crates, a runner that never started) is rerun with `gh run rerun <id> --failed`. Run a suite by hand only to reproduce a failure CI reported, or when CI has not run yet because nothing is pushed (procedures E and G); the commands below are that local run. The last gate is step 7: the release commits are pushed, and CI must be green on them before any tag.
-
-   The local run, with the checks in this order; stop at the first failure:
+   A job that failed on the runner and not in the code (a network error while fetching crates, a runner that never started) is rerun with `gh run rerun <id> --failed`. Run a suite by hand only to reproduce a failure CI reported:
 
    ```bash
    cargo fmt --all -- --check
    cargo clippy --all-targets --all-features -- -D warnings
    cargo test --all-targets
+   GODOT_PATH=/path/to/godot cargo test --test editor_e2e_test -- --ignored --test-threads=1
    ```
 
-   Then, with `GODOT_PATH` (and on Windows `GODOT_CONSOLE_PATH`) set to the build named in that line's `.github/godot-version`:
+   Also confirm that `SECURITY.md` and `CONTRIBUTING.md` are still true: the supported Godot versions, the reporting link, the checks.
+
+2. **Check what the release holds.** The product commits since the previous release tag are the content of the release notes:
 
    ```bash
-   godot --headless --path . --import
-   godot --headless --check-only --path . --script addons/godot_mcp/plugin.gd
-   godot --headless --check-only --path . --script addons/godot_mcp/bridge_server.gd
-   godot --headless --check-only --path . --script addons/godot_mcp/export_plugin.gd
-   godot --headless --check-only --path . --script addons/godot_mcp/editor/game_relay.gd
-   godot --headless --check-only --path . --script addons/godot_mcp/editor/script_ops.gd
-   godot --headless --check-only --path . --script addons/godot_mcp/core/runtime_override.gd
-   godot --headless --check-only --path . --script addons/godot_mcp/runtime/mcp_runtime.gd
-   godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_hold.gd
-   godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_input.gd
-   godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_live.gd
-   godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_output.gd
-   godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_result.gd
-   godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_view.gd
-   godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_record.gd
-   godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_probe.gd
-   godot --headless --check-only --path . --script addons/godot_mcp/runtime/ops/rt_script.gd
-   GODOT_PATH=/path/to/godot cargo test --test editor_e2e_test -- --ignored
-   GODOT_PATH=/path/to/godot cargo test --test addon_export_test -- --ignored
-   GODOT_PATH=/path/to/godot cargo test --test runtime_e2e_test -- --ignored
-   GODOT_PATH=/path/to/godot cargo test --test scenario_e2e_test -- --ignored
-   GODOT_PATH=/path/to/godot cargo test --test export_e2e_test -- --ignored
+   git log --format='%h %s' "$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | grep -v '+' | head -n 1)..origin/master" -- . ':!.design'
    ```
-
-   Also confirm that `SECURITY.md` and `CONTRIBUTING.md` are still true: the supported lines, the reporting link, the checks.
-
-2. **Find uncarried changes, for every line**: product commits that landed on a newer branch since this line's previous release and have no copy here. The example checks line 4.6; list its newer branches in `for newer in …`:
-
-   ```bash
-   line=4.6
-   branch="godot-v$line"
-   prev=$(git tag -l "v*+godot.$line" --sort=-creatordate | head -n 1)
-   since=$(git log -1 --format=%cI "${prev:-$(git merge-base "$branch" master)}")
-   for newer in godot-v4.7 master; do
-       base=$(git merge-base "$branch" "$newer")
-       git log --max-parents=1 --since="$since" --format='%H %s' "$base..$newer" -- . ':!.design' |
-           while read -r sha subject; do
-               case "$subject" in "chore(release)"*|"chore(line)"*) continue ;; esac
-               git cherry "$branch" "$newer" "$base" | grep -qx -- "- $sha" && continue
-               git log "$branch" --format=%h --grep="picked from commit $sha" | grep -q . && continue
-               echo "$newer ${sha:0:9} $subject"
-           done
-   done
-   ```
-
-   Release commits and the commits that set up another line are skipped by the filter. For each listed commit, either carry it now (procedure B) or write down why it does not apply to that line, for example that it uses an API this line's Godot version does not have. The lists go into the approval request (step 6).
 
 3. **Choose the version number.** The highest `X.Y.Z` among all tags:
 
@@ -144,107 +58,74 @@ A release covers every line in `.github/lines`. Work on the branches or on one w
    Do not judge the bump by hand: the number the commits imply is the `version=` of the first line that the steward's readiness script prints. It reads the Conventional Commit types since the newest release tag (a breaking change or a `feat` bumps the minor number before 1.0, anything else the patch; see Numbering):
 
    ```bash
-   bash .agents/skills/repo-steward/scripts/readiness.sh | head -n 1     # state=due version=0.13.0
+   bash .agents/skills/repo-steward/scripts/readiness.sh | head -n 1     # state=due version=0.16.0
    ```
 
    A version the user names wins if it is above that number.
 
-4. **Release commit on every line.** On each line's branch set both manifests to `0.5.1+godot.M.N` (`Cargo.toml` `version = "…"`, `addons/godot_mcp/plugin.cfg` `version="…"`), even when the line has no other change. Then:
-
-   ```bash
-   cargo build                                   # updates Cargo.lock
-   cargo test --test version_sync_test
-   git add Cargo.toml Cargo.lock addons/godot_mcp/plugin.cfg
-   git commit -m "chore(release): godot-mcp 0.5.1 for Godot 4.6"
-   ```
-
-5. **Release commit on `master`.** Write the changelog section in `CHANGELOG.md`, above the previous release:
-   - Heading `## [0.5.1] - YYYY-MM-DD`, then Added / Changed / Fixed / Security, written for users: behaviour changes first, nothing about planning or tasks. Mark what applies to some lines only ("Godot 4.6 only: …").
-   - No compare link for the version itself: commits of different lines are not comparable. Do move the `[Unreleased]` link at the end of the file to `compare/vX.Y.Z...master` of the new release.
-   - Check it: `bash .github/scripts/release-notes.sh v0.5.1`.
-   - Move the development version of `master` past the release: set `Cargo.toml` and `addons/godot_mcp/plugin.cfg` to the next patch with `-dev`, for example `0.5.2-dev+godot.4.8` after releasing 0.5.1 (`master` is never released, so it does not take the release number itself). Without this `master` keeps reporting the version of an older release.
+4. **Release commit.** On `master`:
+   - Write the changelog section in `CHANGELOG.md`, above the previous release: heading `## [X.Y.Z] - YYYY-MM-DD`, then Added / Changed / Fixed / Security, written for users: behaviour changes first, nothing about planning or tasks. Mark what applies to some Godot versions only ("Godot 4.5 only: …"). Move the `[Unreleased]` link at the end of the file to `compare/vX.Y.Z...master`, and add `[X.Y.Z]: …/compare/v<previous>...vX.Y.Z` for the new version.
+   - Check it: `bash .github/scripts/release-notes.sh vX.Y.Z`.
+   - Set `Cargo.toml` and `addons/godot_mcp/plugin.cfg` to `X.Y.Z` and commit:
 
    ```bash
    cargo build                                   # updates Cargo.lock
    cargo test --test version_sync_test
    git add CHANGELOG.md Cargo.toml Cargo.lock addons/godot_mcp/plugin.cfg
-   git commit -m "chore(release): godot-mcp 0.5.1"
+   git commit -m "chore(release): godot-mcp X.Y.Z"
    ```
 
-6. **Stop for approval.** Show the user the version, every line's release commit (`git log -1 --oneline <branch>`), the lists from step 2 with the reason each listed commit does not apply, and the commands of step 7. Continue only after an explicit yes.
+5. **Approval.** A person approves every tag before it is pushed. When the user asked for the release in this conversation, that is the approval: show them the version, the release commit and the commands of step 6 in the final answer, and go on. When a schedule or another agent started the release, stop here and ask.
 
-7. **Push the branches, then the tags**:
+6. **Push the branch, then the tag**:
 
    ```bash
-   git push origin master godot-v4.5 godot-v4.6 godot-v4.7
-   # wait until CI is green on all four branches (gh run list --branch <branch>)
-   for line in 4.5 4.6 4.7; do git tag -a "v0.5.1+godot.$line" -m "godot-mcp 0.5.1 (Godot $line)" "godot-v$line"; done
-   git tag -a v0.5.1 -m "godot-mcp 0.5.1" master
-   git push origin v0.5.1+godot.4.5 v0.5.1+godot.4.6 v0.5.1+godot.4.7
-   bash .github/scripts/release-set.sh v0.5.1   # the release workflow's own checks, run locally first
-   git push origin v0.5.1
+   git push origin master
+   # wait until CI is green on the release commit (gh run list --branch master)
+   git tag -a vX.Y.Z -m "godot-mcp X.Y.Z" master
+   git fetch origin --tags
+   bash .github/scripts/release-set.sh vX.Y.Z   # the release workflow's own checks, run locally first
+   git push origin vX.Y.Z
    ```
 
-   Push the release tag only when CI is green on every branch and `release-set.sh` printed the version and all lines.
+   Push the tag only when CI is green on the release commit and `release-set.sh` printed the version.
 
-8. **Watch and verify the release**:
+7. **Watch and verify the release**:
 
    ```bash
    gh run watch $(gh run list --workflow release.yml -L 1 --json databaseId -q '.[0].databaseId')
-   gh release view v0.5.1
+   gh release view vX.Y.Z
    ```
 
-   - The jobs succeed: `plan`, then `verify`, `addon` and `build` for every line, then `publish`.
-   - The release is named `v0.5.1`, marked "Latest", its text is the changelog section, and for every line it holds five files ending in `-godotM.N`: four server archives (`x86_64-pc-windows-msvc`, `x86_64-unknown-linux-gnu`, `x86_64-apple-darwin`, `aarch64-apple-darwin`) and `godot-mcp-addon-godotM.N.zip` (fifteen files for three lines).
+   - The jobs succeed: `plan`, then `verify`, `addon` and `build` for the four targets, then `publish`.
+   - The release is named `vX.Y.Z`, marked "Latest", its text is the changelog section, and it holds five files: the four server archives and `godot-mcp-addon.zip`.
 
-## D. Release After a Change to One Line
+8. **Move master to the next development version.** Right after the tag is pushed, one more commit: set `Cargo.toml` and `addons/godot_mcp/plugin.cfg` to the next patch with `-dev` (`0.16.1-dev` after releasing 0.16.0), run `cargo build` and `cargo test --test version_sync_test`, and commit it as `chore(release): move master to the next development version` (0.16.1-dev). If the commits that follow include a `feat`, the next release takes a minor number and `master` says so only when the readiness script's `version=` is higher than the `-dev` core: change it then, in a commit of its own.
 
-A fix that concerns one Godot version is released like any other change: run procedure C. The other lines only advance their version in their release commit (step 4), and the changelog section says which lines the change concerns.
+   Without this `master` keeps reporting the version of the release it already made.
 
-## E. Cut a Line for a New Godot Version
+Never force-push, delete a tag or delete a release. A broken release is fixed forward with the next number.
 
-When Godot `M.N` becomes stable. The example cuts line 4.8; until now `master` targeted 4.8.
+## C. Support a New Godot Version
 
-1. On `master`, set `.github/godot-version` to the stable build (`4.8-stable`; later patches are `4.8.1-stable` and so on) and run the C step 1 preflight with it. Fix anything that fails first.
-2. Create the branch and give it its identity:
+When Godot `4.N` becomes stable (or a pre-release should be tested):
 
-   ```bash
-   git switch -c godot-v4.8 master
-   ```
+1. Make `master` pass on it first: install the build, run the suites locally with `GODOT_PATH` set (editor, addon-export, running-game, scenario and export), and fix what fails in a way that keeps the older versions working (guard the call, make the answer field optional).
+2. In one commit: set `TESTED_MINOR` in `addons/godot_mcp/plugin.gd` to `N`; move the previous newest build into the `godot-versions` matrix of `.github/workflows/ci.yml`; set `.github/godot-version` to the new build (`4.N-stable`, later patches `4.N.1-stable`). `tests/version_sync_test.rs` checks that the three agree.
+3. List the version in `README.md`, `SECURITY.md` and `CONTRIBUTING.md` (the supported-versions text), and add a changelog line under the next release.
+4. A new patch release of a Godot minor version that is already supported is a change of the build in the matrix or in `.github/godot-version` only; run the suites before you commit it.
 
-   - `Cargo.toml` and `plugin.cfg`: drop `-dev`, keep the line: `0.6.0+godot.4.8`. The first release still takes its number in C step 3.
-   - `MIN_MAJOR`/`MIN_MINOR`, `config/features` and `.github/godot-version` already name 4.8; leave them.
-   - `CHANGELOG.md` on the branch stays as it is: the release notes live on `master`.
-   - Run `cargo build` and `cargo test --test version_sync_test`, then commit `chore(line): start the Godot 4.8 line`.
-3. Move `master` to the next Godot version, 4.9:
-   - Version `0.6.0-dev+godot.4.9`, `MIN_MINOR = 9`, `config/features` `"4.9"`, and `.github/godot-version` set to the newest 4.9 pre-release on <https://github.com/godotengine/godot-builds/releases>.
-   - If Godot has published no 4.9 pre-release yet, leave `master` on 4.8 and do this step when the first one appears.
-   - Calls that needed a `has_method()` guard only because of 4.8 can become direct calls on `master`.
-4. On `master`, add the line to `.github/lines` and update the line table: a row for the new line, the development row moved to 4.9. Change `.github/lines` and the three documents (`README.md`, `SECURITY.md`, `CONTRIBUTING.md`) in one commit, then carry the documents to every release line (procedure B).
-5. Run the C step 1 preflight on `godot-v4.8` with its build.
-6. Stop for approval to push `master` and `godot-v4.8`. After the push, the new line joins the next release through procedure C, with its own approval.
+## D. Drop the Oldest Godot Version
 
-## F. Retire a Line
+Only when the user explicitly decides to stop supporting a Godot minor version.
 
-Only when the user explicitly decides to retire a line.
-
-1. On `master`, remove the line from `.github/lines` (it is then not in the next release) and mark it retired in the line table of the three documents: no further fixes; upgrade Godot, or keep the line's last release. Commit, and carry the documents to every remaining line.
-2. Keep the branch, its tags and its releases. Delete nothing.
-3. Stop for approval to push.
-
-## G. Move a Line to a New Godot Patch Release
-
-When Godot publishes a patch for a line's version (`4.6.4-stable`), or a newer pre-release for `master`:
-
-1. On that line's branch, set `.github/godot-version` to the new build.
-2. Run the C step 1 preflight with the new build.
-3. If everything passes, commit `ci(line): test the Godot 4.6 line against 4.6.4-stable` and push after approval; no release is needed.
-4. If something fails, fix it through procedures A and B, then release through C.
+1. Raise `MIN_MINOR` in `addons/godot_mcp/plugin.gd`, set `config/features` in `project.godot` to the new oldest version, and remove its build from the `godot-versions` matrix of `.github/workflows/ci.yml` (`tests/version_sync_test.rs` checks the three). The calls that were guarded by `has_method()` only for it can become direct calls.
+2. Update the supported-versions text in `README.md`, `SECURITY.md` and `CONTRIBUTING.md`, and say it in the changelog under "Changed" of the next release: the last release that supports the dropped version stays available.
+3. Release it as a feature (a minor number).
 
 ## Rules
 
-- Never force-push, delete a tag or delete a release. A broken release is fixed forward with the next number.
-- The release tag is exactly `vX.Y.Z` and sits on a `master` commit; a line tag `vX.Y.Z+godot.M.N` sits on its line's release commit and is pushed before the release tag. The release workflow starts on `v[0-9]+.[0-9]+.[0-9]+` only (a filter pattern cannot contain `*+`), and `release-set.sh` enforces the rest.
-- A version with `-dev` is never released: `master` is not in `.github/lines`.
-- Keep files other than the identity files identical on every line, unless a Godot version forces a difference.
+- Never force-push, delete a tag or delete a release.
+- The release tag is exactly `vX.Y.Z` and sits on a `master` commit; `release-set.sh` enforces the rest. The release workflow starts on `v[0-9]+.[0-9]+.[0-9]+` only.
+- A version with `-dev` is never released.
 - Optional, after a release: refresh the git-ignored local `bin/` copy from `target/release` for local MCP client configs.

@@ -1,5 +1,5 @@
 //! The version the server reports: the manifest version, with the commit it was built from as
-//! SemVer build metadata (`0.13.0-dev+godot.4.8.g6295b51ab`).
+//! SemVer build metadata (`0.15.1-dev+g6295b51ab`).
 //!
 //! The manifest version only changes in a release commit, so two builds between releases would
 //! otherwise report the same number. The commit comes from `build.rs`; a build without git has

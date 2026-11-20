@@ -4,25 +4,24 @@ godot-mcp lets an AI assistant drive a live Godot editor, so a flaw in it can le
 
 ## Supported Versions
 
-Each godot-mcp release holds the files for every supported Godot minor version. Every supported Godot version has its own release line, kept on its own branch, and receives security fixes.
+Only the latest release receives security fixes. One release serves every supported Godot version.
 
-| Godot | Branch | Security fixes | Install |
-| --- | --- | --- | --- |
-| 4.7.x | `godot-v4.7` | Yes, in the next release | The files ending in `-godot4.7` of the latest release |
-| 4.6.x | `godot-v4.6` | Yes, in the next release | The files ending in `-godot4.6` of the latest release |
-| 4.5.x | `godot-v4.5` | Yes, in the next release | The files ending in `-godot4.5` of the latest release |
-| 4.8 (pre-release) | `master` | Fixed here first; no releases | Build from source |
-| 0.4.0 and older | — | No | The latest release |
+| Godot | Security fixes | Install |
+| --- | --- | --- |
+| 4.5 to 4.8 | Yes, in the next release | The files of the latest release |
+| Newer than 4.8 | The addon starts with a warning; fixes as above | The files of the latest release |
+| Older than 4.5 | No | — |
+| Releases 0.15.0 and older | No: update to the latest release | The latest release |
 
-- The files for Godot 4.6 end in `-godot4.6`, and the version they report contains `+godot.4.6`; a release build adds the commit it was built from after it (`0.13.0+godot.4.6.g1a2b3c4d5`).
-- To find the version you run, read `version=` in `addons/godot_mcp/plugin.cfg` of your project.
+- Releases 0.5.1 to 0.15.0 were built per Godot version, one release line on its own branch (`godot-v4.5`, `godot-v4.6`, `godot-v4.7`). Those branches and releases are kept as they are and get no further fixes.
+- To find the version you run, read `version=` in `addons/godot_mcp/plugin.cfg` of your project. A running server adds the commit it was built from after it (`0.16.1+g1a2b3c4d5`).
 
 ## Reporting a Vulnerability
 
 - Report it privately at <https://github.com/zeegzoog/godot-mcp/security/advisories/new>. Only the maintainers can see the report.
 - Do not report a vulnerability in a public issue, a pull request, or through the godot-mcp feedback tools (`godot_note_feedback`, `godot_draft_feedback`, `godot_submit_feedback`): their reports become public issues.
 - Include in the report:
-  - the godot-mcp version (for example `0.5.1+godot.4.6`), the Godot version and the operating system;
+  - the godot-mcp version (for example `0.16.0`), the Godot version and the operating system;
   - what an attacker can do, and what they need for it (network access, a local account, a crafted project, a crafted prompt);
   - the steps to reproduce it, and a proof of concept if you have one;
   - whether the problem is already known publicly.
@@ -33,7 +32,7 @@ What happens after you report:
 | --- | --- |
 | 7 days | We acknowledge the report. |
 | 14 days | We tell you whether we accept it and how severe we consider it. |
-| 90 days | A fix is released on every supported line it affects, or we agree on a disclosure date with you. |
+| 90 days | A fix is released, or we agree on a disclosure date with you. |
 
 - Disclosure is coordinated through a GitHub Security Advisory, published once the fixed releases are out.
 - You are credited in the advisory unless you ask not to be.
@@ -60,10 +59,9 @@ The security measures themselves are described in the [security document](docs/s
 
 ## How Fixes Are Released
 
-1. The fix lands first on the newest line it affects (`master`, when the development line is affected).
-2. It is carried to every older supported line it affects.
-3. The next release holds the fixed files of every affected line (and the unchanged files of the others); its notes list the fix under "Security".
-4. The advisory names the fixed release.
+1. The fix lands on `master`, with a test that fails without it, and is checked against every supported Godot version by CI.
+2. The next release holds it; its notes list the fix under "Security".
+3. The advisory names the fixed release.
 
 ## For AI Agents
 

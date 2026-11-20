@@ -4,6 +4,9 @@ on:
   push:
     branches: [master, "godot-v*"]
   pull_request:
+  # The carry workflow pushes with the repository token, whose pushes start no workflow, so it
+  # starts this one on the branch it made.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -91,3 +94,6 @@ jobs:
 
       - name: Played scenario
         run: cargo test --test scenario_e2e_test -- --ignored --test-threads=1
+
+      - name: Exports
+        run: cargo test --test export_e2e_test -- --ignored --test-threads=1

@@ -80,8 +80,11 @@ fi
 newest=${carry_list##* }
 short=${newest:0:9}
 
-# A subject goes into a code span, so it cannot ping anyone or pass for a marker.
-code() { printf '`%s`' "${1//\`/\'}"; }
+# A subject or a file name goes into a code span, so it cannot ping anyone or pass for a marker.
+code() {
+	local text=${1//\`/\'}
+	printf '`%s`' "${text//<!--/<! --}"
+}
 
 # <line> <reason> <sha>...: opens an issue that names the commits and the commands to run by hand.
 report_manual() {
@@ -139,9 +142,9 @@ pick_one() {
 					# The line deleted or never had the file: its change is not carried.
 					git -C "$dir" rm -q -f -- "$file"
 					dropped="$dropped
-- \`${file//\`/\'}\`"
+- $(code "$file")"
 				else
-					manual="$manual ${file}"
+					manual="$manual $(code "$file")"
 				fi
 				;;
 			esac

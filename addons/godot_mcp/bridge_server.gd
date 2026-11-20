@@ -598,8 +598,11 @@ func close_editor(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> vo
     var discard: bool = bool(params.get("discard", false))
     _track_open_scenes()
     var scenes: PackedStringArray = PackedStringArray()
-    for scene_path: String in EditorInterface.get_unsaved_scenes():
-        scenes.append(scene_path if not scene_path.is_empty() else "(a new scene that was never saved)")
+    # EditorInterface.get_unsaved_scenes() exists from Godot 4.7: older editors list only the
+    # open scenes whose tracked state shows unsaved changes (the loop below).
+    if EditorInterface.has_method("get_unsaved_scenes"):
+        for scene_path: String in EditorInterface.call("get_unsaved_scenes"):
+            scenes.append(scene_path if not scene_path.is_empty() else "(a new scene that was never saved)")
     for scene_path: String in EditorInterface.get_open_scenes():
         if not scenes.has(scene_path) and _has_unsaved_changes(scene_path):
             scenes.append(scene_path)
@@ -749,8 +752,15 @@ func _load_report(scene_path: String, dialogs_before: Dictionary) -> Dictionary:
     if not messages.is_empty():
         # The editor marks a scene it changed while loading as unsaved a frame later.
         await get_tree().process_frame
-    var unsaved: bool = EditorInterface.get_unsaved_scenes().has(scene_path)
-    var report: Dictionary = {"load_errors": messages.slice(0, MAX_LOAD_ERRORS), "unsaved": unsaved}
+    # EditorInterface.get_unsaved_scenes() exists from Godot 4.7: older editors cannot tell.
+    var unsaved_known: bool = EditorInterface.has_method("get_unsaved_scenes")
+    var unsaved: bool = false
+    if unsaved_known:
+        var unsaved_scenes: Variant = EditorInterface.call("get_unsaved_scenes")
+        unsaved = unsaved_scenes is PackedStringArray and (unsaved_scenes as PackedStringArray).has(scene_path)
+    var report: Dictionary = {"load_errors": messages.slice(0, MAX_LOAD_ERRORS)}
+    if unsaved_known:
+        report["unsaved"] = unsaved
     if messages.size() > MAX_LOAD_ERRORS:
         report["load_errors_total"] = messages.size()
     if not dialog_title.is_empty():
@@ -1505,8 +1515,10 @@ func get_run_status(peer: WebSocketPeer, cmd_id: String) -> void:
 func is_importable(res_path: String) -> bool:
     return res_path.get_extension().to_lower() in IMPORTED_EXTENSIONS or FileAccess.file_exists(res_path + ".import")
 
+## EditorFileSystem.is_importing() does not exist in Godot 4.5, so it is only called where it
+## is available. Calling it unguarded raises a script error that never sends a reply.
 func is_import_running(fs: EditorFileSystem) -> bool:
-    return fs.is_importing()
+    return fs.has_method("is_importing") and bool(fs.call("is_importing"))
 
 ## True when the editor's file system already has this file. reimport_files() on a path it
 ## has never scanned does not write a .import, and load() then fails.

@@ -3117,7 +3117,12 @@ async fn open_scene_returns_what_the_load_errors_dialog_shows() {
         .await
         .expect("open main");
     assert_eq!(clean["load_errors"], json!([]), "{clean}");
-    assert_eq!(clean["unsaved"], false, "{clean}");
+    assert!(
+        clean
+            .get("unsaved")
+            .is_none_or(|unsaved| unsaved.as_bool() == Some(false)),
+        "{clean}"
+    );
     assert!(clean.get("dialog").is_none(), "{clean}");
     assert!(clean.get("warning").is_none(), "{clean}");
 
@@ -3138,7 +3143,12 @@ async fn open_scene_returns_what_the_load_errors_dialog_shows() {
         "{clash}"
     );
     assert_eq!(clash["dialog"], "Load Errors", "{clash}");
-    assert_eq!(clash["unsaved"], true, "{clash}");
+    assert!(
+        clash
+            .get("unsaved")
+            .is_none_or(|unsaved| unsaved.as_bool() == Some(true)),
+        "{clash}"
+    );
     assert!(
         clash["warning"]
             .as_str()

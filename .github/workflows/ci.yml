@@ -91,3 +91,57 @@ jobs:
 
       - name: Played scenario
         run: cargo test --test scenario_e2e_test -- --ignored --test-threads=1
+
+  # One codebase for several Godot versions: the same sources, with only the identity files of a
+  # line changed, run against each older stable build. Godot 4.8 is the job above.
+  godot-versions:
+    name: Godot ${{ matrix.godot }} (this codebase)
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        godot: [4.5.2-stable, 4.6.3-stable, 4.7.2-stable]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Install Godot ${{ matrix.godot }}
+        env:
+          BUILD: ${{ matrix.godot }}
+        run: |
+          curl -fsSL -o godot.zip "https://github.com/godotengine/godot-builds/releases/download/${BUILD}/Godot_v${BUILD}_linux.x86_64.zip"
+          unzip -q godot.zip -d "$RUNNER_TEMP/godot"
+          chmod +x "$RUNNER_TEMP/godot/Godot_v${BUILD}_linux.x86_64"
+          echo "GODOT_PATH=$RUNNER_TEMP/godot/Godot_v${BUILD}_linux.x86_64" >> "$GITHUB_ENV"
+
+      # The addon refuses an editor older than MIN_MINOR, and the development project names the
+      # Godot version it was saved with: those two are what a line changes.
+      - name: Present the sources as this Godot version
+        env:
+          BUILD: ${{ matrix.godot }}
+        run: |
+          minor=$(echo "$BUILD" | cut -d. -f2)
+          sed -i "s/^const MIN_MINOR: int = .*/const MIN_MINOR: int = $minor/" addons/godot_mcp/plugin.gd
+          sed -i "s/^config\/features=.*/config\/features=PackedStringArray(\"4.$minor\")/" project.godot
+          git diff --stat
+
+      - name: Import the addon dev project
+        run: $GODOT_PATH --headless --path . --import
+
+      - name: End-to-end tests against a real editor
+        run: cargo test --test editor_e2e_test -- --ignored --test-threads=2
+
+      - name: The addon stays out of exported games
+        run: cargo test --test addon_export_test -- --ignored
+
+      - name: Running game
+        run: cargo test --test runtime_e2e_test -- --ignored --test-threads=1
+
+      - name: Played scenario
+        run: cargo test --test scenario_e2e_test -- --ignored --test-threads=1
+
+      - name: Exports
+        run: cargo test --test export_e2e_test -- --ignored --test-threads=1

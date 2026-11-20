@@ -68,7 +68,7 @@ A release covers every line in `.github/lines`. Work on the branches or on one w
    ```bash
    git status --porcelain                        # must print nothing
    git fetch origin --tags
-   for branch in master $(sed 's/^/godot-v/' .github/lines); do
+   for branch in master $(grep -E '^[0-9]' .github/lines | sed 's/^/godot-v/'); do
        tip=$(git rev-parse "origin/$branch")
        echo "$branch tip ${tip:0:7}: $(gh run list --branch "$branch" --workflow ci.yml -L 1 \
            --json headSha,status,conclusion --jq '.[0] | "\(.headSha[0:7]) \(.status) \(.conclusion)"')"

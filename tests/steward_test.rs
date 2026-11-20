@@ -1414,7 +1414,8 @@ fn carry_fixture() -> Option<CarryFixture> {
     );
     let notes = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\n";
     let spec = "s1\ns2\ns3\ns4\ns5\ns6\ns7\ns8\n";
-    write(&repo, ".github/lines", "4.7\n");
+    // The real file starts with a comment.
+    write(&repo, ".github/lines", "# Godot lines\n4.7\n");
     write(&repo, "a.txt", "one\n");
     write(&repo, "b.txt", "base\n");
     write(&repo, "c.txt", "c\n");

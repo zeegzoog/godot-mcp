@@ -46,7 +46,9 @@ if ! printf '%s' "$range" | grep -Eq '^[0-9a-f]{7,40}(\.\.[0-9a-f]{7,40})?$'; th
 	fail "usage: carry.sh <commit | from..to> [--dry-run] (a commit id or a range of commit ids)"
 fi
 [ -f .github/lines ] || fail ".github/lines is missing: run it from the repository root"
-lines=$(cat .github/lines)
+# The file starts with a comment; a line is a line of the form M.N.
+lines=$(grep -vE '^[[:space:]]*(#|$)' .github/lines || true)
+[ -n "$lines" ] || fail ".github/lines names no line"
 for line in $lines; do
 	[[ $line =~ ^[0-9]+\.[0-9]+$ ]] || fail "a line in .github/lines is not M.N: $line"
 done

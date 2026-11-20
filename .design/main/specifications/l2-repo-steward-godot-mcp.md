@@ -1,26 +1,26 @@
 # Repo Steward for godot-mcp
 
-**Version:** 1.0.3
+**Version:** 1.1.0
 **Status:** Stable
 **Layer:** implementation
 **Implements:** l1-repository-stewardship.md
 
 ## Overview
 
-How the portable `repo-steward` skill ([l2-repo-steward-skill.md](l2-repo-steward-skill.md)) is installed and configured in `zeegzoog/godot-mcp`: the profile values, the labels and the board, the priority examples, how fixes are routed to and carried between the Godot release lines, how the readiness notice speaks about the lines, the installed workflows, the issue forms and the pull request template, the changes to the contributor and agent guides, the tests that guard the safety properties, and the settings a maintainer makes by hand.
+How the portable `repo-steward` skill ([l2-repo-steward-skill.md](l2-repo-steward-skill.md)) is installed and configured in `zeegzoog/godot-mcp`: the profile values, the labels and the board, the priority examples, how fixes are routed to `master` and proven on every supported Godot version, what the readiness notice says, the installed workflows, the issue forms and the pull request template, the changes to the contributor and agent guides, the tests that guard the safety properties, and the settings a maintainer makes by hand.
 
 ## Related Specifications
 
 - [l1-repository-stewardship.md](l1-repository-stewardship.md) - Parent concept.
 - [l2-repo-steward-skill.md](l2-repo-steward-skill.md) - The skill this specification configures; every behaviour not named here is the skill's default.
-- [l2-release-branches.md](l2-release-branches.md) - Branch map, line tags, `.github/lines`, the uncarried-change check and the release procedures the steward follows and points to.
+- [l2-release-branches.md](l2-release-branches.md) - The supported range, the CI jobs and the release procedures the steward follows and points to.
 - [l2-community-health-files.md](l2-community-health-files.md) - The contributor guide section and the issue chooser this installation adds to.
 - [l2-test-suite.md](l2-test-suite.md) - Where the steward's tests live.
 - [l2-agent-feedback-rust.md](l2-agent-feedback-rust.md) - §5.7: the fingerprint that agent reports carry.
 
 ## 1. Motivation
 
-The skill is generic by design; this repository has facts it must be told: four lines released together from four branches, a planning engine that exists only on the maintainer's machine, agent reports with a fingerprint, a contributor guide that already fixes routing, checks and conventions, and a backlog of outside pull requests waiting on run approvals. This specification records those facts once, so the profile, the workflows and the guides agree.
+The skill is generic by design; this repository has facts it must be told: one codebase on `master` serving every supported Godot version and released from there (until 2026-11-20 it was four lines from four branches, now retired), a planning engine that exists only on the maintainer's machine, agent reports with a fingerprint, a contributor guide that already fixes routing, checks and conventions, and a backlog of outside pull requests waiting on run approvals. This specification records those facts once, so the profile, the workflows and the guides agree.
 
 ## 2. Constraints & Assumptions
 
@@ -34,9 +34,9 @@ The skill is generic by design; this repository has facts it must be told: four 
 - The planning engine (`.magic/`, the `magic.*` workflow files) is git-ignored, while `.design/` is committed: on a CI runner the ecosystem is used but not available, so unattended runs make no code change (ST-7).
 - Every skill directory is git-ignored except listed exceptions. The rule must name the directory's contents (`/.*/skills/*`): with `/.*/skills/` git excludes the directory itself and no `!` exception can re-include a skill (found while installing; the release skill was tracked only because it had been added by force).
 - Blank issues stay enabled: the agent feedback link opens `issues/new` with a title and a body only, and an issue chooser that forces a form would drop them.
-- The release skill requires a person's approval for every push or tag it makes, so carrying a change to a release line is queued for approval.
+- The release skill requires a person's approval before it pushes a release tag (DS-7), so the steward never releases; it only reports readiness.
 - **Assumption (forecast):** the board is public, owned by the organization and named "godot-mcp issues and pull requests", because the issues it shows are public anyway and contributors can then see where their item stands. Runner-up: a private board. Override: `board.public: false` in `.github/steward.yml`.
-- [DR] Merge method squash, with a Conventional Commit subject: it keeps the history linear as it has been, and one pull request becomes one carryable commit for `git cherry-pick -x`.
+- [DR] Merge method squash, with a Conventional Commit subject: it keeps the history linear as it has been, and one pull request becomes one commit whose subject the readiness script classifies.
 
 ## 4. Invariant Compliance
 
@@ -48,17 +48,17 @@ The skill is generic by design; this repository has facts it must be told: four 
 | ST-4 Every open item triaged | Fingerprint pattern `gmfb[0-9a-f]{12}` (the report line `Fingerprint: …`); priority examples in §5.4; the bug form (§5.8) asks for the godot-mcp version, the Godot version, the OS and the MCP client. An agent report is typed by the kind in its title when the title has one (`bug`, `missing_feature` → `enhancement`, `improvement` → `enhancement`, `docs` → `documentation`), otherwise by its content, and keeps its `agent-feedback` label. |
 | ST-5 Security reports kept private | The redirect links `SECURITY.md` and `https://github.com/zeegzoog/godot-mcp/security/advisories/new`. |
 | ST-6 Pulled in priority order under a WIP limit | WIP In Progress 2, In Review 3. |
-| ST-7 Changes made the project's way | `planning.ecosystem` stays `auto`; detection finds the `magic-spec` adapter (planning directory committed, engine installed locally), so an accepted item goes to `/magic.spec` as raw input with its link, and `/magic.task` and `/magic.run` follow; its planning path is also what readiness ignores. Planning commits are separate from product commits. With the planning files removed from the repository the profile stays valid and the steward falls back to plan messages. Fix branch from the branch `CONTRIBUTING.md` routes to (usually `master`); the verification of `CONTRIBUTING.md` § Verification, including the editor tests with the line's Godot build whenever `addons/godot_mcp/` changes. Carrying: §5.5. |
-| ST-8 Independent review before merge | Skill default; the reviewer also checks the completion checklist of `AGENTS.md`. Checks green means every job of `ci.yml` (three Rust jobs and the Godot job) finished successfully on the head commit. |
-| ST-9 Change requests decided on their merits | Review checklist adds: the target branch per the decision table of `CONTRIBUTING.md`; no change to version strings or `CHANGELOG.md` sections; no reference to `.design/`, task ids or specification names in product files; a pull request that adds tools maps to the roadmap concepts it implements, and while those concepts are parked on undecided questions, accepting it is a maintainer decision. A pull request opened before the line split targets an outdated `master`: it is updated, or its author is asked to rebase. |
+| ST-7 Changes made the project's way | `planning.ecosystem` stays `auto`; detection finds the `magic-spec` adapter (planning directory committed, engine installed locally), so an accepted item goes to `/magic.spec` as raw input with its link, and `/magic.task` and `/magic.run` follow; its planning path is also what readiness ignores. Planning commits are separate from product commits. With the planning files removed from the repository the profile stays valid and the steward falls back to plan messages. Fix branch from `master`; the verification of `CONTRIBUTING.md` § Verification, including the editor tests with the Godot build of `.github/godot-version` whenever `addons/godot_mcp/` changes (CI runs the older supported versions). Routing: §5.5. |
+| ST-8 Independent review before merge | Skill default; the reviewer also checks the completion checklist of `AGENTS.md`. Checks green means every job of `ci.yml` (three Rust jobs, the Godot job and one job per older supported Godot version) finished successfully on the head commit. |
+| ST-9 Change requests decided on their merits | Review checklist adds: the target is `master` and the change works on every supported Godot version (`CONTRIBUTING.md` § Branch and Godot Versions); no change to version strings or `CHANGELOG.md` sections; no reference to `.design/`, task ids or specification names in product files; a pull request that adds tools maps to the roadmap concepts it implements, and while those concepts are parked on undecided questions, accepting it is a maintainer decision. A pull request that targets a retired `godot-v*` branch is retargeted to `master` or its author is asked to do it. |
 | ST-10 Autonomy by action class | Skill defaults (§5.2): `merge_external: approval`. The maintainer of record approves in an attended run or with `/steward approve` on the item. |
 | ST-11 Disclosed, brief, businesslike voice | Language English, the language `CONTRIBUTING.md` prescribes for code, commit messages and documentation. |
-| ST-12 Closure states the outcome | A fix merged to `master` closes its issue as completed through its closing keyword; the fixed message says it ships in the next release, which contains every Godot line. A fix that exists only on a `godot-v*` branch is closed by the steward, since closing keywords act only on `master`. The released message names the release `vX.Y.Z` and the files ending in `-godotM.N` for the reporter's Godot version. |
+| ST-12 Closure states the outcome | A fix merged to `master` closes its issue as completed through its closing keyword; the fixed message says it ships in the next release, which serves every supported Godot version. No fix is made on a retired `godot-v*` branch. The released message names the release `vX.Y.Z`. |
 | ST-13 Conversation answered, disputes handed over | Skill defaults. |
 | ST-14 Idempotent, bounded, loop-free | Skill defaults; allowed bots: `dependabot[bot]` (configured in `.github/dependabot.yml`: weekly updates of the workflow actions and the Cargo dependencies, a release 14 days old before it is proposed). |
-| ST-15 One flow board, explicit policies | Board "godot-mcp issues and pull requests" owned by `zeegzoog`, public, linked to the repository; extra text field `Lines` (the Godot lines an item affects, for example `4.8 4.7 4.6`). |
+| ST-15 One flow board, explicit policies | Board "godot-mcp issues and pull requests" owned by `zeegzoog`, public, linked to the repository; extra text field `Lines` (the Godot versions an item affects, for example `4.5 4.6`; empty means all of them; the field kept its name from the time of the release lines). |
 | ST-16 Maintainer decisions win | Skill defaults. |
-| ST-17 Readiness notice, never a release | §5.6. The notice points to the release skill, procedure C; DS-7 keeps every tag behind a person's approval. |
+| ST-17 Readiness notice, never a release | §5.6. The notice points to the release skill, procedure B; DS-7 keeps every tag behind a person's approval. |
 | ST-18 Accountable runs | Skill defaults; the first run after installation is a report run (§6). |
 
 ## 5. Detailed Design
@@ -94,12 +94,11 @@ Keys that differ from the skill defaults:
 | `triage.priority_examples` | `.github/steward-priorities.md` |
 | `review.sensitive_paths` | `.github/ build.rs .cargo/` |
 | `limits.allowed_bots` | `dependabot[bot]` |
-| `release.procedure` | `.agents/skills/release/SKILL.md, procedure C` |
-| `release.skip_subjects` | `chore(release) chore(line)` |
-| `release.targets_file` | `.github/lines` |
-| `release.target_branch` | `godot-v{t}` |
-| `release.target_tag` | `v{version}+godot.{t}` |
-| `release.target_build_file` | `.github/godot-version` |
+| `release.procedure` | `.agents/skills/release/SKILL.md, procedure B` |
+| `release.skip_subjects` | `chore(release)` |
+| `release.target_branch` | `godot-v{t}` (left in place; without a targets file the skill reads no release targets, so it is unused) |
+
+No `release.targets_file`, `release.target_tag` or `release.target_build_file` is set: a release is one build made from `master`, so the readiness notice has no per-target section.
 
 ### 5.3 Labels Added
 
@@ -110,46 +109,35 @@ Keys that differ from the skill defaults:
 | Priority | godot-mcp examples |
 | --- | --- |
 | P0 | the editor bridge accepts a command without its token or from another machine; a tool writes or reads outside the project; a release file is missing or does not start; CI fails on `master` or a `godot-v*` branch |
-| P1 | a tool always fails on a supported Godot line; an editor mutation cannot be undone; the server hangs a client session |
+| P1 | a tool always fails on a supported Godot version; an editor mutation cannot be undone; the server hangs a client session |
 | P2 | a stale result until the editor restarts (issue #1); an error message without a recovery step; a requested tool that fits the roadmap |
 | P3 | wording of a message or the documentation; questions about usage |
 
-### 5.5 Routing and Carrying
+### 5.5 Routing
 
 ```mermaid
 graph TD
-    A[Item accepted] --> B[Branch per CONTRIBUTING.md decision table]
-    B --> C[Fix with its test, plan through magic-spec]
-    C --> D[Pull request, checks green, independent review]
-    D --> E[Merge with squash]
-    E --> F[Release skill procedure A: run the test on each line]
-    F --> G[Write the affected lines to the board field Lines]
-    G --> H{Older lines affected?}
-    H -->|yes| I[Queue carrying for approval: release skill procedure B]
-    H -->|no| J[Done]
-    I --> J
+    A[Item accepted] --> B[Fix on master with its test, plan through magic-spec]
+    B --> C[Pull request to master, CI green on every supported Godot version, independent review]
+    C --> D[Merge with squash]
+    D --> E[Write the affected Godot versions to the board field Lines]
+    E --> F[Done: the next release serves every supported version]
 ```
 
-The approval for carrying lists every line and the commit to carry, in one consent question in an attended run, or as `status: needs-maintainer` with the list in the run report of an unattended one. RL-7 is still checked by the release procedure itself; the steward's record makes that check short.
+Nothing is carried to another branch. When CI fails on one Godot version only, the pull request is changed until it passes everywhere, and its test names the version when the behaviour really differs (`CONTRIBUTING.md` § Branch and Godot Versions).
 
-### 5.6 Readiness for the Godot Lines
+### 5.6 Readiness Notice
 
-`readiness.sh` with the profile of §5.2 reads the lines from `.github/lines` on `master` (4.5, 4.6 and 4.7 on 2026-10-20), the branch `godot-vM.N` and the Godot build from that branch's `.github/godot-version`, and the line's own commits since its line tag `vX.Y.Z+godot.M.N`. `master` is the development line and is not a target. The last release is the highest plain tag `vX.Y.Z` (v0.5.1).
+`readiness.sh` with the profile of §5.2 counts the commits of `master` since the highest plain tag `vX.Y.Z` (v0.15.0 on 2026-11-20), ignoring release bookkeeping (`chore(release)`) and the planning paths. The profile sets no release targets, so the notice has no per-target section.
 
 ```plaintext
 [REFERENCE] notice body, state due
-Recommendation  A release is due: v0.6.0 (minor) — 1 feature, 2 fixes; the oldest change is 23 days old.
+Recommendation  A release is due: v0.16.0 (minor) — 1 feature, 2 fixes; the oldest change is 23 days old.
 User-facing changes
   feat(tools): reload an open scene when its file changes (#2, closes #1)
   ...
-Release targets  every release contains every line
-  Godot 4.7  godot-v4.7  verified against 4.7.2-stable  own changes: none
-  Godot 4.6  godot-v4.6  verified against 4.6.3-stable  own changes: fix(bridge): ... (abc1234)
-  Godot 4.5  godot-v4.5  verified against 4.5.2-stable  own changes: none
-  Godot 4.8 (development, master) is not released.
-How to release   Ask your agent to "release v0.6.0" (.agents/skills/release/SKILL.md, procedure C).
-                 It runs the checks on every line with that line's Godot build, lists the changes not
-                 carried to each line, and stops for your approval before any tag is pushed.
+How to release   Ask your agent to release v0.16.0, following .agents/skills/release/SKILL.md, procedure B.
+                 The procedure checks every target, and a person approves every tag before it is pushed.
 Not counted      5 internal commits (docs, ci, test, refactor)
 ```
 
@@ -163,7 +151,7 @@ The three templates of the skill with the profile values. `steward-agent.yml` ad
 | --- | --- |
 | `bug_report.yml` (label `bug`) | godot-mcp version (from `plugin.cfg`), Godot version, operating system, MCP client, steps, expected, actual, server log (optional, `RUST_LOG=godot_mcp=debug`); a reminder that vulnerabilities go to `SECURITY.md` |
 | `feature_request.yml` (label `enhancement`) | the problem, the proposed behaviour, alternatives, which Godot versions it concerns |
-| `PULL_REQUEST_TEMPLATE.md` | what changed and why; which Godot lines it affects and how that was checked; the checks of § Verification that were run; `Fixes #` line |
+| `PULL_REQUEST_TEMPLATE.md` | what changed and why; which Godot versions it affects and how that was checked; the checks of § Verification that were run; `Fixes #` line |
 
 Forms only add choices: blank issues and the agent feedback template stay.
 
@@ -179,7 +167,8 @@ Forms only add choices: blank issues and the agent feedback template stay.
 
 | Test | Proves |
 | --- | --- |
-| readiness on a fixture repository | `readiness.sh` classifies Conventional Commits, ignores release commits and commits that touch only `release.ignore_paths` (the fixture sets its own path), computes state and version, and lists the targets with their builds |
+| readiness on a fixture repository | `readiness.sh` classifies Conventional Commits, ignores release commits and commits that touch only `release.ignore_paths` (the fixture sets its own path), computes state and version, and lists the targets with their builds (the skill's own feature; this repository sets no targets) |
+| a release tag must sit on master with the version and the notes | `release-set.sh` on a throwaway repository accepts a plain tag on `master` whose manifests say the version and whose changelog has the section, and refuses a tag elsewhere, a different manifest version, a missing section and a tag that is not `vX.Y.Z` |
 | stale workflow and profile agree | the label the reminder workflow watches equals the profile's needs-info label |
 | agent workflow least privilege | `steward-agent.yml` is gated on `vars.STEWARD_AGENT`, has no `contents: write`, no `pull_request_target`, and no checkout of a pull request ref |
 | no event trigger for the agent | `steward-agent.yml` triggers only on `schedule` and `workflow_dispatch` |
@@ -199,11 +188,11 @@ Forms only add choices: blank issues and the agent feedback template stay.
 | Column limits on the Flow view: In Progress 2, In Review 3 | Project → Flow → column menu → Set limit |
 | Built-in workflows: Item closed → Done; Pull request merged → Done; Item reopened → Triage; Auto-archive closed items after 14 days | Project → ⋯ → Workflows |
 | Automatically delete head branches | Settings → General → Pull Requests |
-| Ruleset for `master`: block force pushes and deletion; require the checks `Rust (ubuntu-24.04)`, `Rust (windows-latest)`, `Rust (macos-latest)`, `Godot addon (headless editor)` for pull requests; maintainers may bypass, because release commits are pushed directly | Settings → Rules → Rulesets |
+| Ruleset for `master`: block force pushes and deletion; require the checks `Rust (ubuntu-24.04)`, `Rust (windows-latest)`, `Rust (macos-latest)`, `Godot addon (headless editor)` and one `Godot <build>` job per older supported version (`Godot 4.5.2-stable`, `Godot 4.6.3-stable`, `Godot 4.7.2-stable`) for pull requests; maintainers may bypass, because release commits are pushed directly | Settings → Rules → Rulesets |
 | Unattended AI run (optional): secret `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`, variable `STEWARD_AGENT=on`; optional `STEWARD_PROJECT_TOKEN` for board updates from CI | Settings → Secrets and variables → Actions |
 | Keep "Require approval for first-time contributors" for fork runs; the steward approves runs outside the sensitive paths | Settings → Actions → General |
 
-The branch protection for `godot-v*` stays as [l2-release-branches.md](l2-release-branches.md) §5.8 defines it.
+The branch protection for the retired `godot-v*` branches stays as [l2-release-branches.md](l2-release-branches.md) §5.8 defines it.
 
 ## 6. Implementation Notes
 
@@ -215,8 +204,7 @@ The branch protection for `godot-v*` stays as [l2-release-branches.md](l2-releas
 
 ## 7. Drawbacks & Alternatives
 
-- **Carrying without approval:** faster lines, but the release skill's push rule would then have two meanings; queued carrying keeps one rule.
-- **A `line:` label per Godot line:** filterable, but every cut and retirement would edit labels on many items; the `Lines` board field carries the same fact without label churn (as [l2-release-branches.md](l2-release-branches.md) §7 rejected per-line labels for carrying).
+- **A label per Godot version:** filterable, but every change of the supported range would edit labels on many items; the `Lines` board field carries the same fact without label churn.
 - **Disabling blank issues to force the forms:** cleaner reports, but breaks the agent feedback link; rejected.
 - **Running the unattended agent on every push:** fresher board, but the cost grows with commit volume; daily is enough for a single-maintainer project.
 
@@ -226,9 +214,9 @@ The branch protection for `godot-v*` stays as [l2-release-branches.md](l2-releas
 | --- | --- | --- |
 | `[CONTRIBUTING]` | `CONTRIBUTING.md` | Routing, checks, conventions; gains the handling section |
 | `[AGENTS]` | `AGENTS.md` | Standards and completion checklist; gains the skill pointer |
-| `[LINES]` | `.github/lines` | Lines every release contains |
-| `[LINE]` | `.github/godot-version` | Godot build per line, read from each branch |
-| `[RELEASE-SKILL]` | `.agents/skills/release/SKILL.md` | Procedures A, B and C the steward follows or points to |
+| `[ENGINE]` | `.github/godot-version` | Godot build of the newest tested version, the main CI editor job |
+| `[RELEASE-SET]` | `.github/scripts/release-set.sh` | The release checks the steward's tests drive |
+| `[RELEASE-SKILL]` | `.agents/skills/release/SKILL.md` | Procedure B (release) the steward points to, and A (land a change) it follows |
 | `[CI]` | `.github/workflows/ci.yml` | The checks a merge waits for |
 | `[CHOOSER]` | `.github/ISSUE_TEMPLATE/config.yml` | Issue chooser kept with blank issues enabled |
 | `[IGNORE]` | `.gitignore` | Skill directory exception |
@@ -250,3 +238,4 @@ The branch protection for `godot-v*` stays as [l2-release-branches.md](l2-releas
 | 1.0.1 | 2026-10-20 | Agent (magic.run) | [MODIFIED] The skills ignore rule names the directory contents so that exceptions work, and the exception names only the canonical copy so a local agent link stays ignored; the `AGENTS.md` pointer sits in its introduction. |
 | 1.0.2 | 2026-10-20 | Agent (magic.run) | [ADDED] Seven tests for the hardened agent workflow, the message checks, the board queue and the script arguments. |
 | 1.0.3 | 2026-11-05 | Agent (magic.spec) | The profile, the priorities file, the three workflows, the issue forms, the pull request template and the dependency configuration are in Canonical References. ST-14 no longer says that no dependency bot is configured: `.github/dependabot.yml` configures one. |
+| 1.1.0 | 2026-11-20 | Agent (magic.spec) | Modified for one build serving every supported Godot version: profile values (`release.procedure` is procedure B, `release.skip_subjects` is `chore(release)`, no targets file, tag pattern or build file), routing without carrying, a readiness notice without a per-target section, the board field `Lines` holding Godot versions, review and closure wording (target `master`, no fix on a retired branch), the required checks include the `godot-versions` jobs, a test row for `release-set.sh`, canonical references. Known drift left to the product files: `.github/steward-priorities.md` and `.github/PULL_REQUEST_TEMPLATE.md` still say "Godot line". Stable → RFC by the parent's amendment (C12) → Stable after Post-Update Review. |

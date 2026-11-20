@@ -1,6 +1,6 @@
 # Game Runtime Channel
 
-**Version:** 1.14.0
+**Version:** 1.14.1
 **Status:** Stable
 **Layer:** implementation
 **Implements:** l1-runtime-observability.md
@@ -108,7 +108,7 @@ A click on a node uses the node's transform with its canvas, so a scrolling came
 ## 6. Implementation Notes
 
 - Accepted risk: the debugger port accepts the first local connection without authentication. The port is random, bound to loopback and closed to further connections once the game connects; a web page cannot use it (a browser's request is not a Variant frame and is refused as oversized). Another process of the same user could connect first, but such a process can already read the bridge token and the project. Another user on a shared machine could, in theory, connect first and feed the agent false state; checking the peer's process would need a different mechanism on each operating system, and the game's own handshake carries nothing to check, so this is left as it is.
-- The runtime uses only the engine API of the line's first release, and the editor tests run it on every line's Godot build.
+- The runtime uses only the engine API of the first release of the oldest supported Godot version, and the editor tests run it on every supported Godot build in CI.
 
 ## 7. Drawbacks & Alternatives
 
@@ -154,3 +154,4 @@ A click on a node uses the node's transform with its canvas, so a scrolling came
 | 1.12.0 | 2026-11-09 | Agent (magic.spec) | [MODIFIED] RO-3: the ended-run record (`signal`, `how_ended`, `last_stderr`), the watch while a call waits, the report of an ended run in place of the bridge error, the byte-wise pipe readers and what a timeout ended. Source: pull requests 130 and 131. Stable → RFC → Stable after Post-Update Review. |
 | 1.13.0 | 2026-11-12 | Agent (magic.spec) | RO-4: runs of one project share `override.cfg` through leases and a cross-process lock, and only the last live lease puts the user's file back; a lease of a dead server is dropped; a crash's marker file is still replaced on the next run. Source: pull request 146. Stable → RFC → Stable after Post-Update Review. |
 | 1.14.0 | 2026-11-19 | Agent (magic.spec) | [ADDED] Movie Maker recordings of a managed run: `src/godot/movie.rs` builds the engine options before `--` (`--write-movie`, `--fixed-fps`, `--quit-after`) from a path checked by `resolve_in_project` or inside `GODOT_MCP_MOVIE_DIR`, and reports the file in the run status; a stop asks the game to quit through the runtime's `run.end` (waiting up to 20 s) before it kills, so an `.avi` gets its frame count; an earlier recording is replaced only with `overwrite`. Not with `held` or `headless`. Source: pull request 160. Stable → RFC → Stable after Post-Update Review. |
+| 1.14.1 | 2026-11-20 | Agent (magic.spec) | The API floor is the first release of the oldest supported Godot version and the tests run on every supported build (one build serves 4.5 to 4.8). No requirement changed. |

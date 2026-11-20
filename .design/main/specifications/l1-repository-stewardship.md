@@ -1,6 +1,6 @@
 # Issue & Pull Request Stewardship
 
-**Version:** 1.0.1
+**Version:** 1.0.2
 **Status:** Stable
 **Layer:** concept
 
@@ -12,7 +12,7 @@ Defines the steward: an AI agent that keeps a project's issue tracker and change
 
 - [l1-community-health.md](l1-community-health.md) - CH-2: the private channel security reports are sent to; CH-5: the contributor guide tells contributors how their items are handled.
 - [l1-agent-feedback.md](l1-agent-feedback.md) - FB-7: reports filed by agents carry a fingerprint the steward matches duplicates by.
-- [l1-release-lines.md](l1-release-lines.md) - RL-6 to RL-8: release targets, carrying a change between lines and the release procedure the readiness notice points to.
+- [l1-release-lines.md](l1-release-lines.md) - RL-6 to RL-8: the portable change, verification on every supported Godot version and the release procedure the readiness notice points to.
 - [l1-distribution.md](l1-distribution.md) - DS-7: only a person approves publishing a release.
 - [l1-quality-assurance.md](l1-quality-assurance.md) - The checks a change passes before the steward merges it.
 - [l2-repo-steward-skill.md](l2-repo-steward-skill.md) - Implementation: the portable agent skill on GitHub.
@@ -220,3 +220,4 @@ The recommended number follows Semantic Versioning: a breaking change bumps the 
 | --- | --- | --- | --- |
 | 1.0.0 | 2026-10-20 | Agent (magic.spec) | Created from the request for a reusable skill and CI that triage, plan, fix, answer and close issues, review and merge pull requests, keep a Kanban board and announce when a release is due, using the project's planning ecosystem. Promoted to Stable after Post-Update Review. |
 | 1.0.1 | 2026-10-21 | Agent (magic.spec) | Linked the procedures specification split from the skill specification. No requirement changed. |
+| 1.0.2 | 2026-11-20 | Agent (magic.spec) | The link to the release concept describes its new subject (one build for every supported Godot version) instead of carrying between lines. No requirement changed; the concept stays portable to projects with several release targets. |

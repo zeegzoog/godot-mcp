@@ -1,6 +1,6 @@
 # Held Stepping
 
-**Version:** 1.3.0
+**Version:** 1.3.1
 **Status:** Stable
 **Layer:** implementation
 **Implements:** l1-controlled-time.md
@@ -14,7 +14,7 @@ How the server and the in-game runtime hold a running Godot game at the start of
 - [l1-controlled-time.md](l1-controlled-time.md) - Parent concept.
 - [l2-game-runtime.md](l2-game-runtime.md) - The channel, the runtime autoload, its jobs and the existing pause-based physics step this builds on.
 - [l2-tool-handlers.md](l2-tool-handlers.md) - How the extended tool arguments are validated and routed.
-- [l2-release-branches.md](l2-release-branches.md) - Carrying the change to every line and the API guards per line.
+- [l2-release-branches.md](l2-release-branches.md) - The supported Godot versions and the version-dependent forms this change does not need.
 
 ## 1. Motivation
 
@@ -23,7 +23,7 @@ The runtime already steps physics by pausing the tree, which leaves idle frames,
 ## 2. Constraints & Assumptions
 
 - Requests reach the runtime as `mcp:request` debugger messages, dispatched by the engine's debugger poll, which normally runs once per main-loop iteration. A hold blocks that iteration, so the hold loop must drive the poll itself.
-- Engine facts checked in the 4.5-stable sources: `EngineDebugger.line_poll()` is bound to scripts and fails without an active debugger; it runs a full non-idle poll (flush of queued outgoing messages, then dispatch of every received message to its capture, `mcp` included) on one call in 2048. The line's first release has it, so no `has_method()` guard is needed on any line.
+- Engine facts checked in the 4.5-stable sources: `EngineDebugger.line_poll()` is bound to scripts and fails without an active debugger; it runs a full non-idle poll (flush of queued outgoing messages, then dispatch of every received message to its capture, `mcp` included) on one call in 2048. The first release of the oldest supported version (4.5.0) has it, so no `has_method()` guard is needed.
 - Verified on Godot 4.8-beta1 by the first end-to-end tests: the tree's `physics_frame` signal is emitted at the start of each physics iteration, before any node's `_physics_process`, also while the tree is paused; a window close request reaches the runtime node as `NOTIFICATION_WM_CLOSE_REQUEST` from `DisplayServer.process_events()` called inside the hold (Windows, `CloseMainWindow`).
 - Measured: `EngineDebugger.is_active()` stays true after the debugger peer closes its socket (a plain TCP listener destroyed the connection and the game still reported active for the next five seconds), and the script API has no other check of the peer. The game cannot learn that the server is gone.
 - Godot exposes no getter for the `--fixed-fps` it was started with, so the server declares it to the runtime with a user argument it writes itself.
@@ -118,9 +118,9 @@ The step decision is the counter of the parent concept (its §4.2). The loop wai
 - A held launch adds `--fixed-fps R` to the engine arguments, where R is `physics/common/physics_ticks_per_second` read from the project (60 when unset), and after `--` the user arguments `--godot-mcp-fixed-fps=R` and `--godot-mcp-hold`. Both values are written by the server as integers; no caller string reaches the command line (TL-5).
 - `deterministic_reason` is one of `not_started_held`, `fixed_rate_differs` (the game changed its tick rate, or the project file disagreed with the engine), `frames_did_not_follow_ticks` (revoked after a step), or empty when exact.
 
-### 5.7 Release Lines
+### 5.7 Supported Godot Versions
 
-The change is a new capability, so it lands on `master` and is carried to every supported line, newest to oldest. Every engine call it uses exists in 4.5.0 (§2), so the carried copies need no guard; each line's end-to-end run proves it with that line's Godot build.
+The change lands on `master` like every other change. Every engine call it uses exists in 4.5.0 (§2), so it needs no guard; CI runs its end-to-end tests with every supported Godot build.
 
 ### 5.8 Scenario
 
@@ -179,3 +179,4 @@ Tests: `runtime_e2e_test.rs` for every row above and for `deterministic` on a he
 | 1.2.1 | 2026-11-02 | Agent (magic.spec) | Added the scenario guide `docs/game-checks.md` to Canonical References; ventilation found it unnamed. No requirement changed. |
 | 1.2.2 | 2026-11-05 | Agent (magic.spec) | Canonical References: the two paths of `[GAME]` are two rows, so each is read as a path. No requirement changed. Removed the `[ADDED]` and `[MODIFIED]` markers from the body: the history rows carry what changed. No requirement changed. |
 | 1.3.0 | 2026-11-05 | Agent (magic.spec) | [ADDED] `game.run_script` served while held, as a held step that lasts until the function returns. Stable → RFC → Stable after Post-Update Review. |
+| 1.3.1 | 2026-11-20 | Agent (magic.spec) | §5.7 and the related-specification note speak of the supported Godot versions instead of carrying to release lines (one build now serves 4.5 to 4.8); the engine call needs no guard on any of them. No requirement changed. |

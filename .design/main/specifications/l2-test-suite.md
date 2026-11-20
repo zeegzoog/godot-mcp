@@ -1,6 +1,6 @@
 # Test Suite
 
-**Version:** 1.7.2
+**Version:** 1.8.0
 **Status:** Stable
 **Layer:** implementation
 **Implements:** l1-quality-assurance.md
@@ -13,7 +13,7 @@ The Cargo test suite and the contributor verification checklist: which test file
 
 - [l1-quality-assurance.md](l1-quality-assurance.md) - Parent concept.
 - [l2-ci-release-pipeline.md](l2-ci-release-pipeline.md) - Where the suite runs automatically.
-- [l2-release-branches.md](l2-release-branches.md) - The line identity files the version sync test checks.
+- [l2-release-branches.md](l2-release-branches.md) - The files that declare the supported Godot versions, which the version sync test checks.
 
 ## 1. Motivation
 
@@ -24,7 +24,7 @@ Tells a contributor where a new test belongs and which environment variables the
 - Opt-in tests are marked ignored and read `GODOT_PATH` (and, on Windows, `GODOT_CONSOLE_PATH`, whose console binary is used to start the editor so its log can be shown on failure). A `.env` file fills in only variables that were not exported, so testing a specific Godot version means exporting both.
 - A `.env` with double-quoted Windows paths does not load; export the variables instead.
 - Editor end-to-end tests run with `--test-threads=2` in CI. Locally every ignored suite runs with `--test-threads=1`: windowed and process-heavy tests interfere in parallel.
-- CI runs the editor, addon export, runtime and scenario suites; the export suite runs locally when its area changes.
+- CI runs the editor, addon export, runtime, scenario and export suites on every supported Godot version.
 
 ## 4. Invariant Compliance
 
@@ -32,11 +32,11 @@ Tells a contributor where a new test belongs and which environment variables the
 | --- | --- |
 | QA-1 Test first | Contributor guide requires a failing test in the matching file before implementation; the 2026-10-14 remediation followed red → green → mutation check. |
 | QA-2 Full pipeline before commit | Contributor checklist: `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-targets`, `godot --headless --check-only` for each addon script (after one `--import`). |
-| QA-3 Editor changes on a real editor | `editor_e2e_test` and `addon_export_test` (ignored by default) are mandatory when the addon changes (and `runtime_e2e_test` when the runtime component or the game and language-server tools change), on every branch the change lands on, with the Godot build named in that branch's `.github/godot-version`. `export_e2e_test` is mandatory when the export tools or the headless runner change; it also holds the headless import parameter tests. |
+| QA-3 Editor changes on a real editor | `editor_e2e_test` and `addon_export_test` (ignored by default) are mandatory when the addon changes (and `runtime_e2e_test` when the runtime component or the game and language-server tools change), before the commit with the Godot build named in `.github/godot-version` (the newest tested version), and in CI on every older supported version too. `export_e2e_test` is mandatory when the export tools or the headless runner change; it also holds the headless import parameter tests. |
 | QA-4 Real dependencies opt-in | `tests/common/mod.rs` provides `MockBridge` (scriptable WebSocket editor), `fake_godot` (prints to stdout/stderr), `sleeping_godot` (stays alive), `project_dir`, `free_port`, `fake_gh` / `FakeGh` (a scripted stand-in for the GitHub client, built from `examples/fake_gh.rs`), and a `Session` that drives the real server binary over stdio. |
 | QA-5 Guards proven | Guard tests: loopback + token (`bridge_is_loopback_only_and_requires_the_token`), stdout purity (`cli_fallback_keeps_stdout_clean`), path confinement and injection (`tools_test.rs`, `paths.rs` unit tests incl. a Unix symlink test), detachment (`detach_test.rs`, process-group unit test), undo fidelity and scene confinement (e2e). |
-| QA-6 Every platform, every push | `ci.yml` runs on pushes to `master` and `godot-v*` and on pull requests: matrix on ubuntu-24.04, windows-latest, macos-latest plus a Linux Godot job with the build from `.github/godot-version`. |
-| QA-7 Version-portable editor code | Covered by running the e2e job on each line's Godot build; the addon guards APIs missing from the line's M.N.0 with `has_method()` (the guards per line are listed in [l2-release-branches.md](l2-release-branches.md) §5.3). |
+| QA-6 Every platform, every push | `ci.yml` runs on pushes to `master` (and to the retired `godot-v*` branches) and on pull requests: matrix on ubuntu-24.04, windows-latest, macos-latest; a Linux Godot job with the build from `.github/godot-version`; and the `godot-versions` matrix, one Linux job per older supported Godot build. |
+| QA-7 Version-portable editor code | Covered by running the e2e suites on every supported Godot build; the addon guards APIs missing from the first release of the oldest supported version (4.5.0) with `has_method()` (the version-dependent forms are listed in [l2-release-branches.md](l2-release-branches.md) §5.3). |
 
 ## 5. Detailed Design
 
@@ -53,10 +53,10 @@ tests/
 ├── bridge_client_test.rs      multiplexing, reconnection, timeout, error classes
 ├── detach_test.rs             launched processes do not hold the server's stderr
 ├── server_test.rs             frame and result helpers, catalog shape
-├── version_sync_test.rs       server version == addon version; line identity files agree
+├── version_sync_test.rs       server version == addon version; the supported Godot versions agree across plugin.gd, the dev project, godot-version and the CI matrix
 ├── version_test.rs            the version a build reports: the manifest version with its commit as build metadata
 ├── script-reference-vectors.json  script-reference cases checked by the server's classifier and the addon's end-to-end test
-├── steward_test.rs            repo-steward: readiness on a fixture repository, workflow least privilege
+├── steward_test.rs            repo-steward: readiness on a fixture repository, workflow least privilege; release-set.sh on a throwaway repository
 ├── editor_e2e_test.rs         (ignored) real headless editor: security, scene/property tools, undo, resave, authoring tools, a game tool right after Play
 ├── runtime_e2e_test.rs        (ignored) real games and language server: process run, live tree, input and gestures, waits, breakpoints, windowed screenshot, diagnostics
 ├── scenario_e2e_test.rs       (ignored) real game: scenario steps, pause, input release, run pinning and the run lock
@@ -83,10 +83,10 @@ Unit tests live next to the code in `src/paths.rs`, `src/validation.rs`, `src/cl
 | The same derived bridge port on both sides | a case in `tests/bridge-port-vectors.json` (both sides read it) |
 | Export exclusion | `tests/addon_export_test.rs` |
 | Process independence | `tests/detach_test.rs` |
-| Release line identity (version string, minimum engine version, engine build) | `tests/version_sync_test.rs` |
+| Version string and the supported Godot versions (oldest supported, newest tested, engine builds, CI matrix) | `tests/version_sync_test.rs` |
 | The version a build reports, with its commit | `tests/version_test.rs` |
 | The same written-or-used classification of a script's reference on both sides | a case in `tests/script-reference-vectors.json` (both sides read it) |
-| Repo steward scripts and workflows (readiness, least privilege, tracked skill) | `tests/steward_test.rs` |
+| Repo steward scripts and workflows (readiness, least privilege, tracked skill), the release checks of `release-set.sh` | `tests/steward_test.rs` |
 
 ## 6. Implementation Notes
 
@@ -103,8 +103,8 @@ Unit tests live next to the code in `src/paths.rs`, `src/validation.rs`, `src/cl
 | `[CLIENT]` | `tests/bridge_client_test.rs` | Bridge client tests |
 | `[DETACH]` | `tests/detach_test.rs` | Process detachment |
 | `[FRAMES]` | `tests/server_test.rs` | Frame helper tests |
-| `[VERSION]` | `tests/version_sync_test.rs` | Version and line identity sync |
-| `[STEWARD]` | `tests/steward_test.rs` | Repo steward readiness and workflow guards |
+| `[VERSION]` | `tests/version_sync_test.rs` | Version and supported-versions sync |
+| `[STEWARD]` | `tests/steward_test.rs` | Repo steward readiness, workflow guards and release checks |
 | `[E2E]` | `tests/editor_e2e_test.rs` | Real-editor tests |
 | `[RUNTIME]` | `tests/runtime_e2e_test.rs` | Real-game and language-server tests |
 | `[SCENARIO]` | `tests/scenario_e2e_test.rs` | Real-game scenario tests |
@@ -133,3 +133,4 @@ Unit tests live next to the code in `src/paths.rs`, `src/validation.rs`, `src/cl
 | 1.7.0 | 2026-11-02 | Agent (magic.spec) | [REMOVED] The end-to-end file of the voxel model check from the layout, the routing table and the references. Stable → RFC → Stable after Post-Update Review. |
 | 1.7.1 | 2026-11-05 | Agent (magic.spec) | The version test and the script-reference cases are in the layout, the routing table and Canonical References. No requirement changed. Removed the `[ADDED]` and `[MODIFIED]` markers from the body: the history rows carry what changed. No requirement changed. |
 | 1.7.2 | 2026-11-05 | Agent (magic.spec) | CI runs the scenario suite, one step after the runtime suite; the contributor and agent guides already name it for changes to the scenario tool. |
+| 1.8.0 | 2026-11-20 | Agent (magic.spec) | Modified for one build serving every supported Godot version: QA-3, QA-6 and QA-7 rows (the `godot-versions` CI matrix, the newest tested build before the commit), the version sync test covers the supported-versions declaration instead of line identity, the steward test file also drives `release-set.sh`, CI runs the export suite. Stable → RFC → Stable after Post-Update Review; the parent's amendment (C12) applied and lifted in the same pass. |

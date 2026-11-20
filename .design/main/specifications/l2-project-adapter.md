@@ -1,6 +1,6 @@
 # Project Adapter Runtime
 
-**Version:** 1.1.2
+**Version:** 1.1.3
 **Status:** Stable
 **Layer:** implementation
 **Implements:** l1-project-adapter.md
@@ -24,11 +24,11 @@ The runtime already has a channel into the game, a value encoding and an output 
 ## 2. Constraints & Assumptions
 
 - The setting is `godot_mcp/adapter`, read from `ProjectSettings` when the component starts. It holds a `res://` path or a `uid://` (the file picker of Project Settings stores a uid); anything else is reported as not loadable. An agent can set it with `godot_set_project_setting`; the addon does not register it in the Project Settings list, as it does not register its other settings.
-- Only API of every line's first release is used: `Callable.get_argument_count()` (since 4.3) and the output capture of `OS.add_logger` (since 4.5) already in `rt_output.gd`.
+- Only API present in the first release of the oldest supported Godot version (4.5.0) is used: `Callable.get_argument_count()` (since 4.3) and the output capture of `OS.add_logger` (since 4.5) already in `rt_output.gd`.
 - Addon scripts declare no `class_name` and are loaded by path; an adapter's `register(registry)` receives the registry untyped.
 - [DR] Two tools, `godot_game_state` and `godot_game_command`, not one tool with an action: the read is annotated read-only and repeatable, the command destructive and not repeatable, and one tool could carry only one of those annotations. Rejected: `godot_game_do` (says less than `command`); `godot_game_project` with an `action` (wrong annotations for one of the two uses). Override: `/magic.spec amend l2-project-adapter.md "one tool"`.
 - [DR] The answer bound is 256 KiB of JSON text: small enough for an agent's context. Override: `/magic.spec amend l2-project-adapter.md "another bound"`.
-- Engine facts, measured on the build named in `.github/godot-version` (4.8-beta1) by the end-to-end test `logger_sees_a_script_error_of_a_called_handler_at_once`: (1) a script error raised inside a handler that the component calls through `Callable.call()` is in the logger by the time the call returns, on the main thread, with the engine's script error type; its text is in the entry's `code`, the `rationale` is empty, and the handler returns null while the caller goes on; (2) `push_error` in a handler is logged with the plain error type, so the two are told apart; (3) a handler that awaits, called without `await`, makes the engine log a script error that names the *calling* function and ends that function, which returns its type's default; the function above it goes on; (4) `await handler.call(args)` from a coroutine runs an awaiting handler and a plain one alike. PA-6 stands on (1) to (3); (4) is not used, see §7.
+- Engine facts, measured on 4.8-beta1, the build `.github/godot-version` named then, by the end-to-end test `logger_sees_a_script_error_of_a_called_handler_at_once`: (1) a script error raised inside a handler that the component calls through `Callable.call()` is in the logger by the time the call returns, on the main thread, with the engine's script error type; its text is in the entry's `code`, the `rationale` is empty, and the handler returns null while the caller goes on; (2) `push_error` in a handler is logged with the plain error type, so the two are told apart; (3) a handler that awaits, called without `await`, makes the engine log a script error that names the *calling* function and ends that function, which returns its type's default; the function above it goes on; (4) `await handler.call(args)` from a coroutine runs an awaiting handler and a plain one alike. PA-6 stands on (1) to (3); (4) is not used, see §7.
 
 ## 4. Invariant Compliance
 
@@ -95,9 +95,9 @@ Both select the run as `godot_game_get` does: `run_id`, else the newest managed 
 
 The README's tool list gains the two tools and a section on the adapter: the setting, the registry calls, the outcome table and a fixture-sized example. The agent guide's running-game protocol gains one line on the adapter. The GDScript syntax check lists in `AGENTS.md` and `CONTRIBUTING.md` gain the two scripts, together.
 
-### 5.5 Release Lines
+### 5.5 Supported Godot Versions
 
-Built on `master` and carried to `godot-v4.7`, `godot-v4.6` and `godot-v4.5`: nothing here needs API newer than 4.5.0.
+Built on `master` for every supported Godot version: nothing here needs API newer than 4.5.0, and CI runs the end-to-end tests with every supported Godot build.
 
 ## 6. Implementation Notes
 
@@ -105,7 +105,7 @@ Built on `master` and carried to `godot-v4.7`, `godot-v4.6` and `godot-v4.5`: no
 2. `rt_output.gd` mark and read, `rt_registry.gd`, `rt_project.gd`, the hello and `RUNTIME_FILES`, with the fixture adapter's real-game tests (registration, refusals, isolation, script errors, the bound, a held game, editor Play).
 3. The server tools, annotations and run status, with their protocol tests.
 4. Documentation and the check lists.
-5. Carry to the release lines and run the line checks there.
+5. Run the end-to-end tests on every supported Godot version (CI).
 
 ## 7. Drawbacks & Alternatives
 
@@ -134,3 +134,4 @@ Built on `master` and carried to `godot-v4.7`, `godot-v4.6` and `godot-v4.5`: no
 | 1.1.0 | 2026-10-29 | Agent (magic.run) | [MODIFIED] The engine facts measured by the feasibility test replace the premise (§2); PA-6 names the contained function per call; PA-9: an awaiting handler is not supported, with the measured reason, and §7 records the alternative. Stable → RFC → Stable after Post-Update Review. |
 | 1.1.1 | 2026-10-29 | Agent (magic.run) | The two methods are added to the served list of the hold, which refuses everything not on it (the first text said they needed no change); a command's value over the bound is a `GODOT_ERROR` that says the command ran. No other requirement changed. |
 | 1.1.2 | 2026-11-05 | Agent (magic.spec) | The mentions of a tool outside the technology scope are gone from the registry, refusal and call notes and from the rejected alternatives. No requirement changed. |
+| 1.1.3 | 2026-11-20 | Agent (magic.spec) | §5.5 and the implementation steps speak of the supported Godot versions instead of carrying to release lines; the API floor is the first release of the oldest supported version. No requirement changed. |

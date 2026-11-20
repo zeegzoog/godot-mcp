@@ -8,7 +8,7 @@ A fast, cross-platform [Model Context Protocol](https://modelcontextprotocol.io)
 
 ## Installation
 
-Requirements: **Godot 4.5 or newer** (4.5 to 4.8 are tested), the godot-mcp files from the latest release, and an MCP client such as Claude Code, Claude Desktop, Cursor, VS Code, or Antigravity. No Rust toolchain needed.
+Requirements: **Godot 4.5 or newer** (4.5 to 4.8 are tested; 4.8 is a pre-release build), the godot-mcp files from the latest release, and an MCP client such as Claude Code, Claude Desktop, Cursor, VS Code, or Antigravity. No Rust toolchain needed.
 
 ### Let your AI assistant install it
 

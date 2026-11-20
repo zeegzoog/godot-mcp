@@ -909,7 +909,7 @@ fn the_steward_never_merges_what_controls_the_steward_and_the_releases() {
         ".agents/skills/repo-steward/scripts/act.sh",
         ".agents/skills/repo-steward/SKILL.md",
         ".agents/rules/magic.md",
-        ".agents/skills/release/scripts/release-set.sh",
+        ".github/scripts/release-set.sh",
         ".claude/settings.json",
         ".cargo/config.toml",
         ".github/steward.yml",

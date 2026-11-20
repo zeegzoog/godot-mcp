@@ -26,7 +26,7 @@ func _enter_tree() -> void:
     # older version lacks is called behind has_method(). An older editor may lack more than that,
     # and a newer one has not been tested.
     if major < MIN_MAJOR or (major == MIN_MAJOR and minor < MIN_MINOR):
-        printerr("[Godot MCP] This godot-mcp build needs Godot %d.%d or newer, but this is Godot %s. Use a godot-mcp release made for your Godot version, or update Godot. The bridge was not started." % [MIN_MAJOR, MIN_MINOR, version["string"]])
+        printerr("[Godot MCP] This godot-mcp build needs Godot %d.%d or newer, but this is Godot %s. Update Godot. The bridge was not started." % [MIN_MAJOR, MIN_MINOR, version["string"]])
         return
     if major > MIN_MAJOR or minor > TESTED_MINOR:
         push_warning("[Godot MCP] This godot-mcp build is tested with Godot %d.%d to %d.%d, but this is Godot %s. It should work; if something fails, update godot-mcp or report it." % [MIN_MAJOR, MIN_MINOR, MIN_MAJOR, TESTED_MINOR, version["string"]])

@@ -181,7 +181,7 @@ An AI assistant, the repo steward, works the issue tracker and the pull requests
 
 ## Planning and Specifications
 
-- The `.design/` folder holds the project's specifications and plan. It is committed and shared, and it is maintained on `master` only; a release branch keeps the copy from the day it was created.
+- The `.design/` folder holds the project's specifications and plan. It is committed and shared, and it is maintained on `master` only; the retired release branches keep the copy from the day they were retired.
 - Maintainers plan and design through the Magic Spec workflow (`/magic.spec`, `/magic.task`, `/magic.run`, `/magic.analyze`), run by their AI agent. Its engine (`.magic/` and the `magic.*` workflow files) is installed locally from its release archive and is git-ignored.
 - You do not need the engine to contribute. If your change alters documented behaviour, say so in the pull request, and a maintainer updates the specifications.
 - Commit changes to `.design/` separately from product changes, so that a product commit never mixes with planning.

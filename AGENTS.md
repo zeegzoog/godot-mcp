@@ -2,7 +2,7 @@
 
 This document establishes the architectural principles, development workflow, and operational rules for AI agents and human contributors developing or interacting with the Godot MCP Server.
 
-The contribution workflow — branches per Godot version, carrying changes between them, commit and pull request rules — is in [CONTRIBUTING.md](CONTRIBUTING.md). The verification commands below are the same as its Verification section; change both together.
+The contribution workflow — one branch, `master`, one build for every supported Godot version, commit and pull request rules — is in [CONTRIBUTING.md](CONTRIBUTING.md). The verification commands below are the same as its Verification section; change both together.
 
 A fresh clone or git worktree gets its agent folders (`.claude/` and the like, linked to `.agents/`) from the agents-init skill, [.agents/skills/agents-init/SKILL.md](.agents/skills/agents-init/SKILL.md).
 

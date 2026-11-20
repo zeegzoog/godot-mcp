@@ -4,7 +4,7 @@ All notable changes to godot-mcp. The server and the Godot addon always ship wit
 version number. The section for a version is used as the text of its GitHub Release, so every
 release needs one (the release workflow fails without it).
 
-Each Godot version has its own release line and branch (`godot-v4.5`, `godot-v4.6`, `godot-v4.7`, …). From 0.5.1 on, one release holds the files of every supported Godot version, and its notes are the section of this file; they mark changes that concern some Godot versions only.
+Releases 0.5.1 to 0.15.0 were built once per Godot version, from the branches `godot-v4.5`, `godot-v4.6` and `godot-v4.7`, and held the files of every supported Godot version, with names ending in `-godotM.N`. Releases after 0.15.0 are made from `master` as one build for Godot 4.5 and newer.
 
 ## [Unreleased]
 

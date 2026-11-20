@@ -38,7 +38,7 @@ Pushing a tag publishes a GitHub Release that cannot be taken back. Every step t
 
 1. Land the change, with its test, on the newest affected line: `master` when it is affected, else the newest affected `godot-v*` branch. CI must be green there.
 2. Commit changes to the planning files (`.design/`) separately from product changes; only product commits are carried.
-3. Carry the change to each older affected line, newest to oldest:
+3. Carry the change to each older affected line, newest to oldest. After a merge to `master` the carry workflow (`.github/scripts/carry.sh`) has already opened `[M.N] <title>` pull requests for every line and reports a conflict as an issue; merge those when their CI is green, and carry by hand only what the workflow left (a change to one line, a conflict). By hand:
 
    ```bash
    git switch godot-v4.7

@@ -56,6 +56,7 @@ Post one review with `scripts/act.sh review <n> approve|request-changes|comment 
 
 | Finding | Decision | Do |
 | --- | --- | --- |
+| A carry pull request (marker `kind=carry`, branch `carry/*`, title `[M.N] …`) whose changes are those of the master commit it names, `git cherry-pick -x` copies apart from the line's own changelog and planning files, with green checks | accept | merge it without a new review: the commit was reviewed on master; check with `git range-diff` or the patch ids that the copy changes nothing else, and that a line's `Cargo.toml` and `Cargo.lock` keep the line's own version |
 | Correct, tested, in scope, follows the rules, checks green | accept | approve; merge if the autonomy level allows, else recommend acceptance and queue the merge |
 | Correct in substance, small fixable gaps | accept with edits | make the edits (§ Edits), then as accept |
 | Fixable problems the author should decide on | changes requested | review listing each problem, where it is and what resolves it; board In Review, waiting for the author |

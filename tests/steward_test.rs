@@ -1298,3 +1298,206 @@ fn the_planning_owed_text_names_no_planning_artifact() {
         }
     }
 }
+
+#[test]
+fn carry_workflow_starts_only_from_master_and_by_hand() {
+    let file = ".github/workflows/carry.yml";
+    let workflow = read(file);
+    let found = triggers(&workflow);
+    assert!(
+        found.contains(&"push".to_string()),
+        "{file} carries on a push"
+    );
+    for trigger in &found {
+        assert!(
+            trigger == "push" || trigger == "workflow_dispatch",
+            "{file} must start only on a push to master or by hand, found {trigger}"
+        );
+    }
+    assert!(
+        workflow.contains("branches: [master]"),
+        "{file} must carry only what lands on master"
+    );
+    assert!(
+        !workflow.contains("pull_request"),
+        "{file} must not start on a pull request: its token can write"
+    );
+    for step in steps(&workflow) {
+        if let Some(run) = step.split("run: |").nth(1) {
+            assert!(
+                !run.contains("${{"),
+                "{file}: a run block must read event data from env, never interpolate it:\n{run}"
+            );
+        }
+    }
+}
+
+/// The revision of `rev` in `dir`.
+fn revision(dir: &Path, rev: &str) -> String {
+    let output = Command::new("git")
+        .current_dir(dir)
+        .args(["rev-parse", rev])
+        .output()
+        .expect("git rev-parse");
+    assert!(output.status.success(), "git rev-parse {rev} failed");
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn git_output(dir: &Path, args: &[&str]) -> (bool, String) {
+    let output = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .unwrap_or_else(|err| panic!("cannot run git {args:?}: {err}"));
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+    )
+}
+
+#[test]
+fn carry_picks_what_a_line_lacks_and_leaves_what_the_line_keeps_for_itself() {
+    let Some(bash) = bash() else {
+        eprintln!("skipped: no bash");
+        return;
+    };
+    if !git_available() {
+        eprintln!("skipped: no git");
+        return;
+    }
+    let base = tempfile::tempdir().expect("temp dir");
+    let origin = base.path().join("origin.git");
+    let repo = base.path().join("repo");
+    std::fs::create_dir_all(&origin).expect("origin dir");
+    std::fs::create_dir_all(&repo).expect("repo dir");
+    let day = "2026-11-01T10:00:00+00:00";
+    git(&origin, &["init", "--quiet", "--bare"], day);
+    git(&repo, &["init", "--quiet"], day);
+    git(
+        &repo,
+        &["remote", "add", "origin", origin.to_str().expect("path")],
+        day,
+    );
+
+    // The shared start: the line list, a file both branches change, the release notes, a steward
+    // workflow, and a file only the line changes.
+    write(&repo, ".github/lines", "4.7\n");
+    write(&repo, "a.txt", "one\n");
+    write(&repo, "b.txt", "base\n");
+    write(&repo, "CHANGELOG.md", "notes\n");
+    write(&repo, ".github/workflows/steward-agent.yml", "agent\n");
+    git(&repo, &["add", "--all"], day);
+    git(&repo, &["commit", "--quiet", "-m", "chore: start"], day);
+    let start = revision(&repo, "HEAD");
+
+    // The line keeps its own notes, has no steward workflow, and changed b.txt itself.
+    git(&repo, &["switch", "--quiet", "-c", "godot-v4.7"], day);
+    git(
+        &repo,
+        &["rm", "--quiet", ".github/workflows/steward-agent.yml"],
+        day,
+    );
+    write(&repo, "CHANGELOG.md", "notes of the line\n");
+    write(&repo, "b.txt", "line\n");
+    git(&repo, &["add", "--all"], day);
+    git(
+        &repo,
+        &["commit", "--quiet", "-m", "chore(line): own files"],
+        day,
+    );
+    git(&repo, &["switch", "--quiet", "-c", "master", &start], day);
+
+    commit(&repo, "a.txt", "two\n", "fix(x): change a (#1)", day);
+    // The same commit touches the notes and the steward workflow: both are the line's business.
+    write(&repo, "CHANGELOG.md", "notes\n- fixed a\n");
+    write(&repo, ".github/workflows/steward-agent.yml", "agent 2\n");
+    git(&repo, &["add", "--all"], day);
+    git(&repo, &["commit", "--quiet", "--amend", "--no-edit"], day);
+    let fix = revision(&repo, "HEAD");
+    commit(
+        &repo,
+        "v.txt",
+        "0.2.0\n",
+        "chore(release): godot-mcp 0.2.0",
+        day,
+    );
+    commit(
+        &repo,
+        ".design/spec.md",
+        "spec\n",
+        "docs(spec): describe a",
+        day,
+    );
+    commit(&repo, "b.txt", "master\n", "fix(y): change b (#2)", day);
+    let clash = revision(&repo, "HEAD");
+    git(&repo, &["push", "--quiet", "origin", "--all"], day);
+    git(&repo, &["fetch", "--quiet", "origin"], day);
+
+    let script = root().join(".github/scripts/carry.sh");
+    let run = |argument: &str| {
+        let output = Command::new(&bash)
+            .arg(&script)
+            .arg(argument)
+            .arg("--dry-run")
+            .current_dir(&repo)
+            .env("GIT_AUTHOR_NAME", "Fixture")
+            .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Fixture")
+            .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+            .env("GIT_CONFIG_COUNT", "2")
+            .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
+            .env("GIT_CONFIG_VALUE_0", "false")
+            .env("GIT_CONFIG_KEY_1", "core.hooksPath")
+            .env("GIT_CONFIG_VALUE_1", "no-hooks")
+            .output()
+            .expect("carry.sh runs");
+        (
+            output.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        )
+    };
+
+    let (ok, text) = run("--upload-pack=touch-x");
+    assert!(!ok, "an option must not be taken as a revision:\n{text}");
+    let (ok, text) = run(&format!("{start}..{clash}"));
+    assert!(ok, "carry.sh failed:\n{text}");
+    let work = format!("carry/{}-4.7", &clash[..9]);
+    assert!(
+        text.contains(&format!("READY {work} (1 commit(s)")),
+        "the fix is carried and nothing else:\n{text}"
+    );
+    assert!(
+        text.contains(&format!("MANUAL 4.7 {}", &clash[..9])) && text.contains("b.txt"),
+        "a conflict in a product file is left to a person:\n{text}"
+    );
+
+    let (_, file) = git_output(&repo, &["show", &format!("{work}:a.txt")]);
+    assert_eq!(file, "two\n", "the product change is on the line");
+    let (_, notes) = git_output(&repo, &["show", &format!("{work}:CHANGELOG.md")]);
+    assert_eq!(notes, "notes of the line\n", "the line keeps its own notes");
+    let (exists, _) = git_output(
+        &repo,
+        &[
+            "cat-file",
+            "-e",
+            &format!("{work}:.github/workflows/steward-agent.yml"),
+        ],
+    );
+    assert!(!exists, "a file the line does not have is not added");
+    let (_, log) = git_output(
+        &repo,
+        &["log", "--format=%B", &format!("origin/godot-v4.7..{work}")],
+    );
+    assert!(
+        log.contains(&format!("(cherry picked from commit {fix})")),
+        "the copy says where it came from:\n{log}"
+    );
+    assert!(
+        !log.contains("chore(release)") && !log.contains("docs(spec)"),
+        "release and planning commits are not carried:\n{log}"
+    );
+}

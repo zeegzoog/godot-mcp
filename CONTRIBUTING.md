@@ -94,7 +94,7 @@ The project does not integrate any other third-party product, service, program o
    | A played input scenario (`godot_game_scenario`) with a real Godot | `tests/scenario_e2e_test.rs` |
    | Version string and release line identity | `tests/version_sync_test.rs` |
    | The version a build reports, with its commit | `tests/version_test.rs` |
-   | Repo steward scripts and workflows | `tests/steward_test.rs` |
+   | Repo steward scripts and workflows, the carry script | `tests/steward_test.rs` |
 
    Unit tests live next to the code in `src/`.
 3. Follow the engineering standards in [AGENTS.md](AGENTS.md): no `unwrap()` or `expect()` in production code, logs to stderr only, every editor mutation undoable, every path checked against the project, strict typing in GDScript.
@@ -197,7 +197,9 @@ An AI assistant, the repo steward, works the issue tracker and the pull requests
 
 ## Carrying Changes Between Lines
 
-A change that affects several lines lands on the newest of them first and is then carried to each older one, newest to oldest. Maintainers usually do the carrying; you may do it yourself:
+A change that affects several lines lands on the newest of them first and is then carried to each older one, newest to oldest.
+
+A change that lands on `master` is carried by a workflow (`.github/workflows/carry.yml`, script `.github/scripts/carry.sh`): after the merge it opens one pull request per line, titled `[4.7] <original title>`, with `git cherry-pick -x`. The changelog and the planning files keep each line's own copy, and files a line does not have are not added. When a commit conflicts in a product file, the workflow opens an issue that names the commit instead, and a person carries it by hand. A commit that changes a workflow file is carried by hand too: the repository token may not push one. Merge a carry pull request with a squash that keeps the commit message (the repository default), because the "(cherry picked from commit …)" line is how a later run knows the line holds the commit. Other changes (to a line only) are carried by hand; you may do it yourself:
 
 ```bash
 git switch godot-v4.7

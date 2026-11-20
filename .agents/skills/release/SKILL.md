@@ -38,7 +38,7 @@ Pushing a tag publishes a GitHub Release that cannot be taken back. Every step t
 
 1. Land the change, with its test, on the newest affected line: `master` when it is affected, else the newest affected `godot-v*` branch. CI must be green there.
 2. Commit changes to the planning files (`.design/`) separately from product changes; only product commits are carried.
-3. Carry the change to each older affected line, newest to oldest:
+3. Carry the change to each older affected line, newest to oldest. After a merge to `master` the carry workflow (`.github/scripts/carry.sh`) has already opened `[M.N] <title>` pull requests for every line and reports a conflict as an issue; merge those when their CI is green, and carry by hand only what the workflow left (a change to one line, a conflict). By hand:
 
    ```bash
    git switch godot-v4.7
@@ -63,11 +63,23 @@ A pull request does not do this (contributors leave versions alone); the maintai
 
 A release covers every line in `.github/lines`. Work on the branches or on one worktree per line. The examples release 0.5.1 with the lines 4.5, 4.6 and 4.7.
 
-1. **Preflight, on every line.** All of these must pass; stop and report on the first failure:
+1. **Preflight, on every line.** CI already runs the whole preflight on each branch with that line's own Godot build (`.github/godot-version`): `cargo fmt`, `clippy` and the unit tests on Linux, Windows and macOS, the GDScript checks, and the editor, addon-export, running-game, scenario and export end-to-end suites. Do not repeat it by hand: check that CI is green on the tip of every line and of `master`, and stop and report on the first line that is not.
 
    ```bash
    git status --porcelain                        # must print nothing
    git fetch origin --tags
+   for branch in master $(sed 's/^/godot-v/' .github/lines); do
+       tip=$(git rev-parse "origin/$branch")
+       echo "$branch tip ${tip:0:7}: $(gh run list --branch "$branch" --workflow ci.yml -L 1 \
+           --json headSha,status,conclusion --jq '.[0] | "\(.headSha[0:7]) \(.status) \(.conclusion)"')"
+   done
+   ```
+
+   The run's commit must be the tip and it must read `completed success`. A job that failed on the runner and not in the code (a network error while fetching crates, a runner that never started) is rerun with `gh run rerun <id> --failed`. Run a suite by hand only to reproduce a failure CI reported, or when CI has not run yet because nothing is pushed (procedures E and G); the commands below are that local run. The last gate is step 7: the release commits are pushed, and CI must be green on them before any tag.
+
+   The local run, with the checks in this order; stop at the first failure:
+
+   ```bash
    cargo fmt --all -- --check
    cargo clippy --all-targets --all-features -- -D warnings
    cargo test --all-targets
@@ -96,6 +108,8 @@ A release covers every line in `.github/lines`. Work on the branches or on one w
    GODOT_PATH=/path/to/godot cargo test --test editor_e2e_test -- --ignored
    GODOT_PATH=/path/to/godot cargo test --test addon_export_test -- --ignored
    GODOT_PATH=/path/to/godot cargo test --test runtime_e2e_test -- --ignored
+   GODOT_PATH=/path/to/godot cargo test --test scenario_e2e_test -- --ignored
+   GODOT_PATH=/path/to/godot cargo test --test export_e2e_test -- --ignored
    ```
 
    Also confirm that `SECURITY.md` and `CONTRIBUTING.md` are still true: the supported lines, the reporting link, the checks.

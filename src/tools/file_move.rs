@@ -21,7 +21,7 @@ use super::files::{
 use super::{EditorChoice, ToolManager};
 use crate::error::McpError;
 use crate::godot::{md5_hex, record_uids};
-use crate::paths::{res_display, resolve_in_project, skipped_by_godot};
+use crate::paths::{move_name_problem, res_display, resolve_in_project, skipped_by_godot};
 use crate::protocol::{Tool, ToolResult};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -45,7 +45,7 @@ pub fn handles(name: &str) -> bool {
 pub fn catalog() -> Vec<Tool> {
     vec![super::tool(
         MOVE,
-        "Moves or renames files and whole folders of a Godot project the way the editor's FileSystem dock does, keeping the project working. Each file moves with its .uid and .import files, and its imported data in .godot/imported is renamed to match the new path, so nothing is imported again. Every res:// mention of an old path in the project's text files (.tscn, .tres, .gd, shaders, project.godot, .cfg, .import, .cs, .json, the moved files included) is rewritten to the new path; a folder move rewrites every path inside it. uid:// references stay valid because the uid moves with the file. With the editor connected the move goes through it: a file that is open with unsaved changes (a scene, or a script in the script editor) is refused, and afterwards the editor's cached resources, uids, open scene tabs and in-memory project settings follow the new paths, binary .scn/.res files that named an old path are saved again by the editor so they name the new one (resaved), open scenes and scripts whose text changed are reloaded, and the editor rescans. Without an editor the files are changed on disk, the uid cache and global class cache in .godot are updated so a game run finds the files, binary_references lists the .scn/.res files that still hold an old path (they still load through their uids; open the project in the editor and move again or resave them), and rescan_needed is true. Pass moves: a list of {from, to} res:// paths (at most 64); a to ending in / moves the file or folder into that folder under its own name. Refuses a missing source, project.godot, anything in .godot/ or the Godot MCP addon, a lone .uid or .import file, a destination in .godot/, a destination that already exists (or whose .uid/.import does), a folder moved into itself, and moves that overlap each other. All or nothing: while any move is refused nothing changes, and the answer lists each refusal with its reason. dry_run lists the files that would move and every file whose references would be rewritten, without changing anything. Not rewritten: relative paths (preload(\"enemy.gd\")) and paths built at run time (\"res://levels/level_%d.tscn\" % n); check scripts that build paths.",
+        "Moves or renames files and whole folders of a Godot project the way the editor's FileSystem dock does, keeping the project working. Each file moves with its .uid and .import files, and its imported data in .godot/imported is renamed to match the new path, so nothing is imported again. Every res:// mention of an old path in the project's text files (.tscn, .tres, .gd, shaders, project.godot, .cfg, .import, .cs, .json, the moved files included) is rewritten to the new path; a folder move rewrites every path inside it. uid:// references stay valid because the uid moves with the file. With the editor connected the move goes through it: a file that is open with unsaved changes (a scene, or a script in the script editor) is refused, and afterwards the editor's cached resources, uids, open scene tabs and in-memory project settings follow the new paths, binary .scn/.res files that named an old path are saved again by the editor so they name the new one (resaved), open scenes and scripts whose text changed are reloaded, and the editor rescans. Without an editor the files are changed on disk, the uid cache and global class cache in .godot are updated so a game run finds the files, binary_references lists the .scn/.res files that still hold an old path (they still load through their uids; open the project in the editor and move again or resave them), and rescan_needed is true. Pass moves: a list of {from, to} res:// paths (at most 64); a to ending in / moves the file or folder into that folder under its own name. Refuses a missing source, project.godot, anything in .godot/ or the Godot MCP addon, a lone .uid or .import file, a destination in .godot/, a destination name Godot refuses in file names (: \\ ? * \" | % < >, control characters, leading or trailing spaces), a destination that already exists (or whose .uid/.import does), a folder moved into itself, and moves that overlap each other. All or nothing: while any move is refused nothing changes, and the answer lists each refusal with its reason. dry_run lists the files that would move and every file whose references would be rewritten, without changing anything. Not rewritten: relative paths (preload(\"enemy.gd\")) and paths built at run time (\"res://levels/level_%d.tscn\" % n); check scripts that build paths.",
         json!({
             "moves": {
                 "type": "array",
@@ -528,6 +528,15 @@ fn check_move(plan: &mut Plan, project: &Path, request: &Request) -> Option<Move
         }
     };
     let to_res = res_display(project, &to).trim_end_matches('/').to_string();
+    if let Some((name, problem)) = move_name_problem(&from_res, &to_res) {
+        plan.refuse(
+            &from_res,
+            format!(
+                "cannot move to {to_res:?}: the name {name:?} has {problem}, which cannot be used in a file name (Godot refuses : \\ ? * \" | % < >, control characters and leading or trailing spaces); pick another name"
+            ),
+        );
+        return None;
+    }
     if let Some(reason) = protected(&to_res).or_else(|| protected_by_identity(project, &to)) {
         plan.refuse(&from_res, format!("cannot move to {to_res}: it {reason}"));
         return None;

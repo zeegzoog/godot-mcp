@@ -3548,6 +3548,69 @@ const MOVE_PROBE_HOOK: &str = r#"        "__test_save_binary":
             send_success(peer, cmd_id, {"in_filesystem": _filesystem_has(EditorInterface.get_resource_filesystem(), path), "script_tabs": scripts, "open_scenes": EditorInterface.get_open_scenes(), "setting": str(ProjectSettings.get_setting(str(params.get("setting", "application/config/name")), "")), "uid_path": uid_path})
 "#;
 
+/// The editor's part of a move refuses a destination name Godot cannot store in its text files
+/// with the same rule the server applies (`move_name_problem` in src/paths.rs), so a server that
+/// skipped its check still could not have the editor take part in such a move.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn the_editor_refuses_the_destination_names_the_server_refuses() {
+    let editor = start_editor(false).await;
+    let cases = [
+        ("res://a.gd", "res://b.gd"),
+        ("res://a.gd", "res://Сцены и скрипты/my script.gd"),
+        ("res://a.gd", "res://b\".gd"),
+        (
+            "res://a.gd",
+            "res://b\n[autoload]\nEvil=\"*res://evil.gd\".gd",
+        ),
+        ("res://a.gd", "res://b\r.gd"),
+        ("res://a.gd", "res://b\t.gd"),
+        ("res://a.gd", "res://dir\u{1}/b.gd"),
+        ("res://a.gd", "res://b\u{7f}.gd"),
+        ("res://a.gd", "res://b\u{85}.gd"),
+        ("res://a.gd", "res://b\\c.gd"),
+        ("res://a.gd", "res://b:c.gd"),
+        ("res://a.gd", "res://b?.gd"),
+        ("res://a.gd", "res://b*.gd"),
+        ("res://a.gd", "res://b|.gd"),
+        ("res://a.gd", "res://b<.gd"),
+        ("res://a.gd", "res://b>.gd"),
+        ("res://a.gd", "res://b%20.gd"),
+        ("res://a.gd", "res:// b.gd"),
+        ("res://a.gd", "res://b.gd "),
+        ("res://a.gd", "res://b#;[]'=.gd"),
+        ("res://odd%dir/a.gd", "res://odd%dir/b.gd"),
+        ("res://in/odd%name.gd", "res://out/odd%name.gd"),
+        ("res://lv1/odd%name.png", "res://lv\"2/odd%name.png"),
+    ];
+    for (from, to) in cases {
+        let check = editor
+            .bridge
+            .send_command(
+                "move_files_check",
+                json!({"files": [{"from": from, "to": to}], "rewrite": [], "binary": []}),
+            )
+            .await
+            .expect("move_files_check");
+        let refused = check["refused"].as_array().expect("refused list");
+        let server = godot_mcp::paths::move_name_problem(from, to);
+        assert_eq!(
+            !refused.is_empty(),
+            server.is_some(),
+            "{from:?} -> {to:?}: editor {check}, server {server:?}"
+        );
+        if server.is_some() {
+            assert_eq!(refused[0]["path"], from, "{check}");
+            assert!(
+                refused[0]["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("cannot be used in a file name")),
+                "{from:?} -> {to:?}: {check}"
+            );
+        }
+    }
+}
+
 /// godot_move_file through the editor: a scene with unsaved changes is refused; a script and a
 /// folder (a scene, its script and an imported image) move with their companions; the text
 /// references are rewritten, a binary scene that uses the moved script is saved again by the

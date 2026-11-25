@@ -235,6 +235,54 @@ func _more(count: int) -> String:
 func _refuse(report: Dictionary, res_path: String, reason: String) -> void:
     report["refused"].append({"path": res_path, "reason": reason})
 
+## text quoted, with each control character written as \uXXXX: Godot's JSON writer leaves most
+## of them as they are, and a reply holding one is not valid JSON for the server.
+func _printable(text: String) -> String:
+    var out: String = ""
+    for index: int in text.length():
+        var code: int = text.unicode_at(index)
+        if code < 32 or (code >= 127 and code < 160):
+            out += "\\u%04x" % code
+        elif text[index] == "\"" or text[index] == "\\":
+            out += "\\" + text[index]
+        else:
+            out += text[index]
+    return "\"" + out + "\""
+
+## The first name a move from one res:// path to another introduces that file_name_problem
+## refuses, and the problem, or an empty array. Only the names the move changes are checked: the
+## folders both paths start with and the names both end with are part of the old path already.
+## The server applies the same rule (move_name_problem in src/paths.rs).
+func move_name_problem(from: String, to: String) -> PackedStringArray:
+    var old: PackedStringArray = from.trim_prefix("res://").split("/")
+    var new: PackedStringArray = to.trim_prefix("res://").split("/")
+    var start: int = 0
+    while start < old.size() and start < new.size() and old[start] == new[start]:
+        start += 1
+    var shared_end: int = 0
+    while shared_end < old.size() - start and shared_end < new.size() - start and old[old.size() - 1 - shared_end] == new[new.size() - 1 - shared_end]:
+        shared_end += 1
+    for index: int in range(start, new.size() - shared_end):
+        var problem: String = file_name_problem(new[index])
+        if not problem.is_empty():
+            return PackedStringArray([new[index], problem])
+    return PackedStringArray()
+
+## Why name, one segment of a path, cannot be a file or folder name written into Godot's text
+## files, or "": String.is_valid_filename(), and no control character anywhere (Godot allows one
+## inside a name, and a line break in a path written into a scene would start a new line of it).
+## The server checks destinations the same way (file_name_problem in src/paths.rs).
+func file_name_problem(name: String) -> String:
+    if name.is_empty():
+        return "an empty name"
+    for index: int in name.length():
+        var code: int = name.unicode_at(index)
+        if code < 32 or (code >= 127 and code < 160):
+            return "a control character (%d)" % code
+    if not name.is_valid_filename():
+        return "a character Godot refuses, or a leading or trailing space"
+    return ""
+
 ## Why a path may never be deleted through this call, or "".
 func _protected(path: String) -> String:
     # Windows and macOS file systems ignore case, and every file system reads "./" and "//" as
@@ -651,7 +699,12 @@ func move_check(bridge: Object, params: Dictionary) -> Dictionary:
     var paths: Array[String] = []
     for item: Variant in params.get("files", []):
         if item is Dictionary:
-            paths.append(str((item as Dictionary).get("from", "")))
+            var from: String = str((item as Dictionary).get("from", ""))
+            var to: String = str((item as Dictionary).get("to", ""))
+            paths.append(from)
+            var found: PackedStringArray = move_name_problem(from, to)
+            if not found.is_empty():
+                _refuse(report, from, "cannot move to %s: the name %s has %s, which cannot be used in a file name (Godot refuses : \\ ? * \" | %% < >, control characters and leading or trailing spaces); pick another name" % [_printable(to), _printable(found[0]), found[1]])
     for key: String in ["rewrite", "binary"]:
         for item: Variant in params.get(key, []):
             paths.append(str(item))

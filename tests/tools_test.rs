@@ -8245,3 +8245,75 @@ async fn an_earlier_recording_is_replaced_only_when_asked() {
     assert!(!project.path().join("movies/clip.wav").exists());
     wait_for_file(&record).await;
 }
+
+/// godot_move_file refuses a destination name that cannot be written into Godot's text files as
+/// it is (a quote, a backslash, a control character, or another character Godot refuses in file
+/// names), before anything changes: a quote or a newline in the new path would end the quoted
+/// path in a scene or project.godot and let the rest of the name be read as new lines of the
+/// file. A name with spaces or other letters still moves.
+#[tokio::test]
+async fn a_destination_name_godot_cannot_store_is_refused() {
+    let project = project_dir();
+    let root = project.path();
+    std::fs::write(
+        root.join("project.godot"),
+        "config_version=5\n\n[application]\n\nrun/main_scene=\"res://main.tscn\"\n\n[autoload]\n\nIcon=\"*res://a.gd\"\n",
+    )
+    .expect("project.godot");
+    std::fs::write(root.join("a.gd"), "extends Node\n").expect("a.gd");
+    std::fs::write(
+        root.join("main.tscn"),
+        "[gd_scene format=3]\n\n[ext_resource type=\"Script\" path=\"res://a.gd\" id=\"1\"]\n\n[node name=\"Main\" type=\"Node\"]\nscript = ExtResource(\"1\")\n",
+    )
+    .expect("main.tscn");
+    let snapshot = || {
+        walk(root)
+            .into_iter()
+            .map(|entry| (entry.clone(), std::fs::read(&entry).expect("readable")))
+            .collect::<Vec<_>>()
+    };
+    let before = snapshot();
+    let mv = |to: &str| {
+        let args = json!({"project_path": root, "moves": [{"from": "res://a.gd", "to": to}]});
+        async move { call("godot_move_file", args).await }
+    };
+    for to in [
+        "res://b\".gd",
+        "res://b\"]\n[ext_resource type=\"Script\" path=\"res://evil.gd\" id=\"9\"]\n#.gd",
+        "res://b\n[autoload]\nEvil=\"*res://evil.gd\".gd",
+        "res://b\r.gd",
+        "res://b\t.gd",
+        "res://b\u{0}.gd",
+        "res://dir\u{1}/b.gd",
+        "res://b:c.gd",
+        "res://b?.gd",
+        "res://b*.gd",
+        "res://b|.gd",
+        "res://b<.gd",
+        "res://b>.gd",
+        "res://b%.gd",
+        "res://b%20.gd",
+    ] {
+        let refused = mv(to).await;
+        assert!(refused.is_error, "{to:?}: {}", text(&refused));
+        assert!(
+            text(&refused).contains("Nothing was moved"),
+            "{to:?}: {}",
+            text(&refused)
+        );
+        assert!(
+            text(&refused).contains("cannot be used in a file name"),
+            "{to:?}: {}",
+            text(&refused)
+        );
+        assert!(snapshot() == before, "{to:?}: a refused move changed files");
+    }
+
+    let moved = mv("res://Сцены и скрипты/my script.gd").await;
+    assert!(!moved.is_error, "{}", text(&moved));
+    let main = std::fs::read_to_string(root.join("main.tscn")).expect("main.tscn");
+    assert!(
+        main.contains("path=\"res://Сцены и скрипты/my script.gd\""),
+        "{main}"
+    );
+}

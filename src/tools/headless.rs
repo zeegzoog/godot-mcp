@@ -745,15 +745,12 @@ impl ToolManager {
             .into();
         }
 
-        let (project_dir, from_editor) =
-            if str_arg(args, "project_path").is_some() || script_path.starts_with("res://") {
-                match self.resolve_project(args).await {
-                    Ok(project) => (Some(project.dir), project.from_editor),
-                    Err(result) => return result.into(),
-                }
-            } else {
-                (None, false)
-            };
+        // Only a script of a project is checked, as every other tool reads only project files:
+        // the engine is never pointed at an arbitrary file on disk.
+        let (project_dir, from_editor) = match self.resolve_project(args).await {
+            Ok(project) => (Some(project.dir), project.from_editor),
+            Err(result) => return result.into(),
+        };
 
         let file = match &project_dir {
             Some(dir) => match resolve_in_project(dir, script_path) {
@@ -768,13 +765,14 @@ impl ToolManager {
             },
             None => PathBuf::from(script_path),
         };
+        // Godot gets the checked file, named by its res:// path, never the caller's string.
+        let engine_path = match &project_dir {
+            Some(dir) => res_display(dir, &file),
+            None => file.display().to_string(),
+        };
         if !file.is_file() {
-            let shown = match &project_dir {
-                Some(dir) => res_display(dir, &file),
-                None => file.display().to_string(),
-            };
             return ToolResult::error(
-                format!("Script file not found: {shown}"),
+                format!("Script file not found: {engine_path}"),
                 &["Check the path; res:// paths are resolved against the project directory"],
             )
             .into();
@@ -859,7 +857,7 @@ impl ToolManager {
         let finish = |result: ToolResult| with_cache_report(result, classes.as_ref());
         match self
             .cli
-            .validate_script(project_dir.as_deref(), Path::new(script_path))
+            .validate_script(project_dir.as_deref(), Path::new(&engine_path))
             .await
         {
             Ok(msg) => ScriptCheck::Checked(finish(match lsp_problem {

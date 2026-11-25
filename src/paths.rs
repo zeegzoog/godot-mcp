@@ -98,7 +98,13 @@ pub fn skipped_by_godot(path: &Path, is_dir: bool) -> bool {
 /// on Windows, no difference of case.
 pub fn same_directory(a: &Path, b: &Path) -> bool {
     fn normalized(path: &Path) -> String {
-        let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        // A network path is compared by its spelling: resolving it would make Windows connect
+        // to that host (and offer it the user's credentials) on behalf of whoever reported it.
+        let resolved = if is_network_path(path) {
+            path.to_path_buf()
+        } else {
+            std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+        };
         let mut text = resolved.to_string_lossy().replace('\\', "/");
         if let Some(rest) = text.strip_prefix("//?/") {
             text = rest.to_string();
@@ -114,11 +120,168 @@ pub fn same_directory(a: &Path, b: &Path) -> bool {
     normalized(a) == normalized(b)
 }
 
+/// Whether `path` names a network share or a Windows device rather than a local file:
+/// `\\host\share`, `//host/share`, `\\?\UNC\...` or `\\.\device`. A verbatim local path
+/// (`\\?\C:\...`) is not one.
+fn is_network_path(path: &Path) -> bool {
+    let text = path.to_string_lossy().replace('\\', "/");
+    match text.strip_prefix("//?/") {
+        Some(rest) => rest
+            .get(..4)
+            .is_some_and(|head| head.eq_ignore_ascii_case("UNC/")),
+        None => text.starts_with("//"),
+    }
+}
+
+/// The spelling of `path` used to compare it with another without touching the file system:
+/// `\` read as `/`, no Windows verbatim prefix, no `.` segments and, on Windows, lower case.
+fn comparable_components(path: &Path) -> Vec<String> {
+    let text = path.to_string_lossy().replace('\\', "/");
+    let text = text.strip_prefix("//?/").unwrap_or(&text);
+    let mut parts: Vec<String> = Vec::new();
+    if text.starts_with('/') {
+        parts.push(String::new());
+    }
+    for part in text.split('/') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        parts.push(if cfg!(windows) {
+            part.to_lowercase()
+        } else {
+            part.to_string()
+        });
+    }
+    parts
+}
+
+/// The components of `path` below whichever of `roots` contains it, compared by spelling only;
+/// `None` when no root contains it.
+fn components_below(path: &Path, roots: &[&Path]) -> Option<Vec<String>> {
+    let wanted = comparable_components(path);
+    let text = path.to_string_lossy().replace('\\', "/");
+    let text = text.strip_prefix("//?/").unwrap_or(&text).to_string();
+    let original: Vec<&str> = text
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    let rooted = |path: &Path| {
+        path.has_root()
+            || path
+                .components()
+                .any(|component| matches!(component, Component::Prefix(_)))
+    };
+    roots.iter().find_map(|root| {
+        if rooted(root) != rooted(path) {
+            return None;
+        }
+        let root = comparable_components(root);
+        if !wanted.starts_with(&root) {
+            return None;
+        }
+        // `original` lacks the leading empty marker of a rooted path that `wanted` carries.
+        let skip = root.len() - usize::from(root.first().is_some_and(String::is_empty));
+        Some(
+            original
+                .iter()
+                .skip(skip)
+                .map(|part| (*part).to_string())
+                .collect(),
+        )
+    })
+}
+
+/// Where an absolute link target starts inside the project: the resolved project root and the
+/// components below it when the target is spelled under the project, otherwise the resolved
+/// deepest part of the target that exists (a local path, never a network one) and the rest.
+/// `None` when the target is outside the project.
+fn absolute_link_target(
+    target: &Path,
+    root: &Path,
+    project: &Path,
+) -> Option<(PathBuf, Vec<String>)> {
+    if let Some(below) = components_below(target, &[root, project]) {
+        return Some((root.to_path_buf(), below));
+    }
+    let existing = target.ancestors().find(|candidate| candidate.exists())?;
+    let resolved = existing.canonicalize().ok()?;
+    if !resolved.starts_with(root) {
+        return None;
+    }
+    let below = components_below(target, &[existing])?;
+    Some((resolved, below))
+}
+
+/// How many symbolic links one path may pass through before it is refused, as on Linux.
+const MAX_LINKS: usize = 40;
+
+/// Follows `below` (components under `root`, which is resolved) the way the operating system
+/// would when the path is opened or created, and says whether it stays inside `root`. A link is
+/// read, never followed blindly: its target is checked by spelling before anything at it is
+/// looked at, so a link that points outside the project, or at a network share, is refused
+/// whether or not its target exists.
+fn stays_inside(root: &Path, project: &Path, below: Vec<String>) -> Result<(), &'static str> {
+    let mut current = root.to_path_buf();
+    let mut pending: std::collections::VecDeque<String> = below.into();
+    let mut links = 0;
+    while let Some(part) = pending.pop_front() {
+        if part == "." || part.is_empty() {
+            continue;
+        }
+        if part == ".." {
+            if !current.pop() || !current.starts_with(root) {
+                return Err("a link leads out of the project directory");
+            }
+            continue;
+        }
+        let next = current.join(&part);
+        let Ok(meta) = std::fs::symlink_metadata(&next) else {
+            // Nothing exists here: the rest is created under `current`, unless it climbs back.
+            return if pending.iter().any(|rest| rest == "..") {
+                Err("a link leads out of the project directory")
+            } else {
+                Ok(())
+            };
+        };
+        if !meta.file_type().is_symlink() {
+            current = next;
+            continue;
+        }
+        links += 1;
+        if links > MAX_LINKS {
+            return Err("too many levels of symbolic links");
+        }
+        let target = std::fs::read_link(&next).map_err(|_| "a symbolic link cannot be read")?;
+        let target_text = target.to_string_lossy().replace('\\', "/");
+        let mut expanded: Vec<String> = if target.has_root()
+            || target
+                .components()
+                .any(|component| matches!(component, Component::Prefix(_)))
+            || target_text.starts_with('/')
+        {
+            if is_network_path(&target) {
+                return Err("a link points at a network path");
+            }
+            let (start, below) = absolute_link_target(&target, root, project)
+                .ok_or("a link points outside the project directory")?;
+            current = start;
+            below
+        } else {
+            target_text.split('/').map(str::to_string).collect()
+        };
+        expanded.extend(pending.drain(..));
+        pending = expanded.into();
+    }
+    Ok(())
+}
+
 /// Resolves a `res://` path, a project-relative path, or an absolute path to a location
 /// inside `project`.
 ///
 /// Rejects `..` segments (a name merely containing two dots is fine) and anything that lands
-/// outside the project, including through symlinks of the part that already exists.
+/// outside the project, including through symlinks, whether their target exists or not. The
+/// path is first compared with the project by its spelling, so a path elsewhere (a network
+/// share above all) is refused before anything at it is looked at.
 pub fn resolve_in_project(project: &Path, requested: &str) -> Result<PathBuf, String> {
     let trimmed = requested.trim();
     if trimmed.is_empty() {
@@ -128,6 +291,15 @@ pub fn resolve_in_project(project: &Path, requested: &str) -> Result<PathBuf, St
     let relative = trimmed.strip_prefix(RES_PREFIX).unwrap_or(trimmed);
     let normalized = relative.replace('\\', "/");
     let path = Path::new(&normalized);
+    let outside = || {
+        format!(
+            "Path is outside the project directory {}: {requested}; pass a res:// path or a path inside the project",
+            project.display()
+        )
+    };
+    if trimmed.starts_with(RES_PREFIX) && normalized.starts_with("//") {
+        return Err(outside());
+    }
 
     let is_absolute = path.has_root()
         || path
@@ -158,17 +330,10 @@ pub fn resolve_in_project(project: &Path, requested: &str) -> Result<PathBuf, St
             project.display()
         )
     })?;
-    let existing_ancestor = resolved
-        .ancestors()
-        .find(|candidate| candidate.exists())
-        .and_then(|candidate| candidate.canonicalize().ok());
-    match existing_ancestor {
-        Some(ancestor) if ancestor.starts_with(&project_root) => Ok(resolved),
-        _ => Err(format!(
-            "Path is outside the project directory {}: {requested}",
-            project.display()
-        )),
-    }
+    let below = components_below(&resolved, &[project, &project_root]).ok_or_else(outside)?;
+    stays_inside(&project_root, project, below)
+        .map(|()| resolved)
+        .map_err(|why| format!("{} ({why})", outside()))
 }
 
 #[cfg(test)]
@@ -334,5 +499,107 @@ mod tests {
         let outside = tempfile::tempdir().expect("outside");
         std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).expect("symlink");
         assert!(resolve_in_project(dir.path(), "link/a.gd").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_cannot_lead_out_of_the_project() {
+        let dir = project();
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::create_dir(dir.path().join("scripts")).expect("mkdir");
+        let target = outside.path().join("evil.plist");
+        std::os::unix::fs::symlink(&target, dir.path().join("scripts/x.gd")).expect("symlink");
+        let err = resolve_in_project(dir.path(), "res://scripts/x.gd").expect_err("dangling link");
+        assert!(err.contains("outside the project"), "{err}");
+
+        // The same through a relative link and through a link to a directory that is missing.
+        std::os::unix::fs::symlink(
+            "../../../../../../../../../tmp/evil.gd",
+            dir.path().join("rel.gd"),
+        )
+        .expect("symlink");
+        assert!(resolve_in_project(dir.path(), "rel.gd").is_err());
+        std::os::unix::fs::symlink(outside.path().join("gone"), dir.path().join("gone"))
+            .expect("symlink");
+        assert!(resolve_in_project(dir.path(), "gone/a.gd").is_err());
+        assert!(!target.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_to_a_network_path_is_refused() {
+        let dir = project();
+        std::os::unix::fs::symlink("//host/share/x.gd", dir.path().join("share.gd"))
+            .expect("symlink");
+        assert!(resolve_in_project(dir.path(), "share.gd").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_inside_the_project_still_resolve() {
+        let dir = project();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("real/sub")).expect("mkdir");
+        std::fs::write(root.join("real/a.gd"), "").expect("write");
+        std::os::unix::fs::symlink(root.join("real"), root.join("abs")).expect("symlink");
+        std::os::unix::fs::symlink("real", root.join("rel")).expect("symlink");
+        std::os::unix::fs::symlink("../a.gd", root.join("real/sub/up.gd")).expect("symlink");
+        // A dangling link whose target would be created inside the project.
+        std::os::unix::fs::symlink("real/new.gd", root.join("new.gd")).expect("symlink");
+        for path in [
+            "abs/a.gd",
+            "rel/a.gd",
+            "rel/b.gd",
+            "real/sub/up.gd",
+            "new.gd",
+        ] {
+            assert_eq!(
+                resolve_in_project(root, path).expect(path),
+                root.join(path),
+                "{path}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_loop_is_refused() {
+        let dir = project();
+        std::os::unix::fs::symlink("b", dir.path().join("a")).expect("symlink");
+        std::os::unix::fs::symlink("a", dir.path().join("b")).expect("symlink");
+        assert!(resolve_in_project(dir.path(), "a/x.gd").is_err());
+    }
+
+    #[test]
+    fn network_and_device_paths_are_refused_by_their_spelling() {
+        let dir = project();
+        for path in [
+            "res:////host/share/x.gd",
+            "res://\\\\host\\share\\x.gd",
+            "res://\\\\?\\UNC\\host\\share\\x.gd",
+            "res://\\\\.\\pipe\\x",
+            "\\\\host\\share\\x.gd",
+            "//host/share/x.gd",
+        ] {
+            assert!(resolve_in_project(dir.path(), path).is_err(), "{path}");
+        }
+        // Without touching the share: nothing under it is ever below the project.
+        assert!(components_below(Path::new("//host/share/x.gd"), &[dir.path()]).is_none());
+        assert!(is_network_path(Path::new("\\\\host\\share")));
+        assert!(is_network_path(Path::new("\\\\?\\UNC\\host\\share")));
+        assert!(!is_network_path(Path::new("\\\\?\\C:\\proj")));
+        assert!(!is_network_path(Path::new("/home/me/proj")));
+    }
+
+    #[test]
+    fn a_network_path_is_compared_by_its_spelling() {
+        assert!(same_directory(
+            Path::new("//host/share/proj"),
+            Path::new("\\\\host\\share\\proj\\")
+        ));
+        assert!(!same_directory(
+            Path::new("//host/share/proj"),
+            Path::new("/host/share/proj")
+        ));
     }
 }

@@ -1838,8 +1838,13 @@ impl CliRunner {
     }
 }
 
-/// Creates a new, empty directory for one engine call; it is removed by the caller.
+/// Creates a new, empty directory for one engine call; it is removed by the caller. On Unix only
+/// this user may enter it: the temporary directory is shared, and the folder holds the call's
+/// request and answer (project paths, screenshots).
 fn create_scratch_dir(purpose: &str) -> Result<PathBuf> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos());
@@ -1848,7 +1853,7 @@ fn create_scratch_dir(purpose: &str) -> Result<PathBuf> {
             "godot-mcp-{purpose}-{}-{nanos:x}-{attempt:x}",
             std::process::id()
         ));
-        match std::fs::create_dir(&dir) {
+        match builder.create(&dir) {
             Ok(()) => return Ok(dir),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error.into()),
@@ -2284,8 +2289,23 @@ fn strip_banner(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{binary_uid_limit, script_errors_in, strip_banner};
+    use super::{binary_uid_limit, create_scratch_dir, script_errors_in, strip_banner};
     use std::time::Duration;
+
+    /// A scratch folder holds the request and the answer of one engine call (scene paths,
+    /// screenshots): in the shared temporary directory, no other user may read it.
+    #[cfg(unix)]
+    #[test]
+    fn a_scratch_folder_is_private_to_this_user() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = create_scratch_dir("mode-test").expect("scratch dir");
+        let mode = std::fs::metadata(&dir)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        std::fs::remove_dir(&dir).expect("remove scratch dir");
+        assert_eq!(mode & 0o777, 0o700, "{mode:o}");
+    }
 
     /// The run that lost 20 uids: 96 compressed meshes of 373 MB in all were given 30 s, while
     /// Godot needs about 13 s for them on an idle machine and more under load.

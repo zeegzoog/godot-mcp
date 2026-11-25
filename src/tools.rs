@@ -1197,11 +1197,11 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
             json!({
                 "script_path": {
                     "type": "string",
-                    "description": "Path to the .gd script file (res:// paths need a project)."
+                    "description": "The .gd script: a res:// path or a path inside the project. A script outside the project is refused."
                 },
                 "project_path": {
                     "type": "string",
-                    "description": "Optional project root path for class resolution. For res:// paths it defaults to the editor's project, else the project the server was started in."
+                    "description": "Optional project root path. Defaults to the editor's project, else the project the server was started in."
                 }
             }),
             &["script_path"],

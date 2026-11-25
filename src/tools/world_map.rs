@@ -234,20 +234,31 @@ pub(crate) fn reply_options(project: &Path, args: &Value) -> Result<ReplyOptions
             if file.is_dir() {
                 return Err(format!("output_path is a directory: {requested}"));
             }
+            json_beside(project, &file).map_err(|problem| format!("output_path: {problem}"))?;
             Some(file)
         }
     };
     Ok(ReplyOptions { detail, output })
 }
 
-/// Writes the PNG and the full answer beside it, and returns their paths for the reply.
+/// The JSON file written beside the PNG, checked against the project like the PNG itself: a
+/// link in its place must not carry the write out of the project.
+fn json_beside(project: &Path, png_file: &Path) -> Result<PathBuf, String> {
+    let json_file = png_file.with_extension("json");
+    resolve_in_project(project, &json_file.to_string_lossy())
+        .map_err(|problem| format!("the JSON beside the PNG: {problem}"))
+}
+
+/// Writes the PNG and the full answer beside it, and returns their paths for the reply. Both
+/// paths are checked again here, just before writing, since the map took a while to draw.
 fn write_outputs(
     project: &Path,
     png_file: &Path,
     png: &[u8],
     answer: &Map<String, Value>,
 ) -> Result<Value, String> {
-    let json_file = png_file.with_extension("json");
+    let png_file = &resolve_in_project(project, &png_file.to_string_lossy())?;
+    let json_file = json_beside(project, png_file)?;
     if let Some(parent) = png_file.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
@@ -622,6 +633,27 @@ fn base64_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn the_json_beside_the_png_cannot_be_a_link_out_of_the_project() {
+        let dir = project();
+        let outside = tempfile::tempdir().expect("outside");
+        let victim = outside.path().join("bashrc");
+        std::fs::write(&victim, "keep").expect("victim");
+        std::fs::create_dir_all(dir.path().join("maps")).expect("maps");
+        std::os::unix::fs::symlink(&victim, dir.path().join("maps/out.json")).expect("symlink");
+
+        let err = reply_options(dir.path(), &json!({"output_path": "res://maps/out.png"}))
+            .expect_err("a json link out of the project");
+        assert!(err.contains("outside the project"), "{err}");
+
+        let png = dir.path().join("maps/out.png");
+        let err =
+            write_outputs(dir.path(), &png, b"\x89PNG", &Map::new()).expect_err("write refused");
+        assert!(err.contains("outside the project"), "{err}");
+        assert_eq!(std::fs::read_to_string(&victim).expect("read"), "keep");
+    }
 
     fn project() -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("project");

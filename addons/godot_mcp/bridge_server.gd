@@ -7,7 +7,9 @@ extends Node
 ## listed in every exported game's class list even though the addon's files are left out.
 ##
 ## Listens on loopback only and requires the shared token (see prepare_token) on every
-## command, so neither other machines nor web pages can drive the editor.
+## command, so neither other machines nor web pages can drive the editor. A peer is sent events
+## (game output, screenshots) only after it has sent the token; a peer that sends a wrong one, or
+## none within AUTH_TIMEOUT_MSEC of connecting, is closed.
 
 ## Without a configured port the bridge listens on the port derived from the project path
 ## (core/bridge_port.gd), and also on this one while it is free, for setups made before ports
@@ -20,6 +22,18 @@ const LOOPBACK_ADDRESS: String = "127.0.0.1"
 ## are far too small for scene trees and screenshots.
 const INBOUND_BUFFER_SIZE: int = 1 << 22
 const OUTBOUND_BUFFER_SIZE: int = 1 << 25
+## Open connections at most. Each MCP server keeps one, so this leaves room for several servers
+## on one editor while bounding the buffers a flood of connections could take.
+const MAX_PEERS: int = 8
+## A peer that has not sent a command with the token by then is closed. It must also have been
+## polled AUTH_TIMEOUT_POLLS times, so a client that connected while the editor was busy (a long
+## import blocks every frame) is not closed before its first command could be read.
+const AUTH_TIMEOUT_MSEC: int = 5000
+const AUTH_TIMEOUT_POLLS: int = 20
+## WebSocket close code "policy violation".
+const CLOSE_POLICY_VIOLATION: int = 1008
+## The only debugger message game_send forwards to the running game: the runtime's request channel.
+const GAME_SEND_COMMANDS: PackedStringArray = ["mcp:request"]
 
 const MAX_VALUE_CHARS: int = 2000
 ## Frames godot_open_scene waits for the editor to show a reloaded scene's tab.
@@ -77,7 +91,7 @@ const PARAM_TYPES: Dictionary = {
     "delete_files": {"paths": TYPE_ARRAY, "force": TYPE_BOOL, "allow_empty_dir": TYPE_BOOL, "dry_run": TYPE_BOOL, "trash": TYPE_BOOL},
     "move_files_check": {"files": TYPE_ARRAY, "rewrite": TYPE_ARRAY, "binary": TYPE_ARRAY},
     "move_files_apply": {"files": TYPE_ARRAY, "folders": TYPE_ARRAY, "rewritten": TYPE_ARRAY, "binary": TYPE_ARRAY, "pairs": TYPE_ARRAY},
-    "game_send": {"command": TYPE_STRING},
+    "game_send": {"command": TYPE_STRING, "data": TYPE_ARRAY, "session": TYPE_FLOAT},
     "close_editor": {"discard": TYPE_BOOL},
     "import_params": {"path": TYPE_STRING, "action": TYPE_STRING, "params": TYPE_DICTIONARY, "copy_from": TYPE_STRING, "reimport": TYPE_BOOL, "importer": TYPE_STRING},
 }
@@ -86,6 +100,12 @@ var server: TCPServer = TCPServer.new()
 ## Listens on LEGACY_PORT next to the derived port; null when the port is configured or busy.
 var legacy_server: TCPServer = null
 var peers: Array[WebSocketPeer] = []
+## Peers that have sent a command carrying the token (peer -> true). Only they get events.
+var _authenticated: Dictionary = {}
+## When each peer connected (Time.get_ticks_msec()), for AUTH_TIMEOUT_MSEC.
+var _connected_at: Dictionary = {}
+## How often each unauthenticated peer was polled since _connected_at, for AUTH_TIMEOUT_POLLS.
+var _polls: Dictionary = {}
 var undo_redo: EditorUndoRedoManager = null
 var game_relay: EditorDebuggerPlugin = null
 var port: int = LEGACY_PORT
@@ -219,22 +239,40 @@ func prepare_token() -> void:
     if legacy_server != null:
         _write_token_file(LEGACY_PORT)
 
+## Writes the token so that no other OS user can read it at any moment. FileAccess writes to a
+## temporary file next to the target and renames it into place on close, so the file only exists,
+## and can only be restricted, after close: the folder is restricted to its owner first, which
+## keeps other users out of the file while it still has the default mode. Windows has no Unix
+## permissions; the folder there is in the user's own profile.
 func _write_token_file(for_port: int) -> void:
     var token_file: String = OS.get_data_dir().path_join("godot-mcp").path_join("bridge-%d.token" % for_port)
-    DirAccess.make_dir_recursive_absolute(token_file.get_base_dir())
+    var folder: String = token_file.get_base_dir()
+    DirAccess.make_dir_recursive_absolute(folder)
+    var unix: bool = OS.get_name() != "Windows"
+    if unix:
+        var owner_only_dir: int = FileAccess.UNIX_READ_OWNER | FileAccess.UNIX_WRITE_OWNER | FileAccess.UNIX_EXECUTE_OWNER
+        var dir_err: Error = FileAccess.set_unix_permissions(folder, owner_only_dir)
+        if dir_err != OK:
+            printerr("[Godot MCP] Cannot restrict ", folder, " to its owner: ", error_string(dir_err), ". Other OS users may be able to read the bridge token; set GODOT_MCP_TOKEN for the editor and the MCP server instead.")
     var file: FileAccess = FileAccess.open(token_file, FileAccess.WRITE)
     if file == null:
         printerr("[Godot MCP] Cannot write the bridge token to ", token_file, ": ", error_string(FileAccess.get_open_error()))
         return
     file.store_string(_token)
     file.close()
-    FileAccess.set_unix_permissions(token_file, FileAccess.UNIX_READ_OWNER | FileAccess.UNIX_WRITE_OWNER)
+    if unix:
+        var file_err: Error = FileAccess.set_unix_permissions(token_file, FileAccess.UNIX_READ_OWNER | FileAccess.UNIX_WRITE_OWNER)
+        if file_err != OK:
+            printerr("[Godot MCP] Cannot restrict the bridge token file ", token_file, " to its owner: ", error_string(file_err))
     _token_files.append(token_file)
 
 func stop_server() -> void:
     for peer in peers:
         peer.close()
     peers.clear()
+    _authenticated.clear()
+    _connected_at.clear()
+    _polls.clear()
     server.stop()
     if legacy_server != null:
         legacy_server.stop()
@@ -244,20 +282,72 @@ func stop_server() -> void:
     _token_files.clear()
     print("[Godot MCP] Bridge server stopped")
 
-## Upgrades incoming TCP connections to WebSocket peers.
+## Upgrades incoming TCP connections to WebSocket peers. With MAX_PEERS open, the oldest peer
+## that has not sent the token yet makes room; when every peer has, the new connection is refused.
 func _accept_connections(listener: TCPServer) -> void:
     while listener.is_connection_available():
         var tcp_conn: StreamPeerTCP = listener.take_connection()
-        if tcp_conn != null:
-            var ws_peer: WebSocketPeer = WebSocketPeer.new()
-            ws_peer.inbound_buffer_size = INBOUND_BUFFER_SIZE
-            ws_peer.outbound_buffer_size = OUTBOUND_BUFFER_SIZE
-            var err: Error = ws_peer.accept_stream(tcp_conn)
-            if err == OK:
-                peers.append(ws_peer)
-                log_verbose("Client connected")
-            else:
-                printerr("[Godot MCP] Failed to accept WebSocket connection: ", error_string(err))
+        if tcp_conn == null:
+            continue
+        if peers.size() >= MAX_PEERS and not _drop_oldest_unauthenticated():
+            tcp_conn.disconnect_from_host()
+            printerr("[Godot MCP] Refused a bridge connection: %d clients are connected already. Close an MCP server connected to this editor, or restart the editor." % MAX_PEERS)
+            continue
+        var ws_peer: WebSocketPeer = WebSocketPeer.new()
+        ws_peer.inbound_buffer_size = INBOUND_BUFFER_SIZE
+        ws_peer.outbound_buffer_size = OUTBOUND_BUFFER_SIZE
+        var err: Error = ws_peer.accept_stream(tcp_conn)
+        if err == OK:
+            peers.append(ws_peer)
+            _connected_at[ws_peer] = Time.get_ticks_msec()
+            log_verbose("Client connected")
+        else:
+            printerr("[Godot MCP] Failed to accept WebSocket connection: ", error_string(err))
+
+## Drops the longest-connected peer that has not authenticated. False when every peer has.
+func _drop_oldest_unauthenticated() -> bool:
+    var oldest: int = -1
+    for index: int in range(peers.size()):
+        var candidate: WebSocketPeer = peers[index]
+        if _authenticated.has(candidate):
+            continue
+        if oldest < 0 or int(_connected_at.get(candidate, 0)) < int(_connected_at.get(peers[oldest], 0)):
+            oldest = index
+    if oldest < 0:
+        return false
+    var dropped: WebSocketPeer = peers[oldest]
+    dropped.close(-1)
+    _forget_peer(oldest)
+    log_verbose("Dropped an unauthenticated client to make room")
+    return true
+
+func _forget_peer(index: int) -> void:
+    var peer: WebSocketPeer = peers[index]
+    peers.remove_at(index)
+    _authenticated.erase(peer)
+    _connected_at.erase(peer)
+    _polls.erase(peer)
+
+## Closes a peer that failed authentication. Replies queued before are still delivered.
+func _reject_peer(peer: WebSocketPeer, reason: String) -> void:
+    _authenticated.erase(peer)
+    if peer.get_ready_state() == WebSocketPeer.STATE_OPEN:
+        peer.close(CLOSE_POLICY_VIOLATION, reason)
+    log_verbose("Closed a client: " + reason)
+
+## Constant-time comparison, so the time a refusal takes does not tell how much of a guess matched.
+func _token_matches(candidate: Variant) -> bool:
+    if _token.is_empty() or not candidate is String:
+        return false
+    var expected: PackedByteArray = _token.to_utf8_buffer()
+    var text: String = candidate
+    var given: PackedByteArray = text.to_utf8_buffer()
+    if given.size() != expected.size():
+        return false
+    var difference: int = 0
+    for index: int in range(expected.size()):
+        difference |= expected[index] ^ given[index]
+    return difference == 0
 
 func _process(_delta: float) -> void:
     if not _editor_started and _startup_probe.call():
@@ -278,12 +368,29 @@ func _process(_delta: float) -> void:
         var state: WebSocketPeer.State = peer.get_ready_state()
 
         if state == WebSocketPeer.STATE_OPEN:
-            while peer.get_available_packet_count() > 0:
+            while peer.get_ready_state() == WebSocketPeer.STATE_OPEN and peer.get_available_packet_count() > 0:
                 var packet: PackedByteArray = peer.get_packet()
                 handle_message(peer, packet.get_string_from_utf8())
         elif state == WebSocketPeer.STATE_CLOSED:
-            peers.remove_at(i)
+            _forget_peer(i)
             log_verbose("Client disconnected")
+            i -= 1
+            continue
+
+        if not _authenticated.has(peer):
+            _polls[peer] = int(_polls.get(peer, 0)) + 1
+        if not _authenticated.has(peer) and int(_polls[peer]) > AUTH_TIMEOUT_POLLS \
+                and Time.get_ticks_msec() - int(_connected_at.get(peer, 0)) > AUTH_TIMEOUT_MSEC:
+            if peer.get_ready_state() == WebSocketPeer.STATE_OPEN:
+                _reject_peer(peer, "No command with the bridge token within %d ms" % AUTH_TIMEOUT_MSEC)
+                # A peer that does not answer the close frame is dropped on the next timeout.
+                _connected_at[peer] = Time.get_ticks_msec()
+                _polls[peer] = 0
+            else:
+                # Still in the handshake, or ignoring the close frame.
+                peer.close(-1)
+                _forget_peer(i)
+                log_verbose("Dropped a client that did not authenticate")
 
         i -= 1
 
@@ -295,10 +402,14 @@ func handle_message(peer: WebSocketPeer, raw_msg: String) -> void:
     var json: JSON = JSON.new()
     if json.parse(raw_msg) != OK:
         send_error(peer, "", "Invalid JSON format: " + json.get_error_message())
+        if not _authenticated.has(peer):
+            _reject_peer(peer, "Invalid JSON before authentication")
         return
 
     if not json.data is Dictionary:
         send_error(peer, "", "Message payload must be a JSON dictionary")
+        if not _authenticated.has(peer):
+            _reject_peer(peer, "Not a JSON object before authentication")
         return
     var message: Dictionary = json.data
 
@@ -307,10 +418,11 @@ func handle_message(peer: WebSocketPeer, raw_msg: String) -> void:
     var raw_id: Variant = message.get("commandId", "")
     var cmd_id: String = raw_id if raw_id is String else str(raw_id)
 
-    var token: Variant = message.get("token", null)
-    if _token.is_empty() or not token is String or token != _token:
+    if not _token_matches(message.get("token", null)):
         send_error(peer, cmd_id, "Unauthorized: missing or invalid bridge token. Restart the MCP client so it re-reads the token, and run it as the same OS user as the editor (or set the same GODOT_MCP_TOKEN for both).")
+        _reject_peer(peer, "Unauthorized")
         return
+    _authenticated[peer] = true
 
     var raw_type: Variant = message.get("type", "")
     if not raw_type is String:
@@ -2833,11 +2945,14 @@ func game_send(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
         send_error(peer, cmd_id, "The game relay is not active. Update the Godot MCP addon and restart the editor.")
         return
     var command: String = str(params.get("command", ""))
+    if not GAME_SEND_COMMANDS.has(command):
+        send_error(peer, cmd_id, "game_send forwards only %s to the running game, not '%s'. Use the godot_game_* tools, which send their requests through mcp:request." % [", ".join(GAME_SEND_COMMANDS), command])
+        return
     var data: Variant = params.get("data", [])
     if not data is Array:
         send_error(peer, cmd_id, "game_send data must be an array")
         return
-    var session_id := int(params.get("session", -1))
+    var session_id: int = int(params.get("session", -1))
     var sent: Dictionary = game_relay.call("send", session_id, command, data)
     if sent.has("error"):
         send_error(peer, cmd_id, str(sent["error"]))
@@ -2853,7 +2968,7 @@ func game_status(peer: WebSocketPeer, cmd_id: String) -> void:
 func broadcast_event(event_name: String, data: Dictionary) -> void:
     var payload := JSON.stringify({"type": "event", "event": event_name, "data": data})
     for peer: WebSocketPeer in peers:
-        if peer.get_ready_state() == WebSocketPeer.STATE_OPEN:
+        if _authenticated.has(peer) and peer.get_ready_state() == WebSocketPeer.STATE_OPEN:
             peer.send_text(payload)
 
 func send_success(peer: WebSocketPeer, cmd_id: String, result: Dictionary) -> void:

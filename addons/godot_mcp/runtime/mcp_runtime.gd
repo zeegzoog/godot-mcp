@@ -23,6 +23,19 @@ const MODULES: Array = [
     preload("ops/rt_script.gd"),
 ]
 
+## Expected JSON type of each parameter that a method converts (int(), float(), bool()), checked
+## before the method runs: converting a wrongly typed value is a script error that sends no reply
+## and leaves the caller waiting for its timeout. JSON null counts as not provided.
+const PARAM_TYPES: Dictionary = {
+    "game.tree": {"max_nodes": TYPE_FLOAT, "depth": TYPE_FLOAT},
+    "game.get": {"signals": TYPE_BOOL, "methods": TYPE_BOOL},
+    "game.observe": {"frames": TYPE_FLOAT},
+    "game.screenshot": {"frames": TYPE_FLOAT, "every": TYPE_FLOAT, "max_dimension": TYPE_FLOAT},
+    "game.probe": {"detail": TYPE_BOOL, "areas": TYPE_BOOL, "bodies": TYPE_BOOL},
+    "rt.output": {"since": TYPE_FLOAT, "limit": TYPE_FLOAT},
+    "input.wait": {"frames": TYPE_FLOAT, "timeout": TYPE_FLOAT},
+}
+
 var _methods: Dictionary = {}
 var _registered := false
 var _hello_sent := false
@@ -143,6 +156,10 @@ func _on_message(message: String, data: Array) -> bool:
         return true
     var parser := JSON.new()
     if parser.parse(data[0]) != OK:
+        # Answered when its id can be read, so the caller does not wait for its timeout.
+        var id: Variant = recovered_id(data[0])
+        if id != null:
+            _reply({"id": id}, R.err(R.BAD_PARAMS, "The request is not valid JSON: %s at line %d. Send one JSON object with id, method and params." % [parser.get_error_message(), parser.get_error_line()]))
         return true
     var parsed: Variant = parser.data
     if parsed is Dictionary:
@@ -165,12 +182,17 @@ func _dispatch(req: Dictionary) -> void:
         params = {}
     var reply: Dictionary
     var refused := ""
-    if params is Dictionary and Hold.is_held() and _methods.has(method):
+    var mistyped := ""
+    if params is Dictionary:
+        mistyped = mistyped_param(method, params)
+    if params is Dictionary and mistyped.is_empty() and Hold.is_held() and _methods.has(method):
         refused = Hold.refusal(method, params)
     if not _methods.has(method):
         reply = R.err(R.BAD_PARAMS, "Unknown runtime method '%s'." % method, {"methods": _method_names()})
     elif not params is Dictionary:
         reply = R.err(R.BAD_PARAMS, "%s: params must be an object." % method)
+    elif not mistyped.is_empty():
+        reply = R.err(R.BAD_PARAMS, mistyped)
     elif not refused.is_empty():
         reply = R.err(R.BAD_PARAMS, refused)
     else:
@@ -189,6 +211,40 @@ func _dispatch(req: Dictionary) -> void:
         else:
             reply = R.err("INTERNAL", "%s returned an unexpected value." % method)
     _reply(req, reply)
+
+
+## The first wrongly typed parameter of a method (PARAM_TYPES), or "". A null is removed, as if
+## it had not been passed.
+func mistyped_param(method: String, params: Dictionary) -> String:
+    var spec: Dictionary = PARAM_TYPES.get(method, {})
+    for key: String in spec:
+        if not params.has(key):
+            continue
+        var value: Variant = params[key]
+        if value == null:
+            params.erase(key)
+            continue
+        var expected: int = spec[key]
+        var actual: int = typeof(value)
+        if actual != expected and not (expected == TYPE_FLOAT and actual == TYPE_INT):
+            var wanted := "a number" if expected == TYPE_FLOAT else type_string(expected)
+            return "%s: '%s' must be %s, got %s. Pass it as %s or leave it out." % [method, key, wanted, type_string(actual), wanted]
+    return ""
+
+
+## The id of a request whose JSON does not parse, read from its text: a number or a string
+## after "id":, or null when there is none.
+func recovered_id(text: String) -> Variant:
+    var pattern := RegEx.new()
+    if pattern.compile("\"id\"\\s*:\\s*(-?[0-9]+|\"(?:[^\"\\\\]|\\\\.)*\")") != OK:
+        return null
+    var found := pattern.search(text)
+    if found == null:
+        return null
+    var raw := found.get_string(1)
+    if raw.begins_with("\""):
+        return raw.substr(1, raw.length() - 2)
+    return int(raw)
 
 
 func _reply(req: Dictionary, reply: Dictionary) -> void:
@@ -261,6 +317,11 @@ func _script_stamp(scene: Node) -> Dictionary:
         "sha256": ctx.finish().hex_encode(),
         "basis": "loaded_source_at_scene_enter",
     }
+
+
+## Whether a node is this runtime or under it: game.set and game.call never act on it.
+func is_own(node: Node) -> bool:
+    return node == self or is_ancestor_of(node)
 
 
 func scene_root() -> Node:

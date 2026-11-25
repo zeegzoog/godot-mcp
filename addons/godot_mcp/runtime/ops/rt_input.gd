@@ -24,6 +24,8 @@ const R := preload("rt_result.gd")
 const MAX_PATH_FRAMES := 600
 ## The spaces a caller may give pointer positions in. viewport is the default.
 const COORDINATE_SPACES: Array[String] = ["viewport", "window"]
+## Step fields that _parse converts with int() or float().
+const NUMBER_FIELDS: Array[String] = ["x", "y", "to_x", "to_y", "index", "frames", "frames_per_point", "device", "value", "timeout"]
 
 const MOUSE_BUTTONS := {
     "left": MOUSE_BUTTON_LEFT,
@@ -1172,6 +1174,13 @@ static func _release_tap(step: Dictionary) -> void:
 
 
 static func _parse(step: Dictionary, index: int) -> Dictionary:
+    # Converting a wrongly typed field is a script error that sends no reply: refuse it here. A
+    # null is a field left out.
+    for field: String in NUMBER_FIELDS:
+        if step.has(field) and step[field] == null:
+            step.erase(field)
+        elif step.has(field) and not (step[field] is float or step[field] is int):
+            return R.err(R.BAD_PARAMS, "steps[%d]: %s must be a number, got %s." % [index, field, type_string(typeof(step[field]))])
     var kind := str(step.get("type", ""))
     var phase := str(step.get("phase", "tap"))
     if phase == "move" and kind != "touch":
@@ -1274,6 +1283,8 @@ static func _parse(step: Dictionary, index: int) -> Dictionary:
                 if not item is Array or (item as Array).size() < 2:
                     return R.err(R.BAD_PARAMS, "steps[%d]: each path point must be [x, y]." % index)
                 var pair: Array = item
+                if not (pair[0] is float or pair[0] is int) or not (pair[1] is float or pair[1] is int):
+                    return R.err(R.BAD_PARAMS, "steps[%d]: each path point must be [x, y] numbers." % index)
                 parsed_points.append(Vector2(float(pair[0]), float(pair[1])))
             var path_pointer := str(step.get("pointer", "mouse"))
             if not path_pointer in ["mouse", "touch"]:

@@ -1341,6 +1341,36 @@ async fn game_call_requires_an_explicit_permit_before_any_game_is_running() {
     assert!(text(&denied).contains("not allowed"), "{}", text(&denied));
 }
 
+/// RO-6: the server refuses, before it reaches any game, every engine method that calls another
+/// method by name, sets a property by name, sends a notification or replaces a node,
+/// the thread-safe and thread-group variants included. Moving a node (`remove_child`, `reparent`)
+/// stays allowed: it takes a Node argument, which a JSON value never becomes.
+#[tokio::test]
+async fn game_call_refuses_the_by_name_and_tree_changing_variants_before_any_game_is_running() {
+    for method in [
+        "call_thread_safe",
+        "call_deferred_thread_group",
+        "set_thread_safe",
+        "set_deferred_thread_group",
+        "notify_thread_safe",
+        "notify_deferred_thread_group",
+        "rpc_config",
+        "create_instance",
+    ] {
+        let denied = call(
+            "godot_game_call",
+            json!({"method": method, "path": ".", "permit": [method]}),
+        )
+        .await;
+        assert!(denied.is_error, "{method}: {}", text(&denied));
+        assert!(
+            text(&denied).contains("not allowed"),
+            "{method}: {}",
+            text(&denied)
+        );
+    }
+}
+
 #[test]
 fn tool_text_helper_reads_error_flag() {
     let result = ToolResult::error("boom", &["try again"]);

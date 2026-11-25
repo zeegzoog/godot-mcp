@@ -1,6 +1,9 @@
 //! Path and identifier checks shared by the tools that touch the file system.
 
-use std::path::{Component, Path, PathBuf};
+use std::collections::VecDeque;
+use std::ffi::OsString;
+use std::io::ErrorKind;
+use std::path::{Component, Path, PathBuf, Prefix};
 
 const RES_PREFIX: &str = "res://";
 
@@ -94,8 +97,8 @@ pub fn skipped_by_godot(path: &Path, is_dir: bool) -> bool {
 }
 
 /// Whether two paths name the same directory: compared after resolving links where the
-/// directory exists, with `\` read as `/`, no trailing separator, no Windows verbatim prefix and,
-/// on Windows, no difference of case.
+/// directory exists, with no trailing separator, no Windows verbatim prefix and, on Windows, `\`
+/// read as `/` and no difference of case.
 pub fn same_directory(a: &Path, b: &Path) -> bool {
     fn normalized(path: &Path) -> String {
         // A network path is compared by its spelling: resolving it would make Windows connect
@@ -105,7 +108,7 @@ pub fn same_directory(a: &Path, b: &Path) -> bool {
         } else {
             std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
         };
-        let mut text = resolved.to_string_lossy().replace('\\', "/");
+        let mut text = host_text(&resolved);
         if let Some(rest) = text.strip_prefix("//?/") {
             text = rest.to_string();
         }
@@ -120,11 +123,22 @@ pub fn same_directory(a: &Path, b: &Path) -> bool {
     normalized(a) == normalized(b)
 }
 
+/// `path` as text with the separators of this system read as `/`: on Windows `\` too, while on
+/// Unix a `\` is an ordinary character of a file name and stays one.
+fn host_text(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if cfg!(windows) {
+        text.replace('\\', "/")
+    } else {
+        text.into_owned()
+    }
+}
+
 /// Whether `path` names a network share or a Windows device rather than a local file:
-/// `\\host\share`, `//host/share`, `\\?\UNC\...` or `\\.\device`. A verbatim local path
-/// (`\\?\C:\...`) is not one.
+/// `//host/share` and, on Windows, `\\host\share`, `\\?\UNC\...` or `\\.\device`. A verbatim
+/// local path (`\\?\C:\...`) is not one.
 fn is_network_path(path: &Path) -> bool {
-    let text = path.to_string_lossy().replace('\\', "/");
+    let text = host_text(path);
     match text.strip_prefix("//?/") {
         Some(rest) => rest
             .get(..4)
@@ -133,73 +147,73 @@ fn is_network_path(path: &Path) -> bool {
     }
 }
 
-/// The spelling of `path` used to compare it with another without touching the file system:
-/// `\` read as `/`, no Windows verbatim prefix, no `.` segments and, on Windows, lower case.
-fn comparable_components(path: &Path) -> Vec<String> {
-    let text = path.to_string_lossy().replace('\\', "/");
-    let text = text.strip_prefix("//?/").unwrap_or(&text);
-    let mut parts: Vec<String> = Vec::new();
-    if text.starts_with('/') {
-        parts.push(String::new());
-    }
-    for part in text.split('/') {
-        if part.is_empty() || part == "." {
-            continue;
-        }
-        parts.push(if cfg!(windows) {
-            part.to_lowercase()
+/// The components of `path`, each with the key it is compared by without touching the file
+/// system: a Windows prefix in one spelling (verbatim or not), the root as `/`, no `.` segments
+/// and, on Windows, lower case. The second item is the component as written.
+fn comparable_components(path: &Path) -> Vec<(String, OsString)> {
+    let fold = |text: String| {
+        if cfg!(windows) {
+            text.to_lowercase()
         } else {
-            part.to_string()
-        });
-    }
-    parts
+            text
+        }
+    };
+    path.components()
+        .filter_map(|component| match component {
+            Component::Prefix(prefix) => {
+                let key = match prefix.kind() {
+                    Prefix::Verbatim(name) => name.to_string_lossy().into_owned(),
+                    Prefix::VerbatimUNC(host, share) | Prefix::UNC(host, share) => {
+                        format!("//{}/{}", host.to_string_lossy(), share.to_string_lossy())
+                    }
+                    Prefix::VerbatimDisk(disk) | Prefix::Disk(disk) => {
+                        format!("{}:", char::from(disk))
+                    }
+                    Prefix::DeviceNS(name) => format!("//./{}", name.to_string_lossy()),
+                };
+                Some((fold(key), prefix.as_os_str().to_os_string()))
+            }
+            Component::RootDir => Some(("/".to_string(), OsString::from("/"))),
+            Component::CurDir => None,
+            Component::ParentDir => Some(("..".to_string(), OsString::from(".."))),
+            Component::Normal(name) => Some((
+                fold(name.to_string_lossy().into_owned()),
+                name.to_os_string(),
+            )),
+        })
+        .collect()
 }
 
 /// The components of `path` below whichever of `roots` contains it, compared by spelling only;
 /// `None` when no root contains it.
-fn components_below(path: &Path, roots: &[&Path]) -> Option<Vec<String>> {
+fn components_below(path: &Path, roots: &[&Path]) -> Option<Vec<OsString>> {
     let wanted = comparable_components(path);
-    let text = path.to_string_lossy().replace('\\', "/");
-    let text = text.strip_prefix("//?/").unwrap_or(&text).to_string();
-    let original: Vec<&str> = text
-        .split('/')
-        .filter(|part| !part.is_empty() && *part != ".")
-        .collect();
-    let rooted = |path: &Path| {
-        path.has_root()
-            || path
-                .components()
-                .any(|component| matches!(component, Component::Prefix(_)))
-    };
     roots.iter().find_map(|root| {
-        if rooted(root) != rooted(path) {
-            return None;
-        }
         let root = comparable_components(root);
-        if !wanted.starts_with(&root) {
-            return None;
-        }
-        // `original` lacks the leading empty marker of a rooted path that `wanted` carries.
-        let skip = root.len() - usize::from(root.first().is_some_and(String::is_empty));
-        Some(
-            original
+        let inside = wanted.len() >= root.len()
+            && wanted
                 .iter()
-                .skip(skip)
-                .map(|part| (*part).to_string())
-                .collect(),
-        )
+                .zip(&root)
+                .all(|((key, _), (root_key, _))| key == root_key);
+        inside.then(|| {
+            wanted[root.len()..]
+                .iter()
+                .map(|(_, part)| part.clone())
+                .collect()
+        })
     })
 }
 
-/// Where an absolute link target starts inside the project: the resolved project root and the
-/// components below it when the target is spelled under the project, otherwise the resolved
-/// deepest part of the target that exists (a local path, never a network one) and the rest.
-/// `None` when the target is outside the project.
+/// Where an absolute path starts inside the project: the resolved project root and the
+/// components below it when the path is spelled under the project, otherwise the resolved
+/// deepest part of the path that exists and the rest (so a spelling of the project in another
+/// case, or through a link to it, still counts). Never called for a network path. `None` when
+/// the path is outside the project.
 fn absolute_link_target(
     target: &Path,
     root: &Path,
     project: &Path,
-) -> Option<(PathBuf, Vec<String>)> {
+) -> Option<(PathBuf, Vec<OsString>)> {
     if let Some(below) = components_below(target, &[root, project]) {
         return Some((root.to_path_buf(), below));
     }
@@ -215,14 +229,19 @@ fn absolute_link_target(
 /// How many symbolic links one path may pass through before it is refused, as on Linux.
 const MAX_LINKS: usize = 40;
 
-/// Follows `below` (components under `root`, which is resolved) the way the operating system
-/// would when the path is opened or created, and says whether it stays inside `root`. A link is
-/// read, never followed blindly: its target is checked by spelling before anything at it is
-/// looked at, so a link that points outside the project, or at a network share, is refused
-/// whether or not its target exists.
-fn stays_inside(root: &Path, project: &Path, below: Vec<String>) -> Result<(), &'static str> {
-    let mut current = root.to_path_buf();
-    let mut pending: std::collections::VecDeque<String> = below.into();
+/// Follows `below` (components under `start`, a resolved folder inside the resolved project
+/// `root`) the way the operating system would when the path is opened or created, and says
+/// whether it stays inside `root`. A link is read, never followed blindly: its target is checked
+/// by spelling before anything at it is looked at, so a link that points outside the project,
+/// or at a network share, is refused whether or not its target exists.
+fn stays_inside(
+    root: &Path,
+    project: &Path,
+    start: PathBuf,
+    below: Vec<OsString>,
+) -> Result<(), &'static str> {
+    let mut current = start;
+    let mut pending: VecDeque<OsString> = below.into();
     let mut links = 0;
     while let Some(part) = pending.pop_front() {
         if part == "." || part.is_empty() {
@@ -235,13 +254,21 @@ fn stays_inside(root: &Path, project: &Path, below: Vec<String>) -> Result<(), &
             continue;
         }
         let next = current.join(&part);
-        let Ok(meta) = std::fs::symlink_metadata(&next) else {
-            // Nothing exists here: the rest is created under `current`, unless it climbs back.
-            return if pending.iter().any(|rest| rest == "..") {
-                Err("a link leads out of the project directory")
-            } else {
-                Ok(())
-            };
+        let meta = match std::fs::symlink_metadata(&next) {
+            Ok(meta) => meta,
+            Err(error)
+                if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) =>
+            {
+                // Nothing exists here: the rest is created under `current`, unless it climbs
+                // back.
+                return if pending.iter().any(|rest| rest == "..") {
+                    Err("a link leads out of the project directory")
+                } else {
+                    Ok(())
+                };
+            }
+            // What cannot be looked at may be a link: refuse rather than guess.
+            Err(_) => return Err("a part of the path cannot be read"),
         };
         if !meta.file_type().is_symlink() {
             current = next;
@@ -252,13 +279,11 @@ fn stays_inside(root: &Path, project: &Path, below: Vec<String>) -> Result<(), &
             return Err("too many levels of symbolic links");
         }
         let target = std::fs::read_link(&next).map_err(|_| "a symbolic link cannot be read")?;
-        let target_text = target.to_string_lossy().replace('\\', "/");
-        let mut expanded: Vec<String> = if target.has_root()
+        let absolute = target.has_root()
             || target
                 .components()
-                .any(|component| matches!(component, Component::Prefix(_)))
-            || target_text.starts_with('/')
-        {
+                .any(|component| matches!(component, Component::Prefix(_)));
+        let mut expanded: Vec<OsString> = if absolute {
             if is_network_path(&target) {
                 return Err("a link points at a network path");
             }
@@ -267,7 +292,15 @@ fn stays_inside(root: &Path, project: &Path, below: Vec<String>) -> Result<(), &
             current = start;
             below
         } else {
-            target_text.split('/').map(str::to_string).collect()
+            // Split by this system's own rules: on Unix `a\b` is one name.
+            target
+                .components()
+                .filter_map(|component| match component {
+                    Component::Normal(name) => Some(name.to_os_string()),
+                    Component::ParentDir => Some(OsString::from("..")),
+                    _ => None,
+                })
+                .collect()
         };
         expanded.extend(pending.drain(..));
         pending = expanded.into();
@@ -279,9 +312,10 @@ fn stays_inside(root: &Path, project: &Path, below: Vec<String>) -> Result<(), &
 /// inside `project`.
 ///
 /// Rejects `..` segments (a name merely containing two dots is fine) and anything that lands
-/// outside the project, including through symlinks, whether their target exists or not. The
-/// path is first compared with the project by its spelling, so a path elsewhere (a network
-/// share above all) is refused before anything at it is looked at.
+/// outside the project, including through symlinks, whether their target exists or not. A
+/// network path is refused by its spelling, before anything at it is looked at; a local path
+/// spelled otherwise than the project (another case, a link to it) is compared by the folder on
+/// disk it names.
 pub fn resolve_in_project(project: &Path, requested: &str) -> Result<PathBuf, String> {
     let trimmed = requested.trim();
     if trimmed.is_empty() {
@@ -330,8 +364,13 @@ pub fn resolve_in_project(project: &Path, requested: &str) -> Result<PathBuf, St
             project.display()
         )
     })?;
-    let below = components_below(&resolved, &[project, &project_root]).ok_or_else(outside)?;
-    stays_inside(&project_root, project, below)
+    // A network path is refused by its spelling, before anything at it is looked at.
+    if is_network_path(&resolved) {
+        return Err(outside());
+    }
+    let (start, below) =
+        absolute_link_target(&resolved, &project_root, project).ok_or_else(outside)?;
+    stays_inside(&project_root, project, start, below)
         .map(|()| resolved)
         .map_err(|why| format!("{} ({why})", outside()))
 }
@@ -570,6 +609,78 @@ mod tests {
         assert!(resolve_in_project(dir.path(), "a/x.gd").is_err());
     }
 
+    /// On Unix a backslash is an ordinary character of a file name, so a link named `a\b` is
+    /// one entry, never the folders `a` and `b`.
+    #[cfg(unix)]
+    #[test]
+    fn a_backslash_in_a_link_name_does_not_hide_the_link() {
+        let dir = project();
+        let root = dir.path().canonicalize().expect("canonical project");
+        let outside = tempfile::tempdir().expect("outside");
+        let victim = outside.path().join("victim");
+        std::os::unix::fs::symlink(&victim, root.join("a\\b")).expect("symlink");
+        std::os::unix::fs::symlink("a\\b", root.join("L1")).expect("symlink");
+        std::os::unix::fs::symlink(root.join("a\\b"), root.join("L2")).expect("symlink");
+        for path in ["L1", "L2", "res://L1"] {
+            let err = resolve_in_project(dir.path(), path).expect_err(path);
+            assert!(err.contains("outside the project"), "{path}: {err}");
+        }
+        assert!(resolve_in_project(&root, "L2").is_err());
+        assert!(!victim.exists());
+    }
+
+    /// A request may spell the project's folders in another case on a file system that ignores
+    /// case (macOS, Windows): the folder on disk decides, as it did before links were walked.
+    #[test]
+    fn an_absolute_path_in_another_case_of_the_project_still_resolves() {
+        let dir = project();
+        let root = dir.path().canonicalize().expect("canonical project");
+        let Some(name) = root
+            .file_name()
+            .map(|name| name.to_string_lossy().to_uppercase())
+        else {
+            return;
+        };
+        let shouted = root.with_file_name(&name);
+        if shouted == root || !shouted.exists() {
+            return; // A file system that tells case apart: nothing to check.
+        }
+        let requested = shouted.join("x.gd");
+        let resolved =
+            resolve_in_project(dir.path(), &requested.to_string_lossy()).expect("other case");
+        assert_eq!(resolved, requested);
+
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::create_dir(root.join("sub")).expect("mkdir");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(outside.path(), root.join("sub/out")).expect("symlink");
+            let through = shouted.join("sub/out/x.gd");
+            assert!(resolve_in_project(dir.path(), &through.to_string_lossy()).is_err());
+        }
+    }
+
+    /// A part of the path that cannot be looked at is refused, not taken for a missing one.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_that_cannot_be_read_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = project();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).expect("mkdir");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let probe = std::fs::symlink_metadata(locked.join("x.gd"));
+        let result = resolve_in_project(dir.path(), "locked/x.gd");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        // Root reads every folder: then there is nothing to refuse.
+        if probe
+            .as_ref()
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+        {
+            assert!(result.is_err(), "{result:?}");
+        }
+    }
+
     #[test]
     fn network_and_device_paths_are_refused_by_their_spelling() {
         let dir = project();
@@ -585,14 +696,24 @@ mod tests {
         }
         // Without touching the share: nothing under it is ever below the project.
         assert!(components_below(Path::new("//host/share/x.gd"), &[dir.path()]).is_none());
-        assert!(is_network_path(Path::new("\\\\host\\share")));
-        assert!(is_network_path(Path::new("\\\\?\\UNC\\host\\share")));
-        assert!(!is_network_path(Path::new("\\\\?\\C:\\proj")));
+        assert!(is_network_path(Path::new("//host/share")));
         assert!(!is_network_path(Path::new("/home/me/proj")));
+        // On Unix a `\` is part of a file name, so only Windows reads these as shares.
+        assert_eq!(is_network_path(Path::new("\\\\host\\share")), cfg!(windows));
+        assert_eq!(
+            is_network_path(Path::new("\\\\?\\UNC\\host\\share")),
+            cfg!(windows)
+        );
+        assert!(!is_network_path(Path::new("\\\\?\\C:\\proj")));
     }
 
     #[test]
     fn a_network_path_is_compared_by_its_spelling() {
+        assert!(same_directory(
+            Path::new("//host/share/proj"),
+            Path::new("//host/share/proj/")
+        ));
+        #[cfg(windows)]
         assert!(same_directory(
             Path::new("//host/share/proj"),
             Path::new("\\\\host\\share\\proj\\")

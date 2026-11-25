@@ -4081,6 +4081,12 @@ async fn game_set_and_call_build_no_object_from_text() {
         ("items", r#"[Resource("res://scenes/holder.gd")]"#),
         ("table", r#"{"a": Object(Node,"name":"Planted")}"#),
         ("spot", r#"Object(Node,"name":"Planted")"#),
+        // Godot reads ; outside a string as a comment: the quote after it opens no string.
+        ("items", "[;\"\nObject(Node,\"name\":\"Planted\")\n;\"\n]"),
+        (
+            "table",
+            "{;\"\n\"a\": Object(Node,\"name\":\"Planted\")\n;\"\n}",
+        ),
     ] {
         let refused = call(
             &tools,
@@ -4102,6 +4108,10 @@ async fn game_set_and_call_build_no_object_from_text() {
     for (method, text) in [
         ("count_items", r#"[Object(Node,"name":"Planted")]"#),
         ("count_keys", r#"{"a": Object(Node,"name":"Planted")}"#),
+        (
+            "count_items",
+            "[;\"\nObject(Node,\"name\":\"Planted\")\n;\"\n]",
+        ),
     ] {
         let refused = call(
             &tools,
@@ -5228,6 +5238,10 @@ async fn set_resource_properties_without_an_editor_keeps_uids_and_unset_uniforms
         (
             json!({"shader": "res://../water.gdshader"}),
             "not a path inside the project",
+        ),
+        (
+            json!({"shader": ";\"\nObject(Shader,\"code\":\"shader_type spatial;\")\n;\""}),
+            "not a built-in type",
         ),
     ] {
         let refused = set(properties.clone()).await;

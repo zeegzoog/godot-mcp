@@ -848,7 +848,7 @@ static func _refused_text(value: Variant, expected: int, what: String) -> Dictio
         return {}
     if expected == TYPE_STRING_NAME or expected == TYPE_NODE_PATH or text_builds_no_object(value):
         return {}
-    return R.err(R.BAD_PARAMS, "%s: the text uses a constructor that is not a built-in type (such as Object(...) or Resource(...)), and no Object is built from text. Nothing was changed. Pass built-in literals such as Vector3(0, 1, 0), JSON arrays and objects, or a res:// path for a resource property." % what)
+    return R.err(R.BAD_PARAMS, "%s: the text uses a constructor that is not a built-in type (such as Object(...) or Resource(...)) or a ; comment, and no Object is built from text. Nothing was changed. Pass built-in literals such as Vector3(0, 1, 0), JSON arrays and objects, or a res:// path for a resource property." % what)
 
 
 ## Whether every constructor in a value text, outside its strings, is a built-in type other than
@@ -877,6 +877,10 @@ static func text_builds_no_object(text: String) -> bool:
             word = ""
         if character == "\"":
             in_string = true
+        elif character == ";":
+            # The parser reads ; outside a string as a comment to the end of the line, and a quote
+            # in it would make this scan see a string the parser skips. Godot never writes one.
+            return false
         elif character == "(":
             if last_word.is_empty() or last_word == "Object" or not is_builtin_type_name(last_word):
                 return false

@@ -2388,7 +2388,7 @@ func _setting_from_text(raw: String) -> Dictionary:
     if text.is_empty():
         return {"error": "value_text is empty: give a value as project.godot stores it, such as Vector2i(1152, 648) or {\"key\": 1}"}
     if text.begins_with("Object(") or not PropertyValues.text_builds_no_object(text):
-        return {"error": "value_text uses a constructor that is not a built-in type (an Object or a Resource); only built-in types such as Vector4(0, 1, 0, 0) or Color(1, 1, 1, 1) are parsed"}
+        return {"error": "value_text uses a constructor that is not a built-in type (an Object or a Resource) or a ; comment; only built-in types such as Vector4(0, 1, 0, 0) or Color(1, 1, 1, 1) are parsed"}
     var parsed: Variant = str_to_var(text)
     if parsed == null:
         return {"error": "value_text is not a value Godot can read: give it as project.godot stores it, such as Vector2i(1152, 648), \"text\" or {\"key\": Vector4(0, 1, 0, 0)}; to remove the setting pass remove: true"}

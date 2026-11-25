@@ -318,7 +318,7 @@ static func convert_property_value(info: Dictionary, raw: Variant) -> Dictionary
 ## refused before it is parsed.
 static func parse_value_text(raw: String) -> Dictionary:
     if not text_builds_no_object(raw):
-        return {"error": "the text %s uses a constructor that is not a built-in type (such as Object(...) or Resource(...)); no Object is built from text. Pass built-in literals such as Vector3(0, 1, 0), JSON arrays and objects, and res:// paths for resources" % describe_value(raw)}
+        return {"error": "the text %s uses a constructor that is not a built-in type (such as Object(...) or Resource(...)) or a ; comment; no Object is built from text. Pass built-in literals such as Vector3(0, 1, 0), JSON arrays and objects, and res:// paths for resources" % describe_value(raw)}
     return {"value": str_to_var(raw)}
 
 ## Whether every constructor in a value text, outside its strings, is a built-in type other than
@@ -346,6 +346,10 @@ static func text_builds_no_object(text: String) -> bool:
             word = ""
         if character == "\"":
             in_string = true
+        elif character == ";":
+            # The parser reads ; outside a string as a comment to the end of the line, and a quote
+            # in it would make this scan see a string the parser skips. Godot never writes one.
+            return false
         elif character == "(":
             if last_word.is_empty() or last_word == "Object" or not is_builtin_type_name(last_word):
                 return false

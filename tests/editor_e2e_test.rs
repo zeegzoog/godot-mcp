@@ -1470,6 +1470,11 @@ async fn project_settings_take_a_value_text_and_remove_like_the_file_fallback() 
             json!({"key": key, "value_text": "{\"a\": Object(Node)}"}),
             "built-in",
         ),
+        // Godot reads ; outside a string as a comment: the quote after it opens no string.
+        (
+            json!({"key": key, "value_text": "{;\"\n\"a\": Object(RefCounted,\"a\":1)\n;\"\n}"}),
+            "not a built-in type",
+        ),
         (
             json!({"key": key, "value_text": "Vector4(0, "}),
             "not a value",
@@ -4142,6 +4147,11 @@ async fn typed_container_properties_convert_each_element_or_refuse() {
             "mats",
             json!(["res://../mat.tres"]),
             "not a path inside the project",
+        ),
+        (
+            "nodes",
+            json!("[;\"\nObject(Node,\"name\":\"Planted\")\n;\"\n]"),
+            "not a built-in type",
         ),
     ] {
         expect_error(

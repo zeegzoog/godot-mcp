@@ -715,7 +715,8 @@ async fn bridge_caps_its_connections() {
     }
     let mut stranger = stranger.expect("the freed place was not taken");
 
-    // A client with the token gets the stranger's place.
+    // A client with the token gets the stranger's place once the stranger's grace period is over.
+    sleep(Duration::from_millis(1200)).await;
     let mut newcomer = authenticated_peer(&editor).await;
     assert_closed(&mut stranger, Duration::from_secs(5), "the stranger").await;
     let token = editor.bridge.secret().expect("bridge token");
@@ -730,6 +731,51 @@ async fn bridge_caps_its_connections() {
         .send_command("ping", json!({}))
         .await
         .expect("the server's own connection still works");
+}
+
+/// A flood of connections from another local process does not push out a client that has just
+/// connected and not yet sent its first command, and a client connecting during the flood still
+/// gets in.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn a_flood_of_connections_does_not_push_out_a_new_client() {
+    let editor = start_editor(false).await;
+    let url = format!("ws://127.0.0.1:{}", editor.port);
+    let mut client = raw_peer(editor.port).await;
+    let mut flood = Vec::new();
+    for _ in 0..12 {
+        if let Ok(Ok((ws, _))) = timeout(
+            Duration::from_secs(2),
+            tokio_tungstenite::connect_async(&url),
+        )
+        .await
+        {
+            flood.push(ws);
+        }
+    }
+    let token = editor.bridge.secret().expect("bridge token");
+    let reply = raw_command(
+        &mut client,
+        json!({"commandId": "late", "type": "ping", "params": {}, "token": token}),
+    )
+    .await;
+    assert_eq!(reply["status"], "success", "{reply}");
+
+    // A server connecting while the flood holds every free place gets in once the flood's
+    // connections are past their grace period.
+    let newcomer = BridgeClient::new(editor.port);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if newcomer.send_command("ping", json!({})).await.is_ok() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a new client could not connect during the flood"
+        );
+        sleep(Duration::from_millis(200)).await;
+    }
+    drop(flood);
 }
 
 /// game_send forwards only the runtime's request channel, so a client cannot send the game

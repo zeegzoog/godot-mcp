@@ -30,6 +30,10 @@ const MAX_PEERS: int = 8
 ## import blocks every frame) is not closed before its first command could be read.
 const AUTH_TIMEOUT_MSEC: int = 5000
 const AUTH_TIMEOUT_POLLS: int = 20
+## A new peer is never dropped to make room during this long: a real client sends its first
+## command right after connecting, and a flood of connections must not push it out before that
+## command was read. A connection arriving while every other place is taken is refused instead.
+const AUTH_GRACE_MSEC: int = 1000
 ## WebSocket close code "policy violation".
 const CLOSE_POLICY_VIOLATION: int = 1008
 ## The only debugger message game_send forwards to the running game: the runtime's request channel.
@@ -282,14 +286,14 @@ func stop_server() -> void:
     _token_files.clear()
     print("[Godot MCP] Bridge server stopped")
 
-## Upgrades incoming TCP connections to WebSocket peers. With MAX_PEERS open, the oldest peer
-## that has not sent the token yet makes room; when every peer has, the new connection is refused.
+## Upgrades incoming TCP connections to WebSocket peers. With MAX_PEERS open, a peer that has not
+## sent the token makes room (see _drop_unauthenticated); when none can, the new connection is refused.
 func _accept_connections(listener: TCPServer) -> void:
     while listener.is_connection_available():
         var tcp_conn: StreamPeerTCP = listener.take_connection()
         if tcp_conn == null:
             continue
-        if peers.size() >= MAX_PEERS and not _drop_oldest_unauthenticated():
+        if peers.size() >= MAX_PEERS and not _drop_unauthenticated():
             tcp_conn.disconnect_from_host()
             printerr("[Godot MCP] Refused a bridge connection: %d clients are connected already. Close an MCP server connected to this editor, or restart the editor." % MAX_PEERS)
             continue
@@ -304,20 +308,30 @@ func _accept_connections(listener: TCPServer) -> void:
         else:
             printerr("[Godot MCP] Failed to accept WebSocket connection: ", error_string(err))
 
-## Drops the longest-connected peer that has not authenticated. False when every peer has.
-func _drop_oldest_unauthenticated() -> bool:
-    var oldest: int = -1
+## Drops one peer that has not authenticated, to make room: one already being closed first, then
+## the oldest one past AUTH_GRACE_MSEC. A peer inside its grace period is never dropped. False when
+## no peer can be dropped.
+func _drop_unauthenticated() -> bool:
+    var now: int = Time.get_ticks_msec()
+    var chosen: int = -1
+    var chosen_closing: bool = false
     for index: int in range(peers.size()):
         var candidate: WebSocketPeer = peers[index]
         if _authenticated.has(candidate):
             continue
-        if oldest < 0 or int(_connected_at.get(candidate, 0)) < int(_connected_at.get(peers[oldest], 0)):
-            oldest = index
-    if oldest < 0:
+        var closing: bool = candidate.get_ready_state() == WebSocketPeer.STATE_CLOSING
+        var since: int = int(_connected_at.get(candidate, 0))
+        if not closing and now - since < AUTH_GRACE_MSEC:
+            continue
+        if chosen < 0 or (closing and not chosen_closing) \
+                or (closing == chosen_closing and since < int(_connected_at.get(peers[chosen], 0))):
+            chosen = index
+            chosen_closing = closing
+    if chosen < 0:
         return false
-    var dropped: WebSocketPeer = peers[oldest]
+    var dropped: WebSocketPeer = peers[chosen]
     dropped.close(-1)
-    _forget_peer(oldest)
+    _forget_peer(chosen)
     log_verbose("Dropped an unauthenticated client to make room")
     return true
 

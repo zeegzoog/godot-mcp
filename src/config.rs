@@ -162,11 +162,11 @@ fn parse_port(raw: &str) -> Result<PortSetting, String> {
         .map_err(|err| format!("{err}"))
 }
 
-/// The variables a `.env` file may set: the settings the server reads, and nothing else.
+/// The variables a settings file may set: the settings the server reads, and nothing else.
 ///
-/// Every variable the server sets is inherited by the processes it starts (Godot, `gh`), so a
-/// `.env` file in a cloned project must not be able to set `DYLD_INSERT_LIBRARIES`,
-/// `LD_PRELOAD`, `PATH` or the like.
+/// Every variable the server sets is inherited by the processes it starts (Godot, `gh`), so no
+/// settings file may set `DYLD_INSERT_LIBRARIES`, `LD_PRELOAD`, `PATH` or the like. All of
+/// them may come from the user's own settings file ([`user_settings_path`]).
 pub const DOTENV_KEYS: [&str; 8] = [
     "GODOT_PATH",
     "GODOT_CONSOLE_PATH",
@@ -178,18 +178,56 @@ pub const DOTENV_KEYS: [&str; 8] = [
     "GODOT_MCP_LSP_PORT",
 ];
 
-/// Splits the entries of a `.env` file into the ones to apply and the names of the keys that
-/// are not settings of the server. An allowed key that `is_set` already is left out without
-/// a note: a variable exported to the server wins over the file.
+/// The variables a `.env` file in the working directory may set. The MCP client usually starts
+/// the server in the user's project, so that file belongs to whoever wrote the project: it must
+/// not choose the programs the server runs (`GODOT_PATH`, `GODOT_CONSOLE_PATH`,
+/// `GODOT_MCP_GH_PATH`), the bridge secret (`GODOT_MCP_TOKEN`) or a folder outside the project
+/// to write to (`GODOT_MCP_MOVIE_DIR`).
+pub const PROJECT_DOTENV_KEYS: [&str; 3] = [
+    "GODOT_DEBUG_PORT",
+    "GODOT_MCP_FEEDBACK",
+    "GODOT_MCP_LSP_PORT",
+];
+
+/// The user's own settings file: `godot-mcp/.env` in the user's configuration folder
+/// (`%APPDATA%` on Windows, `~/Library/Application Support` on macOS, `$XDG_CONFIG_HOME` or
+/// `~/.config` elsewhere).
+pub fn user_settings_path() -> Option<PathBuf> {
+    let config_dir = if cfg!(windows) {
+        std::env::var_os("APPDATA")
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from)
+    } else if cfg!(target_os = "macos") {
+        std::env::var_os("HOME")
+            .filter(|dir| !dir.is_empty())
+            .map(|home| PathBuf::from(home).join("Library/Application Support"))
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .filter(|dir| !dir.is_empty())
+                    .map(|home| PathBuf::from(home).join(".config"))
+            })
+    }?;
+    Some(config_dir.join("godot-mcp").join(".env"))
+}
+
+/// Splits the entries of a settings file into the ones to apply and the names of the keys that
+/// are not in `allowed`. An allowed key that `is_set` already is left out without a note: a
+/// variable that is already set wins over the file. A key with an empty value is never named,
+/// since an empty value means "not set" anyway (a copied `.env.example`).
 fn select_dotenv_entries(
     entries: Vec<(String, String)>,
+    allowed: &[&str],
     is_set: impl Fn(&str) -> bool,
 ) -> (Vec<(String, String)>, Vec<String>) {
     let mut apply = Vec::new();
     let mut ignored: Vec<String> = Vec::new();
     for (key, value) in entries {
-        if !DOTENV_KEYS.contains(&key.as_str()) {
-            if !ignored.contains(&key) {
+        if !allowed.contains(&key.as_str()) {
+            if !value.trim().is_empty() && !ignored.contains(&key) {
                 ignored.push(key);
             }
         } else if !is_set(&key) && !apply.iter().any(|(applied, _)| applied == &key) {
@@ -199,46 +237,85 @@ fn select_dotenv_entries(
     (apply, ignored)
 }
 
-/// Loads the settings in a `.env` file in the working directory, if there is one.
+/// Applies the entries of the settings file at `path` whose keys are in `allowed` and not set
+/// yet, and returns the other keys it names. A missing file is no error.
 ///
-/// Only that one file is read, never one in a parent directory, and only the keys in
-/// [`DOTENV_KEYS`]; other keys are named in a warning and ignored. Exported variables win.
-///
-/// A file that exists but cannot be parsed is reported instead of silently ignored, since
-/// none of its settings take effect. The usual cause on Windows is a path in double
-/// quotes: `"C:\Godot\Godot.exe"` is read as escape sequences, `'C:\Godot\Godot.exe'` is not.
-fn load_dotenv() {
-    let path = Path::new(".env");
+/// A file that exists but cannot be parsed is reported instead of silently ignored, and none
+/// of its settings take effect. The usual cause on Windows is a path in double quotes:
+/// `"C:\Godot\Godot.exe"` is read as escape sequences, `'C:\Godot\Godot.exe'` is not.
+fn load_dotenv_file(path: &Path, allowed: &[&str]) -> Vec<String> {
     let entries = match dotenvy::from_path_iter(path) {
         Ok(iter) => iter.collect::<Result<Vec<(String, String)>, dotenvy::Error>>(),
-        Err(err) if err.not_found() => return,
+        Err(err) if err.not_found() => return Vec::new(),
         Err(err) => Err(err),
     };
     let entries = match entries {
         Ok(entries) => entries,
         Err(err) => {
             warn!(
-                "Ignoring the .env file because it could not be read ({err}). \
-                 Put Windows paths in single quotes, e.g. GODOT_PATH='C:\\Godot\\Godot.exe'"
+                "Ignoring {} because it could not be read ({err}). \
+                 Put Windows paths in single quotes, e.g. GODOT_PATH='C:\\Godot\\Godot.exe'",
+                path.display()
             );
-            return;
+            return Vec::new();
         }
     };
-    let (apply, ignored) = select_dotenv_entries(entries, |key| std::env::var_os(key).is_some());
+    let (apply, ignored) =
+        select_dotenv_entries(entries, allowed, |key| std::env::var_os(key).is_some());
     for (key, value) in apply {
         // SAFETY: this runs once at start-up, before the server starts any task or thread that
         // reads the environment.
         unsafe { std::env::set_var(key, value) };
     }
-    if !ignored.is_empty() {
+    debug!("Loaded settings from {}", path.display());
+    ignored
+}
+
+/// Loads the settings files: the user's own one ([`user_settings_path`]), then `.env` in the
+/// working directory, never one in a parent directory. Exported variables win over both, and
+/// the user's file wins over the working directory's. Keys a file may not set are named in a
+/// warning and ignored.
+fn load_dotenv() {
+    let user_file = user_settings_path();
+    let user_file_name = user_file.as_ref().map_or_else(
+        || "the godot-mcp/.env file in your user configuration folder".to_string(),
+        |path| path.display().to_string(),
+    );
+    if let Some(path) = &user_file {
+        let ignored = load_dotenv_file(path, &DOTENV_KEYS);
+        if !ignored.is_empty() {
+            warn!(
+                "Ignoring {} in {}: it may only set {}. \
+                 Set other variables in the environment of the server (the MCP client's \"env\" block)",
+                ignored.join(", "),
+                path.display(),
+                DOTENV_KEYS.join(", ")
+            );
+        }
+    }
+    let ignored = load_dotenv_file(Path::new(".env"), &PROJECT_DOTENV_KEYS);
+    let (user_only, unknown): (Vec<String>, Vec<String>) = ignored
+        .into_iter()
+        .partition(|key| DOTENV_KEYS.contains(&key.as_str()));
+    if !user_only.is_empty() {
         warn!(
-            "Ignoring {} in the .env file: a .env file may only set {}. \
-             Set other variables in the environment of the server (the MCP client's \"env\" block)",
-            ignored.join(", "),
-            DOTENV_KEYS.join(", ")
+            "Ignoring {} in the .env file of the working directory: a project's .env file may only \
+             set {}, never the programs the server runs, the bridge token or folders outside the \
+             project. Put {} in {} or in the MCP client's \"env\" block",
+            user_only.join(", "),
+            PROJECT_DOTENV_KEYS.join(", "),
+            user_only.join(", "),
+            user_file_name
         );
     }
-    debug!("Loaded settings from {}", path.display());
+    if !unknown.is_empty() {
+        warn!(
+            "Ignoring {} in the .env file of the working directory: it may only set {}. \
+             Set other variables in the environment of the server (the MCP client's \"env\" block)",
+            unknown.join(", "),
+            PROJECT_DOTENV_KEYS.join(", ")
+        );
+    }
 }
 
 impl Config {
@@ -421,8 +498,8 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, DOTENV_KEYS, FeedbackMode, LEGACY_DEBUG_PORT, PortOrigin, describe_bridge_port,
-        select_dotenv_entries,
+        Config, DOTENV_KEYS, FeedbackMode, LEGACY_DEBUG_PORT, PROJECT_DOTENV_KEYS, PortOrigin,
+        describe_bridge_port, select_dotenv_entries,
     };
     use clap::parser::ValueSource;
     use clap::{CommandFactory, FromArgMatches, Parser};
@@ -436,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn a_dotenv_file_sets_only_the_settings_of_the_server() {
+    fn a_settings_file_sets_only_the_settings_of_the_server() {
         let (apply, ignored) = select_dotenv_entries(
             entries(&[
                 ("GODOT_PATH", "/opt/godot"),
@@ -446,7 +523,9 @@ mod tests {
                 ("PATH", "/tmp"),
                 ("LD_PRELOAD", "/tmp/again.so"),
                 ("GH_HOST", "evil.example"),
+                ("RUST_LOG", ""),
             ]),
+            &DOTENV_KEYS,
             |_| false,
         );
         assert_eq!(
@@ -460,9 +539,9 @@ mod tests {
     }
 
     #[test]
-    fn every_setting_of_the_server_can_come_from_a_dotenv_file() {
+    fn every_setting_of_the_server_can_come_from_the_user_settings_file() {
         let pairs: Vec<(&str, &str)> = DOTENV_KEYS.iter().map(|key| (*key, "1")).collect();
-        let (apply, ignored) = select_dotenv_entries(entries(&pairs), |_| false);
+        let (apply, ignored) = select_dotenv_entries(entries(&pairs), &DOTENV_KEYS, |_| false);
         assert_eq!(apply, entries(&pairs));
         assert!(ignored.is_empty(), "{ignored:?}");
         for arg in Config::command().get_arguments() {
@@ -481,10 +560,54 @@ mod tests {
                 ("GODOT_DEBUG_PORT", "7000"),
                 ("GODOT_DEBUG_PORT", "7001"),
             ]),
+            &DOTENV_KEYS,
             |key| key == "GODOT_PATH",
         );
         assert_eq!(apply, entries(&[("GODOT_DEBUG_PORT", "7000")]));
         assert!(ignored.is_empty(), "{ignored:?}");
+    }
+
+    #[test]
+    fn a_project_dotenv_file_may_not_choose_programs_secrets_or_outside_folders() {
+        let (apply, ignored) = select_dotenv_entries(
+            entries(&[
+                ("GODOT_PATH", "./tools/evil"),
+                ("GODOT_CONSOLE_PATH", "./tools/evil"),
+                ("GODOT_MCP_GH_PATH", "./tools/evil"),
+                ("GODOT_MCP_TOKEN", "known"),
+                ("GODOT_MCP_MOVIE_DIR", "/etc"),
+                ("GODOT_DEBUG_PORT", "7000"),
+                ("GODOT_MCP_FEEDBACK", "off"),
+                ("GODOT_MCP_LSP_PORT", "6006"),
+                // An empty placeholder from a copied .env.example is not worth a warning.
+                ("GODOT_PATH", ""),
+            ]),
+            &PROJECT_DOTENV_KEYS,
+            |_| false,
+        );
+        assert_eq!(
+            apply,
+            entries(&[
+                ("GODOT_DEBUG_PORT", "7000"),
+                ("GODOT_MCP_FEEDBACK", "off"),
+                ("GODOT_MCP_LSP_PORT", "6006"),
+            ])
+        );
+        assert_eq!(
+            ignored,
+            [
+                "GODOT_PATH",
+                "GODOT_CONSOLE_PATH",
+                "GODOT_MCP_GH_PATH",
+                "GODOT_MCP_TOKEN",
+                "GODOT_MCP_MOVIE_DIR",
+            ]
+        );
+        assert!(
+            PROJECT_DOTENV_KEYS
+                .iter()
+                .all(|key| DOTENV_KEYS.contains(key))
+        );
     }
 
     #[test]

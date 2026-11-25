@@ -1,6 +1,6 @@
 # Configuration
 
-The server reads its settings from CLI flags, the environment (e.g. the MCP client's `env` block), or a `.env` file in its working directory, in that order of precedence.
+The server reads its settings from CLI flags, the environment (e.g. the MCP client's `env` block), your own settings file, or a `.env` file in its working directory, in that order of precedence.
 
 | Variable | Flag | Default | Purpose |
 | --- | --- | --- | --- |
@@ -15,7 +15,20 @@ The server reads its settings from CLI flags, the environment (e.g. the MCP clie
 
 An empty value counts as "not set", so placeholders in a copied `.env.example` or an MCP client's `env` block are harmless.
 
-A `.env` file is read only from the working directory itself, never from a parent directory, and it can set only the variables in this table. The server ignores any other key in it (such as `PATH`, `LD_PRELOAD` or `DYLD_INSERT_LIBRARIES`) and names it in a warning on stderr, so a `.env` file in a cloned project cannot change the environment of the Godot or `gh` processes the server starts. Set other variables in the MCP client's `env` block.
+### Settings files
+
+The server reads two settings files at start-up, both in the `.env` format of [.env.example](../.env.example). A variable already set in its environment wins over both.
+
+| File | Location | May set |
+| --- | --- | --- |
+| Your settings file | `godot-mcp/.env` in your configuration folder: `%APPDATA%\godot-mcp\.env` on Windows, `~/Library/Application Support/godot-mcp/.env` on macOS, `$XDG_CONFIG_HOME/godot-mcp/.env` (or `~/.config/godot-mcp/.env`) on Linux | every variable in the table above |
+| The project's `.env` | `.env` in the server's working directory only, never in a parent directory | `GODOT_DEBUG_PORT`, `GODOT_MCP_FEEDBACK` and `GODOT_MCP_LSP_PORT` only |
+
+Your settings file wins over the project's `.env`.
+
+An MCP client usually starts the server in your project, so the working directory's `.env` belongs to whoever wrote the project, for example a repository you cloned. It cannot choose the programs the server runs (`GODOT_PATH`, `GODOT_CONSOLE_PATH`, `GODOT_MCP_GH_PATH`), the bridge token (`GODOT_MCP_TOKEN`) or a folder outside the project to write to (`GODOT_MCP_MOVIE_DIR`). Put those in your settings file or in the MCP client's `env` block.
+
+Neither file can set a variable the server does not read, such as `PATH`, `LD_PRELOAD` or `DYLD_INSERT_LIBRARIES`, so no file can change the environment of the Godot or `gh` processes the server starts. The server ignores such keys and names them in a warning on stderr, together with the file to use instead.
 
 In a `.env` file, put **Windows paths in single quotes** (`GODOT_PATH='C:\Program Files\Godot\Godot.exe'`). In double quotes a backslash starts an escape sequence and the whole file fails to load; the server logs a warning when that happens. See [.env.example](../.env.example).
 

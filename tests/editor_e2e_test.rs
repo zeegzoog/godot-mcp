@@ -4121,6 +4121,28 @@ async fn typed_container_properties_convert_each_element_or_refuse() {
             json!("Array[NodePath]([NodePath(\"a\")])"),
             "names: element 0: expected String",
         ),
+        // Text is never parsed into an Object or a loaded Resource, even inside an array whose
+        // elements would then pass the class check.
+        (
+            "nodes",
+            json!("[Object(Node,\"name\":\"Planted\")]"),
+            "not a built-in type",
+        ),
+        (
+            "mats",
+            json!("[Resource(\"res://mat.tres\")]"),
+            "not a built-in type",
+        ),
+        (
+            "weights",
+            json!("{\"a\": Object(Node,\"name\":\"Planted\")}"),
+            "not a built-in type",
+        ),
+        (
+            "mats",
+            json!(["res://../mat.tres"]),
+            "not a path inside the project",
+        ),
     ] {
         expect_error(
             call(
@@ -4131,8 +4153,17 @@ async fn typed_container_properties_convert_each_element_or_refuse() {
             needle,
         );
     }
+    expect_error(
+        call(
+            "set_node_properties",
+            json!({"node_path": "Lists", "properties": {"loose": "[Object(Node,\"name\":\"Planted\")]"}}),
+        )
+        .await,
+        "not a built-in type",
+    );
     let read = props().await;
     assert_eq!(read["loose"]["value"], "[\"x\", 1.0]", "{read}");
+    assert_eq!(read["nodes"]["value"], "Array[Node]([])", "{read}");
     assert_eq!(
         read["paths"]["value"],
         "Array[NodePath]([NodePath(\"../UI\")])"

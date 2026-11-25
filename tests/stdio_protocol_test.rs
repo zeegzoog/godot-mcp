@@ -2,7 +2,10 @@
 
 mod common;
 
-use common::{MockBridge, Reply, Session, fake_godot, free_port, is_tool_error, project_dir};
+use common::{
+    MockBridge, Reply, Session, env_printing_godot, fake_godot, free_port, is_tool_error,
+    project_dir, tool_text,
+};
 use serde_json::json;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -367,6 +370,81 @@ async fn unparsable_dotenv_is_ignored_instead_of_stopping_the_server() {
 
     let reply = session.request("ping", json!({}), FAST).await;
     assert!(reply["result"].is_object());
+}
+
+/// A `.env` file that names an `env_printing_godot` as Godot, a free bridge port and a variable
+/// the server does not read.
+fn dotenv_with_unlisted_variable(godot: &std::path::Path) -> String {
+    format!(
+        "GODOT_PATH='{}'\nGODOT_DEBUG_PORT={}\nGODOT_MCP_TEST_UNLISTED=leaked\n",
+        godot.display(),
+        free_port()
+    )
+}
+
+#[tokio::test]
+async fn a_dotenv_file_sets_the_settings_but_no_other_variable_reaches_godot() {
+    let bin = tempfile::tempdir().expect("fake godot dir");
+    let godot = env_printing_godot(bin.path(), "GODOT_MCP_TEST_UNLISTED");
+    let mut session = Session::start_with_dotenv(&dotenv_with_unlisted_variable(&godot)).await;
+
+    let reply = session
+        .call_tool("godot_get_version", json!({}), FAST)
+        .await;
+    let text = tool_text(&reply);
+    // GODOT_PATH came from the file: the stand-in answered.
+    assert!(text.contains("4.5.stable"), "{text}");
+    // The unlisted variable was not put into the environment Godot inherits.
+    assert!(!text.contains("[leaked]"), "{text}");
+}
+
+#[tokio::test]
+async fn a_dotenv_file_in_a_parent_directory_is_not_read() {
+    let bin = tempfile::tempdir().expect("fake godot dir");
+    let godot = env_printing_godot(bin.path(), "GODOT_MCP_TEST_UNLISTED");
+    let mut session =
+        Session::start_with_dotenv_in_parent(&dotenv_with_unlisted_variable(&godot)).await;
+
+    let reply = session
+        .call_tool("godot_get_version", json!({}), FAST)
+        .await;
+    let text = tool_text(&reply);
+    assert!(!text.contains("GODOT_MCP_TEST_UNLISTED="), "{text}");
+}
+
+#[test]
+fn variables_a_dotenv_file_may_not_set_are_named_in_a_warning_on_stderr() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let cwd = tempfile::tempdir().expect("working directory");
+    std::fs::write(
+        cwd.path().join(".env"),
+        "GODOT_MCP_TEST_UNLISTED=leaked\nDYLD_INSERT_LIBRARIES=/nonexistent/inject.dylib\n",
+    )
+    .expect("write .env");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_godot-mcp"))
+        .current_dir(cwd.path())
+        .env_remove("GODOT_PATH")
+        .env_remove("GODOT_DEBUG_PORT")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start the server");
+    let mut stdin = child.stdin.take().expect("server stdin");
+    writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"ping"}}"#).expect("send ping");
+    drop(stdin);
+    let output = child.wait_with_output().expect("server output");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(r#""id":1"#), "{stdout}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("GODOT_MCP_TEST_UNLISTED") && stderr.contains("DYLD_INSERT_LIBRARIES"),
+        "{stderr}"
+    );
+    assert!(!stdout.contains("DYLD_INSERT_LIBRARIES"), "{stdout}");
 }
 
 #[test]

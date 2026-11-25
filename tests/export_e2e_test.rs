@@ -32,7 +32,8 @@ script = ExtResource("1")
 const ICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><rect width="16" height="16" fill="#4a8"/></svg>"##;
 
 fn godot_binary() -> PathBuf {
-    let _ = dotenvy::dotenv();
+    // The repository's own .env only, never one in a parent directory.
+    let _ = dotenvy::from_path(concat!(env!("CARGO_MANIFEST_DIR"), "/.env"));
     std::env::var("GODOT_PATH")
         .ok()
         .filter(|value| !value.is_empty())

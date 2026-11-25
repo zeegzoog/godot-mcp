@@ -162,20 +162,83 @@ fn parse_port(raw: &str) -> Result<PortSetting, String> {
         .map_err(|err| format!("{err}"))
 }
 
-/// Loads a `.env` file from the working directory (or a parent) if there is one.
+/// The variables a `.env` file may set: the settings the server reads, and nothing else.
+///
+/// Every variable the server sets is inherited by the processes it starts (Godot, `gh`), so a
+/// `.env` file in a cloned project must not be able to set `DYLD_INSERT_LIBRARIES`,
+/// `LD_PRELOAD`, `PATH` or the like.
+pub const DOTENV_KEYS: [&str; 8] = [
+    "GODOT_PATH",
+    "GODOT_CONSOLE_PATH",
+    "GODOT_DEBUG_PORT",
+    "GODOT_MCP_FEEDBACK",
+    "GODOT_MCP_GH_PATH",
+    "GODOT_MCP_MOVIE_DIR",
+    "GODOT_MCP_TOKEN",
+    "GODOT_MCP_LSP_PORT",
+];
+
+/// Splits the entries of a `.env` file into the ones to apply and the names of the keys that
+/// are not settings of the server. An allowed key that `is_set` already is left out without
+/// a note: a variable exported to the server wins over the file.
+fn select_dotenv_entries(
+    entries: Vec<(String, String)>,
+    is_set: impl Fn(&str) -> bool,
+) -> (Vec<(String, String)>, Vec<String>) {
+    let mut apply = Vec::new();
+    let mut ignored: Vec<String> = Vec::new();
+    for (key, value) in entries {
+        if !DOTENV_KEYS.contains(&key.as_str()) {
+            if !ignored.contains(&key) {
+                ignored.push(key);
+            }
+        } else if !is_set(&key) && !apply.iter().any(|(applied, _)| applied == &key) {
+            apply.push((key, value));
+        }
+    }
+    (apply, ignored)
+}
+
+/// Loads the settings in a `.env` file in the working directory, if there is one.
+///
+/// Only that one file is read, never one in a parent directory, and only the keys in
+/// [`DOTENV_KEYS`]; other keys are named in a warning and ignored. Exported variables win.
 ///
 /// A file that exists but cannot be parsed is reported instead of silently ignored, since
-/// none of its settings would take effect. The usual cause on Windows is a path in double
+/// none of its settings take effect. The usual cause on Windows is a path in double
 /// quotes: `"C:\Godot\Godot.exe"` is read as escape sequences, `'C:\Godot\Godot.exe'` is not.
 fn load_dotenv() {
-    match dotenvy::dotenv() {
-        Ok(path) => debug!("Loaded settings from {}", path.display()),
-        Err(err) if err.not_found() => {}
-        Err(err) => warn!(
-            "Ignoring the .env file because it could not be parsed ({err}). \
-             Put Windows paths in single quotes, e.g. GODOT_PATH='C:\\Godot\\Godot.exe'"
-        ),
+    let path = Path::new(".env");
+    let entries = match dotenvy::from_path_iter(path) {
+        Ok(iter) => iter.collect::<Result<Vec<(String, String)>, dotenvy::Error>>(),
+        Err(err) if err.not_found() => return,
+        Err(err) => Err(err),
+    };
+    let entries = match entries {
+        Ok(entries) => entries,
+        Err(err) => {
+            warn!(
+                "Ignoring the .env file because it could not be read ({err}). \
+                 Put Windows paths in single quotes, e.g. GODOT_PATH='C:\\Godot\\Godot.exe'"
+            );
+            return;
+        }
+    };
+    let (apply, ignored) = select_dotenv_entries(entries, |key| std::env::var_os(key).is_some());
+    for (key, value) in apply {
+        // SAFETY: this runs once at start-up, before the server starts any task or thread that
+        // reads the environment.
+        unsafe { std::env::set_var(key, value) };
     }
+    if !ignored.is_empty() {
+        warn!(
+            "Ignoring {} in the .env file: a .env file may only set {}. \
+             Set other variables in the environment of the server (the MCP client's \"env\" block)",
+            ignored.join(", "),
+            DOTENV_KEYS.join(", ")
+        );
+    }
+    debug!("Loaded settings from {}", path.display());
 }
 
 impl Config {
@@ -357,10 +420,72 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, FeedbackMode, LEGACY_DEBUG_PORT, PortOrigin, describe_bridge_port};
+    use super::{
+        Config, DOTENV_KEYS, FeedbackMode, LEGACY_DEBUG_PORT, PortOrigin, describe_bridge_port,
+        select_dotenv_entries,
+    };
     use clap::parser::ValueSource;
     use clap::{CommandFactory, FromArgMatches, Parser};
     use std::path::{Path, PathBuf};
+
+    fn entries(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_dotenv_file_sets_only_the_settings_of_the_server() {
+        let (apply, ignored) = select_dotenv_entries(
+            entries(&[
+                ("GODOT_PATH", "/opt/godot"),
+                ("DYLD_INSERT_LIBRARIES", "/tmp/evil.dylib"),
+                ("LD_PRELOAD", "/tmp/evil.so"),
+                ("GODOT_MCP_LSP_PORT", "6006"),
+                ("PATH", "/tmp"),
+                ("LD_PRELOAD", "/tmp/again.so"),
+                ("GH_HOST", "evil.example"),
+            ]),
+            |_| false,
+        );
+        assert_eq!(
+            apply,
+            entries(&[("GODOT_PATH", "/opt/godot"), ("GODOT_MCP_LSP_PORT", "6006")])
+        );
+        assert_eq!(
+            ignored,
+            ["DYLD_INSERT_LIBRARIES", "LD_PRELOAD", "PATH", "GH_HOST"]
+        );
+    }
+
+    #[test]
+    fn every_setting_of_the_server_can_come_from_a_dotenv_file() {
+        let pairs: Vec<(&str, &str)> = DOTENV_KEYS.iter().map(|key| (*key, "1")).collect();
+        let (apply, ignored) = select_dotenv_entries(entries(&pairs), |_| false);
+        assert_eq!(apply, entries(&pairs));
+        assert!(ignored.is_empty(), "{ignored:?}");
+        for arg in Config::command().get_arguments() {
+            if let Some(name) = arg.get_env() {
+                let name = name.to_string_lossy();
+                assert!(DOTENV_KEYS.contains(&name.as_ref()), "{name} is missing");
+            }
+        }
+    }
+
+    #[test]
+    fn an_exported_variable_wins_over_the_dotenv_file_and_the_first_entry_wins_over_a_repeat() {
+        let (apply, ignored) = select_dotenv_entries(
+            entries(&[
+                ("GODOT_PATH", "/from/dotenv"),
+                ("GODOT_DEBUG_PORT", "7000"),
+                ("GODOT_DEBUG_PORT", "7001"),
+            ]),
+            |key| key == "GODOT_PATH",
+        );
+        assert_eq!(apply, entries(&[("GODOT_DEBUG_PORT", "7000")]));
+        assert!(ignored.is_empty(), "{ignored:?}");
+    }
 
     #[test]
     fn the_feedback_mode_defaults_to_full_and_accepts_any_case() {

@@ -15,7 +15,8 @@ use std::sync::Arc;
 const IGNORE: &str = "needs GODOT_PATH pointing at a Godot 4.5+ executable";
 
 fn godot_path() -> PathBuf {
-    let _ = dotenvy::dotenv();
+    // The repository's own .env only, never one in a parent directory.
+    let _ = dotenvy::from_path(concat!(env!("CARGO_MANIFEST_DIR"), "/.env"));
     std::env::var("GODOT_PATH")
         .ok()
         .filter(|value| !value.is_empty())

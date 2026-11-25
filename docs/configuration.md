@@ -1,6 +1,6 @@
 # Configuration
 
-The server reads its settings from CLI flags, the environment (e.g. the MCP client's `env` block), or a `.env` file in its working directory or a parent directory, in that order of precedence.
+The server reads its settings from CLI flags, the environment (e.g. the MCP client's `env` block), or a `.env` file in its working directory, in that order of precedence.
 
 | Variable | Flag | Default | Purpose |
 | --- | --- | --- | --- |
@@ -14,6 +14,8 @@ The server reads its settings from CLI flags, the environment (e.g. the MCP clie
 | `GODOT_MCP_GH_PATH` | `--gh-path` | `gh` on `PATH` | The [GitHub CLI](https://cli.github.com) used when you let the AI submit a report. Set it when your MCP client does not see `gh` on its `PATH`. |
 
 An empty value counts as "not set", so placeholders in a copied `.env.example` or an MCP client's `env` block are harmless.
+
+A `.env` file is read only from the working directory itself, never from a parent directory, and it can set only the variables in this table. The server ignores any other key in it (such as `PATH`, `LD_PRELOAD` or `DYLD_INSERT_LIBRARIES`) and names it in a warning on stderr, so a `.env` file in a cloned project cannot change the environment of the Godot or `gh` processes the server starts. Set other variables in the MCP client's `env` block.
 
 In a `.env` file, put **Windows paths in single quotes** (`GODOT_PATH='C:\Program Files\Godot\Godot.exe'`). In double quotes a backslash starts an escape sequence and the whole file fails to load; the server logs a warning when that happens. See [.env.example](../.env.example).
 

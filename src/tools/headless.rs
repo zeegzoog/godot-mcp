@@ -6,6 +6,7 @@ use super::main_loop::main_loop_problem;
 use super::project_gate::ScriptTurn;
 use super::run::StaleImports;
 use super::{ToolManager, bridge_error_result, code, missing_argument, str_arg, user_args_of};
+use crate::bridge_protocol::for_editor;
 use crate::cli_runner::{
     SET_RESOURCE_MARKER, ScriptErrorLoc, ScriptRun, binary_uid_limit, script_load_failure,
 };
@@ -14,13 +15,15 @@ use crate::godot::class_cache;
 use crate::godot::{
     BinaryUidFix, IMPORTED_EXTENSIONS, ResourceDamage, ResourceRepair, TextResourceSnapshot,
     UidCacheUpdate, changed_imports, force_reimport, import_fingerprints, import_kind, record_uids,
-    stale_reason,
+    stale_reason, written_in,
 };
 use crate::paths::{res_display, resolve_in_project, same_directory};
 use crate::protocol::ToolResult;
+use crate::util::blocking;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 const DEFAULT_SCRIPT_TIMEOUT: u64 = 120;
 const MAX_SCRIPT_TIMEOUT: u64 = 3600;
@@ -585,6 +588,12 @@ const STILL_STALE_FORCED_HINTS: &[&str] = &[
 /// What to do about classes the project's class cache lacks.
 const UNREGISTERED_RECOVERY: &str = "Register the classes with godot_resave_resources (without the editor it runs `godot --headless --path <project> --import`, which rewrites the class cache), or open the project in the editor, then validate again";
 
+/// [`TextResourceSnapshot::damage_since`], off the async workers.
+async fn damage_since(snapshot: &Arc<TextResourceSnapshot>, project: &Path) -> Vec<ResourceDamage> {
+    let (snapshot, project) = (snapshot.clone(), project.to_path_buf());
+    blocking(move || snapshot.damage_since(&project)).await
+}
+
 /// What `godot_validate_script` adds about classes the project's class cache lacks.
 struct CacheReport {
     text: String,
@@ -593,8 +602,14 @@ struct CacheReport {
 }
 
 /// Classes declared in the project but missing from `.godot/global_script_class_cache.cfg`
-/// that the validated script declares or uses, or `None` when there are none.
-async fn cache_report(project: &Path, file: &Path, script_path: &str) -> Option<CacheReport> {
+/// that the validated script declares or uses, or `None` when there are none. `scripts` is a
+/// scan of the project's scripts already made, else the project is scanned here.
+async fn cache_report(
+    project: &Path,
+    file: &Path,
+    script_path: &str,
+    scripts: Option<Vec<code::ScannedScript>>,
+) -> Option<CacheReport> {
     let project = project.to_path_buf();
     let file = file.to_path_buf();
     let script_path = script_path.to_string();
@@ -604,9 +619,13 @@ async fn cache_report(project: &Path, file: &Path, script_path: &str) -> Option<
             .strip_prefix(&project)
             .ok()
             .map(|relative| format!("res://{}", relative.to_string_lossy().replace('\\', "/")));
+        let scripts = scripts.unwrap_or_else(|| code::scan_scripts(&project));
+        let declared = scripts.iter().filter_map(|script| {
+            Some((script.file.as_path(), script.header_class.as_deref()?))
+        });
         let mut lines = Vec::new();
         let mut used = false;
-        for class in class_cache::unregistered(&project) {
+        for class in class_cache::unregistered_among(&project, declared) {
             if Some(&class.path) == own.as_ref() {
                 lines.push(format!(
                     "Warning: {script_path} declares class_name {}, which the project's class cache ({}) does not list yet, so headless runs and process runs cannot find it.",
@@ -674,6 +693,7 @@ fn with_cache_report(result: ToolResult, report: Option<&CacheReport>) -> ToolRe
     ToolResult {
         content: vec![crate::protocol::ToolContent::Text { text }],
         is_error: true,
+        structured_content: None,
     }
 }
 
@@ -790,24 +810,32 @@ impl ToolManager {
                 .await
             {
                 Ok(Some(mut value)) => {
-                    let mut unregistered = code::unregistered_classes(dir, &file, &value);
+                    // One read of the project's scripts serves both class checks below.
+                    let mut scripts = code::scan_scripts_off_executor(dir).await;
+                    let mut unregistered =
+                        code::unregistered_classes_in(dir, &scripts, &file, &value);
                     // A script written outside the editor is unknown to its class list until
                     // the editor rescans; registering the declaring scripts and asking again
                     // tells a stale class list apart from a real error.
                     if !unregistered.is_empty()
                         && external_ok
                         && self.register_scripts(&unregistered).await
-                        && let Ok(Some(again)) = self
+                    {
+                        // The editor may have saved the scripts again: read them anew.
+                        scripts = code::scan_scripts_off_executor(dir).await;
+                        if let Ok(Some(again)) = self
                             .lsp
                             .diagnostics_if_reachable(dir, external_ok, &file)
                             .await
-                    {
-                        value = again;
-                        unregistered = code::unregistered_classes(dir, &file, &value);
+                        {
+                            value = again;
+                            unregistered =
+                                code::unregistered_classes_in(dir, &scripts, &file, &value);
+                        }
                     }
                     // The class cache is what headless runs and process runs know; the language
                     // server scans the project itself, so it can know classes they do not.
-                    let classes = cache_report(dir, &file, script_path).await;
+                    let classes = cache_report(dir, &file, script_path, Some(scripts)).await;
                     let finish = |result: ToolResult| with_cache_report(result, classes.as_ref());
                     let mut report = code::report_diagnostics(script_path, &value);
                     if code::addon_warnings_hidden(dir, &file) {
@@ -853,7 +881,7 @@ impl ToolManager {
         }
 
         let classes = match &project_dir {
-            Some(dir) => cache_report(dir, &file, script_path).await,
+            Some(dir) => cache_report(dir, &file, script_path, None).await,
             None => None,
         };
         let finish = |result: ToolResult| with_cache_report(result, classes.as_ref());
@@ -928,7 +956,10 @@ impl ToolManager {
             return self.import_headless(&args).await;
         }
         let bridge = self.bridge.clone().with_timeout(Self::RESAVE_BRIDGE_WAIT);
-        match bridge.send_command("resave_resources", args.clone()).await {
+        match bridge
+            .send_command("resave_resources", for_editor(&args, &["force"]))
+            .await
+        {
             Ok(result) => {
                 let text = serde_json::to_string_pretty(&result).unwrap_or_default();
                 if result.get("timed_out").and_then(Value::as_bool) == Some(true) {
@@ -1178,12 +1209,28 @@ impl ToolManager {
 
     /// The file part of [`Self::repair_resources`]: binary uids first, so a rewritten text scene
     /// that refers to one finds its uid again, then the text scenes and resources.
-    async fn repair_files(&self, project: &Path, snapshot: &TextResourceSnapshot) -> RepairReport {
-        // Binary files first, so a rewritten text scene that refers to one finds its uid again.
-        let plan = snapshot.binary_uid_plan(project);
+    ///
+    /// The project is walked once for what the run changed, off the async workers; only when
+    /// Godot rewrote binary files in between is it walked again, so the text repair and the list
+    /// of written files see what that Godot process left.
+    async fn repair_files(
+        &self,
+        project: &Path,
+        snapshot: &Arc<TextResourceSnapshot>,
+    ) -> RepairReport {
+        let (changes, plan) = {
+            let (snapshot, project) = (snapshot.clone(), project.to_path_buf());
+            blocking(move || {
+                let changes = snapshot.changes_since(&project);
+                let plan = snapshot.binary_uid_plan_of(&changes);
+                (changes, plan)
+            })
+            .await
+        };
         let mut binary_error = None;
-        let mut repairs = Vec::new();
-        if !plan.is_empty() {
+        let changes = if plan.is_empty() {
+            Some(changes)
+        } else {
             let carries = |fix: &BinaryUidFix| {
                 !snapshot
                     .binary_repairs(project, std::slice::from_ref(fix))
@@ -1205,13 +1252,27 @@ impl ToolManager {
                 self.cli.set_binary_uids(project, &uids, limit).await
             };
             binary_error = write_binary_uids_in_passes(&plan, write, carries).await;
-            repairs = snapshot.binary_repairs(project, &plan);
-        }
-        repairs.extend(snapshot.repair_since(project));
-        repairs.sort_by(|a, b| a.path.cmp(&b.path));
+            None
+        };
+        let (repairs, written) = {
+            let (snapshot, project) = (snapshot.clone(), project.to_path_buf());
+            blocking(move || {
+                let changes = changes.unwrap_or_else(|| snapshot.changes_since(&project));
+                let mut repairs = if plan.is_empty() {
+                    Vec::new()
+                } else {
+                    snapshot.binary_repairs(&project, &plan)
+                };
+                let texts = changes.read_texts();
+                repairs.extend(snapshot.repair_texts(&project, &texts));
+                repairs.sort_by(|a, b| a.path.cmp(&b.path));
+                (repairs, written_in(&changes, &texts))
+            })
+            .await
+        };
         RepairReport {
             repairs,
-            written: snapshot.written_since(project),
+            written,
             editor: None,
             editor_error: None,
             binary_error,
@@ -1251,7 +1312,7 @@ impl ToolManager {
         repair.overlapped = turn.overlapped();
         let damage = {
             let _alone = turn.exclusive().await;
-            turn.snapshot().damage_since(project)
+            damage_since(turn.snapshot(), project).await
         };
         let answer = run
             .stdout
@@ -1394,7 +1455,7 @@ impl ToolManager {
                 repair.overlapped = turn.overlapped();
                 let damage = {
                     let _alone = turn.exclusive().await;
-                    turn.snapshot().damage_since(&project.dir)
+                    damage_since(turn.snapshot(), &project.dir).await
                 };
                 script_run_result(
                     &report,

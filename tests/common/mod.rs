@@ -220,11 +220,12 @@ pub fn slowly_printing_godot(dir: &Path) -> PathBuf {
 }
 
 /// A stand-in for the Godot executable that answers the class check of the authoring fallbacks:
-/// it reads the class name after `--` (the last argument) and prints `GODOT_MCP_CLASS=scene` for
-/// a few Node classes, `resource` for a few Resource classes and `no` for anything else. It
-/// answers the project setting type check as for a setting the engine does not define, and the
-/// resource load check (a `res://` path last) as a file that loaded as the resource class it
-/// classified last.
+/// asked for the class list (its script, `class_list.gd`, is the last argument) it lists a few
+/// Node classes as scene roots and a few Resource classes as resources, and adds a line to
+/// `class_lists.txt` next to itself. Asked for `--version` it prints a version and adds a line to
+/// `versions.txt`. It answers the project setting type check as for a setting the engine does not
+/// define, and the resource load check (a `res://` path last) as a file that loaded as the class
+/// its header names.
 pub fn classifying_godot(dir: &Path) -> PathBuf {
     #[cfg(windows)]
     {
@@ -232,16 +233,36 @@ pub fn classifying_godot(dir: &Path) -> PathBuf {
         std::fs::write(
             &path,
             "@echo off
+setlocal
+set PROJ=
+set PREV=
+set LAST=
+for %%a in (%*) do call :arg %%a
+if \"%LAST%\"==\"--version\" goto version
+if \"%LAST:~-13%\"==\"class_list.gd\" goto classes
 echo GODOT_MCP_SETTING={}
-for %%a in (%*) do set LAST=%%a
 if \"%LAST:~0,6%\"==\"res://\" goto load
-for %%c in (Node Node2D Node3D Control) do if \"%LAST%\"==\"%%c\" (echo GODOT_MCP_CLASS=scene& exit /b 0)
-for %%c in (Resource Curve Gradient) do if \"%LAST%\"==\"%%c\" (>\"%~dp0last_class.txt\" echo %%c& echo GODOT_MCP_CLASS=resource& exit /b 0)
-echo GODOT_MCP_CLASS=no
+exit /b 0
+:arg
+if \"%PREV%\"==\"--path\" set PROJ=%~1
+set PREV=%~1
+set LAST=%~1
+exit /b 0
+:version
+>>\"%~dp0versions.txt\" echo v
+echo 4.8.beta1.stand-in
+exit /b 0
+:classes
+>>\"%~dp0class_lists.txt\" echo c
+echo GODOT_MCP_CLASSES={\"scene\":[\"Node\",\"Node2D\",\"Node3D\",\"Control\"],\"resource\":[\"Resource\",\"Curve\",\"Gradient\"]}
 exit /b 0
 :load
-set /p CLASS=<\"%~dp0last_class.txt\"
+set FILE=%PROJ%\\%LAST:~6%
+set FILE=%FILE:/=\\%
+set CLASS=
+for /f usebackq^ tokens^=2^ delims^=^\" %%t in (`findstr /b /l /c:\"[gd_resource\" \"%FILE%\"`) do set CLASS=%%t
 echo GODOT_MCP_RESOURCE={\"loaded\":true,\"class\":\"%CLASS%\"}
+exit /b 0
 ",
         )
         .expect("write classifying godot");
@@ -254,13 +275,22 @@ echo GODOT_MCP_RESOURCE={\"loaded\":true,\"class\":\"%CLASS%\"}
         std::fs::write(
             &path,
             "#!/bin/sh
-echo 'GODOT_MCP_SETTING={}'
-for last; do :; done
+here=$(dirname \"$0\")
+prev=; project=; last=
+for arg; do
+  [ \"$prev\" = --path ] && project=$arg
+  prev=$arg; last=$arg
+done
 case \"$last\" in
-  res://*) echo \"GODOT_MCP_RESOURCE={\\\"loaded\\\":true,\\\"class\\\":\\\"$(cat \"$(dirname \"$0\")/last_class\")\\\"}\" ;;
-  Node|Node2D|Node3D|Control) echo GODOT_MCP_CLASS=scene ;;
-  Resource|Curve|Gradient) echo \"$last\" > \"$(dirname \"$0\")/last_class\"; echo GODOT_MCP_CLASS=resource ;;
-  *) echo GODOT_MCP_CLASS=no ;;
+  --version) echo v >> \"$here/versions.txt\"; echo 4.8.beta1.stand-in; exit 0 ;;
+  *class_list.gd) echo c >> \"$here/class_lists.txt\"
+    echo 'GODOT_MCP_CLASSES={\"scene\":[\"Node\",\"Node2D\",\"Node3D\",\"Control\"],\"resource\":[\"Resource\",\"Curve\",\"Gradient\"]}'
+    exit 0 ;;
+esac
+echo 'GODOT_MCP_SETTING={}'
+case \"$last\" in
+  res://*) class=$(sed -n '1s/^\\[gd_resource type=\"\\([A-Za-z0-9_]*\\)\".*/\\1/p' \"$project/${last#res://}\")
+    echo \"GODOT_MCP_RESOURCE={\\\"loaded\\\":true,\\\"class\\\":\\\"$class\\\"}\" ;;
 esac
 ",
         )
@@ -269,6 +299,13 @@ esac
             .expect("chmod classifying godot");
         path
     }
+}
+
+/// How many lines a stand-in added to the file `name` next to itself: how often it was asked.
+pub fn stand_in_count(engine_dir: &Path, name: &str) -> usize {
+    std::fs::read_to_string(engine_dir.join(name))
+        .map(|text| text.lines().filter(|line| !line.trim().is_empty()).count())
+        .unwrap_or(0)
 }
 
 /// A stand-in for the Godot executable that answers the project setting type check with
@@ -524,7 +561,12 @@ pub enum Reply {
     Ok(Value),
     OkWithEvent(Value, Value),
     Err(String),
+    /// An error with a code, as addons that send error codes answer: (code, message).
+    ErrCode(&'static str, String),
     After(Duration, Value),
+    /// Sends this text as it is, with `$ID` replaced by the command id: a reply that is not
+    /// necessarily valid JSON, written the way Godot's `JSON.stringify` writes it.
+    Raw(String),
     Never,
 }
 
@@ -643,12 +685,22 @@ where
                     json!({"commandId": id, "status": "error", "error": message}).to_string(),
                 );
             }
+            Reply::ErrCode(code, message) => {
+                let _ = out_tx.send(
+                    json!({"commandId": id, "status": "error", "error": message, "code": code})
+                        .to_string(),
+                );
+            }
             Reply::After(delay, result) => {
                 let tx = out_tx.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(delay).await;
                     let _ = tx.send(success(&id, result));
                 });
+            }
+            Reply::Raw(text) => {
+                let id = id.as_str().unwrap_or_default();
+                let _ = out_tx.send(text.replace("$ID", id));
             }
             Reply::Never => {}
         }

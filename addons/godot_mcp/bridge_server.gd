@@ -46,9 +46,26 @@ const IMPORTED_EXTENSIONS: PackedStringArray = [
     "wav", "ogg", "mp3", "glb", "gltf", "fbx", "obj", "ttf", "otf", "woff", "woff2",
 ]
 
-## Expected JSON type of each parameter, checked before a handler runs so that a wrongly typed
-## value produces an error response instead of a script error that leaves the caller waiting.
+## The version of the commands and parameters this bridge understands, answered by get_version
+## with the list of them (commands). The server reads it once per connection. An addon that
+## answers no protocol field is protocol 1: it ignored parameters it did not know. Raise it when
+## a command or parameter changes meaning; adding one is announced by commands alone.
+const PROTOCOL: int = 2
+
+## Every command and the expected JSON type of each of its parameters, checked before a handler
+## runs so that a wrongly typed value produces an error response instead of a script error that
+## leaves the caller waiting. A parameter not listed is refused: it comes from a newer server,
+## and ignoring it would report success for something not done. TYPE_NIL accepts any type.
+## src/bridge_protocol.rs checks that the server sends only the parameters listed here.
 const PARAM_TYPES: Dictionary = {
+    "ping": {},
+    "get_version": {},
+    "get_project_info": {},
+    "get_open_scenes": {},
+    "save_scene": {},
+    "stop_project": {},
+    "get_run_status": {},
+    "game_status": {},
     "get_scene_tree": {"scene_path": TYPE_STRING},
     "add_node": {"parent_node_path": TYPE_STRING, "node_type": TYPE_STRING, "scene": TYPE_STRING, "node_name": TYPE_STRING, "properties": TYPE_DICTIONARY, "make_editable": TYPE_BOOL},
     "remove_node": {"node_path": TYPE_STRING},
@@ -70,14 +87,14 @@ const PARAM_TYPES: Dictionary = {
     "list_signals": {"node_path": TYPE_STRING},
     "create_resource": {"resource_path": TYPE_STRING, "class_name": TYPE_STRING},
     "set_resource_properties": {"resource_path": TYPE_STRING, "properties": TYPE_DICTIONARY},
-    "set_project_setting": {"key": TYPE_STRING, "value_text": TYPE_STRING, "replace_type": TYPE_BOOL, "remove": TYPE_BOOL},
+    "set_project_setting": {"key": TYPE_STRING, "value": TYPE_NIL, "value_text": TYPE_STRING, "replace_type": TYPE_BOOL, "remove": TYPE_BOOL},
     "get_project_settings": {"prefix": TYPE_STRING},
     "get_input_map": {"action": TYPE_STRING, "include_builtin": TYPE_BOOL},
     "edit_input_action": {"action": TYPE_STRING, "add_events": TYPE_ARRAY, "remove_events": TYPE_ARRAY, "deadzone": TYPE_FLOAT, "create": TYPE_BOOL, "delete": TYPE_BOOL},
     "delete_files": {"paths": TYPE_ARRAY, "force": TYPE_BOOL, "allow_empty_dir": TYPE_BOOL, "dry_run": TYPE_BOOL, "trash": TYPE_BOOL},
     "move_files_check": {"files": TYPE_ARRAY, "rewrite": TYPE_ARRAY, "binary": TYPE_ARRAY},
     "move_files_apply": {"files": TYPE_ARRAY, "folders": TYPE_ARRAY, "rewritten": TYPE_ARRAY, "binary": TYPE_ARRAY, "pairs": TYPE_ARRAY},
-    "game_send": {"command": TYPE_STRING},
+    "game_send": {"command": TYPE_STRING, "data": TYPE_ARRAY, "session": TYPE_FLOAT},
     "close_editor": {"discard": TYPE_BOOL},
     "import_params": {"path": TYPE_STRING, "action": TYPE_STRING, "params": TYPE_DICTIONARY, "copy_from": TYPE_STRING, "reimport": TYPE_BOOL, "importer": TYPE_STRING},
 }
@@ -309,7 +326,7 @@ func handle_message(peer: WebSocketPeer, raw_msg: String) -> void:
 
     var token: Variant = message.get("token", null)
     if _token.is_empty() or not token is String or token != _token:
-        send_error(peer, cmd_id, "Unauthorized: missing or invalid bridge token. Restart the MCP client so it re-reads the token, and run it as the same OS user as the editor (or set the same GODOT_MCP_TOKEN for both).")
+        send_error(peer, cmd_id, "Unauthorized: missing or invalid bridge token. Restart the MCP client so it re-reads the token, and run it as the same OS user as the editor (or set the same GODOT_MCP_TOKEN for both).", "UNAUTHORIZED")
         return
 
     var raw_type: Variant = message.get("type", "")
@@ -328,23 +345,32 @@ func handle_message(peer: WebSocketPeer, raw_msg: String) -> void:
 
     var problem: String = validate_params(cmd_type, params)
     if not problem.is_empty():
-        send_error(peer, cmd_id, problem)
+        send_error(peer, cmd_id, problem, "BAD_PARAMS")
         return
 
     dispatch_command(peer, cmd_id, cmd_type, params)
 
-## Returns a description of the first wrongly typed parameter, or "" if all are fine.
-## JSON null counts as "not provided".
+## Returns a description of the first unknown or wrongly typed parameter, or "" if all are fine.
+## JSON null counts as "not provided". A command without a PARAM_TYPES entry is left to
+## dispatch_command, which reports it as unknown.
 func validate_params(cmd_type: String, params: Dictionary) -> String:
-    var spec: Dictionary = PARAM_TYPES.get(cmd_type, {})
-    for key: String in spec:
-        if not params.has(key):
-            continue
-        var value: Variant = params[key]
+    if not PARAM_TYPES.has(cmd_type):
+        return ""
+    var spec: Dictionary = PARAM_TYPES[cmd_type]
+    for raw_key: Variant in params.keys():
+        var key: String = str(raw_key)
+        var value: Variant = params[raw_key]
         if value == null:
-            params.erase(key)
+            params.erase(raw_key)
             continue
+        if not spec.has(key):
+            var accepted: PackedStringArray = []
+            for accepted_key: String in spec:
+                accepted.append(accepted_key)
+            return "Unknown parameter '%s' for command '%s' (this addon accepts: %s). The server and the addon come from different builds: install this server's addon with godot_update_addon (restart_editor: true while the editor has the project open)." % [key, cmd_type, ", ".join(accepted) if not accepted.is_empty() else "none"]
         var expected: int = spec[key]
+        if expected == TYPE_NIL:
+            continue
         var actual: int = typeof(value)
         var numeric_ok: bool = expected == TYPE_FLOAT and actual == TYPE_INT
         if actual != expected and not numeric_ok:
@@ -435,7 +461,7 @@ func dispatch_command(peer: WebSocketPeer, cmd_id: String, cmd_type: String, par
         "import_params":
             import_params(peer, cmd_id, params)
         _:
-            send_error(peer, cmd_id, "Unknown command type: " + cmd_type)
+            send_error(peer, cmd_id, "Unknown command type: " + cmd_type, "UNKNOWN_COMMAND")
 
 # --- Helpers ---------------------------------------------------------------------------
 
@@ -483,7 +509,7 @@ func _res_path_by_prefix(absolute: String) -> String:
 func scene_root_or_error(peer: WebSocketPeer, cmd_id: String) -> Node:
     var root: Node = EditorInterface.get_edited_scene_root()
     if root == null:
-        send_error(peer, cmd_id, "No active scene open in the editor")
+        send_error(peer, cmd_id, "No active scene open in the editor", "NO_SCENE")
     return root
 
 ## Resolves a node inside the edited scene. Paths that leave the scene ("..", absolute paths
@@ -576,8 +602,21 @@ func get_version(peer: WebSocketPeer, cmd_id: String) -> void:
         "major": info["major"],
         "minor": info["minor"],
         "patch": info["patch"],
-        "status": info["status"]
+        "status": info["status"],
+        "protocol": PROTOCOL,
+        "commands": command_parameters(),
     })
+
+## Every command this bridge answers, with the names of its parameters, for the server to check a
+## call against before sending it.
+func command_parameters() -> Dictionary:
+    var commands: Dictionary = {}
+    for command: String in PARAM_TYPES:
+        var names: Array[String] = []
+        for parameter: String in PARAM_TYPES[command]:
+            names.append(parameter)
+        commands[command] = names
+    return commands
 
 func get_project_info(peer: WebSocketPeer, cmd_id: String) -> void:
     var project_name: String = ProjectSettings.get_setting("application/config/name", "")
@@ -648,7 +687,7 @@ func get_scene_tree(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> 
         var open_paths: PackedStringArray = EditorInterface.get_open_scenes()
         var idx: int = open_paths.find(scene_path)
         if idx == -1:
-            send_error(peer, cmd_id, "Scene is not currently open in the editor: " + scene_path + ". Use get_open_scenes to list open scenes, or open_scene to open it first.")
+            send_error(peer, cmd_id, "Scene is not currently open in the editor: " + scene_path + ". Use get_open_scenes to list open scenes, or open_scene to open it first.", "NOT_FOUND")
             return
         root = EditorInterface.get_open_scene_roots()[idx]
 
@@ -697,7 +736,7 @@ func open_scene(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void
         send_error(peer, cmd_id, "Scene path must be a res:// path inside the project: " + requested)
         return
     if not FileAccess.file_exists(scene_path):
-        send_error(peer, cmd_id, "Scene file does not exist: " + scene_path)
+        send_error(peer, cmd_id, "Scene file does not exist: " + scene_path, "NOT_FOUND")
         return
 
     var decision: Dictionary = _reload_decision(scene_path, bool(params.get("reload", false)), bool(params.get("discard", false)))
@@ -809,7 +848,7 @@ func save_scene(peer: WebSocketPeer, cmd_id: String) -> void:
     var err: Error = EditorInterface.save_scene()
     _restore_editor_settings(restore)
     if err != OK:
-        send_error(peer, cmd_id, "Failed to save scene: " + error_string(err) + ". Give the scene a file with godot_create_scene or save it once in the editor, then save again.")
+        send_error(peer, cmd_id, "Failed to save scene: " + error_string(err) + ". Give the scene a file with godot_create_scene or save it once in the editor, then save again.", "WRITE_FAILED")
         return
     var scene_path: String = ""
     var root: Node = EditorInterface.get_edited_scene_root()
@@ -962,7 +1001,7 @@ func add_node(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> void:
 
     var parent_node: Node = find_scene_node(root, parent_path)
     if parent_node == null:
-        send_error(peer, cmd_id, "Parent node not found at path: " + parent_path)
+        send_error(peer, cmd_id, "Parent node not found at path: " + parent_path, "NOT_FOUND")
         return
     var guard: Dictionary = editable_instances_or_error(peer, cmd_id, root, parent_node, params)
     if guard.is_empty():
@@ -1049,7 +1088,7 @@ func remove_node(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> voi
 
     var target_node: Node = find_scene_node(root, node_path)
     if target_node == null:
-        send_error(peer, cmd_id, "Node not found at path: " + node_path)
+        send_error(peer, cmd_id, "Node not found at path: " + node_path, "NOT_FOUND")
         return
     if target_node == root:
         send_error(peer, cmd_id, "The scene root cannot be removed; remove its children or close the scene instead")
@@ -1090,7 +1129,7 @@ func get_node_properties(peer: WebSocketPeer, cmd_id: String, params: Dictionary
 
     var target_node: Node = find_scene_node(root, node_path)
     if target_node == null:
-        send_error(peer, cmd_id, "Node not found at path: " + node_path)
+        send_error(peer, cmd_id, "Node not found at path: " + node_path, "NOT_FOUND")
         return
 
     var wanted: Array = params.get("properties", [])
@@ -1359,7 +1398,7 @@ func set_node_properties(peer: WebSocketPeer, cmd_id: String, params: Dictionary
 
     var target_node: Node = find_scene_node(root, node_path)
     if target_node == null:
-        send_error(peer, cmd_id, "Node not found at path: " + node_path)
+        send_error(peer, cmd_id, "Node not found at path: " + node_path, "NOT_FOUND")
         return
     var guard: Dictionary = editable_instances_or_error(peer, cmd_id, root, target_node, params)
     if guard.is_empty():
@@ -1489,7 +1528,7 @@ func run_project(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> voi
             send_error(peer, cmd_id, "Scene path must be a res:// path inside the project: " + requested)
             return
         if not FileAccess.file_exists(scene_path):
-            send_error(peer, cmd_id, "Scene file does not exist: " + scene_path)
+            send_error(peer, cmd_id, "Scene file does not exist: " + scene_path, "NOT_FOUND")
             return
         EditorInterface.play_custom_scene(scene_path)
     else:
@@ -1853,7 +1892,7 @@ func create_scene(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> vo
         send_error(peer, cmd_id, "scene_path must be a res:// path ending in .tscn")
         return
     if FileAccess.file_exists(scene_path):
-        send_error(peer, cmd_id, "Scene already exists: " + scene_path)
+        send_error(peer, cmd_id, "Scene already exists: " + scene_path, "EXISTS")
         return
     var made_folder: String = _ensure_folder(scene_path)
     if not made_folder.is_empty():
@@ -1873,7 +1912,7 @@ func create_scene(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> vo
         return
     var save_err: Error = ResourceSaver.save(packed, scene_path)
     if save_err != OK:
-        send_error(peer, cmd_id, "Failed to save scene: " + error_string(save_err))
+        send_error(peer, cmd_id, "Failed to save scene: " + error_string(save_err), "WRITE_FAILED")
         return
     EditorInterface.get_resource_filesystem().update_file(scene_path)
     EditorInterface.open_scene_from_path(scene_path)
@@ -1887,7 +1926,7 @@ func attach_script(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> v
     var node_path: String = str(params.get("node_path", "."))
     var target: Node = find_scene_node(root, node_path)
     if target == null:
-        send_error(peer, cmd_id, "Node not found at path: " + node_path)
+        send_error(peer, cmd_id, "Node not found at path: " + node_path, "NOT_FOUND")
         return
     var guard: Dictionary = editable_instances_or_error(peer, cmd_id, root, target, params)
     if guard.is_empty():
@@ -1898,7 +1937,7 @@ func attach_script(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> v
     if not script_path.is_empty() and script_path != "null":
         script_path = to_res_path(script_path)
         if script_path.is_empty() or not FileAccess.file_exists(script_path):
-            send_error(peer, cmd_id, "Script file does not exist: " + str(params.get("script_path", "")))
+            send_error(peer, cmd_id, "Script file does not exist: " + str(params.get("script_path", "")), "NOT_FOUND")
             return
         script = load(script_path) as Script
         if script == null:
@@ -2106,7 +2145,7 @@ func connect_signal(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> 
     var signal_name: String = str(params.get("signal_name", ""))
     var method_name: String = str(params.get("method", ""))
     if source == null or target == null:
-        send_error(peer, cmd_id, "Signal source or target node was not found in the edited scene")
+        send_error(peer, cmd_id, "Signal source or target node was not found in the edited scene", "NOT_FOUND")
         return
     if not source.has_signal(signal_name):
         send_error(peer, cmd_id, "Node has no signal '%s'" % signal_name)
@@ -2147,7 +2186,7 @@ func list_signals(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> vo
         return
     var node: Node = find_scene_node(root, str(params.get("node_path", ".")))
     if node == null:
-        send_error(peer, cmd_id, "Node not found")
+        send_error(peer, cmd_id, "Node not found", "NOT_FOUND")
         return
     var signals: Array = []
     for info: Dictionary in node.get_signal_list():
@@ -2176,7 +2215,7 @@ func create_resource(peer: WebSocketPeer, cmd_id: String, params: Dictionary) ->
         return
     # Saving over a file would replace it, also one the editor has open, without a way back.
     if FileAccess.file_exists(resource_path):
-        send_error(peer, cmd_id, "File already exists: " + resource_path)
+        send_error(peer, cmd_id, "File already exists: " + resource_path, "EXISTS")
         return
     if not (resource_path.ends_with(".tres") or resource_path.ends_with(".res")):
         send_error(peer, cmd_id, "resource_path must end in .tres or .res")
@@ -2191,7 +2230,7 @@ func create_resource(peer: WebSocketPeer, cmd_id: String, params: Dictionary) ->
     var resource: Resource = ClassDB.instantiate(resource_class)
     var save_err: Error = ResourceSaver.save(resource, resource_path)
     if save_err != OK:
-        send_error(peer, cmd_id, "Failed to save resource: " + error_string(save_err))
+        send_error(peer, cmd_id, "Failed to save resource: " + error_string(save_err), "WRITE_FAILED")
         return
     EditorInterface.get_resource_filesystem().update_file(resource_path)
     send_success(peer, cmd_id, {"resource_path": resource_path, "class_name": resource_class})
@@ -2461,7 +2500,7 @@ func set_project_setting(peer: WebSocketPeer, cmd_id: String, params: Dictionary
         var removed_err: Error = ProjectSettings.save()
         if removed_err != OK:
             ProjectSettings.set_setting(key, previous)
-            send_error(peer, cmd_id, "Failed to save project settings: " + error_string(removed_err))
+            send_error(peer, cmd_id, "Failed to save project settings: " + error_string(removed_err), "WRITE_FAILED")
             return
         send_success(peer, cmd_id, {"key": key, "removed": true, "previous": _reported_setting(previous)})
         return
@@ -2497,7 +2536,7 @@ func set_project_setting(peer: WebSocketPeer, cmd_id: String, params: Dictionary
             var hint: String = ""
             if not _setting_has_default(key):
                 hint = " For a Godot value such as a Vector4 pass value_text; pass replace_type: true to store a value of another type, or remove: true to remove the setting."
-            send_error(peer, cmd_id, "'%s': %s%s" % [key, coerced["error"], hint])
+            send_error(peer, cmd_id, "'%s': %s%s" % [key, coerced["error"], hint], "SETTING_TYPE")
             return
         value = coerced["value"]
     elif value is Array or value is Dictionary:
@@ -2509,7 +2548,7 @@ func set_project_setting(peer: WebSocketPeer, cmd_id: String, params: Dictionary
     var err: Error = ProjectSettings.save()
     if err != OK:
         ProjectSettings.set_setting(key, previous)
-        send_error(peer, cmd_id, "Failed to save project settings: " + error_string(err))
+        send_error(peer, cmd_id, "Failed to save project settings: " + error_string(err), "WRITE_FAILED")
         return
     send_success(peer, cmd_id, {"key": key, "saved": true, "type": type_string(typeof(value)), "previous": _reported_setting(previous)})
 
@@ -2707,7 +2746,7 @@ func get_input_map(peer: WebSocketPeer, cmd_id: String, params: Dictionary) -> v
             continue
         actions.append(_describe_action(action, stored))
     if not only.is_empty() and actions.is_empty():
-        send_error(peer, cmd_id, "Action '%s' does not exist. Call godot_get_input_map without action to list the actions, or create it with godot_edit_input_action create: true." % only)
+        send_error(peer, cmd_id, "Action '%s' does not exist. Call godot_get_input_map without action to list the actions, or create it with godot_edit_input_action create: true." % only, "NOT_FOUND")
         return
     send_success(peer, cmd_id, {"actions": actions, "builtin_hidden": hidden})
 
@@ -2733,12 +2772,12 @@ func edit_input_action(peer: WebSocketPeer, cmd_id: String, params: Dictionary) 
             send_error(peer, cmd_id, "'%s' is a built-in action: it can be edited but not deleted" % action)
             return
         if not exists:
-            send_error(peer, cmd_id, "Action '%s' does not exist, so there is nothing to delete. List the actions with godot_get_input_map." % action)
+            send_error(peer, cmd_id, "Action '%s' does not exist, so there is nothing to delete. List the actions with godot_get_input_map." % action, "NOT_FOUND")
             return
         _commit_input_action(peer, cmd_id, action, null, {"deleted": true})
         return
     if not exists and not create:
-        send_error(peer, cmd_id, "Action '%s' does not exist. Pass create: true to make it, or list the actions with godot_get_input_map." % action)
+        send_error(peer, cmd_id, "Action '%s' does not exist. Pass create: true to make it, or list the actions with godot_get_input_map." % action, "NOT_FOUND")
         return
 
     var current: Dictionary = _stored_action(action)
@@ -2806,7 +2845,7 @@ func _commit_input_action(peer: WebSocketPeer, cmd_id: String, action: String, v
     var err: Error = ProjectSettings.save()
     if err != OK:
         ProjectSettings.set_setting(key, previous)
-        send_error(peer, cmd_id, "Failed to save project settings: %s. Nothing was changed; check that project.godot is writable." % error_string(err))
+        send_error(peer, cmd_id, "Failed to save project settings: %s. Nothing was changed; check that project.godot is writable." % error_string(err), "WRITE_FAILED")
         return
     if undo_redo != null:
         undo_redo.create_action("Edit Input Action " + action, UndoRedo.MERGE_DISABLE, ProjectSettings)
@@ -2863,12 +2902,17 @@ func send_success(peer: WebSocketPeer, cmd_id: String, result: Dictionary) -> vo
         "result": result
     })
 
-func send_error(peer: WebSocketPeer, cmd_id: String, err_msg: String) -> void:
-    send_json(peer, cmd_id, {
+## `code` names the kind of failure for clients (docs/tools.md, "Error codes"); it is sent only
+## when given, so a failure without one keeps the reply older servers know.
+func send_error(peer: WebSocketPeer, cmd_id: String, err_msg: String, code: String = "") -> void:
+    var reply: Dictionary = {
         "commandId": cmd_id,
         "status": "error",
         "error": err_msg
-    })
+    }
+    if not code.is_empty():
+        reply["code"] = code
+    send_json(peer, cmd_id, reply)
 
 func send_json(peer: WebSocketPeer, cmd_id: String, payload: Dictionary) -> void:
     var text: String = JSON.stringify(payload)

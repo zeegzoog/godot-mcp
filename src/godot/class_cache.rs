@@ -157,10 +157,52 @@ pub struct Unregistered {
 /// Every class declared by a `.gd` file in the project that the cache does not list for that
 /// file. Walks the project as the editor's scan does ([`crate::paths::skipped_by_godot`]).
 pub fn unregistered(project: &Path) -> Vec<Unregistered> {
+    let declared = scan_scripts(project, |file, text| {
+        Some((file.to_path_buf(), header_class(text)?))
+    });
+    unregistered_among(
+        project,
+        declared
+            .iter()
+            .map(|(file, class)| (file.as_path(), class.as_str())),
+    )
+}
+
+/// The `class_name` the header of a script's `text` declares, as the editor's scan reads it.
+pub fn header_class(text: &str) -> Option<String> {
+    parse_header(text).ok()?.class_name
+}
+
+/// The `(file, class)` pairs of `declared` (files inside `project`, each with the class its
+/// header declares) that the project's cache does not list for that file, sorted.
+pub fn unregistered_among<'a>(
+    project: &Path,
+    declared: impl IntoIterator<Item = (&'a Path, &'a str)>,
+) -> Vec<Unregistered> {
     let cache = std::fs::read_to_string(project.join(CACHE_FILE))
         .ok()
         .and_then(|text| Cache::parse(&text).ok())
         .unwrap_or_default();
+    let mut found = Vec::new();
+    for (file, class) in declared {
+        let Some(res_path) = res_path(project, file) else {
+            continue;
+        };
+        if cache.class_of(&res_path).as_deref() != Some(class) {
+            found.push(Unregistered {
+                class: class.to_string(),
+                path: res_path,
+            });
+        }
+    }
+    found.sort_by(|a, b| a.class.cmp(&b.class).then(a.path.cmp(&b.path)));
+    found
+}
+
+/// Reads every `.gd` file of the project once, walking it as the editor's scan does
+/// ([`crate::paths::skipped_by_godot`]), and keeps what `each` makes of its file and text, in
+/// the order of the walk. A file that is not valid UTF-8 is skipped, as Godot refuses to load it.
+pub fn scan_scripts<T>(project: &Path, mut each: impl FnMut(&Path, &str) -> Option<T>) -> Vec<T> {
     let mut found = Vec::new();
     let mut pending = vec![project.to_path_buf()];
     while let Some(dir) = pending.pop() {
@@ -182,26 +224,12 @@ pub fn unregistered(project: &Path) -> Vec<Unregistered> {
                 let Ok(text) = std::fs::read_to_string(&path) else {
                     continue;
                 };
-                let Ok(Header {
-                    class_name: Some(class),
-                    ..
-                }) = parse_header(&text)
-                else {
-                    continue;
-                };
-                let Some(res_path) = res_path(project, &path) else {
-                    continue;
-                };
-                if cache.class_of(&res_path).as_deref() != Some(class.as_str()) {
-                    found.push(Unregistered {
-                        class,
-                        path: res_path,
-                    });
+                if let Some(item) = each(&path, &text) {
+                    found.push(item);
                 }
             }
         }
     }
-    found.sort_by(|a, b| a.class.cmp(&b.class).then(a.path.cmp(&b.path)));
     found
 }
 
@@ -775,11 +803,33 @@ pub fn parse_header(text: &str) -> Result<Header, String> {
     Ok(header)
 }
 
+/// How many characters of a script `tokenize` looks at before it reads the whole file: far more
+/// than a header with its annotations and doc comments takes.
+const HEADER_CHARS: usize = 4096;
+
 /// Tokens of the file's beginning; stops at the first token that cannot belong to a header
-/// line, which is far enough for `parse_header`.
+/// line, which is far enough for `parse_header`. Only the first [`HEADER_CHARS`] characters are
+/// decoded unless the header goes on past them.
 fn tokenize(text: &str) -> Result<Vec<Token>, String> {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut chars: Vec<char> = text.chars().take(HEADER_CHARS + 1).collect();
+    if chars.len() <= HEADER_CHARS {
+        return tokenize_chars(&chars).map(|(tokens, _)| tokens);
+    }
+    chars.truncate(HEADER_CHARS);
+    // A stop word that ends before the cut was read exactly as in the whole text: everything
+    // that looked past the cut (an open string, a comment, a word or a lookahead) runs to the
+    // end of the cut instead, and a parse error there may be the cut's own.
+    if let Ok((tokens, true)) = tokenize_chars(&chars) {
+        return Ok(tokens);
+    }
     let chars: Vec<char> = text.chars().collect();
+    tokenize_chars(&chars).map(|(tokens, _)| tokens)
+}
+
+/// The tokens of `chars` up to the first member keyword, and whether that keyword ended before
+/// the last character.
+fn tokenize_chars(chars: &[char]) -> Result<(Vec<Token>, bool), String> {
     let mut tokens = Vec::new();
     let mut depth = 0usize;
     let mut i = 0;
@@ -800,12 +850,12 @@ fn tokenize(text: &str) -> Result<Vec<Token>, String> {
                 }
             }
             '"' | '\'' => {
-                let (value, end) = read_string(&chars, i, false)?;
+                let (value, end) = read_string(chars, i, false)?;
                 tokens.push(Token::Str(value));
                 i = end;
             }
             'r' if matches!(chars.get(i + 1), Some('"') | Some('\'')) => {
-                let (value, end) = read_string(&chars, i + 1, true)?;
+                let (value, end) = read_string(chars, i + 1, true)?;
                 tokens.push(Token::Str(value));
                 i = end;
             }
@@ -831,7 +881,7 @@ fn tokenize(text: &str) -> Result<Vec<Token>, String> {
                 );
                 tokens.push(Token::Word(word));
                 if stop && depth == 0 {
-                    break;
+                    return Ok((tokens, i < chars.len()));
                 }
             }
             '(' | '[' | '{' => {
@@ -850,7 +900,7 @@ fn tokenize(text: &str) -> Result<Vec<Token>, String> {
             }
         }
     }
-    Ok(tokens)
+    Ok((tokens, false))
 }
 
 /// A string literal starting at `chars[start]` (its opening quote): its value and the index
@@ -955,6 +1005,72 @@ mod tests {
         assert!(!abstract_member.is_abstract);
         let none = header("extends Node\n# class_name InComment\nfunc _ready():\n\tpass\n");
         assert_eq!(none.class_name, None);
+    }
+
+    #[test]
+    fn a_long_file_is_tokenized_from_its_beginning_only_when_the_header_ends_there() {
+        let body = "func f() -> int:\n\treturn 1\n".repeat(1000);
+        let full = |text: &str| {
+            let chars: Vec<char> = text.chars().collect();
+            tokenize_chars(&chars).expect("tokens").0
+        };
+        let short = format!("@tool\nextends Node\nclass_name Short\n\n{body}");
+        assert!(short.chars().count() > HEADER_CHARS);
+        assert_eq!(tokenize(&short).expect("tokens"), full(&short));
+        assert_eq!(header(&short).class_name.as_deref(), Some("Short"));
+
+        // A header longer than the prefix is read from the whole text.
+        let docs = format!(
+            "## {}\n\"\"\"{}\"\"\"\nextends Node\nclass_name LongDocs\n{body}",
+            "d".repeat(HEADER_CHARS),
+            "s".repeat(HEADER_CHARS)
+        );
+        assert_eq!(header(&docs).class_name.as_deref(), Some("LongDocs"));
+
+        // `class_name` cut to `class` by the prefix is not the member keyword `class`.
+        for shift in 0..12 {
+            let pad = HEADER_CHARS - 4 - shift;
+            let text = format!("#{}\nclass_name Cut\nextends Node\n{body}", "p".repeat(pad));
+            assert_eq!(
+                tokenize(&text).expect("tokens"),
+                full(&text),
+                "shift {shift}"
+            );
+            assert_eq!(
+                header(&text).class_name.as_deref(),
+                Some("Cut"),
+                "shift {shift}"
+            );
+        }
+
+        // A string the prefix cuts open is read whole, not reported as unclosed.
+        let open = format!(
+            "extends Node\n@icon(\"{}\")\nclass_name Icon\n{body}",
+            "i".repeat(HEADER_CHARS)
+        );
+        assert_eq!(header(&open).class_name.as_deref(), Some("Icon"));
+    }
+
+    #[test]
+    fn the_scan_reads_each_script_once_in_the_walk_order() {
+        let project = tempfile::tempdir().expect("project");
+        let root = project.path();
+        std::fs::create_dir_all(root.join("sub")).expect("sub");
+        std::fs::write(root.join("a.gd"), "class_name Alpha\n").expect("a");
+        std::fs::write(root.join("sub/b.gd"), "extends Node\n").expect("b");
+        std::fs::write(root.join("sub/c.gd"), [0xff_u8, 0xfe]).expect("not utf-8");
+        std::fs::write(root.join("d.txt"), "class_name Text\n").expect("text");
+        let mut seen = scan_scripts(root, |file, text| {
+            Some((res_path(root, file)?, header_class(text)))
+        });
+        seen.sort();
+        assert_eq!(
+            seen,
+            [
+                ("res://a.gd".to_string(), Some("Alpha".to_string())),
+                ("res://sub/b.gd".to_string(), None),
+            ]
+        );
     }
 
     #[test]

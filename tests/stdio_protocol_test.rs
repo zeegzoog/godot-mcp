@@ -6,7 +6,7 @@ use common::{
     MockBridge, Reply, Session, env_printing_godot, fake_godot, free_port, is_tool_error,
     project_dir, tool_text,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -317,10 +317,13 @@ async fn bridge_commands_carry_the_shared_token() {
         .await;
     assert!(!is_tool_error(&reply));
 
+    // The first call of a connection reads the addon's commands (get_version) first.
     let received = bridge.received();
-    assert_eq!(received.len(), 1);
-    assert_eq!(received[0]["token"], "s3cret");
-    assert_eq!(received[0]["type"], "get_open_scenes");
+    let types: Vec<&Value> = received.iter().map(|command| &command["type"]).collect();
+    assert_eq!(types, [&json!("get_version"), &json!("get_open_scenes")]);
+    for command in &received {
+        assert_eq!(command["token"], "s3cret");
+    }
 }
 
 #[tokio::test]

@@ -89,17 +89,26 @@ static func output(_rt: Node, params: Dictionary) -> Dictionary:
     return R.ok(answer)
 
 
+## The last MAX_LINES lines in a ring: the line numbered seq is in slot seq % MAX_LINES, so a
+## new line overwrites the oldest one without moving the others.
 class OutputLogger extends Logger:
     var _mutex := Mutex.new()
     var _entries: Array = []
+    var _count := 0
     var _seq := 0
     var _errors := 0
     var _warnings := 0
     var _scene: Dictionary = {}
 
+    func _init() -> void:
+        _entries.resize(MAX_LINES)
+
+    ## The stamp is copied here and never changed afterwards: a new scene replaces the dictionary,
+    ## so the lines logged before it keep the old one by reference.
     func set_scene(context: Dictionary) -> void:
+        var copy := context.duplicate(true)
         _mutex.lock()
-        _scene = context.duplicate(true)
+        _scene = copy
         _mutex.unlock()
 
     func _log_message(message: String, error: bool) -> void:
@@ -122,22 +131,22 @@ class OutputLogger extends Logger:
         if text.length() > MAX_TEXT:
             text = text.substr(0, MAX_TEXT)
         _mutex.lock()
-        # Copy the stamp from this moment. A later scene must not rewrite an old line.
-        _entries.append({
+        # The stamp of this moment, shared with the other lines of this scene: set_scene replaces
+        # it instead of changing it, so a later scene does not rewrite an old line.
+        _entries[_seq % MAX_LINES] = {
             "seq": _seq,
             "level": level,
             "text": text,
             "stack": frames,
             "script": script,
-            "scene": _scene.duplicate(true),
-        })
+            "scene": _scene,
+        }
         _seq += 1
+        _count = mini(_count + 1, MAX_LINES)
         if level == "error":
             _errors += 1
         elif level == "warning":
             _warnings += 1
-        while _entries.size() > MAX_LINES:
-            _entries.pop_front()
         _mutex.unlock()
 
     func next_seq() -> int:
@@ -149,10 +158,8 @@ class OutputLogger extends Logger:
     func entries_since(first_seq: int) -> Array:
         var found: Array = []
         _mutex.lock()
-        for index in range(_entries.size() - 1, -1, -1):
-            var entry: Dictionary = _entries[index]
-            if int(entry["seq"]) < first_seq:
-                break
+        for seq in range(maxi(first_seq, _seq - _count), _seq):
+            var entry: Dictionary = _entries[seq % MAX_LINES]
             found.append({
                 "level": entry["level"],
                 "text": entry["text"],
@@ -160,12 +167,14 @@ class OutputLogger extends Logger:
                 "script": entry["script"],
             })
         _mutex.unlock()
-        found.reverse()
         return found
 
+    ## The kept lines oldest first, deep copies the caller may change.
     func snapshot() -> Dictionary:
+        var copy: Array = []
         _mutex.lock()
-        var copy := _entries.duplicate(true)
+        for seq in range(_seq - _count, _seq):
+            copy.append((_entries[seq % MAX_LINES] as Dictionary).duplicate(true))
         var errors := _errors
         var warnings := _warnings
         _mutex.unlock()

@@ -24,6 +24,11 @@ pub enum McpError {
     #[error("Tool execution error: {0}")]
     ToolExecution(String),
 
+    /// The editor reported a failure with a machine-readable `code` (see docs/tools.md,
+    /// "Error codes"). Addons older than the codes send `ToolExecution` instead.
+    #[error("Tool execution error: {message}")]
+    CodedToolExecution { code: String, message: String },
+
     #[error("Validation error: {0}")]
     Validation(String),
 

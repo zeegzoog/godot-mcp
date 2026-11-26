@@ -22,41 +22,37 @@ const MAX_SIDE: i64 = 4096;
 const MAX_PIXELS: i64 = 4096 * 2304;
 const DEFAULT_TIMEOUT: u64 = 120;
 
-pub fn handles(name: &str) -> bool {
-    name == NAME
-}
-
 pub fn catalog() -> Vec<Tool> {
-    let color = json!({"description": "\"#rrggbb\", \"#rrggbbaa\" or [r, g, b] / [r, g, b, a] from 0 to 1."});
+    let color = json!({"description": "\"#rrggbb[aa]\" or [r, g, b(, a)] in 0..1."});
     vec![super::tool(
         NAME,
-        "Renders a set of the project's scenes together in one picture, the way an asset review beside its concept needs it, without writing any scene to the project: a temporary Godot process (a small window, since a headless Godot does not render; audio muted) builds the review in memory with the project's own settings, autoloads and imports, renders it and exits. Without positions the assets stand in a row along X in the given order, gap metres apart, centred on the origin. The environment can be borrowed from a level scene (its first WorldEnvironment and every DirectionalLight3D, copied without their scripts), from an Environment resource, or left to a neutral default; light sets one sun instead of the borrowed ones. The camera is orthogonal by default, at yaw -35 and pitch -30, and fits the assets' bounds unless a size (orthogonal) or distance (perspective) is given; camera.scene copies a Camera3D's projection, size, fov, angle, near/far and attributes (the current one, or camera.node), and fits its view on the assets unless keep_position is true. planes adds ground or water planes at a height under the assets. Returns the PNG and JSON: per asset its scene, placement, bounds (world AABB of its visible geometry), triangles, surfaces and mesh_instances counted from its meshes (a MultiMesh counts each visible instance), and rendered, Godot's render info for a frame with that asset alone and no planes (objects, primitives and draw_calls of the visible pass, and shadow_ ones of the shadow pass); totals sums the meshes and gives the rendered counts of the whole picture with its planes; camera is the camera that was used. Assets must be imported: stale imports are reimported through the editor when it has the project open, otherwise named in a warning. Needs GODOT_PATH and a display. The engine may update caches under the project's .godot folder, as any run does.",
+        "Renders project scenes together in one PNG, writing no scene, in a temporary windowed Godot. Without positions, assets stand in a row along X, gap apart. Light: environment.scene's first WorldEnvironment and suns (scripts dropped), an Environment resource, or a default sun (light replaces the suns). Camera: orthogonal by default, fitted to the assets unless size/distance is set. Returns the PNG and JSON: per asset placement, bounds, triangles, surfaces, rendered (draw_calls etc. of that asset alone); totals; camera. Stale imports are reimported via the editor when it has the project, else warned. Needs GODOT_PATH and a display.",
         json!({
             "assets": {
                 "type": "array",
-                "description": "1 to 64 scenes to review, in order.",
+                "description": "1 to 64 scenes, in order.",
                 "items": {
                     "type": "object",
                     "properties": {
-                        "scene": {"type": "string", "description": "res:// path of a .tscn or .scn file, such as res://assets/rock.tscn."},
-                        "position": {"description": "[x, y, z] world position. Assets without one are laid out in a row.", "type": "array", "items": {"type": "number"}},
-                        "rotation": {"description": "[x, y, z] rotation in degrees.", "type": "array", "items": {"type": "number"}},
+                        "scene": {"type": "string", "description": "res:// .tscn or .scn."},
+                        "position": {"description": "[x, y, z]. Without it: laid out in a row.", "type": "array", "items": {"type": "number"}},
+                        "rotation": {"description": "[x, y, z] degrees.", "type": "array", "items": {"type": "number"}},
                         "scale": {"description": "A number, or [x, y, z]."}
                     },
                     "required": ["scene"],
                     "additionalProperties": false
                 }
             },
-            "gap": {"type": "number", "minimum": 0, "maximum": 1000, "description": "Metres between the bounds of assets laid out in a row. Default 1."},
+            "gap": {"type": "number", "minimum": 0, "maximum": 1000, "description": "Metres between row neighbours' bounds. Default 1."},
             "environment": {
                 "type": "object",
-                "description": "Lighting. scene and resource cannot be combined. Omitted: a grey background, soft ambient light and one sun.",
+                "description": "scene or resource. Default: grey background, one sun.",
                 "properties": {
-                    "scene": {"type": "string", "description": "A level scene whose first WorldEnvironment and DirectionalLight3D nodes are copied, such as res://levels/old_pond.tscn."},
-                    "resource": {"type": "string", "description": "An Environment resource (.tres or .res)."},
+                    "scene": {"type": "string", "description": "Level scene to copy lights from (scripts dropped)."},
+                    "resource": {"type": "string", "description": "Environment .tres/.res."},
                     "light": {
                         "type": "object",
-                        "description": "One sun, replacing the scene's lights: yaw and pitch in degrees (defaults -40 and -50), energy (default 1), color, shadows (default true).",
+                        "description": "One sun replacing the lights: yaw/pitch degrees (-40/-50), energy (1), color, shadows (true).",
                         "properties": {
                             "yaw": {"type": "number"},
                             "pitch": {"type": "number"},
@@ -71,46 +67,46 @@ pub fn catalog() -> Vec<Tool> {
             },
             "camera": {
                 "type": "object",
-                "description": "The view. Every field is optional.",
+                "description": "Optional view settings.",
                 "properties": {
-                    "projection": {"type": "string", "enum": ["orthogonal", "perspective"]},
-                    "yaw": {"type": "number", "description": "Degrees about Y. Default -35."},
-                    "pitch": {"type": "number", "description": "Degrees about X; negative looks down. Default -30."},
-                    "size": {"type": "number", "description": "Orthogonal size in metres (the height, as Camera3D.size). Setting it turns fitting off."},
-                    "fov": {"type": "number", "description": "Perspective vertical field of view in degrees, 1 to 179. Default 75."},
-                    "distance": {"type": "number", "description": "Metres from the target to the camera. Setting it turns fitting off for a perspective camera."},
-                    "target": {"description": "[x, y, z] the camera looks at. Default: the centre of the assets' bounds.", "type": "array", "items": {"type": "number"}},
-                    "fit": {"type": "boolean", "description": "Size (orthogonal) or move back (perspective) so every asset is in view. Default true unless size, distance or a copied orthogonal camera sets the scale."},
-                    "margin": {"type": "number", "description": "Free border on each side when fitting, as a fraction of the picture, 0 to 0.45. Default 0.05."},
-                    "scene": {"type": "string", "description": "A scene with the Camera3D to copy, such as the game's player scene."},
-                    "node": {"type": "string", "description": "Path of the Camera3D in camera.scene, relative to its root. Default: its current camera, else its first."},
-                    "keep_position": {"type": "boolean", "description": "Keep the copied camera's own position instead of aiming it at the assets. Default false."}
+                    "projection": {"type": "string", "enum": ["orthogonal", "perspective"], "description": "orthogonal (default) or perspective; fov and distance apply to perspective."},
+                    "yaw": {"type": "number", "description": "Degrees. Default -35."},
+                    "pitch": {"type": "number", "description": "Degrees, negative looks down. Default -30."},
+                    "size": {"type": "number", "description": "Orthogonal height in metres; turns fitting off."},
+                    "fov": {"type": "number", "description": "Perspective vertical degrees, 1-179. Default 75."},
+                    "distance": {"type": "number", "description": "Metres to the target; turns perspective fitting off."},
+                    "target": {"description": "[x, y, z]. Default: centre of the assets' bounds.", "type": "array", "items": {"type": "number"}},
+                    "fit": {"type": "boolean", "description": "Default true unless size, distance or a copied orthogonal camera sets it."},
+                    "margin": {"type": "number", "description": "Fit border per side, 0-0.45. Default 0.05."},
+                    "scene": {"type": "string", "description": "Scene whose Camera3D settings are copied; still fitted unless keep_position."},
+                    "node": {"type": "string", "description": "Camera3D in camera.scene. Default: current, else first."},
+                    "keep_position": {"type": "boolean", "description": "Keep the copied camera's position. Default false."}
                 },
                 "additionalProperties": false
             },
             "planes": {
                 "type": "array",
-                "description": "Up to 8 horizontal planes, centred under the assets.",
+                "description": "Up to 8 horizontal planes under the assets.",
                 "items": {
                     "type": "object",
                     "properties": {
-                        "kind": {"type": "string", "enum": ["ground", "water"], "description": "Default ground. Water is a translucent blue-green."},
-                        "height": {"type": "number", "description": "Y of the plane. Default 0."},
-                        "size": {"description": "A number or [x, z] in metres. Default three times the assets' extent, at least 10."},
+                        "kind": {"type": "string", "enum": ["ground", "water"], "description": "Default ground; water is translucent."},
+                        "height": {"type": "number", "description": "Y. Default 0."},
+                        "size": {"description": "Number or [x, z] metres. Default 3x extent."},
                         "color": color,
-                        "material": {"type": "string", "description": "A Material resource of the project to use instead of the plain one."}
+                        "material": {"type": "string", "description": "Material resource to use instead."}
                     },
                     "additionalProperties": false
                 }
             },
-            "width": {"type": "integer", "minimum": 16, "maximum": MAX_SIDE, "description": "Picture width in pixels. Default 1280."},
-            "height": {"type": "integer", "minimum": 16, "maximum": MAX_SIDE, "description": "Picture height in pixels. Default 720. width * height is at most 4096 * 2304."},
-            "settle_frames": {"type": "integer", "minimum": 1, "maximum": 240, "description": "Frames rendered before the picture is taken, for shadows and effects that build up over frames. Default 8."},
-            "timeout_seconds": {"type": "integer", "minimum": 10, "maximum": 600, "description": "Limit for the whole run. Default 120."},
+            "width": {"type": "integer", "minimum": 16, "maximum": MAX_SIDE, "description": "Pixels. Default 1280."},
+            "height": {"type": "integer", "minimum": 16, "maximum": MAX_SIDE, "description": "Pixels. Default 720. width*height at most 4096*2304."},
+            "settle_frames": {"type": "integer", "minimum": 1, "maximum": 240, "description": "Frames before capture (shadows, effects). Default 8."},
+            "timeout_seconds": {"type": "integer", "minimum": 10, "maximum": 600, "description": "Seconds. Default 120."},
             "project_path": {"type": "string"}
         }),
         &["assets"],
-    )]
+    ).additive_idempotent()]
 }
 
 pub async fn call(tools: &ToolManager, args: Value) -> ToolResult {
@@ -200,6 +196,7 @@ pub async fn call(tools: &ToolManager, args: Value) -> ToolResult {
             },
         ],
         is_error: false,
+        structured_content: None,
     }
 }
 

@@ -11,11 +11,11 @@
 //! guard or after they drop it.
 
 use crate::godot::TextResourceSnapshot;
-use crate::util::lock;
+use crate::util::{blocking, lock};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
+use tokio::sync::{OnceCell, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
 #[derive(Default)]
 pub(super) struct ProjectGates(Mutex<HashMap<PathBuf, Arc<Gate>>>);
@@ -35,14 +35,22 @@ struct Batch {
     runs: usize,
     /// Every run that joined the batch, finished or not.
     joined: usize,
-    /// The project as it was before the first of them started.
-    before: Option<Arc<TextResourceSnapshot>>,
+    /// The project as it was before the first of them started. The first run takes it off the
+    /// async workers and without holding the batch's lock; a run that joins meanwhile waits for
+    /// that snapshot instead of taking its own.
+    before: Arc<OnceCell<Arc<TextResourceSnapshot>>>,
 }
 
 /// A script run's place in its project's batch. Dropping it ends the run's part in the batch.
 pub(super) struct ScriptTurn {
-    gate: Arc<Gate>,
+    member: BatchMember,
     snapshot: Arc<TextResourceSnapshot>,
+}
+
+/// A run counted in its project's batch; dropping it, even while the run still waits for the
+/// batch's snapshot, takes the run out again.
+struct BatchMember {
+    gate: Arc<Gate>,
 }
 
 impl ProjectGates {
@@ -61,20 +69,23 @@ impl ProjectGates {
     ) -> (ScriptTurn, OwnedRwLockReadGuard<()>) {
         let gate = self.gate(project);
         let running = gate.order.clone().read_owned().await;
-        let snapshot = {
+        let before = {
             let mut batch = lock(&gate.batch);
             batch.runs += 1;
             batch.joined += 1;
-            match &batch.before {
-                Some(snapshot) => snapshot.clone(),
-                None => {
-                    let snapshot = Arc::new(TextResourceSnapshot::take(project));
-                    batch.before = Some(snapshot.clone());
-                    snapshot
-                }
-            }
+            batch.before.clone()
         };
-        (ScriptTurn { gate, snapshot }, running)
+        let member = BatchMember { gate };
+        let snapshot = before
+            .get_or_init(|| {
+                let project = project.to_path_buf();
+                async move {
+                    Arc::new(blocking(move || TextResourceSnapshot::take(&project)).await)
+                }
+            })
+            .await
+            .clone();
+        (ScriptTurn { member, snapshot }, running)
     }
 
     /// Waits for an import or export running in the project to finish, so a game started now
@@ -92,21 +103,21 @@ impl ProjectGates {
 }
 
 impl ScriptTurn {
-    pub(super) fn snapshot(&self) -> &TextResourceSnapshot {
+    pub(super) fn snapshot(&self) -> &Arc<TextResourceSnapshot> {
         &self.snapshot
     }
 
     /// Whether another script run in the project worked at the same time as this one.
     pub(super) fn overlapped(&self) -> bool {
-        lock(&self.gate.batch).joined > 1
+        lock(&self.member.gate.batch).joined > 1
     }
 
     pub(super) async fn exclusive(&self) -> OwnedRwLockWriteGuard<()> {
-        self.gate.order.clone().write_owned().await
+        self.member.gate.order.clone().write_owned().await
     }
 }
 
-impl Drop for ScriptTurn {
+impl Drop for BatchMember {
     fn drop(&mut self) {
         let mut batch = lock(&self.gate.batch);
         batch.runs = batch.runs.saturating_sub(1);
@@ -150,6 +161,60 @@ mod tests {
             !Arc::ptr_eq(&first_snapshot, &third.snapshot),
             "a new batch takes a new snapshot"
         );
+    }
+
+    #[tokio::test]
+    async fn a_run_dropped_while_the_snapshot_is_taken_leaves_the_batch() {
+        let dir = project();
+        // Enough files that the snapshot is still being taken after the first poll.
+        for index in 0..400 {
+            std::fs::write(
+                dir.path().join(format!("s{index}.tscn")),
+                "[gd_scene format=3 uid=\"uid://a\"]\n",
+            )
+            .expect("scene");
+        }
+        let gates = ProjectGates::default();
+        tokio::select! {
+            biased;
+            _ = gates.begin_script(dir.path()) => {}
+            () = std::future::ready(()) => {}
+        }
+        let (turn, _running) = gates.begin_script(dir.path()).await;
+        assert!(!turn.overlapped(), "the dropped run left the batch");
+        drop(turn);
+        let gate = gates.gate(dir.path());
+        assert_eq!(lock(&gate.batch).runs, 0);
+    }
+
+    #[tokio::test]
+    async fn the_snapshot_is_taken_without_holding_the_batch_lock() {
+        let dir = project();
+        for index in 0..400 {
+            std::fs::write(
+                dir.path().join(format!("s{index}.tscn")),
+                "[gd_scene format=3]\n",
+            )
+            .expect("scene");
+        }
+        let gates = Arc::new(ProjectGates::default());
+        let first = tokio::spawn({
+            let (gates, path) = (gates.clone(), dir.path().to_path_buf());
+            async move { gates.begin_script(&path).await.0 }
+        });
+        // The first run starts its snapshot and gives the (only) worker back while it is taken:
+        // the batch can be read meanwhile and a second run joins it.
+        tokio::task::yield_now().await;
+        assert!(
+            !first.is_finished(),
+            "the snapshot is taken off the async workers"
+        );
+        let gate = gates.gate(dir.path());
+        assert!(gate.batch.try_lock().is_ok(), "the batch lock is free");
+        let (second, _running) = gates.begin_script(dir.path()).await;
+        let first = first.await.expect("first run");
+        assert!(Arc::ptr_eq(&first.snapshot, &second.snapshot));
+        assert!(first.overlapped() && second.overlapped());
     }
 
     #[tokio::test]

@@ -68,6 +68,30 @@ fn test_tool_result_helpers() {
     assert_eq!(err_res.content.len(), 1);
 }
 
+#[test]
+fn an_error_with_a_code_gives_it_in_structured_content_and_keeps_its_text() {
+    let plain = ToolResult::error("Node not found", &["Look it up"]);
+    let plain_json = serde_json::to_value(&plain).expect("serialize");
+    assert!(
+        plain_json.get("structuredContent").is_none(),
+        "{plain_json}"
+    );
+
+    let coded = ToolResult::error("Node not found", &["Look it up"]).with_error_code(
+        "NOT_FOUND",
+        "Node not found",
+        Some(serde_json::json!({"data": {"path": "X"}})),
+    );
+    assert_eq!(coded.error_code(), Some("NOT_FOUND"));
+    let coded_json = serde_json::to_value(&coded).expect("serialize");
+    assert_eq!(coded_json["content"], plain_json["content"]);
+    assert_eq!(coded_json["isError"], true);
+    assert_eq!(
+        coded_json["structuredContent"],
+        serde_json::json!({"error": {"code": "NOT_FOUND", "message": "Node not found", "data": {"path": "X"}}})
+    );
+}
+
 fn schema_of(name: &str) -> serde_json::Value {
     ToolManager::list_tools()
         .into_iter()
@@ -181,5 +205,23 @@ fn create_script_takes_script_path_like_the_other_script_tools() {
             .get("required")
             .is_none_or(|required| required.as_array().is_some_and(|r| r.is_empty())),
         "neither name may be required alone: {schema}"
+    );
+}
+
+/// Every client receives the whole tool list at the start of each session, so its size is a
+/// cost paid in every conversation. Long explanations belong in docs/; raise this budget only
+/// for a new tool or parameter, not for longer prose.
+const TOOL_LIST_BUDGET_BYTES: usize = 97_000;
+
+#[test]
+fn the_tool_list_stays_within_its_size_budget() {
+    let tools = ToolManager::list_tools();
+    let bytes = serde_json::to_string(&json!({ "tools": tools }))
+        .expect("tool list serializes")
+        .len();
+    assert!(
+        bytes <= TOOL_LIST_BUDGET_BYTES,
+        "tools/list is {bytes} bytes, over the {TOOL_LIST_BUDGET_BYTES} byte budget: \
+         shorten descriptions and move detail to docs/"
     );
 }

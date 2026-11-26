@@ -1,6 +1,7 @@
 pub mod addon;
 pub mod bridge;
 pub mod bridge_port;
+pub mod bridge_protocol;
 pub mod cli_runner;
 pub mod config;
 pub mod error;
@@ -12,6 +13,7 @@ pub mod lsp;
 pub mod paths;
 pub mod progress;
 pub mod protocol;
+pub mod replies;
 pub mod server;
 pub mod tools;
 pub mod util;

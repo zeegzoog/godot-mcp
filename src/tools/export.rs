@@ -60,57 +60,53 @@ const SOURCE_EXTENSIONS: &[&str] = &[
     "gd", "tscn", "scn", "tres", "res", "godot", "cfg", "import", "uid", "gdshader", "cs",
 ];
 
-pub fn handles(name: &str) -> bool {
-    matches!(name, LIST | SET | EXPORT)
-}
-
 pub fn catalog() -> Vec<Tool> {
     let project_path = json!({
         "type": "string",
-        "description": "Project directory containing project.godot. Optional: defaults to the project open in the connected editor, else the project the server was started in."
+        "description": "Default: editor's, else server's project."
     });
     vec![
         super::tool(
             LIST,
-            "Lists the export presets in the project's export_presets.cfg, read by Godot's own ConfigFile: index, name, platform, export_path, export_filter, export_files (the res:// paths the resources, exclude and scenes filters use, when stored), include_filter, exclude_filter, custom_features and every stored option (such as binary_format/architecture or texture_format/etc2_astc). Options the preset never stored are absent; Godot uses the platform's default for them. Needs the Godot binary, not the editor.",
+            "Lists export presets: index, name, platform, export_path, export_filter, export_files, include/exclude_filter, custom_features and stored options (an unstored option takes the platform default). Needs the Godot binary only.",
             json!({ "project_path": project_path }),
             &[],
-        ),
+        ).read_only(),
         super::tool(
             SET,
-            "Creates an export preset (create true, with platform) or changes one, in export_presets.cfg through Godot's own ConfigFile, the way the editor's Export dialog stores it. Only the fields and options given are changed; a new preset exports all resources (export_filter all_resources), and every option it does not store gets the platform's default when Godot loads it. An option keeps the type it already has (a whole number becomes an int unless the option holds a float). Godot ignores an option name its platform does not have, so the answer lists new_options: the names that were not stored before; check them for typos. Refused while the editor has the project open, because the editor would write its own copy of the presets back: close it with godot_close_editor first. Platform names: Linux, Windows Desktop, macOS, Android, iOS, Web, visionOS, or one an export plugin adds.",
+            "Creates (create true, with platform) or changes an export preset in export_presets.cfg. Only given fields and options change; options keep their stored type. Godot ignores an option its platform lacks: check new_options in the answer for typos. Refused while the editor has the project open: godot_close_editor first. Platforms: Linux, Windows Desktop, macOS, Android, iOS, Web, visionOS, or one an export plugin adds. A new preset exports all_resources.",
             json!({
-                "name": {"type": "string", "description": "Preset name, as godot_export_project and the Export dialog show it."},
-                "create": {"type": "boolean", "description": "Create the preset when no preset has this name. Default false, which refuses an unknown name."},
-                "platform": {"type": "string", "description": "Export platform, such as Linux or Android. Required to create a preset; for an existing preset it must equal the stored platform."},
-                "export_path": {"type": "string", "description": "Default output path, relative to the project, such as build/game.pck."},
-                "export_filter": {"type": "string", "enum": EXPORT_FILTERS, "description": "Which resources the export takes. all_resources: every resource in the project (export_files is not used). scenes: the scenes listed in export_files and their dependencies. resources: only the files listed in export_files and their dependencies. exclude: every resource except the files listed in export_files. customized: per-file choices the Export dialog stores (customized_files), which this tool does not set. include_filter and exclude_filter apply on top of every filter."},
-                "export_files": {"type": "array", "items": {"type": "string"}, "description": "The files the scenes, resources or exclude filter lists, as res:// paths (a project-relative path gets res:// added), such as [\"res://main.tscn\", \"res://levels/one.tscn\"]. Replaces the whole stored list; [] empties it. The answer's missing_files names listed files the project does not have."},
-                "include_filter": {"type": "string", "description": "Comma-separated globs of non-resource files to include, such as *.json, data/*."},
-                "exclude_filter": {"type": "string", "description": "Comma-separated globs of files to leave out, such as tests/*."},
-                "custom_features": {"type": "string", "description": "Comma-separated custom feature tags for OS.has_feature()."},
+                "name": {"type": "string", "description": "Preset name."},
+                "create": {"type": "boolean", "description": "Create if missing. Default false: an unknown name is refused."},
+                "platform": {"type": "string", "description": "Required to create; else must match the stored one."},
+                "export_path": {"type": "string", "description": "Project-relative output path."},
+                "export_filter": {"type": "string", "enum": EXPORT_FILTERS, "description": "all_resources, scenes / resources (listed + dependencies), exclude (all but listed), customized (not settable). include/exclude_filter apply on top."},
+                "export_files": {"type": "array", "items": {"type": "string"}, "description": "res:// paths for the filter; replaces the list. missing_files names absent ones."},
+                "include_filter": {"type": "string", "description": "Comma-separated globs of non-resource files to add (*.json)."},
+                "exclude_filter": {"type": "string", "description": "Comma-separated globs to leave out."},
+                "custom_features": {"type": "string", "description": "Comma-separated feature tags."},
                 "options": {
                     "type": "object",
-                    "description": "Platform options to set, by name, each a string, number or boolean. Examples: {\"binary_format/architecture\": \"arm32\", \"texture_format/etc2_astc\": true, \"texture_format/s3tc_bptc\": false, \"custom_template/release\": \"/path/to/template\"}.",
+                    "description": "Options by name, each a string, number or boolean, e.g. {\"binary_format/architecture\": \"arm32\"}.",
                     "additionalProperties": {"type": ["string", "number", "boolean"]}
                 },
                 "project_path": project_path
             }),
             &["name"],
-        ),
+        ).destructive_idempotent(),
         super::tool(
             EXPORT,
-            "Exports the project headless with one of its presets: mode pack runs godot --export-pack (a .pck or .zip of the project data, no export template needed), release runs --export-release and debug runs --export-debug (both need the platform's export templates, or the preset's custom_template options). Runs godot --headless --import first (import false skips it; it is skipped while the editor has the project open, since that editor keeps the imports current). Returns ok, the output path and size_bytes, the exit code, the duration, the ERROR and WARNING lines, and the last lines of Godot's output. A missing preset, a missing export template, a failed import, an export that wrote no file or a timeout is an error with the log. output_path defaults to the preset's export_path and must resolve inside the project (such as build/game.pck); its folder is created. An existing file there is replaced. The import and the export wait for the godot_run_script calls working in the project to finish, and run alone there until the file is written: a script started meanwhile waits. Other projects never wait.",
+            "Exports headless with a preset: pack (.pck/.zip data, no template), release or debug (need export templates or custom_template options). Imports first unless import is false or the editor has the project open. Returns ok, path, size_bytes, exit code, duration, ERROR/WARNING lines, log tail; a missing preset or template, failed import, no file or timeout is an error. output_path must be in the project (folder created, file replaced). Runs alone in the project: waits for godot_run_script calls there.",
             json!({
-                "preset": {"type": "string", "description": "Name of the export preset; godot_list_export_presets lists them."},
-                "mode": {"type": "string", "enum": ["pack", "release", "debug"], "description": "pack (default): .pck or .zip data only. release or debug: the exported game with an export template."},
-                "output_path": {"type": "string", "description": "Output file inside the project, as a res:// path or relative to the project, such as build/game.pck. In pack mode it must end in .pck or .zip. Defaults to the preset's export_path."},
-                "import": {"type": "boolean", "description": "Run godot --headless --import before the export. Default true."},
-                "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 3600, "description": "Limit for the import and for the export, each. Default 600. On timeout the process tree is killed."},
+                "preset": {"type": "string", "description": "Preset name (godot_list_export_presets)."},
+                "mode": {"type": "string", "enum": ["pack", "release", "debug"], "description": "pack (default): data only. release/debug: the game, with an export template."},
+                "output_path": {"type": "string", "description": "In the project; .pck/.zip for pack. Default: preset export_path."},
+                "import": {"type": "boolean", "description": "Import before exporting. Default true."},
+                "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 3600, "description": "Per step. Default 600; the process tree is killed on timeout."},
                 "project_path": project_path
             }),
             &["preset"],
-        ),
+        ).destructive(),
     ]
 }
 

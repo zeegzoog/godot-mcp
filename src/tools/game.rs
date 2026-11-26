@@ -53,34 +53,6 @@ const DENY_METHODS: &[&str] = &[
     "replace_by",
 ];
 
-pub fn handles(name: &str) -> bool {
-    matches!(
-        name,
-        "godot_run_output"
-            | "godot_game_tree"
-            | "godot_game_get"
-            | "godot_game_set"
-            | "godot_game_call"
-            | "godot_game_signals"
-            | "godot_game_observe"
-            | "godot_game_snapshot"
-            | "godot_game_state"
-            | "godot_game_command"
-            | "godot_game_input"
-            | "godot_game_input_release"
-            | "godot_game_wait"
-            | "godot_game_physics"
-            | "godot_game_scenario"
-            | "godot_game_run_script"
-            | "godot_game_probe"
-            | "godot_game_screenshot"
-            | "godot_game_record"
-            | "godot_debug_breakpoints"
-            | "godot_debug_control"
-            | "godot_debug_state"
-    )
-}
-
 pub async fn call(tools: &ToolManager, name: &str, args: Value) -> ToolResult {
     match name {
         "godot_run_output" => output(tools, &args).await,
@@ -247,7 +219,15 @@ fn runtime_error(error: &McpError) -> ToolResult {
         McpError::BridgeUnavailable(_)
         | McpError::Bridge(_)
         | McpError::ToolExecution(_)
+        | McpError::CodedToolExecution { .. }
         | McpError::RunEnded(_) => super::bridge_error_result(error),
+        McpError::Process(detail) if detail.contains("runtime protocol") => ToolResult::error(
+            error.to_string(),
+            &[
+                "Update the project's addon with godot_update_addon (restart_editor: true while the editor has the project open), then start the game again",
+                "Or start the game with godot_run_project mode \"process\": the server then gives it its own runtime",
+            ],
+        ),
         McpError::Process(detail) if detail.contains("is still alive") => ToolResult::error(
             error.to_string(),
             &[

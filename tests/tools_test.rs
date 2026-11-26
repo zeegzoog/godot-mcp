@@ -218,7 +218,7 @@ async fn overwriting_a_script_open_with_unsaved_changes_is_refused() {
         BridgeClient::new(bridge.port),
         CliRunner::new(PathBuf::from("unused-godot")),
     ));
-    let result = manager
+    let result = Arc::clone(&manager)
         .call_tool(
             "godot_create_script",
             json!({"script_path": "res://open.gd", "overwrite": true}),
@@ -246,7 +246,7 @@ async fn overwriting_a_script_open_in_a_clean_tab_reloads_the_tab() {
         BridgeClient::new(bridge.port),
         CliRunner::new(PathBuf::from("unused-godot")),
     ));
-    let result = manager
+    let result = Arc::clone(&manager)
         .call_tool(
             "godot_create_script",
             json!({"script_path": "res://open.gd", "overwrite": true}),
@@ -827,6 +827,98 @@ async fn create_resource_without_an_editor_never_replaces_a_file() {
     );
 }
 
+/// The engine is asked for its classes once: later scenes and resources are checked against the
+/// answer it gave, until the executable at that path changes.
+#[tokio::test]
+async fn class_checks_ask_the_engine_once_per_executable() {
+    let project = project_dir();
+    let cwd = tempfile::tempdir().expect("working dir");
+    let engine = tempfile::tempdir().expect("engine dir");
+    let godot = common::classifying_godot(engine.path());
+    let manager = manager_in(cwd.path(), godot.clone());
+    let scene = |name: &str, root: &str| {
+        json!({"scene_path": format!("res://{name}.tscn"), "root_type": root,
+               "project_path": project.path()})
+    };
+    let resource = |name: &str, class: &str| {
+        json!({"resource_path": format!("res://{name}.tres"), "class_name": class,
+               "project_path": project.path()})
+    };
+    for (tool, args) in [
+        ("godot_create_scene", scene("a", "Node2D")),
+        ("godot_create_scene", scene("b", "Control")),
+        ("godot_create_resource", resource("c", "Curve")),
+        ("godot_create_resource", resource("d", "Gradient")),
+    ] {
+        let result = manager.clone().call_tool(tool, args).await;
+        assert!(!result.is_error, "{tool}: {}", text(&result));
+    }
+    let refused = Arc::clone(&manager)
+        .call_tool("godot_create_scene", scene("e", "Curve"))
+        .await;
+    assert!(refused.is_error, "{}", text(&refused));
+    assert!(
+        text(&refused).contains("not a Node type"),
+        "{}",
+        text(&refused)
+    );
+    assert_eq!(
+        common::stand_in_count(engine.path(), "class_lists.txt"),
+        1,
+        "every class check started the engine again"
+    );
+
+    // Another build at the same path: its classes may differ, so it is asked again.
+    let mut script = std::fs::read(&godot).expect("read stand-in");
+    script.extend_from_slice(b"\n");
+    std::fs::write(&godot, script).expect("rewrite stand-in");
+    let result = Arc::clone(&manager)
+        .call_tool("godot_create_scene", scene("f", "Node3D"))
+        .await;
+    assert!(!result.is_error, "{}", text(&result));
+    assert_eq!(
+        common::stand_in_count(engine.path(), "class_lists.txt"),
+        2,
+        "a changed executable was not asked for its classes"
+    );
+}
+
+/// The headless version answer is kept for the executable it came from.
+#[tokio::test]
+async fn version_is_asked_once_per_executable() {
+    let cwd = tempfile::tempdir().expect("working dir");
+    let engine = tempfile::tempdir().expect("engine dir");
+    let godot = common::classifying_godot(engine.path());
+    let manager = manager_in(cwd.path(), godot.clone());
+    for _ in 0..2 {
+        let result = manager
+            .clone()
+            .call_tool("godot_get_version", json!({}))
+            .await;
+        assert!(!result.is_error, "{}", text(&result));
+        assert!(
+            text(&result).contains("4.8.beta1.stand-in"),
+            "{}",
+            text(&result)
+        );
+    }
+    assert_eq!(common::stand_in_count(engine.path(), "versions.txt"), 1);
+
+    let mut script = std::fs::read(&godot).expect("read stand-in");
+    script.extend_from_slice(b"\n");
+    std::fs::write(&godot, script).expect("rewrite stand-in");
+    let result = manager
+        .clone()
+        .call_tool("godot_get_version", json!({}))
+        .await;
+    assert!(!result.is_error, "{}", text(&result));
+    assert_eq!(
+        common::stand_in_count(engine.path(), "versions.txt"),
+        2,
+        "a changed executable was not asked for its version"
+    );
+}
+
 /// When the headless load check says Godot cannot read the resource it just wrote, the call
 /// is an error with Godot's message, and the file it made is gone again.
 #[cfg(unix)]
@@ -844,7 +936,7 @@ for last; do :; done
 case \"$last\" in
   res://*) echo 'made.tres:2 - Parse Error: Unexpected end of file' >&2
            echo 'GODOT_MCP_RESOURCE={\"loaded\":false,\"class\":\"\"}' ;;
-  *) echo GODOT_MCP_CLASS=resource ;;
+  *) echo 'GODOT_MCP_CLASSES={\"scene\":[],\"resource\":[\"Curve\"]}' ;;
 esac
 ",
     )
@@ -1468,6 +1560,74 @@ async fn editor_runtime_waits_for_hello_and_targets_the_ready_session() {
     assert!(!result.is_error, "{}", text(&result));
     assert!(text(&result).contains("count"), "{}", text(&result));
     assert!(polls.load(Ordering::SeqCst) >= 3);
+}
+
+/// The game's runtime writes its replies with Godot's `JSON.stringify`, which leaves U+0001
+/// raw inside a string; a node name carrying one must not turn the reply into an error.
+#[tokio::test]
+async fn editor_runtime_reply_with_a_raw_control_character_is_read() {
+    use common::{MockBridge, Reply};
+    let bridge = MockBridge::start(move |command| {
+        match command["type"].as_str().unwrap_or_default() {
+            "get_run_status" => Reply::Ok(json!({"running": true})),
+            "game_status" => Reply::Ok(json!({"sessions": [{"session": 7, "hello": "{}"}]})),
+            "game_send" => {
+                let request: Value = serde_json::from_str(command["params"]["data"][0].as_str().expect("request")).expect("JSON");
+                let reply = format!(
+                    "{{\"id\":{},\"result\":{{\"count\":1,\"nodes\":[{{\"name\":\"Bad\u{1}Name\\v\"}}]}}}}",
+                    request["id"]
+                );
+                Reply::OkWithEvent(json!({"sent": true}), json!({
+                    "type": "event", "event": "game.message", "data": {
+                        "session": 7, "message": "mcp:reply", "data": [reply]
+                    }
+                }))
+            }
+            _ => Reply::Err("unexpected command".into())
+        }
+    }).await;
+    let manager = ToolManager::new(
+        BridgeClient::new(bridge.port),
+        CliRunner::new(PathBuf::from("unused-godot")),
+    );
+    let result = Arc::new(manager)
+        .call_tool("godot_game_tree", json!({"run_id": "editor"}))
+        .await;
+    assert!(!result.is_error, "{}", text(&result));
+    assert!(
+        text(&result).contains("Bad\\u0001Name\\u000b"),
+        "{}",
+        text(&result)
+    );
+}
+
+#[tokio::test]
+async fn an_editor_game_of_another_runtime_protocol_is_refused_with_the_update() {
+    use common::{MockBridge, Reply};
+    let bridge = MockBridge::start(
+        |command| match command["type"].as_str().unwrap_or_default() {
+            "get_run_status" => Reply::Ok(json!({"running": true})),
+            "game_status" => {
+                Reply::Ok(json!({"sessions": [{"session": 3, "hello": "{\"protocol\": 99}"}]}))
+            }
+            "game_send" => Reply::Err("a request reached a runtime of another protocol".into()),
+            _ => Reply::Ok(json!({})),
+        },
+    )
+    .await;
+    let result = editor_manager(&bridge)
+        .call_tool("godot_game_tree", json!({"run_id": "editor"}))
+        .await;
+    assert!(result.is_error);
+    let message = text(&result);
+    assert!(message.contains("runtime protocol 99"), "{message}");
+    assert!(message.contains("godot_update_addon"), "{message}");
+    assert!(
+        !bridge
+            .received()
+            .iter()
+            .any(|command| command["type"] == "game_send")
+    );
 }
 
 #[tokio::test]
@@ -2171,11 +2331,10 @@ async fn read_script_asks_the_editor_first_and_does_not_hide_its_errors() {
         "{}",
         text(&refused)
     );
-    assert!(
-        bridge.received().iter().all(
-            |command| command["type"] == "read_script" || command["type"] == "get_project_info"
-        )
-    );
+    assert!(bridge.received().iter().all(|command| {
+        ["read_script", "get_project_info", "get_version"]
+            .contains(&command["type"].as_str().unwrap_or_default())
+    }));
 }
 
 const TWO_VARS: &str = "extends Node\n\nvar x = 1\nvar y = 1\n";
@@ -2514,11 +2673,13 @@ async fn manager_with_editor(
     (bridge, manager)
 }
 
+/// The commands sent, less the get_version that reads the addon's commands once per connection.
 fn sent_types(bridge: &common::MockBridge) -> Vec<String> {
     bridge
         .received()
         .iter()
         .filter_map(|command| command["type"].as_str().map(str::to_string))
+        .filter(|kind| kind != "get_version")
         .collect()
 }
 
@@ -3025,7 +3186,10 @@ async fn each_failure_class_gets_its_own_hint_and_never_the_generic_one() {
             BridgeClient::new(bridge.port),
             CliRunner::new(PathBuf::from("unused-godot")),
         ));
-        let result = manager.call_tool("godot_get_scene_tree", json!({})).await;
+        let result = manager
+            .clone()
+            .call_tool("godot_get_scene_tree", json!({}))
+            .await;
         let shown = text(&result);
         assert!(result.is_error, "{shown}");
         assert!(
@@ -3037,6 +3201,151 @@ async fn each_failure_class_gets_its_own_hint_and_never_the_generic_one() {
             "generic hint used: {shown}"
         );
     }
+}
+
+/// The answer of `tool` when the editor refuses every command with `reply`.
+async fn refused_by_editor(
+    tool: &str,
+    reply: impl Fn() -> common::Reply + Send + Sync + 'static,
+) -> Value {
+    let bridge = common::MockBridge::start(move |_| reply()).await;
+    let result = editor_manager(&bridge).call_tool(tool, json!({})).await;
+    assert!(result.is_error, "{}", text(&result));
+    serde_json::to_value(&result).expect("serialize result")
+}
+
+#[tokio::test]
+async fn an_editor_error_code_chooses_the_hint_whatever_the_message_says() {
+    use common::Reply;
+    // Messages reworded so that no substring of the old ones is left: the code alone decides.
+    let cases: &[(&'static str, &str, &str)] = &[
+        ("NOT_FOUND", "Kein Knoten unter X", "godot_get_scene_tree"),
+        ("UNAUTHORIZED", "Token rejected", "GODOT_MCP_TOKEN"),
+        ("NO_SCENE", "Nothing is being edited", "godot_open_scene"),
+        ("EXISTS", "res://a.tres is taken", "another path"),
+        ("WRITE_FAILED", "Disk said no", "writable"),
+        (
+            "SETTING_TYPE",
+            "Wrong kind of value",
+            "type the setting already has",
+        ),
+        (
+            "BAD_PARAMS",
+            "Parameter 'node_path' must be of type String, got int",
+            "inputSchema",
+        ),
+    ];
+    for (code, message, expected) in cases {
+        let message = message.to_string();
+        let shown = message.clone();
+        let answer = refused_by_editor("godot_get_scene_tree", move || {
+            Reply::ErrCode(code, message.clone())
+        })
+        .await;
+        let text = answer["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(text.starts_with(&format!("Error: {shown}")), "{text}");
+        assert!(
+            text.contains(expected),
+            "{code}: expected {expected:?} in: {text}"
+        );
+        assert!(!text.contains("Correct the arguments"), "{code}: {text}");
+        assert_eq!(
+            answer["structuredContent"],
+            json!({"error": {"code": code, "message": shown}}),
+            "{code}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_editor_error_code_this_server_does_not_know_keeps_the_hint_of_its_message() {
+    let answer = refused_by_editor("godot_get_scene_tree", || {
+        common::Reply::ErrCode("SOMETHING_NEW", "File already exists: res://a.tres".into())
+    })
+    .await;
+    let text = answer["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(text.contains("another path"), "{text}");
+    assert_eq!(
+        answer["structuredContent"]["error"]["code"],
+        "SOMETHING_NEW"
+    );
+}
+
+#[tokio::test]
+async fn an_older_addon_without_codes_gets_hints_from_the_message_and_no_structured_error() {
+    let answer = refused_by_editor("godot_get_scene_tree", || {
+        common::Reply::Err("Node not found at path: X".into())
+    })
+    .await;
+    let text = answer["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(text.contains("godot_get_scene_tree"), "{text}");
+    // A code guessed from English words is not an API: only a code the addon sent is given.
+    assert!(answer.get("structuredContent").is_none(), "{answer}");
+}
+
+#[tokio::test]
+async fn a_running_games_failure_code_is_given_in_structured_content() {
+    let answer = refused_by_editor("godot_get_scene_tree", || {
+        common::Reply::Err(
+            r#"{"code":"DENIED","message":"Refusing to set 'script'.","data":{"property":"script"}}"#
+                .into(),
+        )
+    })
+    .await;
+    assert_eq!(
+        answer["structuredContent"],
+        json!({"error": {
+            "code": "DENIED",
+            "message": "Refusing to set 'script'.",
+            "data": {"property": "script"}
+        }})
+    );
+    let text = answer["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(text.contains("by design"), "{text}");
+}
+
+#[tokio::test]
+async fn an_unreachable_editor_is_given_as_a_code() {
+    let manager = Arc::new(ToolManager::new(
+        BridgeClient::new(free_port()),
+        CliRunner::new(PathBuf::from("unused-godot")),
+    ));
+    let result = manager.call_tool("godot_get_scene_tree", json!({})).await;
+    assert!(result.is_error);
+    assert_eq!(
+        result.error_code(),
+        Some("BRIDGE_UNAVAILABLE"),
+        "{}",
+        text(&result)
+    );
+}
+
+#[tokio::test]
+async fn a_coded_unknown_command_still_names_the_addon_update() {
+    let project = project_dir();
+    let addon = project.path().join("addons/godot_mcp");
+    std::fs::create_dir_all(&addon).expect("addon dir");
+    std::fs::write(
+        addon.join("plugin.cfg"),
+        "[plugin]\n\nname=\"Godot MCP Bridge\"\nversion=\"0.11.1-dev+godot.4.8\"\nscript=\"plugin.gd\"\n",
+    )
+    .expect("old manifest");
+    let dir = project.path().to_string_lossy().replace('\\', "/");
+    let bridge = common::MockBridge::start(move |command| match command["type"].as_str() {
+        Some("get_project_info") => common::Reply::Ok(json!({"project_dir": dir})),
+        Some(other) => {
+            common::Reply::ErrCode("UNKNOWN_COMMAND", format!("Unknown command type: {other}"))
+        }
+        None => common::Reply::Ok(json!({})),
+    })
+    .await;
+    let result = editor_manager(&bridge)
+        .call_tool("godot_get_scene_tree", json!({}))
+        .await;
+    let message = text(&result);
+    assert!(message.contains("0.11.1-dev+godot.4.8"), "{message}");
+    assert!(message.contains("godot_update_addon"), "{message}");
+    assert_eq!(result.error_code(), Some("UNKNOWN_COMMAND"));
 }
 
 #[tokio::test]
@@ -3184,14 +3493,23 @@ async fn the_fallbacks_refuse_a_class_the_engine_cannot_use_and_write_no_file() 
 #[tokio::test]
 async fn a_root_name_is_data_in_the_file_fallback_as_it_is_in_the_editor() {
     let project = project_dir();
-    for (name, expected) in [
-        ("with space", "with space"),
-        ("bad name!", "bad name!"),
-        ("a.b:c@d/e%f", "a_b_c_d_e_f"),
-        ("quote\"inside", "quote_inside"),
-        ("new\nline", "new_line"),
-    ] {
-        let file = format!("n_{}.tscn", expected.len());
+    // (requested, the name Godot's `Node.name` keeps, how Godot's scene writer quotes it)
+    for (index, (name, kept, written)) in [
+        ("with space", "with space", "\"with space\""),
+        ("bad name!", "bad name!", "\"bad name!\""),
+        ("a.b:c@d/e%f", "a_b_c_d_e_f", "\"a_b_c_d_e_f\""),
+        ("quote\"inside", "quote_inside", "\"quote_inside\""),
+        ("new\nline", "new\nline", "\"new\\nline\""),
+        ("Root\\", "Root\\", "\"Root\\\\\""),
+        ("Q\\\"R", "Q\\_R", "\"Q\\\\_R\""),
+        ("C[D]E", "C[D]E", "\"C[D]E\""),
+        ("tab\tctl\u{1}", "tab\tctl\u{1}", "\"tab\\tctl\\u0001\""),
+        ("", "Root", "\"Root\""),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let file = format!("n_{index}.tscn");
         let made = call_classified(
             "godot_create_scene",
             json!({"scene_path": format!("res://{file}"), "root_name": name,
@@ -3199,9 +3517,15 @@ async fn a_root_name_is_data_in_the_file_fallback_as_it_is_in_the_editor() {
         )
         .await;
         assert!(!made.is_error, "{name:?}: {}", text(&made));
+        let reported = serde_json::to_string(kept).expect("name");
+        assert!(
+            text(&made).contains(&format!("root node named {reported}")),
+            "{name:?}: {}",
+            text(&made)
+        );
         let body = std::fs::read_to_string(project.path().join(&file)).expect("scene");
         assert!(
-            body.contains(&format!("[node name=\"{expected}\" type=\"Node2D\"]")),
+            body.contains(&format!("[node name={written} type=\"Node2D\"]")),
             "{name:?}: {body}"
         );
         assert_eq!(
@@ -5630,7 +5954,7 @@ async fn close_editor_asks_the_connected_editor_to_quit_and_waits_for_its_proces
         .with_working_dir(cwd.path().to_path_buf()),
     );
 
-    let result = manager
+    let result = Arc::clone(&manager)
         .call_tool(
             "godot_close_editor",
             json!({"project_path": project.path()}),
@@ -5672,7 +5996,10 @@ async fn close_editor_reports_unsaved_changes_instead_of_closing() {
         .with_working_dir(project.path().to_path_buf()),
     );
 
-    let result = manager.call_tool("godot_close_editor", json!({})).await;
+    let result = manager
+        .clone()
+        .call_tool("godot_close_editor", json!({}))
+        .await;
     assert!(result.is_error, "{}", text(&result));
     let shown = text(&result);
     for needle in [
@@ -5702,7 +6029,7 @@ async fn close_editor_never_closes_an_editor_that_has_another_project_open() {
         CliRunner::new(PathBuf::from("unused-godot")),
     ));
 
-    let result = manager
+    let result = Arc::clone(&manager)
         .call_tool(
             "godot_close_editor",
             json!({"project_path": mine.path(), "discard": true}),
@@ -6252,7 +6579,7 @@ async fn a_preset_is_not_changed_while_the_editor_has_the_project_open() {
         BridgeClient::new(bridge.port),
         CliRunner::new(PathBuf::from("unused-godot")),
     ));
-    let result = manager
+    let result = Arc::clone(&manager)
         .call_tool(
             "godot_set_export_preset",
             json!({"name": "webOS", "create": true, "platform": "Linux",
@@ -6661,7 +6988,7 @@ async fn import_params_go_through_the_editor_that_has_the_project_and_name_dropp
         BridgeClient::new(bridge.port),
         CliRunner::new(PathBuf::from("unused-godot")),
     ));
-    let result = manager
+    let result = Arc::clone(&manager)
         .call_tool(
             "godot_set_import_params",
             json!({"path": "far.png", "copy_from": "res://sky.png",
@@ -6879,7 +7206,7 @@ async fn an_importer_change_goes_to_the_editor_that_has_the_project() {
         BridgeClient::new(bridge.port),
         CliRunner::new(PathBuf::from("unused-godot")),
     ));
-    let result = manager
+    let result = Arc::clone(&manager)
         .call_tool(
             "godot_set_import_params",
             json!({"path": "sky.png", "importer": "3d_texture",
@@ -6953,6 +7280,81 @@ async fn a_command_the_editors_addon_lacks_names_both_versions_and_the_update() 
         "the project to update: {message}"
     );
     assert!(!message.contains("retry in a moment"), "{message}");
+}
+
+#[tokio::test]
+async fn a_parameter_the_editors_addon_lacks_is_explained_before_the_call_is_sent() {
+    use common::{MockBridge, Reply};
+    let project = project_dir();
+    let dir = project.path().to_string_lossy().replace('\\', "/");
+    let bridge = MockBridge::start(move |command| match command["type"].as_str() {
+        Some("get_version") => Reply::Ok(json!({
+            "version_string": "4.5.stable", "protocol": 2,
+            "commands": {"open_scene": ["scene_path"], "get_project_info": []}
+        })),
+        Some("get_project_info") => {
+            Reply::Ok(json!({"project_dir": dir, "addon_version": "0.15.0"}))
+        }
+        _ => Reply::Ok(json!({"opened": true})),
+    })
+    .await;
+    let result = editor_manager(&bridge)
+        .call_tool(
+            "godot_open_scene",
+            json!({"scene_path": "res://main.tscn", "reload": true}),
+        )
+        .await;
+    assert!(result.is_error, "{}", text(&result));
+    let message = text(&result);
+    assert!(message.contains("older than this server"), "{message}");
+    assert!(
+        message.contains("'open_scene' command has no parameter 'reload'"),
+        "{message}"
+    );
+    assert!(message.contains("0.15.0"), "{message}");
+    assert!(message.contains("godot_update_addon"), "{message}");
+    assert!(
+        bridge
+            .received()
+            .iter()
+            .all(|command| command["type"] != "open_scene"),
+        "the call was sent to an addon that would ignore reload"
+    );
+}
+
+#[tokio::test]
+async fn an_addon_too_old_to_list_its_commands_is_served_and_updated_as_before() {
+    let (project, bridge) = editor_with_old_addon(&[]).await;
+    let tools = editor_manager(&bridge);
+    let opened = Arc::clone(&tools)
+        .call_tool(
+            "godot_open_scene",
+            json!({"scene_path": "res://main.tscn", "reload": true}),
+        )
+        .await;
+    assert!(!opened.is_error, "{}", text(&opened));
+    let received = bridge.received();
+    let sent = received
+        .iter()
+        .find(|command| command["type"] == "open_scene")
+        .expect("open_scene was sent");
+    assert_eq!(sent["params"]["reload"], true);
+
+    // The recovery path keeps working against it: the update names the old addon and asks for
+    // the editor to be restarted.
+    let update = tools
+        .call_tool(
+            "godot_update_addon",
+            json!({"project_path": project.path()}),
+        )
+        .await;
+    assert!(update.is_error, "{}", text(&update));
+    assert!(
+        text(&update).contains("restart_editor: true"),
+        "{}",
+        text(&update)
+    );
+    assert!(text(&update).contains("0.11.1-dev"), "{}", text(&update));
 }
 
 #[tokio::test]

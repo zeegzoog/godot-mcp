@@ -2,7 +2,9 @@ extends RefCounted
 ## Saves a series of PNG frames of the game window to a directory the caller created.
 ## The debugger reply lists paths and timings. It does not carry image bytes.
 ## Each frame only grabs an Image. PNG encoding waits until the last frame is captured,
-## so the game's frame time is the capture interval and `msec` is that instant.
+## so the game's frame time is the capture interval and `msec` is that instant. The PNGs are
+## then encoded and saved on WorkerThreadPool threads, one task per frame, while the game keeps
+## running; the recording answers once every file is written.
 
 const R := preload("rt_result.gd")
 const MAX_FRAMES := 240
@@ -56,12 +58,19 @@ static func record(rt: Node, params: Dictionary) -> Dictionary:
         "kept_bytes": 0,
         "clock": false,
         "started_msec": 0,
+        "write_task": -1,
     }
     return {"_pending": true, "_tick": func() -> bool: return _tick_record(rt, state)}
 
 
 static func _tick_record(rt: Node, state: Dictionary) -> bool:
     var phase := str(state["phase"])
+    if phase == "write":
+        if not WorkerThreadPool.is_group_task_completed(int(state["write_task"])):
+            return true
+        var written: Variant = _written(state)
+        rt.finish_job(written if written is Dictionary else _finish(state))
+        return false
     if phase == "render":
         state["phase"] = "capture"
         return true
@@ -92,12 +101,9 @@ static func _tick_record(rt: Node, state: Dictionary) -> bool:
         state["pause"] = int(state["every"])
         state["phase"] = "pause"
         return true
-    var written: Variant = _write_frames(state)
-    if written is Dictionary:
-        rt.finish_job(written)
-        return false
-    rt.finish_job(_finish(state))
-    return false
+    _write_frames(state)
+    state["phase"] = "write"
+    return true
 
 
 static func _grab(viewport: Variant, max_side: int) -> Variant:
@@ -129,11 +135,9 @@ static func _keep_frame(state: Dictionary, image: Image, captured_at: int) -> Va
         @warning_ignore("integer_division")
         var megabytes := pixels / (1024 * 1024)
         return R.err(R.BAD_PARAMS, "This recording would keep %d MB of pixels in memory (frames × width × height × 4), above the 512 MB limit. Lower frames or max_dimension." % megabytes)
-    var copy := image.duplicate() as Image
-    if copy == null:
-        return R.err(R.GODOT_ERROR, "Could not keep frame %d in memory." % index)
+    # The image is the viewport's fresh copy from _grab, so it is kept as it is.
     state["kept_bytes"] = int(state["kept_bytes"]) + frame_bytes
-    (state["images"] as Array).append(copy)
+    (state["images"] as Array).append(image)
     (state["meta"] as Array).append({
         "index": index,
         "file": "frame-%04d.png" % index,
@@ -145,21 +149,32 @@ static func _keep_frame(state: Dictionary, image: Image, captured_at: int) -> Va
     return null
 
 
-static func _write_frames(state: Dictionary) -> Variant:
-    var images: Array = state["images"]
-    var meta: Array = state["meta"]
-    var directory := str(state["directory"])
-    for index in images.size():
-        var image := images[index] as Image
-        var info: Dictionary = meta[index]
-        var file_name := str(info["file"])
-        var path := directory.path_join(file_name)
-        var err := image.save_png(path)
-        if err != OK:
-            return R.err(R.GODOT_ERROR, "Could not save %s (%s)." % [file_name, error_string(err)])
+## Starts one WorkerThreadPool task per kept frame. Each task reads only its own image and
+## writes only its own meta entry, and the main thread reads neither until the group completes.
+static func _write_frames(state: Dictionary) -> void:
+    var save := _save_frame.bind(state["images"], state["meta"], str(state["directory"]))
+    state["write_task"] = WorkerThreadPool.add_group_task(save, (state["images"] as Array).size(), -1, false, "godot_mcp record PNG")
+
+
+static func _save_frame(index: int, images: Array, meta: Array, directory: String) -> void:
+    var image := images[index] as Image
+    var info: Dictionary = meta[index]
+    var path := directory.path_join(str(info["file"]))
+    var err := image.save_png(path)
+    if err == OK:
         info["path"] = path
+    else:
+        info["save_error"] = err
+
+
+## The first frame that could not be saved, as an error, or null when every file was written.
+static func _written(state: Dictionary) -> Variant:
+    WorkerThreadPool.wait_for_group_task_completion(int(state["write_task"]))
     # The reply lists paths, not pixels. Drop the images before the runtime answers.
     state["images"] = []
+    for info: Dictionary in state["meta"]:
+        if info.has("save_error"):
+            return R.err(R.GODOT_ERROR, "Could not save %s (%s)." % [str(info["file"]), error_string(int(info["save_error"]))])
     return null
 
 

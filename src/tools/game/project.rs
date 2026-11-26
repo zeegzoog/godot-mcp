@@ -77,7 +77,7 @@ async fn forward(tools: &ToolManager, args: &Value, method: &str) -> ToolResult 
             }
             ToolResult::text(serde_json::to_string_pretty(&value).unwrap_or_default())
         }
-        Err(error) => project_error(&error),
+        Err(error) => crate::tools::with_runtime_code(project_error(&error), &error),
     }
 }
 

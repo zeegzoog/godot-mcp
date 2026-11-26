@@ -12,6 +12,9 @@ const R := preload("ops/rt_result.gd")
 const Hold := preload("ops/rt_hold.gd")
 const Project := preload("ops/rt_project.gd")
 const PROTOCOL_VERSION := 1
+## Godot's TCP debugger peer encodes each message into an 8 MiB buffer (RemoteDebuggerPeerTCP) and
+## drops a larger one. The rest of the message ([name, thread, [text]]) takes under 100 bytes.
+const MAX_REPLY_BYTES := (8 << 20) - 1024
 const MODULES: Array = [
     preload("ops/rt_live.gd"),
     preload("ops/rt_input.gd"),
@@ -249,7 +252,19 @@ func recovered_id(text: String) -> Variant:
 
 func _reply(req: Dictionary, reply: Dictionary) -> void:
     reply["id"] = req.get("id")
-    _send("mcp:reply", reply)
+    if not EngineDebugger.is_active():
+        return
+    var text := JSON.stringify(reply)
+    # Godot's debugger drops, without a word to either side, a message larger than its 8 MiB
+    # buffer: the caller would wait for a reply that never comes. A code point is at most 4 bytes,
+    # so only a long text is measured.
+    if text.length() * 4 > MAX_REPLY_BYTES:
+        var size := text.to_utf8_buffer().size()
+        if size > MAX_REPLY_BYTES:
+            var refusal := R.err(R.BAD_PARAMS, "The answer to %s is %d bytes, more than the %d bytes the debugger connection carries in one message. Ask for less: for a screenshot, a smaller max_dimension or fewer frames." % [str(req.get("method", "")), size, MAX_REPLY_BYTES], {"size_bytes": size, "limit_bytes": MAX_REPLY_BYTES})
+            refusal["id"] = req.get("id")
+            text = JSON.stringify(refusal)
+    EngineDebugger.send_message("mcp:reply", [text])
 
 
 func finish_job(reply: Dictionary) -> void:

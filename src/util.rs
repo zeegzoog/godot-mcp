@@ -8,6 +8,23 @@ pub fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Runs file system work that may take long (a walk of a whole project) on Tokio's blocking
+/// threads, so it never holds up the async workers. A panic in `work` is raised again here, as
+/// if it had run inline; when the runtime refuses the task (it is shutting down), `work` runs
+/// inline instead.
+pub async fn blocking<T, F>(work: F) -> T
+where
+    F: FnOnce() -> T + Clone + Send + 'static,
+    T: Send + 'static,
+{
+    let inline = work.clone();
+    match tokio::task::spawn_blocking(work).await {
+        Ok(value) => value,
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(_) => inline(),
+    }
+}
+
 /// Whether a process with this id runs. It only reads the process table and sends no signal.
 #[cfg(unix)]
 pub fn process_runs(pid: u32) -> bool {

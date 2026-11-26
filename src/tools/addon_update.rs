@@ -4,6 +4,7 @@
 
 use super::{ToolManager, str_arg};
 use crate::addon::{self, Installed, SERVER_VERSION};
+use crate::bridge_protocol::{UNKNOWN_COMMAND, unknown_parameter_in};
 use crate::error::McpError;
 use crate::paths::same_directory;
 use crate::protocol::{Tool, ToolContent, ToolResult};
@@ -13,33 +14,26 @@ use std::path::{Path, PathBuf};
 
 pub const UPDATE: &str = "godot_update_addon";
 
-/// What an addon answers for a command it does not have.
-const UNKNOWN_COMMAND: &str = "Unknown command type: ";
-
-pub fn handles(name: &str) -> bool {
-    name == UPDATE
-}
-
 pub fn catalog() -> Vec<Tool> {
     vec![super::tool(
         UPDATE,
-        "Installs or updates the Godot MCP Bridge addon (res://addons/godot_mcp) in a project with the addon of this server's own build, so both have the same version, and keeps the plugin enabled in project.godot. The old addon folder is replaced as a whole (files the new addon no longer has are removed; nothing outside addons/godot_mcp is touched). An editor that has the project open runs the old addon until it loads the plugin again, so while one is connected the files are replaced only with restart_editor: true, which closes it (refused while scenes or scripts are unsaved, unless discard: true), installs, and opens it again. The answer gives previous_version, version, the added, updated and removed files and what the editor needs. Nothing is written when the addon is already this version. Use it when a tool says the editor's addon is older than the server.",
+        "Installs or updates res://addons/godot_mcp to this server's build (folder replaced whole), plugin kept enabled. With the project's editor connected it needs restart_editor: true (closes, installs, reopens; refused on unsaved scenes or scripts unless discard: true). Answers previous_version, version, changed files and what the editor needs; no-op when versions match. Use it when a tool says the addon is older than the server.",
         json!({
             "project_path": {
                 "type": "string",
-                "description": "Project directory containing project.godot. Optional: defaults to the project open in the connected editor, else the project the server was started in."
+                "description": "Default: editor's, else server's project."
             },
             "discard": {
                 "type": "boolean",
-                "description": "With restart_editor: close the editor even when it has unsaved scenes or scripts, losing those changes, as godot_close_editor's discard does. Default false: the call is refused and lists them."
+                "description": "With restart_editor: close despite unsaved changes, losing them. Default false."
             },
             "restart_editor": {
                 "type": "boolean",
-                "description": "Close the connected editor of this project before installing and open it again after. Default false: with the editor connected the call is refused and says so."
+                "description": "Close and reopen the connected editor around the install. Default false."
             }
         }),
         &[],
-    )]
+    ).destructive_idempotent()]
 }
 
 pub async fn call(tools: &ToolManager, args: Value) -> ToolResult {
@@ -309,7 +303,9 @@ fn prefixed(mut result: ToolResult, prefix: &str) -> ToolResult {
 /// The command an addon refused as unknown in `error`.
 pub(super) fn unknown_command(error: &McpError) -> Option<String> {
     match error {
-        McpError::ToolExecution(message) | McpError::Bridge(message) => command_in(message),
+        McpError::ToolExecution(message)
+        | McpError::Bridge(message)
+        | McpError::CodedToolExecution { message, .. } => command_in(message),
         _ => None,
     }
 }
@@ -351,39 +347,47 @@ fn update_hint(dir: Option<&Path>) -> String {
     )
 }
 
-/// A tool error that only carries an addon's "Unknown command type", made to say that the
-/// editor's addon is older than the server, with both versions and the update call.
+/// A tool error that only carries an addon's "Unknown command type" or "Unknown parameter"
+/// (answered by the addon, or by the bridge client from the commands the addon listed), made to
+/// say that the editor's addon is older than the server, with both versions and the update call.
 pub(super) async fn explain_unknown_command(
     tools: &ToolManager,
     tool: &str,
     result: ToolResult,
 ) -> ToolResult {
-    let command = match result.content.first() {
-        Some(ToolContent::Text { text }) if result.is_error => command_in(text),
-        _ => None,
-    };
-    let Some(command) = command else {
-        return result;
+    let (lacks, command) = match result.content.first() {
+        Some(ToolContent::Text { text }) if result.is_error => {
+            match (unknown_parameter_in(text), command_in(text)) {
+                (Some((key, command)), _) => (
+                    format!("its '{command}' command has no parameter '{key}'"),
+                    command,
+                ),
+                (None, Some(command)) => (format!("it has no '{command}' command"), command),
+                (None, None) => return result,
+            }
+        }
+        _ => return result,
     };
     let (version, dir) = editor_addon(tools).await;
     let on_disk = dir.as_deref().map(addon::installed);
     let what = if on_disk == Some(Installed::Version(SERVER_VERSION.to_string())) {
         format!(
-            "The editor runs Godot MCP addon {version}, which has no '{command}' command that {tool} needs. The addon on disk is already {SERVER_VERSION} (this server's version), but the editor loaded the older one"
+            "The editor runs Godot MCP addon {version}: {lacks}, which {tool} needs, so the '{command}' command was not run. The addon on disk is already {SERVER_VERSION} (this server's version), but the editor loaded the older one"
         )
     } else {
         format!(
-            "The editor's Godot MCP addon ({version}) is older than this server ({SERVER_VERSION}): it has no '{command}' command, which {tool} needs"
+            "The editor's Godot MCP addon ({version}) is older than this server ({SERVER_VERSION}): {lacks}, which {tool} needs, so the '{command}' command was not run"
         )
     };
     ToolResult::error(
-        what,
+        what.clone(),
         &[
             &update_hint(dir.as_deref()),
             "Or disable and enable Godot MCP Bridge in Project → Project Settings → Plugins once the addon on disk is this server's version",
             "Or close the editor: tools that work without it then use the project files",
         ],
     )
+    .with_error_code("UNKNOWN_COMMAND", &what, None)
 }
 
 /// Tools whose failures say nothing about the addon's behaviour, or that manage the addon or

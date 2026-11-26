@@ -31,14 +31,10 @@ const MOUSE_BUTTON_RANGE: std::ops::RangeInclusive<i64> = 1..=9;
 const JOY_BUTTON_RANGE: std::ops::RangeInclusive<i64> = 0..=127;
 const JOY_AXIS_RANGE: std::ops::RangeInclusive<i64> = 0..=9;
 
-pub fn handles(name: &str) -> bool {
-    name == GET || name == EDIT
-}
-
 pub fn catalog() -> Vec<Tool> {
     let event = json!({
         "type": "object",
-        "description": "One input event. type key: key (a key name such as E, Space, Up, F1), physical (default true: the key at that position on a QWERTY layout), shift, ctrl, alt, meta. type mouse_button: button (left, right, middle, wheel_up, wheel_down, wheel_left, wheel_right, xbutton1, xbutton2, or 1-9). type joypad_button: button (0-127), device (default -1, all devices). type joypad_motion: axis (0-9), axis_value (its sign picks the direction), device.",
+        "description": "One input event, as add_events describes.",
         "properties": {
             "type": {"type": "string", "enum": ["key", "mouse_button", "joypad_button", "joypad_motion"]}
         },
@@ -47,26 +43,26 @@ pub fn catalog() -> Vec<Tool> {
     vec![
         super::tool(
             GET,
-            "Lists the project's InputMap actions with their deadzone and events, as the editor holds them. Godot's built-in ui_ actions are left out unless include_builtin is true. Requires the editor bridge.",
+            "Lists InputMap actions with deadzone and events, as the editor holds them; built-in ui_ actions only with include_builtin. Needs the editor.",
             json!({
                 "action": {"type": "string", "description": "Only this action."},
-                "include_builtin": {"type": "boolean", "description": "Also list the built-in ui_ actions. Default false."}
+                "include_builtin": {"type": "boolean", "description": "Default false."}
             }),
             &[],
-        ),
+        ).read_only(),
         super::tool(
             EDIT,
-            "Adds or removes events of one InputMap action, sets its deadzone, creates it (create true) or deletes it (delete true), and saves project.godot through the editor. An event is a key, a mouse button, a joypad button or a joypad axis. The change is one step in the editor's undo history (Edit > Undo). All or nothing: an event to remove that the action does not have, or a key name Godot does not know, changes nothing. An event the action already has is not added twice and is listed under already_present. Key events use the physical key by default. Built-in ui_ actions can be edited but not deleted. Requires the editor bridge; never edit the [input] section of project.godot by hand.",
+            "Adds or removes events (key, mouse button, joypad button or axis) of one InputMap action, sets its deadzone, creates or deletes it, and saves project.godot via the editor as one undo step. All or nothing: an absent event to remove or an unknown key name changes nothing; events already there go to already_present. Keys are physical by default. ui_ actions cannot be deleted. Needs the editor; never edit [input] by hand.",
             json!({
-                "action": {"type": "string", "description": "Action name, for example jump."},
-                "add_events": {"type": "array", "items": event, "description": "Events to add."},
-                "remove_events": {"type": "array", "items": event, "description": "Events to remove, matched by type, key or button, modifiers and device."},
-                "deadzone": {"type": "number", "minimum": 0, "maximum": 1, "description": "Deadzone from 0 to 1. A new action gets 0.2."},
-                "create": {"type": "boolean", "description": "Create the action when it does not exist. Default false."},
-                "delete": {"type": "boolean", "description": "Delete the action. Cannot be combined with other changes."}
+                "action": {"type": "string", "description": "Action name, such as jump."},
+                "add_events": {"type": "array", "items": event, "description": "Events. key: key (E, Space, Up, F1...), physical (default true), shift, ctrl, alt, meta. mouse_button: button (left, right, middle, wheel_up, wheel_down, wheel_left, wheel_right, xbutton1, xbutton2 or 1-9). joypad_button: button 0-127, device (default -1: all). joypad_motion: axis 0-9, axis_value (sign = direction), device."},
+                "remove_events": {"type": "array", "items": event, "description": "Same shape as add_events; matched by type, key or button, modifiers and device."},
+                "deadzone": {"type": "number", "minimum": 0, "maximum": 1, "description": "0 to 1; a new action gets 0.2."},
+                "create": {"type": "boolean", "description": "Create the action if missing. Default false."},
+                "delete": {"type": "boolean", "description": "Delete the action; not combined with other changes."}
             }),
             &["action"],
-        ),
+        ).destructive_idempotent(),
     ]
 }
 

@@ -6,7 +6,7 @@ use crate::tools::{ToolManager, str_arg};
 use serde_json::Value;
 
 pub(super) async fn screenshot(tools: &ToolManager, args: &Value) -> ToolResult {
-    let value = match tools
+    let mut value = match tools
         .runtime_call(
             str_arg(args, "run_id"),
             "game.screenshot",
@@ -17,14 +17,15 @@ pub(super) async fn screenshot(tools: &ToolManager, args: &Value) -> ToolResult 
         Ok(value) => value,
         Err(error) => return runtime_error(&error),
     };
-    let Some(data) = value.get("data").and_then(Value::as_str) else {
+    // The image moves on to the answer; it is the largest part of it and is not copied.
+    let Some(Value::String(data)) = value.get_mut("data").map(Value::take) else {
         return ToolResult::error(
             "The game did not return image data",
             &["Start a windowed game and retry godot_game_screenshot"],
         );
     };
-    let bytes = match base64_decode(data) {
-        Some(bytes) => bytes,
+    let header = match base64_decode_prefix(&data, PNG_HEADER_BYTES) {
+        Some(header) => header,
         None => {
             return ToolResult::error(
                 "Screenshot payload was not valid base64",
@@ -32,7 +33,7 @@ pub(super) async fn screenshot(tools: &ToolManager, args: &Value) -> ToolResult 
             );
         }
     };
-    let Some((width, height)) = png_dimensions(&bytes) else {
+    let Some((width, height)) = png_dimensions(&header) else {
         return ToolResult::error(
             "Screenshot payload was not a PNG",
             &["The capture failed before a real image was produced"],
@@ -323,7 +324,13 @@ fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     }
 }
 
-fn base64_decode(text: &str) -> Option<Vec<u8>> {
+/// The PNG signature and the IHDR chunk up to the height: all `png_dimensions` reads.
+const PNG_HEADER_BYTES: usize = 24;
+
+/// Decodes the first `limit` bytes of `text` and checks that the rest is base64 too, without
+/// decoding it: a screenshot's size is in its first bytes, and the image itself is passed on as
+/// base64.
+fn base64_decode_prefix(text: &str, limit: usize) -> Option<Vec<u8>> {
     const TABLE: &[u8; 128] = &{
         let mut table = [255_u8; 128];
         let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -334,7 +341,7 @@ fn base64_decode(text: &str) -> Option<Vec<u8>> {
         }
         table
     };
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(limit);
     let mut buffer = 0_u32;
     let mut bits = 0;
     for byte in text.bytes() {
@@ -343,6 +350,9 @@ fn base64_decode(text: &str) -> Option<Vec<u8>> {
         }
         if byte > 127 || TABLE[byte as usize] == 255 {
             return None;
+        }
+        if out.len() >= limit {
+            continue;
         }
         buffer = (buffer << 6) | u32::from(TABLE[byte as usize]);
         bits += 6;
@@ -714,8 +724,8 @@ mod tests {
 
     #[test]
     fn png_magic_is_rejected_when_absent() {
-        assert!(base64_decode("aaaa").is_some());
-        assert!(base64_decode("@@@").is_none());
+        assert!(base64_decode_prefix("aaaa", 8).is_some());
+        assert!(base64_decode_prefix("@@@", 8).is_none());
         assert!(png_dimensions(b"not a png").is_none());
         let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
         png.extend_from_slice(&[0; 8]);
@@ -724,5 +734,61 @@ mod tests {
         assert_eq!(png_dimensions(&png), Some((32, 16)));
         png[16..20].copy_from_slice(&0u32.to_be_bytes());
         assert!(png_dimensions(&png).is_none());
+    }
+
+    fn base64(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let n = chunk
+                .iter()
+                .enumerate()
+                .fold(0_u32, |acc, (i, b)| acc | (u32::from(*b) << (16 - 8 * i)));
+            for i in 0..4 {
+                if i <= chunk.len() {
+                    out.push(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize] as char);
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
+    }
+
+    fn png_with_size(width: u32, height: u32, body: usize) -> Vec<u8> {
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&width.to_be_bytes());
+        png.extend_from_slice(&height.to_be_bytes());
+        png.extend((0..body).map(|i| (i * 7) as u8));
+        png
+    }
+
+    #[test]
+    fn only_the_png_header_is_decoded_and_the_rest_is_still_checked() {
+        let text = base64(&png_with_size(4096, 2304, 300_000));
+        let header = base64_decode_prefix(&text, PNG_HEADER_BYTES).expect("valid base64");
+        assert_eq!(header.len(), PNG_HEADER_BYTES);
+        assert_eq!(png_dimensions(&header), Some((4096, 2304)));
+
+        // A bad character far past the header still makes the payload invalid.
+        let mut broken = text.clone();
+        broken.replace_range(text.len() - 10..text.len() - 9, "@");
+        assert!(base64_decode_prefix(&broken, PNG_HEADER_BYTES).is_none());
+    }
+
+    #[test]
+    fn a_truncated_or_foreign_header_has_no_dimensions() {
+        let png = png_with_size(32, 16, 0);
+        for cut in [0, 8, 16, 23] {
+            let header = base64_decode_prefix(&base64(&png[..cut]), PNG_HEADER_BYTES).unwrap();
+            assert!(png_dimensions(&header).is_none(), "{cut} bytes");
+        }
+        let header = base64_decode_prefix(&base64(&png), PNG_HEADER_BYTES).unwrap();
+        assert_eq!(png_dimensions(&header), Some((32, 16)));
+        let jpeg = base64(b"\xff\xd8\xff\xe0 this is no png at all, but long enough");
+        let header = base64_decode_prefix(&jpeg, PNG_HEADER_BYTES).unwrap();
+        assert!(png_dimensions(&header).is_none());
     }
 }

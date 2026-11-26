@@ -10,6 +10,7 @@ use super::scripts::{
     MAX_BYTES, TextFile, TextKind, edit_file, label, locate, locate_in, read_file, replace_file,
 };
 use super::{EditorChoice, ToolManager, bridge_error_result, str_arg};
+use crate::bridge_protocol::for_editor;
 use crate::error::McpError;
 use crate::protocol::{Tool, ToolResult};
 use serde::Deserialize;
@@ -33,58 +34,49 @@ const SHADER: TextKind = TextKind {
 /// What a clean check covered, for the answer and the tool description.
 const CHECKED: &str = "The saved file was preprocessed (#include, #define, #if) and compiled by Godot's shader compiler for its shader_type: syntax, types, unknown identifiers, built-ins and render modes of that type, and the includes it pulls in. Not checked: the GPU driver's own compile of the generated code, and warnings the shader editor shows (such as unused uniforms).";
 
-pub fn handles(name: &str) -> bool {
-    matches!(
-        name,
-        "godot_create_shader" | "godot_read_shader" | "godot_edit_shader" | "godot_validate_shader"
-    )
-}
-
 pub fn catalog() -> Vec<Tool> {
     vec![
         super::tool(
             "godot_create_shader",
-            "Creates a text shader (.gdshader) or shader include (.gdshaderinc) inside the project with the given code, written as it is (tabs and line endings kept). Refuses an existing file unless overwrite: true. With the editor connected the editor writes it, so the shader it holds in memory (and every material using it) gets the new code and an open shader tab is reloaded; an overwrite is refused while that tab has unsaved changes. A new file gets a .uid file as the editor would give it; an existing file keeps its .uid. Without an editor the file is written directly. Returns {path, created, version, uid}. Run godot_validate_shader afterwards: this tool does not compile the code.",
+            "Creates a .gdshader or .gdshaderinc with the given code, as is. Refuses an existing file unless overwrite: true. With the editor, the editor writes it (materials update, an open tab reloads; overwrite refused while that tab is unsaved); else written directly. A new file gets a .uid. Returns {path, created, version, uid}. Does not compile: run godot_validate_shader.",
             json!({
-                "shader_path": {"type": "string", "description": "res:// path ending in .gdshader or .gdshaderinc."},
-                "code": {"type": "string", "description": "The whole shader source, for example \"shader_type spatial;\\n\\nvoid fragment() {\\n\\tALBEDO = vec3(1.0);\\n}\\n\". At most 1 MiB."},
+                "shader_path": {"type": "string", "description": "res:// .gdshader or .gdshaderinc."},
+                "code": {"type": "string", "description": "Whole shader source, at most 1 MiB."},
                 "overwrite": {"type": "boolean", "description": "Replace an existing file. Default false."},
                 "project_path": {"type": "string"}
             }),
             &["shader_path", "code"],
-        ),
+        ).destructive_idempotent(),
         super::tool(
             "godot_read_shader",
-            "Reads an existing .gdshader or .gdshaderinc as the editor would save it: the shader editor's unsaved text when the shader is open with unsaved changes (dirty: true, source: editor), otherwise the file. Returns {path, text, source, dirty, version}; the version label identifies the returned text. stale_tab: true means the shader is open in a tab without unsaved changes that still shows older text than the file; godot_edit_shader refuses until the tab shows the file. Without an editor it reads the file.",
+            "Reads a .gdshader/.gdshaderinc as the editor would save it: unsaved editor text when dirty (source: editor), else the file. Returns {path, text, source, dirty, version}. stale_tab: an open tab shows older text; godot_edit_shader refuses until it is reloaded.",
             json!({
-                "shader_path": {"type": "string", "description": "res:// path to a .gdshader or .gdshaderinc file in the project."},
+                "shader_path": {"type": "string", "description": "res:// .gdshader or .gdshaderinc."},
                 "project_path": {"type": "string"}
             }),
             &["shader_path"],
-        ),
+        ).read_only(),
         super::tool(
             "godot_edit_shader",
-            "Replaces one fragment of an existing .gdshader or .gdshaderinc: old_text must occur exactly once (any other count is refused with the count), and new_text takes its place. With the editor connected the shader is opened in the shader editor if it is not, the change is one undo step in its tab, the shader is saved, and the editor's shader and the materials using it get the new code; it is refused while the shader has unsaved changes in the editor. Without an editor the file is replaced as a whole. Pass the version from godot_read_shader to refuse the edit if the shader changed since. Never creates a file (use godot_create_shader); run godot_validate_shader after an edit.",
+            "Replaces one fragment of an existing .gdshader/.gdshaderinc: old_text must occur exactly once (else refused with the count). With the editor it is one undo step in the shader tab, saved; refused while the shader has unsaved editor changes. Without an editor the file is rewritten. version (from godot_read_shader) refuses if it changed since. Never creates a file; run godot_validate_shader after.",
             json!({
-                "shader_path": {"type": "string", "description": "res:// path to an existing .gdshader or .gdshaderinc file."},
-                "old_text": {"type": "string", "description": "The exact fragment to replace; it must occur once."},
+                "shader_path": {"type": "string", "description": "res:// path of an existing shader file."},
+                "old_text": {"type": "string", "description": "Exact fragment; must occur once."},
                 "new_text": {"type": "string", "description": "The replacement text."},
                 "version": {"type": "string", "description": "Optional version label from godot_read_shader."},
                 "project_path": {"type": "string"}
             }),
             &["shader_path", "old_text", "new_text"],
-        ),
+        ).destructive(),
         super::tool(
             "godot_validate_shader",
-            &format!(
-                "Compiles a saved .gdshader with Godot's own shader compiler in a headless Godot (needs GODOT_PATH) and lists its errors with file and line; an error inside an included file names that file. {CHECKED} Unsaved text in the shader editor is not checked: save it first. A .gdshaderinc is not compiled on its own (it has no shader_type); validate a shader that includes it. A preprocessor failure (a missing include, an #if without #endif) is reported by Godot at the directive's line as an unknown '#' character."
-            ),
+            "Compiles a saved .gdshader (preprocessed, includes too) with Godot's shader compiler, headless (needs GODOT_PATH), and lists errors with file and line. Not checked: GPU driver compile, editor warnings, unsaved editor text (save first). A .gdshaderinc is not compiled alone: validate a shader including it. A preprocessor failure shows at the directive's line as an unknown '#' character.",
             json!({
-                "shader_path": {"type": "string", "description": "res:// path to a .gdshader file in the project."},
+                "shader_path": {"type": "string", "description": "res:// .gdshader."},
                 "project_path": {"type": "string"}
             }),
             &["shader_path"],
-        ),
+        ).read_only(),
     ]
 }
 
@@ -106,7 +98,11 @@ async fn read(tools: &ToolManager, args: &Value) -> ToolResult {
     if matches!(choice, EditorChoice::Host) {
         return read_file(tools, args, &SHADER).await;
     }
-    match tools.bridge.send_command("read_shader", args.clone()).await {
+    match tools
+        .bridge
+        .send_command("read_shader", for_editor(args, &[]))
+        .await
+    {
         Ok(value) => ToolResult::text(
             serde_json::to_string_pretty(&choice.name_project(value)).unwrap_or_default(),
         ),
@@ -135,7 +131,11 @@ async fn edit(tools: &ToolManager, args: &Value) -> ToolResult {
     if matches!(choice, EditorChoice::Host) {
         return edit_file(tools, args, &SHADER).await;
     }
-    match tools.bridge.send_command("edit_shader", args.clone()).await {
+    match tools
+        .bridge
+        .send_command("edit_shader", for_editor(args, &[]))
+        .await
+    {
         Ok(value) => ToolResult::text(
             serde_json::to_string_pretty(&choice.name_project(value)).unwrap_or_default(),
         ),
@@ -175,7 +175,7 @@ async fn create(tools: &ToolManager, args: &Value) -> ToolResult {
     }
     match tools
         .bridge
-        .send_command("create_shader", args.clone())
+        .send_command("create_shader", for_editor(args, &[]))
         .await
     {
         Ok(value) => ToolResult::text(

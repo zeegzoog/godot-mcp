@@ -5,6 +5,7 @@
 
 use crate::error::{McpError, Result};
 use crate::godot::variant::{PacketReader, frame_packet};
+use crate::replies::{ReplyRouter, ReplyWait, route_reply};
 use serde_json::Value;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -13,8 +14,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::timeout;
+use tracing::{debug, warn};
 
 /// One debugger message from the game: `[message, thread_id, data]`.
+///
+/// Subscribers share one copy (`Arc`). Runtime replies (`mcp:reply`) are not broadcast: they go
+/// to the call that waits for them (`expect_reply`).
 #[derive(Clone, Debug)]
 pub struct GameMessage {
     pub message: String,
@@ -25,7 +30,8 @@ pub struct GameMessage {
 pub struct DebugSession {
     port: u16,
     outbound: mpsc::UnboundedSender<Vec<u8>>,
-    events: broadcast::Sender<GameMessage>,
+    events: broadcast::Sender<Arc<GameMessage>>,
+    replies: ReplyRouter<i64>,
     connected: AtomicBool,
     closed: AtomicBool,
     main_thread: AtomicI64,
@@ -49,12 +55,14 @@ impl DebugSession {
             port,
             outbound,
             events,
+            replies: ReplyRouter::default(),
             connected: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             main_thread: AtomicI64::new(1),
             ignore_error_breaks: AtomicBool::new(true),
         });
         let reader_events = session.events.clone();
+        let replies = session.replies.clone();
         let session_flag = Arc::clone(&session);
         tokio::spawn(async move {
             let Ok((socket, _)) = listener.accept().await else {
@@ -95,25 +103,37 @@ impl DebugSession {
                     Ok(0) | Err(_) => break,
                     Ok(n) => n,
                 };
-                match packets.push(&buf[..n]) {
-                    Ok(values) => {
-                        for value in values {
-                            if let Some(message) = parse_message(&value) {
-                                if message.message == "set_pid" && message.thread > 0 {
-                                    session_flag
-                                        .main_thread
-                                        .store(message.thread, Ordering::Release);
-                                }
-                                let _ = reader_events.send(message);
-                            }
+                for packet in packets.push(&buf[..n]) {
+                    let value = match packet {
+                        Ok(value) => value,
+                        Err(err) => {
+                            warn!("game debugger: {err}");
+                            continue;
                         }
+                    };
+                    let Some(message) = parse_message(value) else {
+                        continue;
+                    };
+                    if message.message == "mcp:reply" {
+                        if let Some(text) = message.data.first().and_then(Value::as_str)
+                            && let Err(why) = route_reply(&replies, text, |id| id)
+                        {
+                            debug!("dropped a game runtime reply: {why}");
+                        }
+                        continue;
                     }
-                    Err(_) => break,
+                    if message.message == "set_pid" && message.thread > 0 {
+                        session_flag
+                            .main_thread
+                            .store(message.thread, Ordering::Release);
+                    }
+                    let _ = reader_events.send(Arc::new(message));
                 }
             }
             writer.abort();
             session_flag.connected.store(false, Ordering::Release);
             session_flag.closed.store(true, Ordering::Release);
+            replies.close_all();
         });
         Ok(session)
     }
@@ -139,8 +159,14 @@ impl DebugSession {
         self.ignore_error_breaks.store(ignore, Ordering::Release);
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<GameMessage> {
+    pub fn subscribe(&self) -> broadcast::Receiver<Arc<GameMessage>> {
         self.events.subscribe()
+    }
+
+    /// Waits for the runtime's `mcp:reply` to request `id`. Call it before sending the request.
+    /// The wait fails when the game disconnects.
+    pub fn expect_reply(&self, id: i64) -> ReplyWait<i64> {
+        self.replies.expect(id)
     }
 
     pub fn main_thread(&self) -> i64 {
@@ -165,7 +191,7 @@ impl DebugSession {
             .map_err(|_| McpError::Process("the debugger connection is closed".into()))
     }
 
-    pub async fn wait_for(&self, name: &str, wait: Duration) -> Result<GameMessage> {
+    pub async fn wait_for(&self, name: &str, wait: Duration) -> Result<Arc<GameMessage>> {
         let mut rx = self.subscribe();
         let result = timeout(wait, async {
             loop {
@@ -190,14 +216,19 @@ impl DebugSession {
     }
 }
 
-fn parse_message(value: &Value) -> Option<GameMessage> {
-    let items = value.as_array()?;
-    if items.len() < 3 {
+/// Takes the message apart without copying its data, which can hold a large screenshot.
+fn parse_message(value: Value) -> Option<GameMessage> {
+    let Value::Array(items) = value else {
         return None;
-    }
-    let message = items[0].as_str()?.to_string();
-    let thread = items[1].as_i64().unwrap_or(1);
-    let data = items[2].as_array()?.clone();
+    };
+    let mut items = items.into_iter();
+    let Some(Value::String(message)) = items.next() else {
+        return None;
+    };
+    let thread = items.next()?.as_i64().unwrap_or(1);
+    let Some(Value::Array(data)) = items.next() else {
+        return None;
+    };
     Some(GameMessage {
         message,
         thread,
@@ -239,7 +270,12 @@ mod tests {
                 .await
                 .expect("read timeout")
                 .unwrap();
-            commands.extend(reader.push(&buf[..n]).unwrap());
+            commands.extend(
+                reader
+                    .push(&buf[..n])
+                    .into_iter()
+                    .map(|packet| packet.unwrap()),
+            );
         }
         let names: Vec<_> = commands
             .iter()
@@ -252,5 +288,55 @@ mod tests {
         );
         assert!(names.contains(&"mcp:request"), "{names:?}");
         let _ = rx.try_recv();
+    }
+
+    /// A game that sends a packet the reader cannot take, and a reply nobody waits for, keeps its
+    /// session; each waiting call gets its own reply, and replies are not broadcast.
+    #[tokio::test]
+    async fn replies_reach_their_own_caller_and_a_bad_packet_does_not_end_the_session() {
+        let session = DebugSession::listen().await.expect("listen");
+        let mut client = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", session.port()))
+            .await
+            .expect("connect");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut events = session.subscribe();
+        let first = session.expect_reply(101);
+        let second = session.expect_reply(102);
+
+        let reply = |id: f64, result: &str| {
+            frame_packet(&serde_json::json!([
+                "mcp:reply",
+                1,
+                [serde_json::json!({"id": id, "result": result}).to_string()]
+            ]))
+            .unwrap()
+        };
+        let mut stream = reply(999.0, "nobody");
+        // An oversized packet: the length prefix and part of the body.
+        stream.extend_from_slice(&((9_u32 << 20).to_le_bytes()));
+        stream.extend(std::iter::repeat_n(0_u8, 4096));
+        client.write_all(&stream).await.unwrap();
+        // The rest of it, then more traffic.
+        let rest = vec![0_u8; (9 << 20) - 4096];
+        client.write_all(&rest).await.unwrap();
+        client.write_all(&reply(102.0, "two")).await.unwrap();
+        client.write_all(&reply(101.0, "one")).await.unwrap();
+        client
+            .write_all(&frame_packet(&serde_json::json!(["output", 1, [["hi"]]])).unwrap())
+            .await
+            .unwrap();
+
+        let wait = Duration::from_secs(5);
+        let second = tokio::time::timeout(wait, second).await.unwrap().unwrap();
+        let first = tokio::time::timeout(wait, first).await.unwrap().unwrap();
+        assert_eq!(first["result"], "one");
+        assert_eq!(second["result"], "two");
+        let event = tokio::time::timeout(wait, events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.message, "output", "replies are not broadcast");
+        assert!(session.is_connected());
+        assert!(!session.is_closed());
     }
 }

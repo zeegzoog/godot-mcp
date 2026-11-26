@@ -82,17 +82,17 @@ impl Drop for ReleaseInput {
 pub fn definition() -> Tool {
     tool(
         "godot_game_scenario",
-        "Plays one input scenario in a running game and returns that run's steps, snapshots, warnings and errors. Each step applies Input Map actions and pointer events, then advances `frames` physics ticks (0 to 600; the whole scenario at most 3600). phase is tap by default, as in godot_game_input: tap stays down for the step's frames and is released before the next step, so a step with a tap needs frames of at least 1. press stays down after the step until a later release, and release lets go at the start of the step. strength is the analog value, 0 to 1. pointers are mouse or touch at x, y in coordinate_space (viewport by default: the root viewport's visible rectangle after content scale; window: game window pixels), and the answer names that space; several touches may be down together, and touch phase move drags an index that is already down. pause sets SceneTree.paused for the following ticks; the runtime still answers, because a hold is not the tree's pause and pausable nodes simply skip their physics callback. bodies reads CharacterBody2D and CharacterBody3D (position, velocity, is_on_floor, is_on_wall, is_on_ceiling, up to 8 slide collisions). nodes reads public properties with game.get. A missing node or an unsupported body is an error that names the path. The game is held for the whole call (started with godot_run_project held true when the ticks must be exact) and left held, so nothing moves after the last snapshot; resume with godot_game_physics action resume. deterministic is true only for a game started held at a fixed frame rate equal to its tick rate. A press is flushed before the ticks, so _input sees it immediately and _process sees it on the following frame. Threads, loading and the physics solver are not made deterministic. screenshot true adds one capture of the last drawn frame (a headless game records a warning and no image). Every synthetic button, action and touch is released when the call finishes, when a step fails, and if the call is cancelled. output.lines and output.errors are only the warnings and errors recorded during this call. The call has a total 60-second budget, including 3 seconds reserved for input cleanup. It targets one managed process selected at the start; starting another process does not redirect it. A timed-out physics step may finish before the game holds again.",
+        "Plays one input scenario in a managed process run; returns steps, snapshots, warnings, errors. Each step applies Input Map actions and pointers, then advances frames physics ticks (3600 per call). phase tap (default) is down for the step then released (needs frames >= 1); press stays down until a release (flushed before the ticks: _input sees it at once, _process next frame); release lets go at step start. Several touch indexes can be down together. pause sets SceneTree.paused for the ticks. bodies reads CharacterBody2D/3D (position, velocity, is_on_floor/wall/ceiling, collisions); nodes reads public properties; a missing node or other class is an error. The game is held during the call and left held: resume with godot_game_physics. deterministic is true only for a game started held (godot_run_project held true); threads, loading and the physics solver never are. screenshot adds one capture (headless: warning, no image). All synthetic input is released at the end, on failure and on cancel (released). output holds only this call's lines. 60 s per call.",
         json!({
-            "run_id": {"type": "string", "description": "Optional managed run id. Default: newest process run, pinned for the entire scenario."},
+            "run_id": {"type": "string", "description": "Managed run id. Default: the newest process run, fixed for the call."},
             "steps": {
                 "type": "array",
                 "maxItems": MAX_STEPS,
-                "description": "1 to 32 steps. frames is the physics ticks to run after the input of that step.",
+                "description": "1 to 32 steps.",
                 "items": {
                     "type": "object",
                     "properties": {
-                        "frames": {"type": "integer", "minimum": 0, "maximum": MAX_FRAMES, "description": "Physics ticks. 0 applies the input and takes the snapshot without stepping, and refuses a tap."},
+                        "frames": {"type": "integer", "minimum": 0, "maximum": MAX_FRAMES, "description": "Physics ticks after this step's input. 0 snapshots without stepping and refuses a tap."},
                         "actions": {
                             "type": "array",
                             "maxItems": MAX_INPUTS,
@@ -116,7 +116,7 @@ pub fn definition() -> Tool {
                                     "phase": {"type": "string", "enum": ["press", "release", "move", "tap"], "description": "Default tap, which needs frames of at least 1."},
                                     "x": {"type": "number"},
                                     "y": {"type": "number"},
-                                    "index": {"type": "integer", "minimum": 0, "maximum": MAX_TOUCH_INDEX, "description": "Touch index. Several indexes can be down at once."},
+                                    "index": {"type": "integer", "minimum": 0, "maximum": MAX_TOUCH_INDEX, "description": "Touch index."},
                                     "button": {"type": "string", "maxLength": MAX_NAME_CHARS, "description": "Mouse button. Default left."}
                                 },
                                 "required": ["pointer", "x", "y"]
@@ -127,11 +127,11 @@ pub fn definition() -> Tool {
                     "required": ["frames"]
                 }
             },
-            "bodies": {"type": "array", "maxItems": MAX_READS, "items": {"type": "string", "maxLength": MAX_NAME_CHARS}, "description": "CharacterBody paths read after every step."},
+            "bodies": {"type": "array", "maxItems": MAX_READS, "items": {"type": "string", "maxLength": MAX_NAME_CHARS}, "description": "CharacterBody paths read after each step."},
             "nodes": {
                 "type": "array",
                 "maxItems": MAX_READS,
-                "description": "Public properties read after every step. Names starting with _ are refused.",
+                "description": "Public properties read after each step; names starting with _ are refused.",
                 "items": {
                     "type": "object",
                     "properties": {
@@ -142,10 +142,10 @@ pub fn definition() -> Tool {
                 }
             },
             "screenshot": {"type": "boolean", "description": "Capture one frame at the end. Default false."},
-            "coordinate_space": {"type": "string", "enum": ["viewport", "window"], "description": "The space of pointer x and y. viewport (default): pixels of the root viewport's visible rectangle after content scale, the space _input sees and Control global positions use. window: pixels of the game window, mapped into viewport space when the step is applied."}
+            "coordinate_space": {"type": "string", "enum": ["viewport", "window"], "description": "viewport (default): root viewport pixels after content scale, as _input sees. window: window pixels."}
         }),
         &["steps"],
-    )
+    ).additive()
 }
 
 struct Step {
@@ -431,6 +431,7 @@ pub async fn call(tools: &ToolManager, args: &Value) -> ToolResult {
     ToolResult {
         content,
         is_error: failed,
+        structured_content: None,
     }
 }
 

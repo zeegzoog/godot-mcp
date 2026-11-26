@@ -24,6 +24,7 @@ use crate::godot::{md5_hex, record_uids};
 use crate::paths::{res_display, resolve_in_project, skipped_by_godot};
 use crate::protocol::{Tool, ToolResult};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -38,32 +39,28 @@ const IMPORTED_DIR: &str = "res://.godot/imported/";
 /// The editor's cache of global classes, which a game run without the editor reads.
 const CLASS_CACHE: &str = ".godot/global_script_class_cache.cfg";
 
-pub fn handles(name: &str) -> bool {
-    name == MOVE
-}
-
 pub fn catalog() -> Vec<Tool> {
     vec![super::tool(
         MOVE,
-        "Moves or renames files and whole folders of a Godot project the way the editor's FileSystem dock does, keeping the project working. Each file moves with its .uid and .import files, and its imported data in .godot/imported is renamed to match the new path, so nothing is imported again. Every res:// mention of an old path in the project's text files (.tscn, .tres, .gd, shaders, project.godot, .cfg, .import, .cs, .json, the moved files included) is rewritten to the new path; a folder move rewrites every path inside it. uid:// references stay valid because the uid moves with the file. With the editor connected the move goes through it: a file that is open with unsaved changes (a scene, or a script in the script editor) is refused, and afterwards the editor's cached resources, uids, open scene tabs and in-memory project settings follow the new paths, binary .scn/.res files that named an old path are saved again by the editor so they name the new one (resaved), open scenes and scripts whose text changed are reloaded, and the editor rescans. Without an editor the files are changed on disk, the uid cache and global class cache in .godot are updated so a game run finds the files, binary_references lists the .scn/.res files that still hold an old path (they still load through their uids; open the project in the editor and move again or resave them), and rescan_needed is true. Pass moves: a list of {from, to} res:// paths (at most 64); a to ending in / moves the file or folder into that folder under its own name. Refuses a missing source, project.godot, anything in .godot/ or the Godot MCP addon, a lone .uid or .import file, a destination in .godot/, a destination that already exists (or whose .uid/.import does), a folder moved into itself, and moves that overlap each other. All or nothing: while any move is refused nothing changes, and the answer lists each refusal with its reason. dry_run lists the files that would move and every file whose references would be rewritten, without changing anything. Not rewritten: relative paths (preload(\"enemy.gd\")) and paths built at run time (\"res://levels/level_%d.tscn\" % n); check scripts that build paths.",
+        "Moves or renames project files and folders like the FileSystem dock: .uid, .import and .godot/imported data move along, res:// mentions in text files are rewritten, uid:// stays valid. With the editor, files open with unsaved changes are refused, binary .scn/.res naming an old path are resaved (resaved), and it rescans. Without it, the uid and class caches are updated, binary_references lists binary files still naming an old path (they load by uid; move again with the editor or resave them), and rescan_needed is true. Refuses a missing source, project.godot, .godot/, the MCP addon, a lone .uid/.import, a destination in .godot/ or that already exists, a folder into itself, overlapping moves; all or nothing. dry_run previews. Relative and run-time-built paths are not rewritten.",
         json!({
             "moves": {
                 "type": "array",
-                "description": "Files or folders to move, at most 64.",
+                "description": "At most 64.",
                 "items": {
                     "type": "object",
                     "properties": {
-                        "from": {"type": "string", "description": "res:// path of the file or folder to move."},
-                        "to": {"type": "string", "description": "Its new res:// path; ending in / moves it into that folder under its own name. Missing folders are created."}
+                        "from": {"type": "string", "description": "res:// file or folder."},
+                        "to": {"type": "string", "description": "Ending in / moves into that folder; missing folders are created."}
                     },
                     "required": ["from", "to"]
                 }
             },
-            "dry_run": {"type": "boolean", "description": "Only report what would move, the references that would be rewritten and the refusals. Default false."},
-            "project_path": {"type": "string", "description": "Project directory. Optional: defaults to the project open in the editor, else the one the server was started in."}
+            "dry_run": {"type": "boolean", "description": "Only report moves, rewrites and refusals. Default false."},
+            "project_path": {"type": "string", "description": "Default: editor's, else server's project."}
         }),
         &["moves"],
-    )]
+    ).destructive()]
 }
 
 pub async fn call(tools: &ToolManager, args: Value) -> ToolResult {
@@ -223,7 +220,9 @@ impl Pair {
         }
     }
 
-    /// Whether `rest` (a text from a `res://` on) starts with this pair's old path.
+    /// Whether `rest` (a text from a `res://` on) starts with this pair's old path. [`PairIndex`]
+    /// finds the same pairs without trying each one; the tests check that against this.
+    #[cfg(test)]
     fn matches(&self, rest: &str) -> bool {
         match self {
             Self::Whole { old, .. } => {
@@ -248,10 +247,94 @@ fn continues_path(next: char) -> bool {
     next.is_ascii_alphanumeric() || "_-./~".contains(next)
 }
 
+/// The pairs of a plan indexed by their old path. A `res://` in a text is matched by looking up
+/// only the lengths an old path has, instead of trying every pair: a folder of thousands of files
+/// makes thousands of pairs, and every `res://` of every text file of the project is matched.
+struct PairIndex<'a> {
+    pairs: &'a [Pair],
+    /// The first pair with each old path, by old path.
+    whole: HashMap<&'a str, usize>,
+    prefix: HashMap<&'a str, usize>,
+    /// Whether some whole (prefix) old path has this length.
+    whole_lengths: Vec<bool>,
+    prefix_lengths: Vec<bool>,
+    /// Whether some prefix old path ends with this byte (`/` or `.` in a plan).
+    prefix_ends: [bool; 256],
+}
+
+impl<'a> PairIndex<'a> {
+    fn new(pairs: &'a [Pair]) -> Self {
+        let longest = pairs.iter().map(|pair| pair.old().len()).max().unwrap_or(0);
+        let mut index = Self {
+            pairs,
+            whole: HashMap::new(),
+            prefix: HashMap::new(),
+            whole_lengths: vec![false; longest + 1],
+            prefix_lengths: vec![false; longest + 1],
+            prefix_ends: [false; 256],
+        };
+        for (at, pair) in pairs.iter().enumerate() {
+            let old = pair.old();
+            match pair {
+                Pair::Whole { .. } => {
+                    index.whole.entry(old).or_insert(at);
+                    index.whole_lengths[old.len()] = true;
+                }
+                Pair::Prefix { .. } => {
+                    index.prefix.entry(old).or_insert(at);
+                    index.prefix_lengths[old.len()] = true;
+                    if let Some(&last) = old.as_bytes().last() {
+                        index.prefix_ends[usize::from(last)] = true;
+                    }
+                }
+            }
+        }
+        index
+    }
+
+    /// The first pair (in the order given) that matches `rest`, as `pairs.iter().find(|pair|
+    /// pair.matches(rest))` would find it.
+    fn find(&self, rest: &str) -> Option<&'a Pair> {
+        let bytes = rest.as_bytes();
+        let limit = (self.whole_lengths.len() - 1).min(rest.len());
+        let mut best: Option<usize> = None;
+        let mut consider = |found: Option<&usize>| {
+            if let Some(&at) = found {
+                best = Some(best.map_or(at, |best| best.min(at)));
+            }
+        };
+        for length in 0..=limit {
+            if !rest.is_char_boundary(length) {
+                continue;
+            }
+            if self.whole_lengths[length]
+                && rest[length..]
+                    .chars()
+                    .next()
+                    .is_none_or(|next| !continues_path(next))
+            {
+                consider(self.whole.get(&rest[..length]));
+            }
+            if self.prefix_lengths[length]
+                && (length == 0 || self.prefix_ends[usize::from(bytes[length - 1])])
+            {
+                consider(self.prefix.get(&rest[..length]));
+            }
+        }
+        best.and_then(|at| self.pairs.get(at))
+    }
+}
+
 /// `text` with every old path of `pairs` replaced, and the number of replacements; `None` when
 /// nothing matched. One pass from left to right: a replaced path is never matched again, so a
-/// chain of moves (a to b, b to c) cannot rename a file twice. The longest old path wins.
+/// chain of moves (a to b, b to c) cannot rename a file twice. The first matching pair wins, and a
+/// plan sorts its pairs longest first, so the longest old path wins.
 fn rewrite(text: &str, pairs: &[Pair]) -> Option<(String, usize)> {
+    rewrite_indexed(text, &PairIndex::new(pairs))
+}
+
+/// [`rewrite`] with the pairs already indexed, for matching many texts against the same pairs.
+fn rewrite_indexed(text: &str, pairs: &PairIndex) -> Option<(String, usize)> {
     let mut out = String::with_capacity(text.len());
     let mut copied = 0;
     let mut at = 0;
@@ -259,7 +342,7 @@ fn rewrite(text: &str, pairs: &[Pair]) -> Option<(String, usize)> {
     while let Some(found) = text[at..].find("res://") {
         let start = at + found;
         let rest = &text[start..];
-        match pairs.iter().find(|pair| pair.matches(rest)) {
+        match pairs.find(rest) {
             Some(pair) => {
                 out.push_str(&text[copied..start]);
                 out.push_str(pair.replacement());
@@ -314,6 +397,8 @@ struct Plan {
     binary: Vec<(String, String)>,
     /// Imported data renamed in `.godot/imported`.
     imported: Vec<(PathBuf, PathBuf)>,
+    /// The entries of `.godot/imported`, read once when the first moved file has imported data.
+    imported_entries: Option<ImportedEntries>,
     refused: Vec<Value>,
     warnings: Vec<String>,
 }
@@ -723,27 +808,62 @@ fn imported_base(res: &str) -> String {
     format!("{name}-{}", md5_hex(res.as_bytes()))
 }
 
+/// The entries of `.godot/imported` by the imported base names (`<file name>-<md5>`) their names
+/// start with, followed by a `.`: the part after that `.`, and the entry's path. Each list keeps the
+/// folder's order.
+type ImportedEntries = HashMap<String, Vec<(String, PathBuf)>>;
+
+/// Reads `.godot/imported` once, so planning a folder of thousands of imported files does not read
+/// the whole folder again for each of them. An unreadable folder has no entries.
+fn imported_entries(folder: &Path) -> ImportedEntries {
+    let mut by_base = ImportedEntries::new();
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return by_base;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        for end in imported_base_ends(&name) {
+            by_base
+                .entry(name[..end].to_string())
+                .or_default()
+                .push((name[end + 1..].to_string(), entry.path()));
+        }
+    }
+    by_base
+}
+
+/// Where an imported base name can end in an entry name: before each `.` that follows a `-` and 32
+/// lowercase hex digits (an md5). A file name that itself holds such a part gives more than one.
+fn imported_base_ends(name: &str) -> impl Iterator<Item = usize> + '_ {
+    const MD5_HEX: usize = 32;
+    let bytes = name.as_bytes();
+    (MD5_HEX + 1..bytes.len()).filter(move |&end| {
+        bytes[end] == b'.'
+            && bytes[end - MD5_HEX - 1] == b'-'
+            && bytes[end - MD5_HEX..end]
+                .iter()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    })
+}
+
 /// Plans renaming the imported data of a source moving from `old` to `new`, so the `.import`
 /// file names data that exists under the name Godot looks for, and no reimport is needed.
 fn imported_data(plan: &mut Plan, old: &str, new: &str) {
     let (old_base, new_base) = (imported_base(old), imported_base(new));
     let folder = plan.project.join(".godot").join("imported");
-    let Ok(entries) = std::fs::read_dir(&folder) else {
+    let entries = plan
+        .imported_entries
+        .get_or_insert_with(|| imported_entries(&folder));
+    let Some(found) = entries.get(&old_base) else {
         return;
     };
-    let prefix = format!("{old_base}.");
-    let mut found = false;
-    for entry in entries.filter_map(Result::ok) {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if let Some(rest) = name.strip_prefix(&prefix) {
-            plan.imported
-                .push((entry.path(), folder.join(format!("{new_base}.{rest}"))));
-            found = true;
-        }
+    for (rest, path) in found {
+        plan.imported
+            .push((path.clone(), folder.join(format!("{new_base}.{rest}"))));
     }
-    if found {
+    if !found.is_empty() {
         plan.pairs.push(Pair::Prefix {
-            old: format!("{IMPORTED_DIR}{prefix}"),
+            old: format!("{IMPORTED_DIR}{old_base}."),
             new: format!("{IMPORTED_DIR}{new_base}."),
         });
     }
@@ -771,6 +891,12 @@ fn moved_path(plan: &Plan, res: &str) -> String {
 
 /// Finds the text files whose references change and the binary files that name an old path.
 fn find_references(plan: &mut Plan) {
+    let pairs = std::mem::take(&mut plan.pairs);
+    references(plan, &PairIndex::new(&pairs));
+    plan.pairs = pairs;
+}
+
+fn references(plan: &mut Plan, pairs: &PairIndex) {
     let mut candidates = Vec::new();
     collect(&plan.project, &mut candidates);
     let mut large = Vec::new();
@@ -790,7 +916,7 @@ fn find_references(plan: &mut Plan) {
         };
         if binary {
             // A binary resource keeps its paths as UTF-8 strings, so they show in a lossy text.
-            if rewrite(&String::from_utf8_lossy(&bytes), &plan.pairs).is_some() {
+            if rewrite_indexed(&String::from_utf8_lossy(&bytes), pairs).is_some() {
                 let later = moved_path(plan, &res);
                 plan.binary.push((res, later));
             }
@@ -799,7 +925,7 @@ fn find_references(plan: &mut Plan) {
         let text = match String::from_utf8(bytes) {
             Ok(text) => text,
             Err(error) => {
-                if rewrite(&String::from_utf8_lossy(error.as_bytes()), &plan.pairs).is_some() {
+                if rewrite_indexed(&String::from_utf8_lossy(error.as_bytes()), pairs).is_some() {
                     plan.warnings.push(format!(
                         "{res} names a moved path but is not valid UTF-8, so it was left as it is; fix it by hand."
                     ));
@@ -807,7 +933,7 @@ fn find_references(plan: &mut Plan) {
                 continue;
             }
         };
-        if let Some((text, count)) = rewrite(&text, &plan.pairs) {
+        if let Some((text, count)) = rewrite_indexed(&text, pairs) {
             let new_res = moved_path(plan, &res);
             plan.rewrites.push(Rewrite {
                 res,
@@ -1108,6 +1234,219 @@ mod tests {
                 .map(|moves| moves.len())
                 .ok(),
             Some(1)
+        );
+    }
+    /// The rewrite before [`PairIndex`]: the first pair that matches, trying each one.
+    fn linear_rewrite(text: &str, pairs: &[Pair]) -> Option<(String, usize)> {
+        let mut out = String::new();
+        let (mut copied, mut at, mut count) = (0, 0, 0);
+        while let Some(found) = text[at..].find("res://") {
+            let start = at + found;
+            match pairs.iter().find(|pair| pair.matches(&text[start..])) {
+                Some(pair) => {
+                    out.push_str(&text[copied..start]);
+                    out.push_str(pair.replacement());
+                    copied = start + pair.old().len();
+                    at = copied;
+                    count += 1;
+                }
+                None => at = start + "res://".len(),
+            }
+        }
+        (count > 0).then(|| (out + &text[copied..], count))
+    }
+
+    /// The imported data found before [`imported_entries`]: every entry named `<base>.<rest>`.
+    fn linear_imported(folder: &Path, base: &str) -> Vec<(String, PathBuf)> {
+        let prefix = format!("{base}.");
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(folder).into_iter().flatten().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(rest) = name.strip_prefix(&prefix) {
+                found.push((rest.to_string(), entry.path()));
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn the_index_finds_the_pair_a_scan_of_every_pair_finds() {
+        let mut pairs = vec![
+            whole("res://a.png", "res://x/a.png"),
+            whole("res://a.png2", "res://x/a.png2"),
+            whole("res://ab.png", "res://x/ab.png"),
+            whole("res://my file.png", "res://x/my file.png"),
+            whole("res://lvl", "res://w/lvl"),
+            prefix("res://lvl/", "res://w/lvl/"),
+            prefix("res://lvl/deep/", "res://deep/"),
+            whole("res://lvl/deep/k.gd", "res://k.gd"),
+            whole("res://ü.gd", "res://u.gd"),
+            prefix(
+                "res://.godot/imported/a.png-0123.",
+                "res://.godot/imported/a.png-4567.",
+            ),
+            whole("res://a.png", "res://second/a.png"),
+            whole("res://b.gd", "res://c.gd"),
+            whole("res://c.gd", "res://b.gd"),
+        ];
+        pairs.sort_by_key(|pair| std::cmp::Reverse(pair.old().len()));
+        let text = "res://a.png res://a.png2 res://a.png.import res://ab.png res://a.pn \"res://my file.png\" res://my file.pngx \
+            res://lvl res://lvl/ res://lvl/x.tscn res://lvl/deep/k.gd res://lvl/deep/k.gdx res://lvl/deep/ res://lvlx \
+            res://ü.gd res://ü.gdx res://.godot/imported/a.png-0123.ctex res://.godot/imported/a.png-01234.ctex \
+            res://b.gd res://c.gd res://res://a.png res://";
+        let index = PairIndex::new(&pairs);
+        for (at, _) in text.match_indices("res://") {
+            let rest = &text[at..];
+            assert_eq!(
+                index.find(rest),
+                pairs.iter().find(|pair| pair.matches(rest)),
+                "at {rest}"
+            );
+        }
+        assert_eq!(rewrite(text, &pairs), linear_rewrite(text, &pairs));
+        assert!(rewrite(text, &pairs).is_some());
+        assert_eq!(PairIndex::new(&[]).find("res://a.gd"), None);
+    }
+
+    #[test]
+    fn imported_entries_are_found_by_their_exact_base_name() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let folder = dir.path();
+        let bases: Vec<String> = [
+            "res://a.png",
+            "res://a.png2",
+            "res://ab.png",
+            "res://b/a.png",
+            "res://my.file.v2.png",
+        ]
+        .iter()
+        .map(|res| imported_base(res))
+        .collect();
+        // A file whose own name holds a dash, 32 hex digits and a dot gives two base names.
+        let tricky = format!("{}.png", bases[0]);
+        let tricky_base = imported_base(&format!("res://{tricky}"));
+        let mut names = vec![
+            format!("{tricky_base}.ctex"),
+            "a.png-short.ctex".into(),
+            "readme".into(),
+        ];
+        for base in &bases {
+            names.push(format!("{base}.ctex"));
+            names.push(format!("{base}.md5"));
+            names.push(format!("{base}.s3tc.ctex"));
+        }
+        names.push(format!("{}.ctex", bases[0].to_uppercase()));
+        for name in &names {
+            std::fs::write(folder.join(name), "").expect("write entry");
+        }
+        let entries = imported_entries(folder);
+        for base in bases.iter().chain([&tricky_base]) {
+            let mut indexed = entries.get(base).cloned().unwrap_or_default();
+            let mut scanned = linear_imported(folder, base);
+            indexed.sort();
+            scanned.sort();
+            assert!(!scanned.is_empty(), "{base}");
+            assert_eq!(indexed, scanned, "{base}");
+        }
+        assert_eq!(entries.get(&bases[0]).map(Vec::len), Some(4));
+        assert_eq!(entries.get(&bases[1]).map(Vec::len), Some(3));
+        assert!(imported_entries(&folder.join("missing")).is_empty());
+    }
+
+    /// A project with a folder of `textures` imported pngs, `extra` other entries in
+    /// `.godot/imported`, and scenes that name the textures and their imported data.
+    fn textured_project(textures: usize, extra: usize) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path();
+        let imported = root.join(".godot").join("imported");
+        std::fs::create_dir_all(&imported).expect("imported folder");
+        std::fs::create_dir_all(root.join("art")).expect("art folder");
+        std::fs::create_dir_all(root.join("scenes")).expect("scenes folder");
+        std::fs::write(root.join("project.godot"), "config_version=5\n").expect("project.godot");
+        for index in 0..extra {
+            let base = imported_base(&format!("res://other/o{index}.png"));
+            std::fs::write(imported.join(format!("{base}.ctex")), "").expect("extra entry");
+        }
+        let mut scene = String::new();
+        for index in 0..textures {
+            let res = format!("res://art/t{index}.png");
+            let base = imported_base(&res);
+            std::fs::write(root.join(format!("art/t{index}.png")), "png").expect("texture");
+            std::fs::write(
+                root.join(format!("art/t{index}.png.import")),
+                format!("[remap]\npath=\"res://.godot/imported/{base}.ctex\"\n[deps]\nsource_file=\"{res}\"\n"),
+            )
+            .expect("import file");
+            std::fs::write(imported.join(format!("{base}.ctex")), "").expect("ctex");
+            std::fs::write(imported.join(format!("{base}.md5")), "").expect("md5");
+            scene.push_str(&format!("[ext_resource path=\"{res}\"]\n"));
+            if index % 50 == 49 {
+                std::fs::write(root.join(format!("scenes/s{index}.tscn")), &scene).expect("scene");
+                scene.clear();
+            }
+        }
+        dir
+    }
+
+    #[test]
+    fn a_folder_of_imported_files_plans_as_a_scan_of_every_entry_and_pair_did() {
+        let dir = textured_project(300, 500);
+        let root = dir.path();
+        let plan = plan(
+            root,
+            &[Request {
+                from: "res://art".into(),
+                to: "res://gfx/art".into(),
+            }],
+        );
+        assert!(plan.refused.is_empty(), "{:?}", plan.refused);
+        let folder = root.join(".godot").join("imported");
+        let mut expected = Vec::new();
+        for file in &plan.files {
+            let new_base = imported_base(&file.to_res);
+            for (rest, path) in linear_imported(&folder, &imported_base(&file.from_res)) {
+                expected.push((path, folder.join(format!("{new_base}.{rest}"))));
+            }
+        }
+        let sorted = |mut list: Vec<(PathBuf, PathBuf)>| {
+            list.sort();
+            list
+        };
+        assert_eq!(plan.imported.len(), 600);
+        assert_eq!(sorted(plan.imported.clone()), sorted(expected));
+        assert_eq!(plan.pairs.len(), 302);
+        assert_eq!(plan.rewrites.len(), 306);
+        for rewrite in &plan.rewrites {
+            let text = std::fs::read_to_string(res_to_disk(root, &rewrite.res)).expect("read");
+            assert_eq!(
+                linear_rewrite(&text, &plan.pairs),
+                Some((rewrite.text.clone(), rewrite.count)),
+                "{}",
+                rewrite.res
+            );
+        }
+    }
+
+    /// Plans moving a folder of 2000 imported textures in a project with 20000 imported entries.
+    /// `cargo test --release --lib planning_a_large_folder_move -- --ignored --nocapture`
+    #[test]
+    #[ignore = "timing measurement"]
+    fn planning_a_large_folder_move() {
+        let dir = textured_project(2000, 16000);
+        let started = std::time::Instant::now();
+        let plan = plan(
+            dir.path(),
+            &[Request {
+                from: "res://art".into(),
+                to: "res://gfx/art".into(),
+            }],
+        );
+        eprintln!(
+            "planned {} files, {} imported, {} rewrites in {:?}",
+            plan.files.len(),
+            plan.imported.len(),
+            plan.rewrites.len(),
+            started.elapsed()
         );
     }
 }

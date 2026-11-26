@@ -196,22 +196,96 @@ pub enum ClassKind {
     Other,
 }
 
-/// The script the class check runs. Fixed text: the class name reaches it only as a user
-/// argument after `--`, never inside the source.
-const CLASS_CHECK_SCRIPT: &str = "extends SceneTree
+/// The script the class check runs: it lists every built-in class the engine can create that is
+/// a `Node` (a scene root) or a `Resource`. Fixed text with no input: the names are looked up in
+/// its answer, so no name reaches the engine at all.
+const CLASS_LIST_SCRIPT: &str = "extends SceneTree
 
 func _init() -> void:
-	var args: PackedStringArray = OS.get_cmdline_user_args()
-	var name: String = args[0] if args.size() > 0 else \"\"
-	var kind: String = \"no\"
-	if name != \"\" and ClassDB.class_exists(name) and ClassDB.can_instantiate(name):
-		if ClassDB.is_parent_class(name, \"Node\"):
-			kind = \"scene\"
-		elif ClassDB.is_parent_class(name, \"Resource\"):
-			kind = \"resource\"
-	print(\"GODOT_MCP_CLASS=\", kind)
-	quit()
+\tvar scene: PackedStringArray = PackedStringArray()
+\tvar resource: PackedStringArray = PackedStringArray()
+\tfor name: String in ClassDB.get_class_list():
+\t\tif not ClassDB.can_instantiate(name):
+\t\t\tcontinue
+\t\tif ClassDB.is_parent_class(name, \"Node\"):
+\t\t\tscene.append(name)
+\t\telif ClassDB.is_parent_class(name, \"Resource\"):
+\t\t\tresource.append(name)
+\tprint(\"GODOT_MCP_CLASSES=\", JSON.stringify({\"scene\": scene, \"resource\": resource}))
+\tquit()
 ";
+
+const CLASS_LIST_MARKER: &str = "GODOT_MCP_CLASSES=";
+
+/// What identifies one Godot executable on disk: where it is, its size and when it was written.
+/// Another build put at the same path has another stamp, so what the old one said is asked again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BinaryStamp {
+    path: PathBuf,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl BinaryStamp {
+    /// The stamp of the executable `binary` starts, found on the `PATH` when it is a bare name
+    /// (only Windows starts a bare name from the working folder first, as `Command` does).
+    /// `None` when it cannot be found: then nothing is kept and every call asks the engine.
+    /// A wrapper script that starts the engine is stamped itself: replacing the engine behind it
+    /// is seen only after the server restarts.
+    fn of(binary: &Path) -> Option<Self> {
+        let bare = binary.components().count() == 1;
+        let path = if bare && !(cfg!(windows) && binary.is_file()) {
+            find_on_path(binary)?
+        } else {
+            binary.to_path_buf()
+        };
+        let metadata = std::fs::metadata(&path).ok()?;
+        Some(Self {
+            path,
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
+}
+
+fn find_on_path(name: &Path) -> Option<PathBuf> {
+    let dirs: Vec<PathBuf> = std::env::split_paths(&std::env::var_os("PATH")?).collect();
+    dirs.iter().find_map(|dir| {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        let exe = candidate.with_extension("exe");
+        (cfg!(windows) && exe.is_file()).then_some(exe)
+    })
+}
+
+/// What the engine said about itself, kept for the executable that said it: the answers depend
+/// on the build only, never on a project.
+#[derive(Debug, Default)]
+struct EngineFacts {
+    classes: Option<(BinaryStamp, Arc<ClassTable>)>,
+    version: Option<(BinaryStamp, String)>,
+}
+
+/// The built-in classes the engine can create, by kind.
+#[derive(Debug, Default, serde::Deserialize)]
+struct ClassTable {
+    scene: std::collections::HashSet<String>,
+    resource: std::collections::HashSet<String>,
+}
+
+impl ClassTable {
+    fn kind(&self, class: &str) -> ClassKind {
+        if self.scene.contains(class) {
+            ClassKind::Scene
+        } else if self.resource.contains(class) {
+            ClassKind::Resource
+        } else {
+            ClassKind::Other
+        }
+    }
+}
 
 /// The script that reads and changes `export_presets.cfg` with Godot's own `ConfigFile`, as the
 /// editor's Export dialog stores it. Fixed text: the request reaches it as `res://request.json`
@@ -765,6 +839,9 @@ pub struct CliRunner {
     godot_binary: PathBuf,
     /// The bridge port of the server, given to the editors it launches.
     bridge_port: Option<u16>,
+    /// The class list and version the executable gave, shared by every clone of this runner.
+    /// Never locked across an await.
+    facts: Arc<Mutex<EngineFacts>>,
 }
 
 impl CliRunner {
@@ -772,6 +849,7 @@ impl CliRunner {
         Self {
             godot_binary,
             bridge_port: None,
+            facts: Arc::default(),
         }
     }
 
@@ -787,8 +865,23 @@ impl CliRunner {
         &self.godot_binary
     }
 
-    /// Retrieve engine version directly via CLI
+    /// The engine version `--version` prints, asked once per executable (see [`BinaryStamp`]).
     pub async fn get_version(&self) -> Result<String> {
+        let stamp = BinaryStamp::of(&self.godot_binary);
+        if let Some(stamp) = &stamp
+            && let Some((known, version)) = &lock_ignoring_poison(&self.facts).version
+            && known == stamp
+        {
+            return Ok(version.clone());
+        }
+        let version = self.ask_version().await?;
+        if let Some(stamp) = stamp {
+            lock_ignoring_poison(&self.facts).version = Some((stamp, version.clone()));
+        }
+        Ok(version)
+    }
+
+    async fn ask_version(&self) -> Result<String> {
         let mut command = Command::new(&self.godot_binary);
         command
             .arg("--version")
@@ -822,26 +915,43 @@ impl CliRunner {
 
     /// Asks the engine whether `class` is a built-in class it can create, and of which kind.
     ///
-    /// One bounded call of the Godot executable in a throw-away project of its own: the fixed
-    /// script and an empty `project.godot` are written to a new directory under the system's
-    /// temporary folder, so no project file is read or written and no project code runs. The class
-    /// name must be an identifier and travels as a user argument.
+    /// The engine lists all its classes in one bounded call of the Godot executable in a
+    /// throw-away project of its own: the fixed script and an empty `project.godot` are written to
+    /// a new directory under the system's temporary folder, so no project file is read or written
+    /// and no project code runs. The list depends on the executable only, so it is kept for it
+    /// (see [`BinaryStamp`]) and later checks start nothing. The class name must be an identifier.
     pub async fn class_kind(&self, class: &str) -> Result<ClassKind> {
         if !crate::paths::is_valid_identifier(class) {
             return Err(McpError::Validation(format!(
                 "{class:?} is not a class name: use letters, digits and underscores only"
             )));
         }
-        let dir = create_scratch_dir("class-check")?;
-        let outcome = self.run_class_check(&dir, class).await;
-        let _ = std::fs::remove_dir_all(&dir);
-        outcome
+        Ok(self.class_table().await?.kind(class))
     }
 
-    async fn run_class_check(&self, dir: &Path, class: &str) -> Result<ClassKind> {
+    async fn class_table(&self) -> Result<Arc<ClassTable>> {
+        let stamp = BinaryStamp::of(&self.godot_binary);
+        if let Some(stamp) = &stamp
+            && let Some((known, table)) = &lock_ignoring_poison(&self.facts).classes
+            && known == stamp
+        {
+            return Ok(Arc::clone(table));
+        }
+        // Two first checks at the same time may both ask; both get the same answer.
+        let dir = create_scratch_dir("class-check")?;
+        let outcome = self.run_class_list(&dir).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        let table = Arc::new(outcome?);
+        if let Some(stamp) = stamp {
+            lock_ignoring_poison(&self.facts).classes = Some((stamp, Arc::clone(&table)));
+        }
+        Ok(table)
+    }
+
+    async fn run_class_list(&self, dir: &Path) -> Result<ClassTable> {
         std::fs::write(dir.join("project.godot"), "config_version=5\n")?;
-        let script = dir.join("class_check.gd");
-        std::fs::write(&script, CLASS_CHECK_SCRIPT)?;
+        let script = dir.join("class_list.gd");
+        std::fs::write(&script, CLASS_LIST_SCRIPT)?;
         let mut command = Command::new(&self.godot_binary);
         command
             .arg("--headless")
@@ -849,8 +959,6 @@ impl CliRunner {
             .arg(dir)
             .arg("--script")
             .arg(&script)
-            .arg("--")
-            .arg(class)
             .stdin(Stdio::null())
             .kill_on_drop(true);
         let output = timeout(CLASS_CHECK_TIMEOUT, command.output())
@@ -868,19 +976,16 @@ impl CliRunner {
                 ))
             })?;
         let stdout = String::from_utf8_lossy(&output.stdout);
-        match stdout
+        stdout
             .lines()
-            .find_map(|line| line.trim().strip_prefix("GODOT_MCP_CLASS="))
-            .map(str::trim)
-        {
-            Some("scene") => Ok(ClassKind::Scene),
-            Some("resource") => Ok(ClassKind::Resource),
-            Some("no") => Ok(ClassKind::Other),
-            _ => Err(McpError::Process(format!(
-                "Godot gave no answer to the class check (exit {})",
-                output.status
-            ))),
-        }
+            .find_map(|line| line.trim().strip_prefix(CLASS_LIST_MARKER))
+            .and_then(|answer| serde_json::from_str(answer.trim()).ok())
+            .ok_or_else(|| {
+                McpError::Process(format!(
+                    "Godot gave no answer to the class check (exit {})",
+                    output.status
+                ))
+            })
     }
 
     /// The type a project setting has, and `value` converted to it when it is not a string,
@@ -1244,7 +1349,7 @@ impl CliRunner {
                 self.godot_binary.display()
             ))
         })?;
-        let pid = child.id().unwrap_or(0);
+        let pid = child.id();
         let stdout_buf = Arc::new(Mutex::new(Vec::new()));
         let stderr_buf = Arc::new(Mutex::new(Vec::new()));
         let stdout_stream: Arc<Mutex<StreamRecord>> = Arc::default();
@@ -1751,7 +1856,7 @@ impl CliRunner {
                 self.godot_binary.display()
             ))
         })?;
-        let pid = child.id().unwrap_or(0);
+        let pid = child.id();
         let stdout_buf = Arc::new(Mutex::new(Vec::new()));
         let stderr_buf = Arc::new(Mutex::new(Vec::new()));
         let stdout_task =
@@ -2255,23 +2360,40 @@ fn error_location(line: &str) -> Option<(String, u32)> {
     Some((file.to_string(), line_no))
 }
 
-fn kill_process_tree(pid: u32) {
-    if pid == 0 {
+/// The process group id of a child started with `process_group(0)`, or `None` for an id that
+/// is no child's group: `kill(0)` would signal the server's own process group and `kill(-1)`
+/// every process of the user.
+#[cfg(unix)]
+fn child_group(pid: u32) -> Option<libc::pid_t> {
+    libc::pid_t::try_from(pid).ok().filter(|group| *group > 1)
+}
+
+/// Kills a child started in its own process group, with everything it started. `None` (a child
+/// already reaped) does nothing.
+fn kill_process_tree(pid: Option<u32>) {
+    let Some(pid) = pid else {
         return;
-    }
+    };
     #[cfg(unix)]
     {
-        // The child is its own process group (`process_group(0)`), so the id to signal is
-        // `-<pid>`. procps `kill` on Linux parses a leading `-` as an option, and
-        // `kill -KILL -<pid>` never reaches the group; a grandchild then keeps the stdout
-        // pipe open. `-s KILL --` ends options on both procps and BSD kill. Windows uses
-        // taskkill /T below.
-        let _ = std::process::Command::new("kill")
-            .args(["-s", "KILL", "--", &format!("-{pid}")])
-            .status();
+        // The child is its own process group (`process_group(0)`), so the whole group is
+        // signalled: a grandchild left alive would keep the stdout pipe open. The signal is
+        // sent directly rather than through the `kill` program, which would block an executor
+        // thread while it runs. Windows uses taskkill /T below.
+        let Some(group) = child_group(pid) else {
+            return;
+        };
+        // SAFETY: `kill` only sends a signal; a group that is already gone makes it fail with
+        // ESRCH, which is harmless here.
+        unsafe {
+            libc::kill(-group, libc::SIGKILL);
+        }
     }
     #[cfg(windows)]
     {
+        if pid == 0 {
+            return;
+        }
         let _ = std::process::Command::new("taskkill")
             .args(["/F", "/T", "/PID", &pid.to_string()])
             .status();
@@ -2380,6 +2502,53 @@ SCRIPT ERROR: Assertion failed: boom\n\
             child_group.trim(),
             process_group_of(&std::process::id().to_string())
         );
+    }
+
+    /// A timed-out script's process group is killed as a whole, grandchildren included, so none
+    /// keeps the output pipe open.
+    #[cfg(unix)]
+    #[test]
+    fn killing_a_process_tree_ends_its_grandchildren() {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+        use std::time::{Duration, Instant};
+
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 30 & echo $!; wait"])
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .expect("spawn sh");
+        let mut first = String::new();
+        std::io::BufReader::new(child.stdout.take().expect("stdout"))
+            .read_line(&mut first)
+            .expect("grandchild pid");
+        let grandchild: u32 = first.trim().parse().expect("pid");
+        assert!(crate::util::process_runs(grandchild));
+
+        super::kill_process_tree(Some(child.id()));
+        let _ = child.wait();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while crate::util::process_runs(grandchild) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !crate::util::process_runs(grandchild),
+            "the grandchild survived"
+        );
+    }
+
+    /// Ids that are not a child's own group are never signalled: 0 is the server's own group
+    /// and 1 (as `-1`) every process of the user. Checked on the id mapping, since a call that
+    /// did signal them would end the test run or the whole session.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_childs_own_group_is_signalled() {
+        assert_eq!(super::child_group(0), None);
+        assert_eq!(super::child_group(1), None);
+        assert_eq!(super::child_group(u32::MAX), None);
+        assert_eq!(super::child_group(4242), Some(4242));
+        super::kill_process_tree(None);
     }
 
     #[cfg(unix)]

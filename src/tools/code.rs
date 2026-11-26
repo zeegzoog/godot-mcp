@@ -8,51 +8,40 @@ use crate::error::McpError;
 use crate::paths::resolve_in_project;
 use crate::protocol::{Tool, ToolResult};
 use serde_json::{Value, json};
-use std::path::Path;
-
-pub fn handles(name: &str) -> bool {
-    matches!(
-        name,
-        "godot_code_diagnostics"
-            | "godot_code_complete"
-            | "godot_code_symbols"
-            | "godot_code_definition"
-            | "godot_code_references"
-    )
-}
+use std::path::{Path, PathBuf};
 
 pub fn catalog() -> Vec<Tool> {
     vec![
         tool(
             "godot_code_diagnostics",
-            "GDScript errors and warnings from Godot's language server (1-based lines), including analyzer warnings such as SHADOWED_GLOBAL_IDENTIFIER. Godot leaves scripts under res://addons/ out of analyzer warnings unless the project sets debug/gdscript/warnings/exclude_addons=false; for such a script the answer carries warnings_hidden saying so. Uses an editor already listening on GODOT_MCP_LSP_PORT (default 6005) when it has this project open, otherwise a private headless editor of this project, which is started again when another script of the project changed so that new class_names are known. Does not report a clean file if the server never answers. godot_validate_script reports the same diagnostics when this server is already running, and otherwise only a headless parse check.",
+            "GDScript errors and warnings (1-based lines) from Godot's language server, analyzer warnings included (for addons/ only with debug/gdscript/warnings/exclude_addons=false; warnings_hidden says so). Uses an editor on GODOT_MCP_LSP_PORT (default 6005) with this project, else a private headless one. Never reports clean when the server does not answer. godot_validate_script gives these only while a language server is already running.",
             json!({"script_path": s("res:// path of a .gd file."), "project_path": s("")}),
             &["script_path"],
-        ),
+        ).read_only(),
         tool(
             "godot_code_complete",
             "Code completion at a 1-based line and column, from Godot's language server.",
             json!({"script_path": s(""), "line": position("Line, counted from 1."), "character": position("Column, counted from 1."), "project_path": s("")}),
             &["script_path", "line", "character"],
-        ),
+        ).read_only(),
         tool(
             "godot_code_symbols",
             "Document symbols of a GDScript file, from Godot's language server.",
             json!({"script_path": s(""), "project_path": s("")}),
             &["script_path"],
-        ),
+        ).read_only(),
         tool(
             "godot_code_definition",
             "Go to definition at a 1-based position, from Godot's language server.",
             json!({"script_path": s(""), "line": position("Line, counted from 1."), "character": position("Column, counted from 1."), "project_path": s("")}),
             &["script_path", "line", "character"],
-        ),
+        ).read_only(),
         tool(
             "godot_code_references",
             "Find references at a 1-based position, from Godot's language server.",
             json!({"script_path": s(""), "line": position("Line, counted from 1."), "character": position("Column, counted from 1."), "project_path": s("")}),
             &["script_path", "line", "character"],
-        ),
+        ).read_only(),
     ]
 }
 
@@ -64,7 +53,7 @@ fn s(description: &str) -> Value {
     }
 }
 
-fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> Tool {
+fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> super::ToolDraft {
     super::tool(name, description, properties, required)
 }
 
@@ -203,9 +192,10 @@ fn text_result(result: Result<Value, McpError>) -> ToolResult {
 
 fn runtime_error(error: &McpError) -> ToolResult {
     match error {
-        McpError::BridgeUnavailable(_) | McpError::Bridge(_) | McpError::ToolExecution(_) => {
-            super::bridge_error_result(error)
-        }
+        McpError::BridgeUnavailable(_)
+        | McpError::Bridge(_)
+        | McpError::ToolExecution(_)
+        | McpError::CodedToolExecution { .. } => super::bridge_error_result(error),
         other => ToolResult::error(
             other.to_string(),
             &[
@@ -319,11 +309,53 @@ pub(super) struct UnregisteredClass {
     pub script: String,
 }
 
+/// One `.gd` file of the project and the classes it declares, from one read of it.
+#[derive(Clone, Debug)]
+pub(super) struct ScannedScript {
+    pub file: PathBuf,
+    /// The `class_name` of its header, as the editor's scan and the class cache read it.
+    pub header_class: Option<String>,
+    /// The first `class_name` line anywhere in it ([`declared_class`]).
+    pub declared_class: Option<String>,
+}
+
+/// Every `.gd` file of the project at `project`, each read once, in one walk. What Godot does not
+/// scan ([`crate::paths::skipped_by_godot`]) is skipped.
+pub(super) fn scan_scripts(project: &Path) -> Vec<ScannedScript> {
+    crate::godot::class_cache::scan_scripts(project, |file, text| {
+        Some(ScannedScript {
+            file: file.to_path_buf(),
+            header_class: crate::godot::class_cache::header_class(text),
+            declared_class: declared_class(text).map(str::to_string),
+        })
+    })
+}
+
+/// [`scan_scripts`] on Tokio's blocking threads.
+pub(super) async fn scan_scripts_off_executor(project: &Path) -> Vec<ScannedScript> {
+    let project = project.to_path_buf();
+    crate::util::blocking(move || scan_scripts(&project)).await
+}
+
 /// The classes that error diagnostics in `value` call unknown and that another script of the
 /// project at `project` declares with `class_name`. What Godot does not scan
 /// ([`crate::paths::skipped_by_godot`]) is skipped.
+#[cfg(test)]
 pub(super) fn unregistered_classes(
     project: &Path,
+    file: &Path,
+    value: &Value,
+) -> Vec<UnregisteredClass> {
+    if unknown_names(value).is_empty() {
+        return Vec::new();
+    }
+    unregistered_classes_in(project, &scan_scripts(project), file, value)
+}
+
+/// [`unregistered_classes`] among the scripts of one [`scan_scripts`].
+pub(super) fn unregistered_classes_in(
+    project: &Path,
+    scripts: &[ScannedScript],
     file: &Path,
     value: &Value,
 ) -> Vec<UnregisteredClass> {
@@ -332,47 +364,29 @@ pub(super) fn unregistered_classes(
         return Vec::new();
     }
     let file = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
-    let mut found = Vec::new();
-    let mut pending = vec![project.to_path_buf()];
-    while let Some(dir) = pending.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+    let mut found: Vec<UnregisteredClass> = Vec::new();
+    for script in scripts {
+        let Some(class) = script.declared_class.as_deref() else {
             continue;
         };
-        for entry in entries.flatten() {
-            let Ok(kind) = entry.file_type() else {
-                continue;
-            };
-            let path = entry.path();
-            if crate::paths::skipped_by_godot(&path, kind.is_dir()) {
-                continue;
-            }
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if kind.is_dir() {
-                pending.push(path);
-                continue;
-            }
-            if !kind.is_file() || !name.ends_with(".gd") {
-                continue;
-            }
-            if path.canonicalize().unwrap_or_else(|_| path.clone()) == file {
-                continue;
-            }
-            let Ok(source) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            if let Some(class) = declared_class(&source)
-                && names.iter().any(|unknown| unknown == class)
-                && !found
-                    .iter()
-                    .any(|item: &UnregisteredClass| item.name == class)
-            {
-                found.push(UnregisteredClass {
-                    name: class.to_string(),
-                    script: crate::paths::res_display(project, &path),
-                });
-            }
+        if !names.iter().any(|unknown| unknown == class)
+            || found.iter().any(|item| item.name == class)
+        {
+            continue;
         }
+        // The script being validated does not explain its own errors.
+        if script
+            .file
+            .canonicalize()
+            .unwrap_or_else(|_| script.file.clone())
+            == file
+        {
+            continue;
+        }
+        found.push(UnregisteredClass {
+            name: class.to_string(),
+            script: crate::paths::res_display(project, &script.file),
+        });
     }
     found.sort_by(|a, b| a.name.cmp(&b.name));
     found
@@ -636,5 +650,58 @@ mod tests {
             "{}",
             error.text
         );
+    }
+
+    /// How long the class scans of `godot_validate_script` take on a project of many scripts:
+    /// GODOT_MCP_BENCH_FILES=<script count, default 8000>.
+    #[test]
+    #[ignore = "timing probe on a synthetic project"]
+    fn class_scan_time_of_a_synthetic_project() {
+        let count = std::env::var("GODOT_MCP_BENCH_FILES")
+            .ok()
+            .and_then(|text| text.parse().ok())
+            .unwrap_or(8_000);
+        let dir = tempfile::tempdir().expect("project");
+        let root = dir.path();
+        let body = "func f() -> int:\n\treturn 1\n".repeat(200);
+        for index in 0..count {
+            let folder = root.join(format!("d{}", index / 200));
+            if index % 200 == 0 {
+                std::fs::create_dir_all(&folder).expect("dir");
+            }
+            std::fs::write(
+                folder.join(format!("c{index}.gd")),
+                format!("## Docs.\nextends Node\nclass_name C{index}\n\n{body}"),
+            )
+            .expect("script");
+        }
+        let file = root.join("d0/c0.gd");
+        let value = json!({"diagnostics": [
+            {"range": {"start": {"line": 1, "character": 1}}, "severity": 1, "message": "Could not find type \"C7\" in the current scope."},
+        ]});
+        let mut least = None;
+        let (mut found, mut missing) = (Vec::new(), 0);
+        for _ in 0..7 {
+            let started = std::time::Instant::now();
+            (found, missing) = validation_scans(root, &file, &value);
+            let time = started.elapsed();
+            least = Some(least.map_or(time, |old: std::time::Duration| old.min(time)));
+        }
+        eprintln!(
+            "{count} scripts, least of 7: {least:?} ({} unregistered for the language server, {} missing from the class cache)",
+            found.len(),
+            missing
+        );
+    }
+
+    /// The scans `godot_validate_script` makes when the language server calls a class unknown.
+    fn validation_scans(
+        root: &Path,
+        file: &Path,
+        value: &Value,
+    ) -> (Vec<UnregisteredClass>, usize) {
+        let found = unregistered_classes(root, file, value);
+        let missing = crate::godot::class_cache::unregistered(root).len();
+        (found, missing)
     }
 }

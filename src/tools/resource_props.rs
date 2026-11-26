@@ -15,30 +15,26 @@ use serde_json::{Value, json};
 
 pub const NAME: &str = "godot_set_resource_properties";
 
-pub fn handles(name: &str) -> bool {
-    name == NAME
-}
-
 pub fn catalog() -> Vec<Tool> {
     vec![super::tool(
         NAME,
-        "Sets properties of a resource saved in its own .tres or .res file (a material, a ShaderMaterial, a Curve, a theme, a custom Resource) and saves the file. This is the tool for a resource that godot_set_node_properties refuses because a .tres file is shared. Values are converted to each property's current type as godot_set_node_properties converts them: vectors, rects and colors accept arrays ([10, 20]) or objects ({\"x\": 10, \"y\": 20}), colors also '#rrggbb' or names, resources a res:// path (of a class the property takes) or null, typed arrays and dictionaries a JSON array or object, and any Godot literal string ('Vector2(1, 2)') is parsed. A shader uniform of a ShaderMaterial is shader_parameter/<uniform>, as the inspector lists it, and must be one of the shader's uniforms; the error names the ones it has. Unknown properties, unconvertible values, ':' steps, resource_path, script and private names reject the whole call without changing anything, and so does a value that reads back differently from the one set (a setter that clamps or refuses it). The answer lists each property's value before and after in changed, as Godot's text form; a shader parameter the material did not set reads null before (the shader's default applied). With the editor bridge connected to the project, the editor's loaded copy is changed, so open scenes that use it follow, as one undoable action whose undo and redo save the file again (mode editor, undoable true). Without it, a headless Godot run changes and saves the file (mode headless), and the server then writes back what headless Godot drops, as after godot_run_script: the file's uid, its ext_resource uids and no shader_parameter lines written as null for unset uniforms (resource_repairs, repair_summary); resource_damage lists what it could not write back.",
+        "Sets properties of a resource in its own .tres/.res and saves it; use it for a shared .tres that godot_set_node_properties refuses. Values convert as there; a ShaderMaterial uniform is shader_parameter/<uniform> and must exist in the shader. All or nothing: unknown properties, unconvertible values, ':' steps, resource_path, script, private names or values that read back differently change nothing. changed lists values before and after. With the editor: one undoable action (mode editor). Without: saved headless (mode headless) with uids restored (resource_repairs; resource_damage: what could not be).",
         json!({
             "resource_path": {
                 "type": "string",
-                "description": "res:// path of the .tres or .res file, such as res://materials/water.tres."
+                "description": "res:// path of the .tres or .res."
             },
             "properties": {
                 "type": "object",
-                "description": "Property names to new values, such as {\"albedo_color\": \"#3a7bd5\"} or {\"shader_parameter/wave_height\": 0.4}."
+                "description": "Name to value, such as {\"shader_parameter/wave_height\": 0.4}."
             },
             "project_path": {
                 "type": "string",
-                "description": "Project directory. Optional: the connected editor's project, else the project the server was started in."
+                "description": "Default: editor's, else server's project."
             }
         }),
         &["resource_path", "properties"],
-    )]
+    ).destructive_idempotent()]
 }
 
 pub async fn call(tools: &ToolManager, args: Value) -> ToolResult {

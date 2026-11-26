@@ -28,39 +28,35 @@ const MAX_TIMEOUT: u64 = 3600;
 const REPLY_LIMIT: usize = 60_000;
 const SCENE_EXTENSIONS: &[&str] = &["tscn", "scn"];
 
-pub fn handles(name: &str) -> bool {
-    name == NAME
-}
-
 pub fn catalog() -> Vec<Tool> {
     vec![super::tool(
         NAME,
-        "Draws a map of a world split into many scene files (streamed zones, tiles of a level), without running the game, and summarises every scene, so a scene with no ground or no geometry shows at once. The scenes come from dir and glob (file names in that directory, recursive optional) and/or a list of scenes; each is instanced at the transform saved in its file. A temporary Godot process (a small window, since a headless Godot does not render; audio muted) loads the scenes one at a time to measure them, then renders the map top-down with an orthographic camera in tiles, instancing only the scenes that touch the tile, so memory stays bounded by one tile's scenes; the scenes' WorldEnvironment nodes are dropped, their cameras and 2D layers are turned off, nothing of theirs processes (their _ready still runs), and the light is a neutral sun without shadows. view \"collision\" draws the collision shapes as solid stand-ins instead of the visible geometry, which shows holes in the ground. labels draws each scene's bounds and file name faintly over the map, in red with \"(no collision)\" or \"(no geometry)\" where one is missing. Returns JSON first and then, without output_path, a JPEG preview of the map at most 1024 pixels on a side (the map itself is at most 4096; with output_path the full PNG and JSON are written into the project and the reply names them instead). The map's top is -Z; a pixel (px, py) is the world point x = rect[0] + px / pixels_per_metre, z = rect[1] + py / pixels_per_metre. The JSON holds, in this order, totals (scenes, no_collision, no_geometry, failed), problems (one line per scene with something missing or failing to load), image (size, rect, pixels_per_metre, tiles, the most scenes loaded at once, preview size), files (with output_path), warnings, and with detail per scene its root (name, type, saved position and rotation), top_level child names, bounds (world AABB of its visible geometry, or null), collision_bounds (world AABB of its enabled collision shapes, or null), mesh_instances, multimesh_instances, collision_objects, collision_shapes, collision_layers, instanced_scenes (nested scene instances), has_geometry, has_collision and load_ms. Scenes must be imported: stale imports are named in a warning. Needs GODOT_PATH and a display. The engine may update caches under the project's .godot folder, as any run does.",
+        "Draws a top-down map of a world split into many scene files without running the game and flags scenes lacking collision or geometry. Scenes (dir+glob and/or scenes) stand at their saved transforms, rendered in orthographic tiles by a temporary windowed Godot (their _ready runs; WorldEnvironments dropped, neutral sun). Returns JSON, and without output_path a JPEG preview (max 1024 px). Map top is -Z; pixel (px, py) is world (rect[0] + px/pixels_per_metre, rect[1] + py/pixels_per_metre). JSON: totals, problems, image (size, rect, pixels_per_metre), files, warnings, and per detail each scene's bounds, collision_bounds, counts, has_geometry, has_collision. Stale imports are warned. Needs GODOT_PATH and a display.",
         json!({
-            "dir": {"type": "string", "description": "res:// directory to take scenes from, such as res://scenes/regions/old_pond."},
-            "glob": {"type": "string", "description": "File name pattern in dir, with * and ?, such as zone_*.tscn. Default *.tscn. Matches names only, not directories."},
-            "recursive": {"type": "boolean", "description": "Also look in dir's subdirectories (those Godot does not skip). Default false."},
+            "dir": {"type": "string", "description": "res:// directory of scenes."},
+            "glob": {"type": "string", "description": "Name pattern (* ?). Default *.tscn."},
+            "recursive": {"type": "boolean", "description": "Include subdirectories. Default false."},
             "scenes": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "res:// paths of .tscn or .scn files, added to those found in dir. 1 to 256 scenes in all."
+                "description": "res:// scenes added to dir's; 1-256 in all."
             },
             "rect": {
                 "type": "array",
                 "items": {"type": "number"},
-                "description": "[min_x, min_z, max_x, max_z] in metres: the area to draw. Default: the bounds of all scenes and a small margin."
+                "description": "[min_x, min_z, max_x, max_z] metres. Default: all bounds plus margin."
             },
-            "pixels_per_metre": {"type": "number", "minimum": 0.01, "maximum": 64, "description": "Map scale. Default: the longer side is 2048 pixels. The map is at most 4096 pixels on a side."},
-            "view": {"type": "string", "enum": ["geometry", "collision"], "description": "geometry (default) draws what the scenes show; collision draws their collision shapes instead."},
-            "labels": {"type": "boolean", "description": "Draw each scene's bounds and file name over the map. Default true."},
-            "tile_metres": {"type": "number", "minimum": 1, "maximum": 100000, "description": "Side of a render tile in metres. Default: chosen so a tile holds at most 9 scenes and at most 1024 pixels."},
-            "detail": {"type": "string", "enum": ["summary", "problems", "scenes"], "description": "What the reply lists per scene: summary (default) gives none, only image, totals, problems and warnings; problems adds the entries of the scenes in problems; scenes adds every scene. The reply is kept under about 60000 characters: scenes that do not fit are left out and counted in scenes_left_out, and output_path's JSON always has all of them."},
-            "output_path": {"type": "string", "description": "A .png file inside the project (res:// or relative to it), such as res://.maps/old_pond.png, where the full-size map is written, with the full answer, every scene included, beside it as the same name with .json. Parent folders are created and earlier files of those two names replaced. With it the reply carries the paths instead of an inline picture. A folder holding a .gdignore file (or starting with a dot) keeps the editor from importing the map."},
+            "pixels_per_metre": {"type": "number", "minimum": 0.01, "maximum": 64, "description": "Default: longer side 2048 px; at most 4096 px a side."},
+            "view": {"type": "string", "enum": ["geometry", "collision"], "description": "geometry (default) or collision shapes."},
+            "labels": {"type": "boolean", "description": "Draw bounds and names (red when collision or geometry is missing). Default true."},
+            "tile_metres": {"type": "number", "minimum": 1, "maximum": 100000, "description": "Metres. Default: at most 9 scenes and 1024 px per tile."},
+            "detail": {"type": "string", "enum": ["summary", "problems", "scenes"], "description": "Per-scene entries: summary (default) none, problems (those in problems), scenes (all). The reply stays under ~60000 chars (scenes_left_out); output_path's JSON has all."},
+            "output_path": {"type": "string", "description": ".png in the project for the full map, with the full JSON beside it, replacing old files; the reply names the paths instead of a picture. A .gdignore or dot folder keeps the editor from importing it."},
             "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": MAX_TIMEOUT, "description": "Default 300."},
             "project_path": {"type": "string"}
         }),
         &[],
-    )]
+    ).additive_idempotent()]
 }
 
 pub async fn call(tools: &ToolManager, args: Value) -> ToolResult {
@@ -187,6 +183,7 @@ pub async fn call(tools: &ToolManager, args: Value) -> ToolResult {
     ToolResult {
         content,
         is_error: false,
+        structured_content: None,
     }
 }
 

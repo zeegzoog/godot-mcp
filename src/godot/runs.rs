@@ -7,6 +7,7 @@
 //! they are copied to a private folder under `.godot/` (which the editor does not scan and
 //! version control ignores), and that copy is removed when the run ends.
 
+use crate::bridge_protocol::check_runtime_hello;
 use crate::error::{McpError, Result};
 use crate::godot::debug_ctl::DebugCtl;
 use crate::godot::debug_session::{DebugSession, GameMessage};
@@ -19,13 +20,20 @@ use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
 const MARKER: &str = "; godot_mcp: temporary runtime autoload (removed automatically)";
 const MAX_LOGS: usize = 2_000;
+/// The characters a log line or error message keeps; a longer one is cut and marked.
+const MAX_LINE_CHARS: usize = 2_000;
+/// The bytes of one line of game output held while it is read: enough for `MAX_LINE_CHARS`
+/// characters of any UTF-8. The rest of a longer line is read and dropped, so a game that
+/// prints without newlines cannot grow the server's memory.
+const MAX_LINE_BYTES: usize = 4 * MAX_LINE_CHARS;
+const TRUNCATED_MARK: &str = " [truncated]";
 /// The last stderr lines a run keeps for the report of how it ended.
 const STDERR_TAIL_LINES: usize = 20;
 const STDERR_TAIL_CHARS: usize = 500;
@@ -834,7 +842,7 @@ impl Run {
             return Err(self.gone(method).await);
         }
         let id = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed);
-        let mut rx = self.session.subscribe();
+        let mut reply = self.session.expect_reply(id);
         let payload = serde_json::to_string(&json!({
             "id": id,
             "method": method,
@@ -853,12 +861,10 @@ impl Run {
             }
             // A reply that arrived before the game went away is read first: this only looks at
             // the process when nothing is waiting to be read.
-            let message = match tokio::time::timeout(left.min(WATCH_INTERVAL), rx.recv()).await {
-                Ok(Ok(message)) => message,
-                Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
-                Ok(Err(broadcast::error::RecvError::Closed)) => {
-                    return Err(self.gone(method).await);
-                }
+            let mut parsed = match tokio::time::timeout(left.min(WATCH_INTERVAL), &mut reply).await
+            {
+                Ok(Ok(parsed)) => parsed,
+                Ok(Err(_)) => return Err(self.gone(method).await),
                 Err(_) => {
                     if self.gone_away() {
                         return Err(self.gone(method).await);
@@ -866,20 +872,13 @@ impl Run {
                     continue;
                 }
             };
-            if message.message != "mcp:reply" {
-                continue;
-            }
-            let Some(text) = message.data.first().and_then(Value::as_str) else {
-                continue;
-            };
-            let parsed: Value = serde_json::from_str(text)?;
-            if !json_id_eq(parsed.get("id"), id) {
-                continue;
-            }
             if let Some(err) = parsed.get("error") {
                 return Err(McpError::ToolExecution(err.to_string()));
             }
-            return Ok(parsed.get("result").cloned().unwrap_or(Value::Null));
+            return Ok(parsed
+                .get_mut("result")
+                .map(Value::take)
+                .unwrap_or(Value::Null));
         }
     }
 
@@ -901,6 +900,7 @@ impl Run {
         let deadline = tokio::time::Instant::now() + wait;
         loop {
             if let Some(hello) = lock(&self.hello).clone() {
+                check_runtime_hello(&hello).map_err(McpError::Process)?;
                 return Ok(hello);
             }
             if !self.is_alive() {
@@ -918,9 +918,15 @@ impl Run {
     }
 
     fn push_line(&self, level: &str, text: &str, stack: Vec<String>) {
+        self.push_clipped_line(level, text, false, stack);
+    }
+
+    /// `cut` says the reader already dropped the end of the line.
+    fn push_clipped_line(&self, level: &str, text: &str, cut: bool, stack: Vec<String>) {
         if text.is_empty() {
             return;
         }
+        let text = clip_line(text, cut);
         let mut logs = lock(&self.logs);
         let seq = logs.seq;
         logs.seq += 1;
@@ -938,7 +944,7 @@ impl Run {
         logs.lines.push_back(LogLine {
             seq,
             level: level.into(),
-            text: text.chars().take(2_000).collect(),
+            text,
             stack,
         });
         while logs.lines.len() > MAX_LOGS {
@@ -1000,24 +1006,11 @@ fn spawn_log_task(run: Arc<Run>) {
     });
 }
 
-pub fn json_id_eq(value: Option<&Value>, id: i64) -> bool {
-    let Some(value) = value else {
-        return false;
-    };
-    if value.as_i64() == Some(id) {
-        return true;
-    }
-    // Godot's JSON parser stores every number as a float, so a reply echoes 1.0.
-    value
-        .as_f64()
-        .is_some_and(|number| number == id as f64 && number.fract() == 0.0)
-}
-
 fn ingest(run: &Run, message: &GameMessage) {
     match message.message.as_str() {
         "mcp:hello" => {
             if let Some(text) = message.data.first().and_then(Value::as_str)
-                && let Ok(payload) = serde_json::from_str::<Value>(text)
+                && let Ok(payload) = crate::godot::json_text::parse::<Value>(text)
             {
                 run.note_hello(payload);
             }
@@ -1083,6 +1076,64 @@ fn parse_error(data: &[Value]) -> Option<(String, String, Vec<String>)> {
     ))
 }
 
+/// Keeps at most `MAX_LINE_CHARS` characters of a line and marks a line that lost its end.
+fn clip_line(text: &str, cut: bool) -> String {
+    let mut chars = text.char_indices();
+    let end = chars.nth(MAX_LINE_CHARS).map(|(index, _)| index);
+    match end {
+        Some(end) => format!("{}{TRUNCATED_MARK}", &text[..end]),
+        None if cut => format!("{text}{TRUNCATED_MARK}"),
+        None => text.to_string(),
+    }
+}
+
+/// Reads one line (up to and including `\n`) into `line`, keeping at most `cap` bytes of it and
+/// reading the rest of a longer line without storing it. Returns `None` at the end of the
+/// stream, else whether the line was cut.
+async fn read_capped_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+    cap: usize,
+) -> std::io::Result<Option<bool>> {
+    line.clear();
+    let mut cut = false;
+    let mut pending_cr = false;
+    let mut read_any = false;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(read_any.then_some(cut || pending_cr));
+        }
+        read_any = true;
+        let (used, done) = match available.iter().position(|byte| *byte == b'\n') {
+            Some(index) => (index + 1, true),
+            None => (available.len(), false),
+        };
+        let room = cap.saturating_sub(line.len());
+        let kept = used.min(room);
+        // Only text is lost text: a dropped line end (`\n` or `\r\n`) is not. A `\r` dropped
+        // at the end of one read is judged with the next one.
+        let mut dropped = &available[kept..used];
+        if pending_cr {
+            pending_cr = false;
+            cut |= dropped.first() != Some(&b'\n');
+        }
+        if done {
+            dropped = dropped.strip_suffix(b"\n").unwrap_or(dropped);
+            dropped = dropped.strip_suffix(b"\r").unwrap_or(dropped);
+        } else if let Some(rest) = dropped.strip_suffix(b"\r") {
+            pending_cr = true;
+            dropped = rest;
+        }
+        cut |= !dropped.is_empty();
+        line.extend_from_slice(&available[..kept]);
+        reader.consume(used);
+        if done {
+            return Ok(Some(cut));
+        }
+    }
+}
+
 fn spawn_pipe(run: Arc<Run>, pipe: Option<impl AsyncRead + Unpin + Send + 'static>, stderr: bool) {
     let Some(pipe) = pipe else {
         return;
@@ -1093,12 +1144,12 @@ fn spawn_pipe(run: Arc<Run>, pipe: Option<impl AsyncRead + Unpin + Send + 'stati
         let mut bytes = Vec::new();
         // Lines are read as bytes: output that is not UTF-8 must not end this loop. Closing the
         // read end would kill the game with SIGPIPE at its next print.
+        // A line is read with a cap: a game printing without newlines must not grow memory.
         loop {
-            bytes.clear();
-            match reader.read_until(b'\n', &mut bytes).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
-            }
+            let cut = match read_capped_line(&mut reader, &mut bytes, MAX_LINE_BYTES).await {
+                Ok(Some(cut)) => cut,
+                Ok(None) | Err(_) => break,
+            };
             let text = String::from_utf8_lossy(&bytes);
             let line = text.trim_end_matches(['\n', '\r']);
             let level = if line.contains("ERROR") {
@@ -1108,7 +1159,7 @@ fn spawn_pipe(run: Arc<Run>, pipe: Option<impl AsyncRead + Unpin + Send + 'stati
             } else {
                 "info"
             };
-            run.push_line(level, line, Vec::new());
+            run.push_clipped_line(level, line, cut, Vec::new());
             if stderr && !line.is_empty() {
                 let mut tail = lock(&run.stderr_tail);
                 tail.push_back(line.chars().take(STDERR_TAIL_CHARS).collect());
@@ -1248,36 +1299,71 @@ impl Drop for OverrideLock {
 
 /// Takes the override lock. When another server holds it past `LOCK_WAIT`, the change goes ahead
 /// without it: a rare overlap is better than a run that cannot start or a file never restored.
+///
+/// It is called from async tasks (a run's start and its end) as well as from `Drop`, so it stays
+/// synchronous. Waiting for another server's lock is handed off the executor: on a
+/// multi-threaded runtime `block_in_place` moves this worker's other tasks elsewhere, so the
+/// wait (up to `LOCK_WAIT`) never stalls other tool calls.
 fn lock_override(project: &Path) -> OverrideLock {
     let path = project.join(LOCK_FILE);
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let deadline = std::time::Instant::now() + LOCK_WAIT;
+    match try_override_lock(&path) {
+        LockAttempt::Taken => return OverrideLock(Some(path)),
+        LockAttempt::Failed => return OverrideLock(None),
+        LockAttempt::Busy => {}
+    }
+    let multi_threaded = tokio::runtime::Handle::try_current()
+        .is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
+    if multi_threaded {
+        tokio::task::block_in_place(|| wait_for_override_lock(path))
+    } else {
+        wait_for_override_lock(path)
+    }
+}
+
+enum LockAttempt {
+    Taken,
+    Busy,
+    Failed,
+}
+
+fn try_override_lock(path: &Path) -> LockAttempt {
     loop {
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&path)
+            .open(path)
         {
-            Ok(_) => return OverrideLock(Some(path)),
+            Ok(_) => return LockAttempt::Taken,
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                let stale = std::fs::metadata(&path)
+                let stale = std::fs::metadata(path)
                     .and_then(|meta| meta.modified())
                     .ok()
                     .and_then(|modified| modified.elapsed().ok())
                     .is_some_and(|age| age > STALE_LOCK_AGE);
-                if stale {
-                    let _ = std::fs::remove_file(&path);
-                    continue;
+                if !stale || std::fs::remove_file(path).is_err() {
+                    return LockAttempt::Busy;
                 }
             }
-            Err(_) => return OverrideLock(None),
+            Err(_) => return LockAttempt::Failed,
         }
+    }
+}
+
+fn wait_for_override_lock(path: PathBuf) -> OverrideLock {
+    let deadline = std::time::Instant::now() + LOCK_WAIT;
+    loop {
         if std::time::Instant::now() >= deadline {
             return OverrideLock(None);
         }
         std::thread::sleep(Duration::from_millis(25));
+        match try_override_lock(&path) {
+            LockAttempt::Taken => return OverrideLock(Some(path)),
+            LockAttempt::Failed => return OverrideLock(None),
+            LockAttempt::Busy => {}
+        }
     }
 }
 
@@ -1403,10 +1489,12 @@ impl Drop for GameHub {
 #[cfg(test)]
 mod tests {
     use super::{
-        RUNTIME_FILES, ensure_runtime, inject_override, physics_tick_rate, restore_override,
+        LOCK_FILE, MAX_LINE_CHARS, RUNTIME_FILES, TRUNCATED_MARK, clip_line, ensure_runtime,
+        inject_override, lock_override, physics_tick_rate, read_capped_line, restore_override,
     };
     use std::path::Path;
     use std::time::{Duration, SystemTime};
+    use tokio::io::{AsyncReadExt, BufReader};
 
     fn project() -> tempfile::TempDir {
         let project = tempfile::tempdir().expect("project");
@@ -1651,5 +1739,109 @@ mod tests {
         let state = inject_override(project.path(), &source, "abc12345").unwrap();
         restore_override(&state);
         assert!(recent.is_file());
+    }
+
+    /// A game that prints without newlines: the reader holds at most the cap, drops the rest of
+    /// the line and goes on with the next one.
+    #[tokio::test]
+    async fn a_line_without_newline_is_read_with_a_cap() {
+        let endless = tokio::io::repeat(b'x').take(64 * 1024 * 1024);
+        let rest: &[u8] = b"\nnext\n";
+        let mut reader = BufReader::new(endless.chain(rest));
+        let mut line = Vec::new();
+
+        let cut = read_capped_line(&mut reader, &mut line, 1024)
+            .await
+            .unwrap();
+        assert_eq!(cut, Some(true));
+        assert_eq!(line.len(), 1024);
+        assert!(
+            line.capacity() < 1024 * 1024,
+            "held {} bytes",
+            line.capacity()
+        );
+
+        let cut = read_capped_line(&mut reader, &mut line, 1024)
+            .await
+            .unwrap();
+        assert_eq!((cut, line.as_slice()), (Some(false), &b"next\n"[..]));
+        assert_eq!(
+            read_capped_line(&mut reader, &mut line, 1024)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_line_that_fits_the_cap_is_not_marked_cut() {
+        let input: &[u8] = b"abcd\nab";
+        let mut reader = BufReader::with_capacity(2, input);
+        let mut line = Vec::new();
+        let cut = read_capped_line(&mut reader, &mut line, 4).await.unwrap();
+        assert_eq!((cut, line.as_slice()), (Some(false), &b"abcd"[..]));
+        let cut = read_capped_line(&mut reader, &mut line, 4).await.unwrap();
+        assert_eq!((cut, line.as_slice()), (Some(false), &b"ab"[..]));
+    }
+
+    /// A Windows line end dropped at the cap is not lost text, even when its `\r` and `\n`
+    /// arrive in different reads; a `\r` followed by more text is.
+    #[tokio::test]
+    async fn a_crlf_dropped_at_the_cap_is_not_marked_cut() {
+        for capacity in [1, 2, 8] {
+            let input: &[u8] = b"abcd\r\nabcd\rx\n";
+            let mut reader = BufReader::with_capacity(capacity, input);
+            let mut line = Vec::new();
+            let cut = read_capped_line(&mut reader, &mut line, 4).await.unwrap();
+            assert_eq!(
+                (cut, line.as_slice()),
+                (Some(false), &b"abcd"[..]),
+                "{capacity}"
+            );
+            let cut = read_capped_line(&mut reader, &mut line, 4).await.unwrap();
+            assert_eq!(
+                (cut, line.as_slice()),
+                (Some(true), &b"abcd"[..]),
+                "{capacity}"
+            );
+        }
+    }
+
+    /// Log lines and error messages keep the same number of characters and say they were cut.
+    #[test]
+    fn long_lines_are_clipped_and_marked() {
+        let long = "é".repeat(MAX_LINE_CHARS + 10);
+        let clipped = clip_line(&long, false);
+        assert_eq!(
+            clipped.chars().count(),
+            MAX_LINE_CHARS + TRUNCATED_MARK.chars().count()
+        );
+        assert!(clipped.ends_with(TRUNCATED_MARK));
+        assert_eq!(clip_line("short", false), "short");
+        assert_eq!(clip_line("short", true), format!("short{TRUNCATED_MARK}"));
+    }
+
+    /// Waiting for another server's override lock must not stall the worker thread: a task on
+    /// the same (only) worker releases the lock while the wait is running.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn waiting_for_the_override_lock_leaves_the_executor_free() {
+        let project = project();
+        let lock_path = project.path().join(LOCK_FILE);
+        write(&lock_path, "");
+        let root = project.path().to_path_buf();
+        let waiter = tokio::spawn(async move { lock_override(&root).0.is_some() });
+        let releaser = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            std::fs::remove_file(&lock_path).unwrap();
+        });
+        let started = std::time::Instant::now();
+        let took = waiter.await.unwrap();
+        releaser.await.unwrap();
+        assert!(took, "the lock was released but never taken");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
     }
 }

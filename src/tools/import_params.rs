@@ -62,44 +62,40 @@ const IMPORTERS: &[(&str, &[&str], &str)] = &[
     ("glsl", &["glsl"], "RDShaderFile"),
 ];
 
-pub fn handles(name: &str) -> bool {
-    name == GET || name == SET
-}
-
 pub fn catalog() -> Vec<Tool> {
     let project_path = json!({
         "type": "string",
-        "description": "Project directory containing project.godot. Optional: defaults to the project open in the connected editor, else the project the server was started in."
+        "description": "Default: editor's, else server's project."
     });
     let path = json!({
         "type": "string",
-        "description": "The imported file (not its .import sidecar), as a res:// path or relative to the project, such as res://assets/sky.png."
+        "description": "The imported file (not its .import), res:// or project-relative."
     });
     vec![
         super::tool(
             GET,
-            "Reads a file's import parameters, the [params] section of its .import sidecar that the Import dock shows: importer (such as texture), type (the imported resource class) and params (each option's value, such as compress/mode or mipmaps/generate), with each option's Godot type under types. A value JSON cannot carry (a Vector2, a Dictionary) is given in Godot's text form. Read from the editor when it has the project open, else with the Godot binary. A file with no .import yet is refused: import it with godot_resave_resources first.",
+            "Reads a file's import parameters ([params] of its .import): importer, type (imported class), params, and each option's Godot type in types; non-JSON values in Godot's text form. Refused for a file with no .import yet: import it with godot_resave_resources first.",
             json!({ "path": path, "project_path": project_path }),
             &["path"],
-        ),
+        ).read_only(),
         super::tool(
             SET,
-            "Changes a file's import parameters and, with importer, the importer itself (the Import dock's \"Import As\"), then reimports it: the given options in the [params] section of its .import sidecar are set, after copying every parameter of copy_from's .import when it is given (both files must use the same importer). An option keeps the type it holds: a whole number becomes an int unless the option holds a float, and a string such as \"Vector2(1, 1)\" becomes the option's type when it is a vector, color, rect or packed array. With the editor holding the project, the change goes through the editor's file system (the Import dock and the loaded resource follow); else Godot's ConfigFile edits the file and godot --headless --import reimports it. The importer keeps only the options it has, so check ignored_options (names it dropped: a typo or another importer's option) and new_options (names the file did not hold before). A new importer starts from its own default options, as in the dock (the old params are dropped, then copy_from and params apply); its name is checked against Godot's importers for the file type, and the answer gives importer, previous_importer and type (the resource class now imported). A file with no .import yet is refused: import it with godot_resave_resources first. Examples: path res://sky.png, params {\"compress/mode\": 2, \"compress/high_quality\": true} for VRAM-compressed textures; path res://lut.png, importer \"3d_texture\", params {\"slices/horizontal\": 33, \"slices/vertical\": 1} for a Texture3D from a strip of 33 slices. The headless reimport waits for the godot_run_script calls working in the project to finish, and runs alone there.",
+            "Changes a file's import parameters (with importer, also the dock's \"Import As\") and reimports it. copy_from's parameters (same importer only) are copied first, then params. Options keep their type; strings such as \"Vector2(1, 1)\" are parsed. Uses the editor when it holds the project, else headless (waits for running godot_run_script calls). ignored_options: names the importer dropped (typo or other importer's); new_options: names new to the file. A new importer starts from its defaults; the answer gives importer, previous_importer and type. Refused for a file with no .import yet: run godot_resave_resources first.",
             json!({
                 "path": path,
                 "params": {
                     "type": "object",
-                    "description": "Options to set, by the name the .import file uses, each a string, number or boolean. Examples: {\"compress/mode\": 2, \"mipmaps/generate\": true, \"process/size_limit\": 1024}.",
+                    "description": "By .import name: string, number or boolean, such as {\"compress/mode\": 2}.",
                     "additionalProperties": {"type": ["string", "number", "boolean"]}
                 },
-                "importer": {"type": "string", "description": "The importer to import the file with, as the Import dock's \"Import As\" lists them. For an image: texture (Texture2D), 2d_array_texture, cubemap_texture, cubemap_array_texture, 3d_texture (Texture3D), texture_atlas, bitmap, image, font_data_image; for a scene file: scene, animation_library; for any file: keep (exported as is) or skip (not imported). Omit to keep the current importer."},
-                "copy_from": {"type": "string", "description": "Another imported file of the project whose parameters are copied first, such as res://assets/sky.png. params are applied after the copy."},
-                "reimport": {"type": "boolean", "description": "Reimport the file after a change. Default true. With false only the .import file changes; the editor reimports it on its next scan, and godot --headless --import does too."},
-                "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 3600, "description": "Limit for the headless import. Default 300."},
+                "importer": {"type": "string", "description": "Images: texture, 2d_array_texture, cubemap_texture, cubemap_array_texture, 3d_texture, texture_atlas, bitmap, image, font_data_image. Scenes: scene, animation_library. Any file: keep, skip. Omit to keep the current one."},
+                "copy_from": {"type": "string", "description": "Imported file whose parameters are copied first."},
+                "reimport": {"type": "boolean", "description": "Default true; false only edits the .import."},
+                "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 3600, "description": "Headless import limit. Default 300."},
                 "project_path": project_path
             }),
             &["path"],
-        ),
+        ).destructive_idempotent(),
     ]
 }
 

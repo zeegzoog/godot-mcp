@@ -69,12 +69,12 @@ pub(super) fn catalog(mode: FeedbackMode) -> Vec<Tool> {
     if mode.enabled() {
         tools.push(tool(
             NOTE,
-            "Records one observation for the godot-mcp maintainers: something missing, broken or misleading in godot-mcp itself (a tool, its message or schema, the editor addon, the README). Not for your own mistakes or problems in the user's project. Write in English: what you tried, what came back, what you expected; one problem per note. The note stays in memory and nothing is sent. Later, godot_draft_feedback turns notes into a report for the human.",
+            "Records one note for the godot-mcp maintainers about godot-mcp itself (tool, message, schema, addon, README), not your mistakes or the user's project. English, one problem per note. Kept in memory; nothing is sent. godot_draft_feedback builds the report.",
             json!({
                 "kind": {
                     "type": "string",
                     "enum": ["bug", "missing_feature", "improvement", "docs"],
-                    "description": "bug: a tool misbehaves or fails for a reason it does not explain. missing_feature: you needed a capability no tool offers. improvement: it works but could be clearer, faster or safer. docs: a description, schema or README is wrong or unclear."
+                    "description": "bug: fails unexplained. missing_feature: no tool for it. improvement: could be better. docs: description, schema or README wrong."
                 },
                 "summary": {
                     "type": "string",
@@ -82,16 +82,16 @@ pub(super) fn catalog(mode: FeedbackMode) -> Vec<Tool> {
                 },
                 "details": {
                     "type": "string",
-                    "description": "What you tried, what came back, what you expected. At most 2000 characters. No secrets and no file contents."
+                    "description": "What you tried, got and expected. At most 2000 characters; no secrets or file contents."
                 },
                 "tool": {
                     "type": "string",
-                    "description": "Name of the godot-mcp tool involved, such as godot_add_node. Lets the report quote that tool's recent failures."
+                    "description": "Tool involved, such as godot_add_node; the report quotes its recent failures."
                 },
                 "impact": {
                     "type": "string",
                     "enum": ["blocked", "workaround", "minor"],
-                    "description": "blocked: you could not finish the task. workaround: you found another way. minor: a nuisance."
+                    "description": "blocked: could not finish; workaround: found another way; minor."
                 },
                 "suggestion": {
                     "type": "string",
@@ -99,7 +99,7 @@ pub(super) fn catalog(mode: FeedbackMode) -> Vec<Tool> {
                 }
             }),
             &["kind", "summary", "details"],
-        ));
+        ).additive());
         let submission = if mode.submits() {
             "have it submitted with godot_submit_feedback, "
         } else {
@@ -108,42 +108,42 @@ pub(super) fn catalog(mode: FeedbackMode) -> Vec<Tool> {
         tools.push(tool(
             DRAFT,
             &format!(
-                "Builds one report for the godot-mcp maintainers from your notes (by default every note not yet in a report; pass note_ids to choose, one report per problem) plus what the server observed: versions, platform, failures of the tools your notes name and requests for tools that do not exist. It contacts no remote service. Call it when the user's request is completed or abandoned, or when the user asks for feedback, and only when notes exist. Then show the user the COMPLETE report, in the user's language: the issue title first, then the issue body. Then offer: copy it, open the link, {submission}or discard it."
+                "Builds one report for the maintainers from notes (note_ids, default the unreported ones; one report per problem) plus versions, platform, failures of the named tools and calls to missing tools. Contacts nothing remote. Call it when the request is completed or abandoned, or the user asks, and only when notes exist. Then show the user the COMPLETE report in their language, title then body, and offer: copy it, open the link, {submission}or discard it."
             ),
             json!({
                 "note_ids": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Ids of the notes to include, such as [\"n1\", \"n3\"]. Default: every note not yet in a report."
+                    "description": "Such as [\"n1\"]."
                 },
                 "title": {
                     "type": "string",
-                    "description": "Optional title; by default it is built from the first note."
+                    "description": "Default: built from the first note."
                 }
             }),
             &[],
-        ));
+        ).additive());
     }
     if mode.submits() {
         tools.push(tool(
             SUBMIT,
-            "Publishes a draft from godot_draft_feedback as a PUBLIC GitHub issue of the godot-mcp project, through the user's own signed-in GitHub CLI. It takes only the draft id, so what is published is exactly the report the user saw. Call it ONLY after the user has seen the complete report and said an explicit yes in this conversation; then pass confirmed: true. It reports whether the issue was created, a duplicate already exists, or nothing was created.",
+            "Publishes a godot_draft_feedback draft, exactly as drafted, as a PUBLIC GitHub issue via the user's GitHub CLI. Call ONLY after the user saw the complete report and gave an explicit yes in this conversation; pass confirmed: true. Reports created, duplicate, or nothing created.",
             json!({
                 "draft_id": {
                     "type": "string",
-                    "description": "The id returned by godot_draft_feedback, such as d1."
+                    "description": "From godot_draft_feedback, such as d1."
                 },
                 "confirmed": {
                     "type": "boolean",
-                    "description": "true only when the user explicitly approved publishing this exact report."
+                    "description": "true only when the user approved publishing this exact report."
                 },
                 "allow_duplicate": {
                     "type": "boolean",
-                    "description": "Create the issue although one with the same fingerprint exists. Only when the user has looked at that issue and still wants a new one."
+                    "description": "Create despite an issue with the same fingerprint; only if the user saw it and still wants one."
                 }
             }),
             &["draft_id", "confirmed"],
-        ));
+        ).open_world().additive());
     }
     tools
 }
@@ -432,7 +432,9 @@ impl ToolManager {
                     .unwrap_or_else(|| "unknown".to_string()),
                 "not reachable (editor closed or plugin disabled)".to_string(),
             ),
-            Err(McpError::ToolExecution(message)) => (
+            Err(
+                McpError::ToolExecution(message) | McpError::CodedToolExecution { message, .. },
+            ) => (
                 "unknown".to_string(),
                 format!("the editor answered with an error: {message}"),
             ),

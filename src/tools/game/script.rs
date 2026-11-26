@@ -27,7 +27,7 @@ pub(super) async fn run_script(tools: &ToolManager, args: &Value) -> ToolResult 
             mark_timeout(&mut value);
             answer(&value)
         }
-        Err(error) => script_error(&error),
+        Err(error) => crate::tools::with_runtime_code(script_error(&error), &error),
     }
 }
 

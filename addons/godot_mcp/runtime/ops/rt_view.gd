@@ -10,6 +10,8 @@ const MAX_MAX := 4096
 const MAX_FRAMES := 8
 const MAX_BASELINES := 8
 const MAX_BASELINE_PIXELS := 512 * 512
+## Pixels a comparison looks at one by one, on the game's main thread (about 10 ms).
+const MEASURE_PIXELS := 65536
 ## The lens an aimed copy may be given: orthographic size in metres, perspective fov in degrees.
 const AIM_SIZE_MIN := 0.001
 const AIM_SIZE_MAX := 10000.0
@@ -319,34 +321,143 @@ static func _diff_against(image: Image, previous: Image) -> Dictionary:
     return measured
 
 
+## Compares two RGBA8 images of one size inside roi. The capture runs on the game's main thread,
+## so the per-pixel loop is kept to about MEASURE_PIXELS: rows that are byte-for-byte equal are
+## found with one native comparison each and are not looped. When the rows that differ hold at
+## most MEASURE_PIXELS pixels every pixel of them is compared (exact); otherwise a uniform grid of
+## at most MEASURE_PIXELS samples is compared (sampled). A grid that misses a change at tolerance 0
+## (a thin line across many rows) is followed by _locate, so a changed pixel is never reported as
+## no change and the cost stays one native search per differing row.
 static func _measure(current: Image, previous: Image, tolerance: int, roi: Rect2i) -> Dictionary:
     var image_width := current.get_width()
-    var image_height := current.get_height()
     var width := roi.size.x
     var height := roi.size.y
-    var stride := 1
-    while width * height > stride * stride * 700000:
-        stride += 1
     var current_bytes := current.get_data()
     var previous_bytes := previous.get_data()
+    var row_bytes := width * 4
+    var dirty := PackedByteArray()
+    dirty.resize(height)
+    var dirty_rows := 0
+    if current_bytes != previous_bytes:
+        for row in height:
+            var start := ((roi.position.y + row) * image_width + roi.position.x) * 4
+            if current_bytes.slice(start, start + row_bytes) != previous_bytes.slice(start, start + row_bytes):
+                dirty[row] = 1
+                dirty_rows += 1
+    var stride := 1
+    if dirty_rows * width > MEASURE_PIXELS:
+        while ceili(float(height) / float(stride)) * ceili(float(width) / float(stride)) > MEASURE_PIXELS:
+            stride += 1
+    var images := {"current": current_bytes, "previous": previous_bytes, "width": image_width, "height": current.get_height()}
+    if tolerance == 0 and dirty_rows > 0:
+        # At a tolerance of 0 a pixel is compared as one 32-bit word.
+        images["current_words"] = current_bytes.to_int32_array()
+        images["previous_words"] = previous_bytes.to_int32_array()
+    var counted := _count(images, dirty, tolerance, roi, stride)
+    if stride > 1 and tolerance == 0 and int(counted["changed"]) == 0 and dirty_rows > 0:
+        counted = _locate(images, dirty, roi, int(counted["sampled"]))
+    var answer := {"compared": true}
+    answer.merge(counted)
+    return answer
+
+
+## Finds, with native comparisons only, the first and the last differing pixel of every row
+## marked in dirty, for a tolerance of 0. changed is then the number of differing rows: a lower
+## bound of the changed pixels (each such row holds at least one), reported as not exact. The
+## bounds hold every change.
+static func _locate(images: Dictionary, dirty: PackedByteArray, roi: Rect2i, sampled: int) -> Dictionary:
+    var current_bytes: PackedByteArray = images["current"]
+    var previous_bytes: PackedByteArray = images["previous"]
+    var image_width := int(images["width"])
+    var width := roi.size.x
+    var rows := 0
+    var min_x := image_width
+    var max_x := -1
+    var min_y := -1
+    var max_y := -1
+    for y in roi.size.y:
+        if dirty[y] == 0:
+            continue
+        var start := ((roi.position.y + y) * image_width + roi.position.x) * 4
+        # First differing pixel: the smallest prefix that differs.
+        var low := 0
+        var high := width
+        while high - low > 1:
+            var middle := (low + high) >> 1
+            if current_bytes.slice(start, start + middle * 4) != previous_bytes.slice(start, start + middle * 4):
+                high = middle
+            else:
+                low = middle
+        var first := high - 1
+        # Last differing pixel: the smallest suffix that differs.
+        var end := start + width * 4
+        low = 0
+        high = width
+        while high - low > 1:
+            var middle := (low + high) >> 1
+            if current_bytes.slice(end - middle * 4, end) != previous_bytes.slice(end - middle * 4, end):
+                high = middle
+            else:
+                low = middle
+        var last := width - high
+        rows += 1
+        min_x = mini(min_x, roi.position.x + first)
+        max_x = maxi(max_x, roi.position.x + last)
+        if min_y < 0:
+            min_y = roi.position.y + y
+        max_y = roi.position.y + y
+    var bounds = null
+    if rows > 0:
+        bounds = {"x": min_x, "y": min_y, "w": max_x - min_x + 1, "h": max_y - min_y + 1}
+    var ratio := 0.0 if sampled == 0 else minf(1.0, float(rows) / float(sampled))
+    return {
+        "changed": rows,
+        "sampled": sampled,
+        "ratio": snappedf(ratio, 0.0001),
+        "bounds": bounds,
+        "exact": false,
+    }
+
+
+## Counts the pixels on a grid of the given stride inside roi that differ by more than tolerance
+## in a channel. Rows not marked in dirty are equal and count as unchanged samples.
+static func _count(images: Dictionary, dirty: PackedByteArray, tolerance: int, roi: Rect2i, stride: int) -> Dictionary:
+    var current_bytes: PackedByteArray = images["current"]
+    var previous_bytes: PackedByteArray = images["previous"]
+    var current_words: PackedInt32Array = images.get("current_words", PackedInt32Array())
+    var previous_words: PackedInt32Array = images.get("previous_words", PackedInt32Array())
+    var words := not current_words.is_empty()
+    var image_width := int(images["width"])
+    var width := roi.size.x
+    var height := roi.size.y
+    var row_samples := ceili(float(width) / float(stride))
     var changed := 0
     var sampled := 0
     var min_x := image_width
-    var min_y := image_height
+    var min_y := roi.position.y + height
     var max_x := -1
     var max_y := -1
     var y := 0
     while y < height:
+        sampled += row_samples
+        if dirty[y] == 0:
+            y += stride
+            continue
+        var pixel_y := roi.position.y + y
         var x := 0
         while x < width:
             var pixel_x := roi.position.x + x
-            var pixel_y := roi.position.y + y
-            var offset := (pixel_y * image_width + pixel_x) * 4
-            sampled += 1
-            if absi(int(current_bytes[offset]) - int(previous_bytes[offset])) > tolerance \
-                    or absi(int(current_bytes[offset + 1]) - int(previous_bytes[offset + 1])) > tolerance \
-                    or absi(int(current_bytes[offset + 2]) - int(previous_bytes[offset + 2])) > tolerance \
-                    or absi(int(current_bytes[offset + 3]) - int(previous_bytes[offset + 3])) > tolerance:
+            var index := pixel_y * image_width + pixel_x
+            var differs := false
+            if words:
+                differs = current_words[index] != previous_words[index]
+            else:
+                var offset := index * 4
+                differs = absi(int(current_bytes[offset]) - int(previous_bytes[offset])) > tolerance \
+                        or absi(int(current_bytes[offset + 1]) - int(previous_bytes[offset + 1])) > tolerance \
+                        or absi(int(current_bytes[offset + 2]) - int(previous_bytes[offset + 2])) > tolerance \
+                        or absi(int(current_bytes[offset + 3]) - int(previous_bytes[offset + 3])) > tolerance
+            if differs:
                 changed += 1
                 min_x = mini(min_x, pixel_x)
                 min_y = mini(min_y, pixel_y)
@@ -360,11 +471,10 @@ static func _measure(current: Image, previous: Image, tolerance: int, roi: Rect2
             "x": min_x,
             "y": min_y,
             "w": mini(max_x - min_x + stride, image_width - min_x),
-            "h": mini(max_y - min_y + stride, image_height - min_y),
+            "h": mini(max_y - min_y + stride, int(images["height"]) - min_y),
         }
     var ratio := 0.0 if sampled == 0 else float(changed) / float(sampled)
     return {
-        "compared": true,
         "changed": changed,
         "sampled": sampled,
         "ratio": snappedf(ratio, 0.0001),

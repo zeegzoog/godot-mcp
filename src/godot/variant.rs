@@ -59,6 +59,8 @@ const PACKED_VECTOR4_ARRAY: u32 = 38;
 const FLAG_64: u32 = 1 << 16;
 const TYPE_MASK: u32 = 0xff;
 const MAX_DEPTH: usize = 64;
+/// Godot encodes each debugger message into an 8 MiB buffer and drops a larger one
+/// (`RemoteDebuggerPeerTCP`), so no game sends more. The runtime refuses a reply that would not fit.
 const MAX_PACKET: usize = 8 << 20;
 
 const KIND_NONE: u32 = 0;
@@ -522,36 +524,57 @@ pub fn frame_packet(value: &Value) -> Result<Vec<u8>, VariantError> {
 }
 
 /// Splits a TCP byte stream into decoded debugger packets.
+///
+/// A packet that is too large or does not decode is reported and skipped: its length prefix says
+/// where the next packet starts, so one bad packet does not end the session.
 #[derive(Debug, Default)]
 pub struct PacketReader {
     pending: Vec<u8>,
+    /// Bytes of a skipped packet that have not arrived yet.
+    skip: usize,
 }
 
 impl PacketReader {
-    pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<Value>, VariantError> {
+    /// Every packet the chunk completes, in order: its value, or why it was skipped.
+    pub fn push(&mut self, mut chunk: &[u8]) -> Vec<Result<Value, VariantError>> {
+        if self.skip > 0 {
+            let skipped = self.skip.min(chunk.len());
+            self.skip -= skipped;
+            chunk = &chunk[skipped..];
+        }
         self.pending.extend_from_slice(chunk);
         let mut out = Vec::new();
-        while let Some(prefix) = self.pending.first_chunk::<4>() {
+        let mut start = 0;
+        while let Some(prefix) = self.pending[start..].first_chunk::<4>() {
             let size = u32::from_le_bytes(*prefix) as usize;
             if size > MAX_PACKET {
-                return Err(VariantError(format!(
-                    "debugger packet too large ({size} bytes)"
-                )));
+                // Godot never sends one this large (its own buffer is 8 MiB), so this is not a
+                // packet a game sent: drop it without buffering it.
+                start += 4;
+                let here = (self.pending.len() - start).min(size);
+                start += here;
+                self.skip = size - here;
+                out.push(Err(VariantError(format!(
+                    "skipped a debugger packet too large ({size} bytes, the limit is {MAX_PACKET})"
+                ))));
+                continue;
             }
-            if self.pending.len() < 4 + size {
+            let end = start + 4 + size;
+            if self.pending.len() < end {
                 break;
             }
-            let body = self.pending[4..4 + size].to_vec();
-            self.pending.drain(..4 + size);
-            let (value, used) = decode_variant(&body)?;
-            if used != body.len() {
-                return Err(VariantError(format!(
-                    "variant used {used} bytes of a {size}-byte packet"
-                )));
-            }
-            out.push(value);
+            let body = &self.pending[start + 4..end];
+            out.push(match decode_variant(body) {
+                Ok((value, used)) if used == size => Ok(value),
+                Ok((_, used)) => Err(VariantError(format!(
+                    "skipped a debugger packet: its variant used {used} bytes of {size}"
+                ))),
+                Err(err) => Err(VariantError(format!("skipped a debugger packet: {err}"))),
+            });
+            start = end;
         }
-        Ok(out)
+        self.pending.drain(..start);
+        out
     }
 }
 
@@ -591,26 +614,61 @@ mod tests {
         roundtrip(json!(i64::from(i32::MIN) - 1));
     }
 
+    fn values(results: Vec<Result<Value, VariantError>>) -> Vec<Value> {
+        results.into_iter().map(|result| result.unwrap()).collect()
+    }
+
     #[test]
     fn framed_packets_split_across_reads() {
         let first = frame_packet(&json!(["set_pid", 1, [7]])).unwrap();
         let second = frame_packet(&json!("ok")).unwrap();
         let mut reader = PacketReader::default();
-        assert!(reader.push(&first[..3]).unwrap().is_empty());
+        assert!(reader.push(&first[..3]).is_empty());
         let mut rest = first[3..].to_vec();
         rest.extend_from_slice(&second[..1]);
-        let one = reader.push(&rest).unwrap();
+        let one = values(reader.push(&rest));
         assert_eq!(one, vec![json!(["set_pid", 1, [7]])]);
-        let two = reader.push(&second[1..]).unwrap();
+        let two = values(reader.push(&second[1..]));
         assert_eq!(two, vec![json!("ok")]);
     }
 
+    /// One oversized packet is reported and its bytes are skipped as they arrive; the packet after
+    /// it still decodes, so the session goes on.
     #[test]
-    fn oversized_packet_is_rejected() {
+    fn an_oversized_packet_is_skipped_and_the_next_one_still_decodes() {
+        let size = MAX_PACKET + 10;
+        let mut huge = (size as u32).to_le_bytes().to_vec();
+        huge.extend(std::iter::repeat_n(0xAB_u8, size));
+        let next = frame_packet(&json!(["set_pid", 1, [9]])).unwrap();
+        let mut stream = huge;
+        stream.extend_from_slice(&next);
+
         let mut reader = PacketReader::default();
-        let huge = ((MAX_PACKET as u32) + 1).to_le_bytes();
-        let err = reader.push(&huge).expect_err("too large");
+        let mut results = Vec::new();
+        for chunk in stream.chunks(64 * 1024 + 3) {
+            results.extend(reader.push(chunk));
+            assert!(
+                reader.pending.len() <= 64 * 1024 + 3 + 4,
+                "the skipped body was buffered"
+            );
+        }
+        assert_eq!(results.len(), 2, "{results:?}");
+        let err = results[0].as_ref().expect_err("too large");
         assert!(err.0.contains("too large"), "{err}");
+        assert_eq!(results[1].as_ref().unwrap(), &json!(["set_pid", 1, [9]]));
+    }
+
+    #[test]
+    fn a_packet_that_does_not_decode_is_skipped() {
+        let mut bad = Vec::new();
+        write_u32(&mut bad, 8);
+        write_u32(&mut bad, 0xEE);
+        write_u32(&mut bad, 0);
+        bad.extend_from_slice(&frame_packet(&json!("ok")).unwrap());
+        let results = PacketReader::default().push(&bad);
+        assert_eq!(results.len(), 2, "{results:?}");
+        assert!(results[0].is_err());
+        assert_eq!(results[1].as_ref().unwrap(), &json!("ok"));
     }
 
     /// A peer chooses the element counts. A twelve-byte packet must not make the decoder

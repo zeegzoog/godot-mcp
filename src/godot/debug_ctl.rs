@@ -325,10 +325,10 @@ fn parse_variable(data: &[Value]) -> Value {
 }
 
 async fn recv_named(
-    rx: &mut broadcast::Receiver<GameMessage>,
+    rx: &mut broadcast::Receiver<Arc<GameMessage>>,
     name: &str,
     wait: Duration,
-) -> Result<GameMessage> {
+) -> Result<Arc<GameMessage>> {
     let deadline = tokio::time::Instant::now() + wait;
     loop {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());

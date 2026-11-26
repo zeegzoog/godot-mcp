@@ -5,6 +5,7 @@
 
 use super::shaders::{random_uid, uid_text};
 use super::{EditorChoice, ToolManager, str_arg};
+use crate::bridge_protocol::for_editor;
 use crate::cli_runner::{ClassKind, SettingType};
 use crate::error::McpError;
 use crate::godot::{UidCacheUpdate, record_uids};
@@ -14,77 +15,63 @@ use serde_json::{Value, json};
 use std::io::{ErrorKind, Write};
 use std::path::Path;
 
-pub fn handles(name: &str) -> bool {
-    matches!(
-        name,
-        "godot_create_project"
-            | "godot_create_scene"
-            | "godot_attach_script"
-            | "godot_connect_signal"
-            | "godot_list_signals"
-            | "godot_create_resource"
-            | "godot_set_project_setting"
-            | "godot_get_project_settings"
-    )
-}
-
 pub fn catalog() -> Vec<Tool> {
     vec![
         tool(
             "godot_create_project",
-            "Creates a minimal Godot 4 project without an engine or editor. Accepts a new or existing directory (documentation and assets are preserved). Never replaces project.godot. Does not install the editor bridge or create a main scene.",
-            json!({"project_path": s("Absolute directory path, without parent traversal."), "name": s("Non-empty project display name.")}),
+            "Creates a minimal Godot 4 project without an engine, in a new or existing directory (files kept). Never replaces project.godot; installs no bridge or main scene.",
+            json!({"project_path": s("Absolute directory without .. segments."), "name": s("Non-empty project display name.")}),
             &["project_path", "name"],
-        ),
+        ).additive_idempotent(),
         tool(
             "godot_create_scene",
-            "Creates a .tscn with one root node and opens it in the editor when the bridge is connected. Refuses to replace an existing scene. Without the editor, writes the file directly.",
+            "Creates a .tscn with one root node (opened in the editor when connected, else written directly). Refuses an existing scene.",
             json!({"scene_path": s("res:// path ending in .tscn"), "root_type": s("Default Node2D."), "root_name": s("Default Root."), "project_path": s("")}),
             &["scene_path"],
-        ),
+        ).additive_idempotent(),
         tool(
             "godot_attach_script",
-            "Attaches a script to a node in the edited scene (undoable). The script must exist in the project. Pass an empty script_path to detach.",
+            "Attaches an existing project script to a node in the edited scene (undoable); empty script_path detaches.",
             json!({"node_path": s(""), "script_path": s("res:// path, or empty to detach."), "make_editable": super::make_editable_param()}),
             &["node_path"],
-        ),
+        ).destructive_idempotent(),
         tool(
             "godot_connect_signal",
-            "Connects a signal inside the edited scene with CONNECT_PERSIST (undoable). The target must already have the method (attach its script first); a connection that exists is refused.",
+            "Connects a signal in the edited scene with CONNECT_PERSIST (undoable). The target must already have the method (attach its script first); an existing connection is refused.",
             json!({"node_path": s(""), "signal_name": s(""), "target_path": s("Default: the same node."), "method": s(""), "make_editable": super::make_editable_param()}),
             &["node_path", "signal_name", "method"],
-        ),
+        ).additive_idempotent(),
         tool(
             "godot_list_signals",
             "Lists signals of a node in the edited scene.",
             json!({"node_path": s("")}),
             &[],
-        ),
+        ).read_only(),
         tool(
             "godot_create_resource",
-            "Creates a Resource .tres of a built-in class. Never replaces an existing file. Uses the editor when connected; without it, writes an empty resource as text (with a uid and an empty [resource] section, as Godot saves one), loads it in a headless Godot to check it, and removes it again with an error when Godot cannot load it.",
+            "Creates a .tres of a built-in Resource class; never replaces a file. Uses the editor when connected; else writes it with a uid and removes it with an error if a headless Godot cannot load it.",
             json!({"resource_path": s(""), "class_name": s("For example StandardMaterial3D."), "project_path": s("")}),
             &["resource_path", "class_name"],
-        ),
+        ).additive_idempotent(),
         tool(
             "godot_get_project_settings",
-            "Reads project settings. Uses the live editor when connected, otherwise the keys stored in project.godot.",
+            "Reads project settings: the live editor's when connected, else the keys in project.godot.",
             json!({"prefix": s("Optional key prefix."), "project_path": s("")}),
             &[],
-        ),
+        ).read_only(),
         tool(
             "godot_set_project_setting",
-            "Sets one project setting and saves it, or removes it. Uses the live editor when connected. Pass exactly one of value, value_text and remove: true. value is a string, number, boolean, array or object, of the type the setting has: the stored one, else the engine's definition of the setting (a feature override such as name.mobile has the type of name); importer_defaults/<importer> (the Import dock's defaults) is a Dictionary of import options, such as {\"detect_3d/compress_to\": 0} for importer_defaults/texture. A JSON object becomes a Dictionary and an array an Array or a packed array; nested values keep their JSON type (a nested string stays a String, never a Vector4 or a Color) except that a whole number becomes an int. A setting of another type takes a string, with and without the editor: an HTML color or color name (\"#102b38\", \"white\") for a Color, otherwise the text project.godot stores (\"Vector2i(1152, 648)\"). A setting that is neither stored nor defined by the engine takes the type of value, so a string is stored as a String. value_text is a value as project.godot stores it, parsed as Godot reads project.godot, with and without the editor: {\"type\": \"vec4\", \"value\": Vector4(0, -1000, 0, 0)} becomes a Dictionary holding a Vector4 (a global shader uniform under shader_globals/<name>), \"text\" a String; only built-in types are built, an Object or Resource never. A value of another type than the setting's is refused; replace_type: true lets a setting the engine does not define (a project's own, such as shader_globals/<name>) take it. remove: true removes the setting from project.godot (one the engine defines returns to its default). Without the editor, project.godot is written and the engine is asked for the type of a setting and to read value_text. InputMap actions (input/...) are changed with godot_edit_input_action.",
+            "Sets and saves one project setting, or removes it (editor when connected, else project.godot). Pass exactly one of value, value_text, remove: true. value must have the setting's type (stored, else engine-defined, else value's): objects become Dictionaries, arrays Arrays, whole numbers int, nested values keep their JSON type (use value_text for a nested Vector4 or Color); other types take a string (an HTML color, or project.godot text). A feature override (name.mobile) has the type of name; importer_defaults/<importer> takes a Dictionary of import options. value_text is project.godot text (built-in types only, e.g. a shader_globals Dictionary with a Vector4). A type mismatch is refused unless replace_type is true for a setting the engine does not define. remove: true deletes it (engine settings return to default). input/... actions: godot_edit_input_action.",
             json!({
                 "key": s("For example application/config/name."),
                 "value": {"description": "String, number, boolean, array or object."},
-                "value_text": s("A value as project.godot stores it, such as Vector2i(1152, 648) or {\"type\": \"vec4\", \"value\": Vector4(0, -1000, 0, 0)}. Instead of value."),
-                "replace_type": {"type": "boolean", "description": "Store a value of another type than the stored one, for a setting the engine does not define. Default false."},
-                "remove": {"type": "boolean", "description": "Remove the setting instead of setting it. Default false."},
+                "value_text": s("Instead of value: project.godot text, e.g. {\"type\": \"vec4\", \"value\": Vector4(0, -1000, 0, 0)}."),
+                "replace_type": {"type": "boolean", "description": "Allow another type for a setting the engine does not define. Default false."},
+                "remove": {"type": "boolean", "description": "Remove the setting. Default false."},
                 "project_path": s("")
             }),
             &["key"],
-        ),
+        ).destructive_idempotent(),
     ]
 }
 
@@ -96,7 +83,7 @@ fn s(description: &str) -> Value {
     }
 }
 
-fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> Tool {
+fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> super::ToolDraft {
     super::tool(name, description, properties, required)
 }
 
@@ -184,7 +171,7 @@ async fn create_scene(tools: &ToolManager, args: &Value) -> ToolResult {
     }
     match tools
         .bridge
-        .send_command("create_scene", args.clone())
+        .send_command("create_scene", for_editor(args, &[]))
         .await
     {
         Ok(value) => editor_answer(&choice, value),
@@ -237,7 +224,10 @@ async fn write_scene(tools: &ToolManager, args: &Value) -> ToolResult {
             );
         }
     };
-    let body = format!("[gd_scene format=3]\n\n[node name=\"{root_name}\" type=\"{root_type}\"]\n");
+    let body = format!(
+        "[gd_scene format=3]\n\n[node name={} type=\"{root_type}\"]\n",
+        godot_string(&root_name)
+    );
     match create_new_file(&file, &body) {
         Ok(()) => {}
         Err(error) if error.kind() == ErrorKind::AlreadyExists => {
@@ -254,7 +244,8 @@ async fn write_scene(tools: &ToolManager, args: &Value) -> ToolResult {
         }
     }
     ToolResult::text(format!(
-        "Created {scene_path} ({root_type}) in {} as text, because no editor has this project open.",
+        "Created {scene_path} ({root_type}, root node named {}) in {} as text, because no editor has this project open.",
+        serde_json::to_string(&root_name).unwrap_or_default(),
         project.display()
     ))
 }
@@ -271,7 +262,7 @@ async fn create_resource(tools: &ToolManager, args: &Value) -> ToolResult {
     } else {
         tools
             .bridge
-            .send_command("create_resource", args.clone())
+            .send_command("create_resource", for_editor(args, &[]))
             .await
     };
     match sent {
@@ -406,24 +397,24 @@ fn class_check_failed(error: &McpError) -> ToolResult {
     )
 }
 
-/// A node name as Godot keeps it: the characters it forbids in a name become `_`. The name is
-/// data and goes into the scene file as a quoted value (TL-5).
+/// A node name as Godot keeps it: the characters it forbids in a name (`. : @ / " %`) become
+/// `_`, as `Node.name` does in the editor; every other character stays, and an empty name is
+/// `Root`, as in the editor's `create_scene`. NUL, which a Godot string cannot hold, becomes `_`
+/// too. The name is data: it goes into the scene file as an escaped, quoted value (TL-5).
 fn node_name(requested: &str) -> String {
-    let cleaned: String = requested
+    if requested.is_empty() {
+        return "Root".to_string();
+    }
+    requested
         .chars()
         .map(|c| {
-            if c.is_control() || matches!(c, '.' | ':' | '@' | '/' | '"' | '%') {
+            if matches!(c, '.' | ':' | '@' | '/' | '"' | '%' | '\0') {
                 '_'
             } else {
                 c
             }
         })
-        .collect();
-    if cleaned.trim().is_empty() {
-        "Root".to_string()
-    } else {
-        cleaned
-    }
+        .collect()
 }
 
 async fn editor_or_error(tools: &ToolManager, command: &str, args: &Value) -> ToolResult {
@@ -507,7 +498,7 @@ async fn set_setting(tools: &ToolManager, args: &Value) -> ToolResult {
     } else {
         tools
             .bridge
-            .send_command("set_project_setting", args.clone())
+            .send_command("set_project_setting", for_editor(args, &[]))
             .await
     };
     match sent {
@@ -558,7 +549,7 @@ async fn get_settings(tools: &ToolManager, args: &Value) -> ToolResult {
     } else {
         tools
             .bridge
-            .send_command("get_project_settings", args.clone())
+            .send_command("get_project_settings", for_editor(args, &[]))
             .await
     };
     match sent {

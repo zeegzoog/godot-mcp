@@ -9,6 +9,7 @@ use crate::paths::{is_valid_identifier, res_display, resolve_in_project};
 use crate::protocol::{Tool, ToolAnnotations, ToolContent, ToolResult};
 use crate::validation::validate_arguments;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
@@ -113,16 +114,16 @@ impl ToolManager {
 
     /// Return the list of all registered tools with their input schemas
     pub fn list_tools() -> Vec<Tool> {
-        tool_catalog().to_vec()
+        registry().tools.clone()
     }
 
     pub fn has_tool(name: &str) -> bool {
-        tool_catalog().iter().any(|tool| tool.name == name)
+        registry().find(name).is_some()
     }
 
     /// Dispatch tool calls to live bridge or CLI runner
     pub async fn call_tool(self: Arc<Self>, name: &str, args: Value) -> ToolResult {
-        let Some(tool) = tool_catalog().iter().find(|tool| tool.name == name) else {
+        let Some((tool, module)) = registry().find(name) else {
             return ToolResult::error(
                 format!("Tool '{name}' is not recognized"),
                 &["Check tool name spelling against tools/list"],
@@ -137,7 +138,33 @@ impl ToolManager {
             return result;
         }
 
-        let result = match name {
+        let result = match module {
+            Module::Manager => self.call_manager(name, args).await,
+            Module::Authoring => authoring::call(&self, name, args).await,
+            Module::InputMap => input_map::call(&self, name, args).await,
+            Module::Files => files::call(&self, args).await,
+            Module::FileMove => file_move::call(&self, args).await,
+            Module::Scripts => scripts::call(&self, name, args).await,
+            Module::Shaders => shaders::call(&self, name, args).await,
+            Module::Game => game::call(&self, name, args).await,
+            Module::Code => code::call(&self, name, args).await,
+            Module::Export => export::call(&self, name, args).await,
+            Module::PackRun => pack_run::call(&self, args).await,
+            Module::AddonUpdate => addon_update::call(&self, args).await,
+            Module::ImportParams => import_params::call(&self, name, args).await,
+            Module::Review => review::call(&self, args).await,
+            Module::ResourceProps => resource_props::call(&self, args).await,
+            Module::WorldMap => world_map::call(&self, args).await,
+        };
+        let result = addon_update::explain_unknown_command(&self, name, result).await;
+        let result = addon_update::flag_other_build(&self, name, result).await;
+        self.observe(name, &result, EvidenceKind::Error);
+        result
+    }
+
+    /// The tools this file and the feedback channel declare, handled by the manager itself.
+    async fn call_manager(self: &Arc<Self>, name: &str, args: Value) -> ToolResult {
+        match name {
             "godot_get_version" => self.handle_get_version().await,
             "godot_get_project_info" => self.handle_bridge_call("get_project_info", args).await,
             "godot_launch_editor" => self.handle_launch_editor(args).await,
@@ -162,21 +189,6 @@ impl ToolManager {
             "godot_validate_script" => self.handle_validate_script(args).await,
             "godot_run_script" => self.handle_run_script(args).await,
             "godot_resave_resources" => self.handle_resave_resources(args).await,
-            name if authoring::handles(name) => authoring::call(&self, name, args).await,
-            name if input_map::handles(name) => input_map::call(&self, name, args).await,
-            name if files::handles(name) => files::call(&self, args).await,
-            name if file_move::handles(name) => file_move::call(&self, args).await,
-            name if scripts::handles(name) => scripts::call(&self, name, args).await,
-            name if shaders::handles(name) => shaders::call(&self, name, args).await,
-            name if game::handles(name) => game::call(&self, name, args).await,
-            name if code::handles(name) => code::call(&self, name, args).await,
-            name if export::handles(name) => export::call(&self, name, args).await,
-            name if pack_run::handles(name) => pack_run::call(&self, args).await,
-            name if addon_update::handles(name) => addon_update::call(&self, args).await,
-            name if import_params::handles(name) => import_params::call(&self, name, args).await,
-            name if review::handles(name) => review::call(&self, args).await,
-            name if resource_props::handles(name) => resource_props::call(&self, args).await,
-            name if world_map::handles(name) => world_map::call(&self, args).await,
             feedback::NOTE => self.handle_note_feedback(args).await,
             feedback::DRAFT => self.handle_draft_feedback(args).await,
             feedback::SUBMIT => self.handle_submit_feedback(args).await,
@@ -184,24 +196,26 @@ impl ToolManager {
                 format!("Tool '{name}' has no handler"),
                 &["This is a server bug; report it with the tool name"],
             ),
-        };
-        let result = addon_update::explain_unknown_command(&self, name, result).await;
-        let result = addon_update::flag_other_build(&self, name, result).await;
-        self.observe(name, &result, EvidenceKind::Error);
-        result
+        }
     }
 
     async fn handle_get_version(&self) -> ToolResult {
         // Try live editor bridge first
         match self.bridge.send_command("get_version", json!({})).await {
-            Ok(result) => {
+            Ok(mut result) => {
+                // The command list is for the bridge client, and long.
+                if let Some(fields) = result.as_object_mut() {
+                    fields.remove("commands");
+                }
                 return ToolResult::text(format!(
                     "Godot Engine (Live Editor Connected):\n{}",
                     serde_json::to_string_pretty(&result).unwrap_or_default()
                 ));
             }
             // An editor that answers with an error (e.g. a token problem) must not be hidden.
-            Err(error @ McpError::ToolExecution(_)) => return bridge_error_result(&error),
+            Err(error @ (McpError::ToolExecution(_) | McpError::CodedToolExecution { .. })) => {
+                return bridge_error_result(&error);
+            }
             Err(_) => {}
         }
 
@@ -575,7 +589,7 @@ const MAX_USER_ARGS: usize = 32;
 fn make_editable_param() -> Value {
     json!({
         "type": "boolean",
-        "description": "Turn on Editable Children (Scene > Editable Children) for every instanced scene the node lies in whose children are not editable, in the same undo action; without it such an edit is refused, because Godot would drop it when the scene is saved. The answer lists them in made_editable."
+        "description": "Turn on Editable Children of the instances the node lies in (same undo action); else the edit is refused. Listed in made_editable."
     })
 }
 const MAX_USER_ARG_CHARS: usize = 256;
@@ -692,27 +706,40 @@ const RUN_ENDED_HINTS: &[&str] = &[
 ];
 
 /// Turns a bridge failure into a tool error whose recovery hints match what actually failed.
+/// Its kind is also given machine-readably in `structuredContent.error.code` (docs/tools.md,
+/// "Error codes").
 fn bridge_error_result(error: &McpError) -> ToolResult {
     match error {
-        McpError::BridgeUnavailable(detail) => ToolResult::error(
-            format!("The Godot Editor bridge is not reachable ({detail})"),
-            &[
-                "Launch Godot Editor with your project (godot_launch_editor can do it)",
-                "Ensure 'Godot MCP Bridge' plugin is enabled in Project Settings -> Plugins",
-                "Start this server in the editor's project directory so both derive the same port, or set the addon's project setting godot_mcp/bridge_port to the port named in the error (the editor's Output panel shows the port it listens on)",
-            ],
-        ),
+        McpError::BridgeUnavailable(detail) => {
+            let message = format!("The Godot Editor bridge is not reachable ({detail})");
+            ToolResult::error(
+                message.clone(),
+                &[
+                    "Launch Godot Editor with your project (godot_launch_editor can do it)",
+                    "Ensure 'Godot MCP Bridge' plugin is enabled in Project Settings -> Plugins",
+                    "Start this server in the editor's project directory so both derive the same port, or set the addon's project setting godot_mcp/bridge_port to the port named in the error (the editor's Output panel shows the port it listens on)",
+                ],
+            )
+            .with_error_code("BRIDGE_UNAVAILABLE", &message, None)
+        }
         McpError::Bridge(detail) => ToolResult::error(
             detail.clone(),
             &[
                 "The editor may be busy (importing, modal dialog) or restarting; retry in a moment",
                 "Look for [Godot MCP] messages in the editor's Output panel",
             ],
-        ),
-        McpError::ToolExecution(message) => {
-            ToolResult::error(message.clone(), editor_error_hints(message))
+        )
+        .with_error_code("BRIDGE_ERROR", detail, None),
+        McpError::CodedToolExecution { code, message } => {
+            let hints = editor_code_hints(code).unwrap_or_else(|| editor_error_hints(message));
+            ToolResult::error(message.clone(), hints).with_error_code(code, message, None)
         }
-        McpError::RunEnded(report) => ToolResult::error(report.clone(), RUN_ENDED_HINTS),
+        McpError::ToolExecution(message) => with_runtime_code(
+            ToolResult::error(message.clone(), editor_error_hints(message)),
+            error,
+        ),
+        McpError::RunEnded(report) => ToolResult::error(report.clone(), RUN_ENDED_HINTS)
+            .with_error_code("RUN_ENDED", report, None),
         McpError::Process(detail) => ToolResult::error(
             format!("Engine process error: {detail}"),
             &["Verify GODOT_PATH points to a working Godot executable"],
@@ -724,12 +751,78 @@ fn bridge_error_result(error: &McpError) -> ToolResult {
     }
 }
 
-/// The `code` of a failure the running game reported, which arrives as a JSON object.
-fn runtime_code(message: &str) -> Option<String> {
+/// A failure the running game reported, which arrives as a JSON object with a `code`.
+fn runtime_report(message: &str) -> Option<(String, Value)> {
     let value: Value = serde_json::from_str(message).ok()?;
-    value.get("code")?.as_str().map(str::to_string)
+    let code = value.get("code")?.as_str()?.to_string();
+    Some((code, value))
 }
 
+/// The `code` of a failure the running game reported.
+fn runtime_code(message: &str) -> Option<String> {
+    runtime_report(message).map(|(code, _)| code)
+}
+
+/// Gives an error result built from a running game's failure that failure's code in
+/// `structuredContent`, with the game's `message` and `data`. Other results are returned as
+/// they are.
+pub(crate) fn with_runtime_code(result: ToolResult, error: &McpError) -> ToolResult {
+    let McpError::ToolExecution(raw) = error else {
+        return result;
+    };
+    if result.structured_content.is_some() {
+        return result;
+    }
+    let Some((code, report)) = runtime_report(raw) else {
+        return result;
+    };
+    let message = report
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or(raw)
+        .to_string();
+    let extra = report.get("data").map(|data| json!({ "data": data }));
+    result.with_error_code(&code, &message, extra)
+}
+
+/// Recovery hints for an error code the editor's addon sent. `None` for a code this server does
+/// not know, whose hints then come from the message.
+fn editor_code_hints(code: &str) -> Option<&'static [&'static str]> {
+    Some(match code {
+        "UNAUTHORIZED" => &[
+            "Restart the MCP client so the server re-reads the bridge token",
+            "Run the MCP server and the Godot editor as the same OS user, or set the same GODOT_MCP_TOKEN for both",
+        ],
+        "NO_SCENE" => &["Open a scene first with godot_open_scene"],
+        "UNSAVED_CHANGES" => &[
+            "Save the script in the editor (Ctrl+S) or discard its changes, then call godot_read_script again and repeat the edit",
+        ],
+        "STALE_TAB" => &[
+            "Save or reload the script in the editor so that it matches the file, then call godot_read_script again",
+        ],
+        "EDITOR_STATE_UNMATCHED" => &[
+            "Close the extra tabs in the script editor (help pages, text files), or save the script, then read it again",
+        ],
+        "EXISTS" => &["Choose another path; an existing file is never replaced"],
+        "WRITE_FAILED" => &[
+            "Check that the folder exists or can be created inside the project and that it is writable, then retry",
+        ],
+        "SETTING_TYPE" => &[
+            "Send a value of the type the setting already has, or change it in the editor's Project Settings",
+        ],
+        "NOT_FOUND" => &["Verify the path with godot_get_scene_tree or godot_get_open_scenes"],
+        "BAD_PARAMS" => &[
+            "Fix the parameter the message names; its type is in the tool's inputSchema from tools/list",
+        ],
+        "UNKNOWN_COMMAND" => &[
+            "The editor's addon is older than this server: update it with godot_update_addon (restart_editor: true while the editor has the project open)",
+        ],
+        _ => return None,
+    })
+}
+
+/// Recovery hints chosen from the message, for running-game codes and for addons that send no
+/// code (older than the codes, or a failure without one).
 fn editor_error_hints(message: &str) -> &'static [&'static str] {
     if let Some(code) = runtime_code(message) {
         return match code.as_str() {
@@ -750,55 +843,98 @@ fn editor_error_hints(message: &str) -> &'static [&'static str] {
             _ => &["Read the message; the running game refused the request"],
         };
     }
+    message_code(message)
+        .and_then(editor_code_hints)
+        .unwrap_or(&["Correct the arguments according to the message above and retry"])
+}
+
+/// The code an addon without error codes means, read from the words of its message. Used only
+/// to choose hints: such an error gets no `structuredContent`.
+fn message_code(message: &str) -> Option<&'static str> {
     let lower = message.to_lowercase();
-    if lower.contains("unauthorized") {
-        &[
-            "Restart the MCP client so the server re-reads the bridge token",
-            "Run the MCP server and the Godot editor as the same OS user, or set the same GODOT_MCP_TOKEN for both",
-        ]
-    } else if lower.contains("no active scene") {
-        &["Open a scene first with godot_open_scene"]
-    } else if lower.contains("unsaved changes") {
-        &[
-            "Save the script in the editor (Ctrl+S) or discard its changes, then call godot_read_script again and repeat the edit",
-        ]
-    } else if lower.contains("differs from the file") {
-        &[
-            "Save or reload the script in the editor so that it matches the file, then call godot_read_script again",
-        ]
-    } else if lower.contains("cannot be matched") {
-        &[
-            "Close the extra tabs in the script editor (help pages, text files), or save the script, then read it again",
-        ]
-    } else if lower.contains("already exists") {
-        &["Choose another path; an existing file is never replaced"]
-    } else if lower.contains("can't open") || lower.contains("failed to save") {
-        &[
-            "Check that the folder exists or can be created inside the project and that it is writable, then retry",
-        ]
-    } else if lower.contains("expects a") {
-        &[
-            "Send a value of the type the setting already has, or change it in the editor's Project Settings",
-        ]
-    } else if lower.contains("not found")
-        || lower.contains("does not exist")
-        || lower.contains("not currently open")
-    {
-        &["Verify the path with godot_get_scene_tree or godot_get_open_scenes"]
+    let has = |words: &str| lower.contains(words);
+    Some(if has("unauthorized") {
+        "UNAUTHORIZED"
+    } else if has("no active scene") {
+        "NO_SCENE"
+    } else if has("unsaved changes") {
+        "UNSAVED_CHANGES"
+    } else if has("differs from the file") {
+        "STALE_TAB"
+    } else if has("cannot be matched") {
+        "EDITOR_STATE_UNMATCHED"
+    } else if has("already exists") {
+        "EXISTS"
+    } else if has("can't open") || has("failed to save") {
+        "WRITE_FAILED"
+    } else if has("expects a") {
+        "SETTING_TYPE"
+    } else if has("not found") || has("does not exist") || has("not currently open") {
+        "NOT_FOUND"
     } else {
-        &["Correct the arguments according to the message above and retry"]
-    }
+        return None;
+    })
 }
 
 /// Which feedback tools the catalog holds; set once at start-up by `configure_catalog`.
 static CATALOG_MODE: OnceLock<FeedbackMode> = OnceLock::new();
 
-fn tool_catalog() -> &'static [Tool] {
-    static CATALOG: OnceLock<Vec<Tool>> = OnceLock::new();
-    CATALOG.get_or_init(|| build_catalog(CATALOG_MODE.get().copied().unwrap_or_default()))
+/// The module whose `call` handles a tool; `Manager` is `ToolManager::call_manager`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Module {
+    Manager,
+    Authoring,
+    ResourceProps,
+    InputMap,
+    Files,
+    FileMove,
+    Scripts,
+    Shaders,
+    AddonUpdate,
+    Game,
+    Code,
+    Export,
+    PackRun,
+    ImportParams,
+    Review,
+    WorldMap,
 }
 
-fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> Tool {
+/// The listed tools, in `tools/list` order, and the module that handles each one by name.
+struct Registry {
+    tools: Vec<Tool>,
+    owners: HashMap<String, (usize, Module)>,
+}
+
+impl Registry {
+    fn new(catalog: Vec<(Module, Vec<Tool>)>) -> Self {
+        let mut tools = Vec::new();
+        let mut owners = HashMap::new();
+        for (module, declared) in catalog {
+            for tool in declared {
+                owners.insert(tool.name.clone(), (tools.len(), module));
+                tools.push(tool);
+            }
+        }
+        Self { tools, owners }
+    }
+
+    fn find(&self, name: &str) -> Option<(&Tool, Module)> {
+        let &(index, module) = self.owners.get(name)?;
+        Some((self.tools.get(index)?, module))
+    }
+}
+
+fn registry() -> &'static Registry {
+    static REGISTRY: OnceLock<Registry> = OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        Registry::new(build_catalog(
+            CATALOG_MODE.get().copied().unwrap_or_default(),
+        ))
+    })
+}
+
+fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> ToolDraft {
     // Closed, so a misspelled or invented key is refused instead of silently ignored.
     let mut input_schema = json!({
         "type": "object",
@@ -808,476 +944,487 @@ fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> 
     if !required.is_empty() {
         input_schema["required"] = json!(required);
     }
-    Tool {
-        name: name.into(),
-        description: description.into(),
-        input_schema,
-        annotations: annotations(name),
+    ToolDraft {
+        tool: Tool {
+            name: name.into(),
+            description: description.into(),
+            input_schema,
+            annotations: None,
+        },
+        open_world: false,
     }
 }
 
-/// Hints for a listed tool. Read-only means it changes nothing in the project,
-/// the editor, a running game or files on disk; scratch state kept by this
-/// server (screenshot baselines) does not count. Destructive means it may
-/// overwrite or remove something there, or run code that can. Idempotent means
-/// repeating the call with the same arguments changes nothing more. Only
-/// godot_submit_feedback reaches outside this machine. A tool missing here is
-/// listed without hints, which hosts read as the most cautious defaults.
-fn annotations(name: &str) -> Option<ToolAnnotations> {
-    let [read_only, destructive, idempotent] = match name {
-        "godot_get_version"
-        | "godot_get_project_info"
-        | "godot_get_run_status"
-        | "godot_get_scene_tree"
-        | "godot_get_open_scenes"
-        | "godot_get_node_properties"
-        | "godot_validate_script"
-        | "godot_list_signals"
-        | "godot_get_project_settings"
-        | "godot_get_input_map"
-        | "godot_read_script"
-        | "godot_read_shader"
-        | "godot_validate_shader"
-        | "godot_run_output"
-        | "godot_game_tree"
-        | "godot_game_get"
-        | "godot_game_signals"
-        | "godot_game_observe"
-        | "godot_game_snapshot"
-        | "godot_game_state"
-        | "godot_game_screenshot"
-        | "godot_game_probe"
-        | "godot_debug_state"
-        | "godot_code_diagnostics"
-        | "godot_code_complete"
-        | "godot_code_symbols"
-        | "godot_code_definition"
-        | "godot_code_references"
-        | "godot_list_export_presets"
-        | "godot_get_import_params" => [true, false, true],
-        "godot_capture_viewport"
-        | "godot_review_assets"
-        | "godot_world_map"
-        | "godot_resave_resources"
-        | "godot_create_project"
-        | "godot_create_scene"
-        | "godot_connect_signal"
-        | "godot_create_resource"
-        | "godot_game_input_release"
-        | "godot_game_wait"
-        | "godot_debug_breakpoints" => [false, false, true],
-        "godot_launch_editor"
-        | "godot_run_project"
-        | "godot_run_pack"
-        | "godot_add_node"
-        | "godot_game_input"
-        | "godot_game_physics"
-        | "godot_game_scenario"
-        | "godot_game_record"
-        | "godot_debug_control"
-        | "godot_note_feedback"
-        | "godot_draft_feedback"
-        | "godot_submit_feedback" => [false, false, false],
-        "godot_stop_project"
-        | "godot_remove_node"
-        | "godot_set_node_properties"
-        | "godot_set_resource_properties"
-        | "godot_open_scene"
-        | "godot_save_scene"
-        | "godot_create_script"
-        | "godot_create_shader"
-        | "godot_attach_script"
-        | "godot_set_project_setting"
-        | "godot_edit_input_action"
-        | "godot_set_export_preset"
-        | "godot_set_import_params"
-        | "godot_delete_file"
-        | "godot_update_addon"
-        | "godot_game_set" => [false, true, true],
-        "godot_run_script"
-        | "godot_edit_script"
-        | "godot_edit_shader"
-        | "godot_game_call"
-        | "godot_game_command"
-        | "godot_game_run_script"
-        | "godot_close_editor"
-        | "godot_move_file"
-        | "godot_export_project" => [false, true, false],
-        _ => return None,
-    };
-    Some(ToolAnnotations {
-        read_only_hint: read_only,
-        destructive_hint: destructive,
-        idempotent_hint: idempotent,
-        open_world_hint: name == "godot_submit_feedback",
-    })
+/// A tool that does not yet say what it does to the project: only one of the hint methods turns
+/// it into a listed `Tool`, so every tool states its hints where it is declared.
+///
+/// Read-only means it changes nothing in the project, the editor, a running game or files on
+/// disk; scratch state kept by this server (screenshot baselines) does not count. Destructive
+/// means it may overwrite or remove something there, or run code that can. Idempotent means
+/// repeating the call with the same arguments changes nothing more. Only godot_submit_feedback
+/// reaches outside this machine.
+#[must_use = "a tool is listed only once its hints are set"]
+struct ToolDraft {
+    tool: Tool,
+    open_world: bool,
 }
 
-fn build_catalog(feedback_mode: FeedbackMode) -> Vec<Tool> {
-    let mut tools = vec![
+impl ToolDraft {
+    /// Reaches a service outside this machine.
+    fn open_world(mut self) -> Self {
+        self.open_world = true;
+        self
+    }
+
+    fn read_only(self) -> Tool {
+        self.hints(true, false, true)
+    }
+
+    fn additive_idempotent(self) -> Tool {
+        self.hints(false, false, true)
+    }
+
+    fn additive(self) -> Tool {
+        self.hints(false, false, false)
+    }
+
+    fn destructive_idempotent(self) -> Tool {
+        self.hints(false, true, true)
+    }
+
+    fn destructive(self) -> Tool {
+        self.hints(false, true, false)
+    }
+
+    fn hints(self, read_only: bool, destructive: bool, idempotent: bool) -> Tool {
+        Tool {
+            annotations: Some(ToolAnnotations {
+                read_only_hint: read_only,
+                destructive_hint: destructive,
+                idempotent_hint: idempotent,
+                open_world_hint: self.open_world,
+            }),
+            ..self.tool
+        }
+    }
+}
+
+fn build_catalog(feedback_mode: FeedbackMode) -> Vec<(Module, Vec<Tool>)> {
+    let tools = vec![
         tool(
             "godot_get_version",
-            "Retrieves the Godot Engine version and build information.",
+            "Godot Engine version and build information.",
             json!({}),
             &[],
-        ),
+        ).read_only(),
         tool(
             "godot_get_project_info",
-            "Reports the name, main scene, enabled features and directory of the project open in the live editor. Requires the editor bridge.",
+            "Name, main scene, enabled features and directory of the project open in the editor. Requires the editor bridge.",
             json!({}),
             &[],
-        ),
+        ).read_only(),
         tool(
             "godot_launch_editor",
-            "Launches the Godot Editor for a project directory. Without project_path, opens the project the server was started in (its working directory or a parent of it, or the only subdirectory that contains project.godot).",
+            "Launches the Godot Editor for a project. Without project_path, opens the project the server was started in (its working directory or a parent, or the only subfolder with project.godot).",
             json!({
                 "project_path": {
                     "type": "string",
-                    "description": "Absolute path to the Godot project directory containing project.godot. Optional when the server runs inside the project."
+                    "description": "Absolute project directory (holding project.godot). Optional inside the project."
                 }
             }),
             &[],
-        ),
+        ).additive(),
         tool(
             "godot_close_editor",
-            "Closes the Godot Editor of a project and waits until its process has exited. The project is project_path, else the project the server was started in, else the connected editor's own. An editor connected to the bridge is asked to quit without saving anything: when it has unsaved scenes or scripts it stays open and the answer lists them, unless discard is true, which closes it and loses them. An editor that has another project open is never closed. Without a connected editor, only an editor this server launched with godot_launch_editor for the project can be stopped, by its PID, and only with discard true, since its unsaved changes cannot be checked.",
+            "Closes a project's editor (project_path, else the server's project, else the connected editor's) and waits for its process to exit. A connected editor quits without saving: with unsaved scenes or scripts it stays open and the answer lists them, unless discard is true. An editor that has another project open is never closed. Without a connected editor, only an editor godot_launch_editor started can be stopped, by its PID, and only with discard true.",
             json!({
                 "project_path": {
                     "type": "string",
-                    "description": "Absolute path to the project directory whose editor should close. Optional when the server runs inside the project."
+                    "description": "Project directory. Optional inside the project."
                 },
                 "discard": {
                     "type": "boolean",
-                    "description": "Close even when the editor has unsaved scenes or scripts, losing those changes. Required to stop a launched editor that is not connected to the bridge. Default false."
+                    "description": "Close despite unsaved scenes or scripts, losing them. Required to stop a launched editor not connected to the bridge. Default false."
                 },
                 "timeout_seconds": {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 120,
-                    "description": "How long to wait for the editor process to exit. Default 30."
+                    "description": "Seconds to wait for the process to exit. Default 30."
                 }
             }),
             &[],
-        ),
+        ).destructive(),
         tool(
             "godot_run_project",
-            "Runs the Godot project or a specific scene. Uses the live editor's Play mode when the bridge is connected. Otherwise starts a managed process (debugger attached) that godot_stop_project can stop. held true (with mode process) starts the game held at its first physics tick at a fixed frame rate equal to the project's tick rate, so godot_game_physics steps are exact. user_args (mode process only) are strings placed after --, so the game reads them with OS.get_cmdline_user_args() and Godot does not treat them as engine options. mode auto and editor Play reject user_args instead of dropping them. movie (mode process only) records the run with Godot's Movie Maker: it adds --write-movie <path>, --fixed-fps <fps> and, with quit_after_frames, --quit-after <frames> to the engine options before --, so user_args still reach the game. path ending in .avi writes MJPEG video with the game's audio; .png writes one image per frame (name00000000.png, name00000001.png, ...) and the audio in name.wav. The path is a res:// or project-relative path, or an absolute path inside the project; outside it only inside the folder the person set with GODOT_MCP_MOVIE_DIR (or --movie-dir). Its folder is created, and a folder created inside the project gets a .gdignore so the editor does not import the frames. An earlier recording at the same path is refused unless overwrite is true, which deletes it first. Movie Maker is deterministic and not real time: every frame advances game time by exactly 1/fps however long it takes to draw and encode, so the run is usually slower than real time on screen, timers, physics and animations follow game time, and the same input gives the same frames. The game's input and inspection tools (godot_game_input, godot_game_scenario, godot_game_tree, godot_game_call and the rest) still work during the recording; timed input follows game time. movie cannot be combined with held (a held game draws no frames) or headless (nothing is rendered). The recording ends when the game quits: after quit_after_frames, by itself, or through godot_stop_project, which asks the game to quit first so Godot finishes the file (a killed .avi lacks its frame count and index). godot_get_run_status and godot_stop_project report movie: the path, size_bytes, frames, duration_seconds and finished. Sound is recorded unless the game is started with its own option to mute it (do not pass --no-sound in user_args for a clip that must be heard). Quality, audio mix rate and vsync are project settings (editor/movie_writer/mjpeg_quality, editor/movie_writer/mix_rate, editor/movie_writer/disable_vsync), set with godot_set_project_setting. Before the run, files with a .import sidecar are compared with their .godot/imported cache. When the editor bridge is connected to this project, stale imports are reimported first, the same way godot_resave_resources does. Otherwise the result warns, lists the res:// paths, and names godot_resave_resources. A managed process runs alongside other calls, script runs and other games included; it starts once an import or export running in the same project has finished.",
+            "Runs the main or a given scene: in editor Play when the bridge is connected (mode auto), else or with mode process as a managed debugger-attached process (godot_stop_project stops it). held, user_args and movie need mode process. held starts it held at the first physics tick at a fixed frame rate, for exact godot_game_physics steps. movie records with Movie Maker, not in real time (each frame advances game time 1/fps); not with held or headless. Quality, mix rate and vsync are editor/movie_writer/* project settings. The file is finished when the game quits (quit_after_frames, itself, godot_stop_project); godot_get_run_status reports movie. Stale imports are reimported first when the editor has this project, else warned. A process run waits for an import or export running in the project.",
             json!({
                 "project_path": {
                     "type": "string",
-                    "description": "Path to the project root directory. Only used by the CLI fallback (i.e. when no editor is connected); defaults to the project the server was started in."
+                    "description": "Project directory, used only without an editor. Default: the server's project."
                 },
                 "scene": {
                     "type": "string",
-                    "description": "Optional specific scene path (e.g., 'res://scenes/Main.tscn'). Defaults to the project's main scene."
+                    "description": "res:// scene. Default: the project's main scene."
                 },
                 "breakpoints": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Optional res://script.gd:LINE breakpoints for a process run."
+                    "description": "res://script.gd:LINE breakpoints (process runs)."
                 },
                 "headless": {
                     "type": "boolean",
-                    "description": "Process runs only. When true, start without a window (screenshots will be unavailable)."
+                    "description": "Process runs: start without a window (no screenshots)."
                 },
                 "break_on_errors": {
                     "type": "boolean",
-                    "description": "Process runs only. When true, a script error pauses the game. Default false: the error is still logged, but the game keeps running."
+                    "description": "Process runs: a script error pauses the game. Default false (logged, game keeps running)."
                 },
                 "held": {
                     "type": "boolean",
-                    "description": "Process runs only (needs mode process). Start the game held at its first physics tick, at a fixed frame rate equal to the project's tick rate, so held steps are exact."
+                    "description": "Needs mode process. Start held at the first physics tick, for exact steps."
                 },
                 "mode": {
                     "type": "string",
                     "enum": ["auto", "process"],
-                    "description": "auto (default) uses the live editor when the bridge is connected. process always starts a managed debugger-attached process that godot_stop_project can stop."
+                    "description": "auto (default): editor Play when the bridge is connected, else a process. process: always a managed debugger-attached process."
                 },
                 "user_args": {
                     "type": "array",
                     "items": {"type": "string"},
                     "maxItems": 32,
-                    "description": "Process mode only. Up to 32 strings, each at most 256 characters, passed to the game after --. They are never Godot engine options. Refused unless mode is process."
+                    "description": "Mode process only (refused otherwise). Up to 32 strings of at most 256 characters, passed after --."
                 },
                 "movie": {
                     "type": "object",
-                    "description": "Process mode only. Record the run with Godot's Movie Maker. Not with held or headless.",
+                    "description": "Mode process only; not with held or headless. Record with Godot's Movie Maker.",
                     "properties": {
-                        "path": {"type": "string", "description": "Output file: .avi (MJPEG video with audio) or .png (an image sequence name########.png with audio in name.wav). res://, project-relative, or absolute inside the project or inside GODOT_MCP_MOVIE_DIR."},
-                        "fps": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Frames per second of the recording and of the game (--fixed-fps). Default 60."},
-                        "quit_after_frames": {"type": "integer", "minimum": 1, "maximum": 10000000, "description": "The game quits after this many frames (--quit-after), which finishes the file. Seconds times fps. Omit to record until the game quits or godot_stop_project stops it."},
-                        "overwrite": {"type": "boolean", "description": "Replace an earlier recording at the same path (its .avi, or its frames and .wav). Default false."}
+                        "path": {"type": "string", "description": ".avi (MJPEG with audio) or .png (name########.png, audio in name.wav). res://, project-relative, or absolute inside the project or GODOT_MCP_MOVIE_DIR. Its folder is created (with a .gdignore inside the project)."},
+                        "fps": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Recording and game frame rate (--fixed-fps). Default 60."},
+                        "quit_after_frames": {"type": "integer", "minimum": 1, "maximum": 10000000, "description": "Quit after this many frames (seconds times fps), finishing the file. Omit to record until the game quits or is stopped."},
+                        "overwrite": {"type": "boolean", "description": "Replace an earlier recording at the path. Default false."}
                     },
                     "required": ["path"]
                 }
             }),
             &[],
-        ),
+        ).additive(),
         tool(
             "godot_stop_project",
-            "Stops what runs: without run_id, the editor's Play mode when it plays and every managed process run that is still running, and the answer lists each one it stopped (or says that nothing was running). Pass run_id to stop one process run.",
+            "Without run_id, stops the editor's Play mode and every running managed process run, and lists what it stopped (or that nothing ran). run_id stops one process run.",
             json!({
-                "run_id": {"type": "string", "description": "Optional id of a managed process run. Omit to stop everything that runs."}
+                "run_id": {"type": "string", "description": "Managed process run id. Omit to stop everything."}
             }),
             &[],
-        ),
+        ).destructive_idempotent(),
         tool(
             "godot_get_run_status",
-            "Reports whether a scene is playing in the editor and lists managed process runs, including each run's user_args and, for a Movie Maker run, movie: its path, size_bytes, frames, duration_seconds and whether Godot finished the file.",
+            "Whether the editor plays a scene, and the managed process runs with their user_args and, for a Movie Maker run, movie (path, size_bytes, frames, duration_seconds, finished).",
             json!({}),
             &[],
-        ),
+        ).read_only(),
         tool(
             "godot_get_scene_tree",
-            "Retrieves the complete node hierarchy of a scene open in Godot Editor. Node paths in the result are relative to the scene root ('.' is the root). This read does not reload the scene; when the file on disk differs, the result sets stale to true. A node that instances another scene has instance (its res:// path) and editable_children: inside an instance whose children are not editable, Godot saves no change, so the editing tools refuse it unless make_editable is passed.",
+            "Node hierarchy of an open scene; paths are relative to the root ('.'). Does not reload: stale is true when the file on disk differs. An instance node has instance (res:// path) and editable_children; inside a non-editable instance the editing tools refuse changes unless make_editable is passed.",
             json!({
                 "scene_path": {
                     "type": "string",
-                    "description": "Optional res:// path of an open scene tab to inspect. Defaults to the currently active/focused scene tab. Use godot_get_open_scenes to list valid values."
+                    "description": "res:// path of an open tab (see godot_get_open_scenes). Default: the active tab."
                 }
             }),
             &[],
-        ),
+        ).read_only(),
         tool(
             "godot_get_open_scenes",
-            "Lists the res:// paths of all scenes currently open as tabs in the editor, and which one is active.",
+            "res:// paths of the open scene tabs, and the active one.",
             json!({}),
             &[],
-        ),
+        ).read_only(),
         tool(
             "godot_add_node",
-            "Adds a node to the active scene in Godot Editor as one undoable action. Pass exactly one of node_type (any instantiable Node class or global script class_name; a script that is not a @tool script gets its native base class with the script attached, as the Create Node dialog does) or scene (a saved .tscn/.scn added as an instance of that scene, as the editor's Instantiate Child Scene does: it saves as an instance=ExtResource node that keeps the scene's uid, and its own nodes stay inside the scene file). A scene that is missing, is not a PackedScene, or contains the scene being edited is refused. properties sets initial values (such as position or transform) the way godot_set_node_properties converts them and checks them the same way; a bad one, or one Godot does not keep, rejects the whole call. The answer lists each value as read back in applied.",
+            "Adds a node to the active scene (undoable). Pass exactly one of node_type (an instantiable Node class or global class_name; a non-@tool script class gets its native base with the script attached) or scene (a saved .tscn/.scn added as an instance that keeps its uid). A scene that is missing, not a PackedScene, or contains the edited scene is refused. properties are converted and checked as in godot_set_node_properties; a bad value, or one Godot does not keep, rejects the call. applied lists the values as read back.",
             json!({
                 "parent_node_path": {
                     "type": "string",
-                    "description": "Path to the parent node relative to the scene root (e.g. '.' for root or 'Player/Sprite')."
+                    "description": "Parent path relative to the scene root ('.' for the root)."
                 },
                 "node_type": {
                     "type": "string",
-                    "description": "Godot class name to instantiate (e.g. 'Sprite2D', 'Camera3D', 'Node'). Leave out when scene is given."
+                    "description": "Class to instantiate, e.g. Sprite2D. Not with scene."
                 },
                 "scene": {
                     "type": "string",
-                    "description": "res:// path of a saved scene to add as an instance (e.g. 'res://props/stump.tscn'). Leave out when node_type is given."
+                    "description": "res:// scene to add as an instance. Not with node_type."
                 },
                 "node_name": {
                     "type": "string",
-                    "description": "Optional custom name for the new node. Godot may adjust invalid characters; the result reports the final name. An instanced scene defaults to its root's name."
+                    "description": "Name; Godot may replace invalid characters (the result has the final name). An instance defaults to its root's name."
                 },
                 "properties": {
                     "type": "object",
-                    "description": "Optional initial property values of the new node, such as {\"position\": [10, 0, 5]} or {\"transform\": \"Transform3D(...)\"}; converted as in godot_set_node_properties. A node reference's path starts at the new node's place, so '../Sibling' names a child of the parent."
+                    "description": "Initial values, e.g. {\"position\": [10, 0, 5]}. A node reference path starts at the new node, so '../Sibling' names a child of the parent."
                 },
                 "make_editable": make_editable_param()
             }),
             &[],
-        ),
+        ).additive(),
         tool(
             "godot_remove_node",
-            "Removes a node from the active scene tree with undo/redo support. The scene root cannot be removed, nor a node an instanced scene brings (Godot cannot save that deletion even with editable children): hide it with godot_set_node_properties or remove it in its own scene.",
+            "Removes a node from the active scene (undoable). Refuses the scene root and a node an instanced scene brings (Godot cannot save that deletion): hide it with godot_set_node_properties or remove it in its own scene.",
             json!({
                 "node_path": {
                     "type": "string",
-                    "description": "Path to the node to remove, relative to the scene root."
+                    "description": "Node path relative to the scene root."
                 }
             }),
             &["node_path"],
-        ),
+        ).destructive_idempotent(),
         tool(
             "godot_get_node_properties",
-            "Inspects the editor-visible properties of a node. Each property is returned as {type, value}, with the value in Godot's text format (e.g. 'Vector2(5, 7)'). With properties, only those names are read, and ':' steps through a resource the way godot_game_get does (material_override:shader_parameter/glow_amount); the last segment is a property of that resource. A name that cannot be read is an entry in property_errors; the others are still returned.",
+            "Reads a node's editor-visible properties as {type, value} in Godot's text format. properties reads only those names; ':' steps through a resource (material_override:shader_parameter/glow_amount). A name that cannot be read goes to property_errors; the rest are returned.",
             json!({
                 "node_path": {
                     "type": "string",
-                    "description": "Path to the target node relative to the scene root ('.' or empty for the root)."
+                    "description": "Relative to the scene root ('.' or empty for the root)."
                 },
                 "properties": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Property names to read instead of every editor-visible property. A name may step through resources with ':' (material_override:shader_parameter/glow_amount)."
+                    "description": "Names to read instead of all; ':' steps through resources."
                 }
             }),
             &["node_path"],
-        ),
+        ).read_only(),
         tool(
             "godot_set_node_properties",
-            "Modifies properties of a node in the active scene with undo/redo support. Values are converted to the property's type: vectors, rects and colors accept arrays ([10, 20]) or objects ({\"x\": 10, \"y\": 20}), colors also accept '#rrggbb' or names, resources accept res:// paths, a node reference (an exported Object of a node type: @export var target: Node3D, or a class_name type) accepts a node path relative to the edited node as the inspector's node picker stores it ('../Toads/King', '..' for the parent, null to clear), which must name a node of that type in the edited scene and is saved as Godot's node_paths reference, typed arrays and dictionaries (Array[NodePath], Dictionary[String, int]) accept a JSON array or object whose every element is converted to the element type the same way (a bad element is refused with its index), and any Godot literal string (e.g. 'Vector2(1, 2)') is parsed. 'metadata/<name>' sets node metadata: an existing entry keeps its type, a missing one is created (as the inspector's Add Metadata does) with the JSON value's own type, a whole number as int; the name must be an identifier and the value not null. ':' steps through a resource the way godot_game_set does (material_override:shader_parameter/glow_amount); the last segment is a property of that resource, converted the same way, and the change is part of the same undo action. Only a resource built into the edited scene (or not saved yet) is changed this way: one saved in a .tres file or built into another scene is shared, so it is refused and the message names the file; change a .tres or .res file with godot_set_resource_properties. Refuses script and a private segment after ':', and a ':' step through a value that is not a resource. Unknown properties or unconvertible values reject the whole call without changing anything, and so does a value that reads back differently from the one set (a setter that clamps or refuses it, or an audio bus the editor's AudioServer does not have, which Godot answers and saves as Master): the message names the property, both values and, for a bus, the bus layout to add it to. The answer lists each value as read back in applied. A node inside an instanced scene whose children are not editable is refused, since Godot would drop the change on save; make_editable turns Editable Children on, and the answer lists them in made_editable.",
+            "Sets node properties in the active scene in one undo action, all or nothing. Values convert to the property's type: arrays or {x, y} for vectors and colors, '#rrggbb' or names for colors, res:// paths for resources, Godot literals ('Vector2(1, 2)'). A node reference (@export var target: Node3D) takes a path relative to the edited node to a node of its type ('../King', '..' for the parent, null clears). 'metadata/<name>' (name an identifier) keeps an existing entry's type, else takes the JSON value's type; not null. ':' steps through a resource built into this scene (material_override:shader_parameter/glow_amount); a shared one (a .tres, another scene's) is refused: use godot_set_resource_properties. script and private segments after ':' are refused. An unknown property, an unconvertible value or one that reads back differently (a clamping setter, an audio bus missing from the layout) rejects the call. applied lists the values as read back. A node in a non-editable instance is refused unless make_editable.",
             json!({
                 "node_path": {
                     "type": "string",
-                    "description": "Path to the target node relative to the scene root ('.' for the root)."
+                    "description": "Relative to the scene root ('.' for the root)."
                 },
                 "properties": {
                     "type": "object",
-                    "description": "Key-value map of property names to new values. A name may step through resources with ':' (material_override:shader_parameter/glow_amount)."
+                    "description": "Property name to value; ':' steps through resources."
                 },
                 "make_editable": make_editable_param()
             }),
             &["node_path", "properties"],
-        ),
+        ).destructive_idempotent(),
         tool(
             "godot_capture_viewport",
-            "Captures a screenshot of the Godot 2D or 3D editor viewport as a PNG image. Renders the scene content (without editor gizmos or grid). Switches the editor's main screen to 2D/3D to render it, so it needs a visible (non-headless) editor with a scene open.",
+            "PNG screenshot of the editor's 2D or 3D viewport (scene content, no gizmos or grid). Switches the editor's main screen; needs a windowed editor with a scene open.",
             json!({
                 "view": {
                     "type": "string",
                     "enum": ["auto", "2d", "3d"],
-                    "description": "Which editor viewport to capture. 'auto' (default) picks 3D for Node3D scenes and 2D otherwise."
+                    "description": "auto (default): 3D for Node3D scenes, else 2D."
                 },
                 "max_dimension": {
                     "type": "integer",
-                    "description": "Downscale the image so neither side exceeds this many pixels (default 1568)."
+                    "description": "Longest side in pixels after downscaling. Default 1568."
                 }
             }),
             &[],
-        ),
+        ).additive_idempotent(),
         tool(
             "godot_open_scene",
-            "Opens a scene file in the Godot Editor by its res:// path. An absolute path inside the project is converted, including both macOS spellings of /var and /private/var. Reloading an already-open scene from disk drops that scene's undo history. The answer lists in load_errors what Godot reported while loading (for example a node renamed because its name clashed with a child of an instanced scene), names the editor dialog that shows them, and (Godot 4.7 and newer) says in unsaved whether the load left the scene with unsaved changes. The opened scene becomes the active tab, named in active_scene, so later calls without scene_path act on it.",
+            "Opens a scene by res:// path (or absolute inside the project) as the active tab (active_scene). Reloading an open scene drops its undo history. load_errors lists what Godot reported while loading; unsaved (Godot 4.7+) says whether the load left unsaved changes.",
             json!({
                 "scene_path": {
                     "type": "string",
-                    "description": "Resource path to scene (e.g. 'res://scenes/level1.tscn')."
+                    "description": "res:// path, e.g. res://scenes/level1.tscn."
                 },
                 "reload": {
                     "type": "boolean",
-                    "description": "When the scene is already open, reload it from disk and drop its undo history. Automatic when the file bytes differ and the editor has no unsaved changes."
+                    "description": "Reload an open scene from disk, dropping its undo history. Automatic when the file changed and the editor has no unsaved changes."
                 },
                 "discard": {
                     "type": "boolean",
-                    "description": "Reload from disk even when the editor has unsaved changes, whether made by hand or through this bridge. Those changes and the scene's undo history are discarded."
+                    "description": "Reload even over unsaved editor changes, discarding them and the undo history."
                 }
             }),
             &["scene_path"],
-        ),
+        ).destructive_idempotent(),
         tool(
             "godot_save_scene",
-            "Saves the current open scene in Godot Editor. The editor saves its open script tabs with it: a script with unsaved typing is written and listed in scripts_saved, while the editor's convert-indent and trim-on-save settings are held off so a clean script is not rewritten. Returns scene_path.",
+            "Saves the active scene and returns scene_path. Open script tabs with unsaved typing are saved too (scripts_saved); clean scripts are not rewritten.",
             json!({}),
             &[],
-        ),
+        ).destructive_idempotent(),
         tool(
             "godot_create_script",
-            "Creates a new GDScript file inside a Godot project: the given content, or a standard header (extends_class, class_name and an empty _ready) when content is absent. Content is validated after it is written, and a script that does not validate is reported as an error; the file stays written so it can be fixed with godot_edit_script. Refuses to overwrite an existing file unless overwrite is true. When the editor has the script open in a tab, an overwrite is refused while the tab has unsaved changes, and otherwise reloads the tab with the new text. script_path is the same parameter the other script tools use; file_path is its older name. Without the editor, a class_name is registered in the project's class cache (.godot/global_script_class_cache.cfg) the way the editor's scan does, so headless runs and process runs know the class at once; with the editor open, the editor registers it.",
+            "Creates a .gd file from content, or a header (extends_class, class_name, an empty _ready). Validated after writing: an invalid script is an error but stays for godot_edit_script. Refuses an existing file unless overwrite is true; an overwrite is refused while the editor tab has unsaved changes, else the tab reloads. Without the editor, a class_name is added to .godot/global_script_class_cache.cfg so runs know it at once.",
             json!({
                 "script_path": {
                     "type": "string",
-                    "description": "Path of the .gd script: a res:// path or a path relative to the project directory."
+                    "description": "res:// or project-relative .gd path."
                 },
                 "file_path": {
                     "type": "string",
-                    "description": "The older name of script_path; both are accepted."
+                    "description": "Older name of script_path."
                 },
                 "content": {
                     "type": "string",
-                    "description": "Full text of the script, written as given (up to 1 MiB). Replaces the standard header, so it cannot be combined with extends_class or class_name."
+                    "description": "Full script text (up to 1 MiB). Not with extends_class or class_name."
                 },
                 "extends_class": {
                     "type": "string",
-                    "description": "Base class of the standard header (e.g. 'Node2D', 'CharacterBody3D'). Defaults to 'Node'. Not used with content."
+                    "description": "Header base class. Default Node. Not with content."
                 },
                 "class_name": {
                     "type": "string",
-                    "description": "Optional global class_name of the standard header. Not used with content."
+                    "description": "Header global class_name. Not with content."
                 },
                 "project_path": {
                     "type": "string",
-                    "description": "Project directory containing project.godot. Optional: defaults to the project open in the connected editor, else the project the server was started in."
+                    "description": "Default: editor's, else server's project."
                 },
                 "overwrite": {
                     "type": "boolean",
-                    "description": "Replace the file if it already exists. Defaults to false."
+                    "description": "Replace an existing file. Default false."
                 }
             }),
             &[],
-        ),
+        ).destructive_idempotent(),
         tool(
             "godot_validate_script",
-            "Checks a GDScript file. When a language server is already running (the open editor, or one godot_code_diagnostics started), returns its errors and warnings as file:line:col, code and message, with 1-based lines. A warning does not fail the check; an error does. When the language server calls a class unknown that another script of the project declares with class_name (a script written outside the editor is unknown to it until the editor rescans), the connected editor is asked to register that script and the check runs again; if the class is still unknown, the answer says so. Without a language server, runs godot --headless --check-only, which sees parse errors only, and says that analyzer warnings were not checked. godot_code_diagnostics is the tool that starts a language server when none is running. It also reports classes the project declares but its class cache (.godot/global_script_class_cache.cfg) does not list yet: using one fails the check, since headless runs and process runs fail with Could not find type until godot_resave_resources or the editor registers it.",
+            "Checks a GDScript file. With a running language server (the editor's, or one godot_code_diagnostics started) returns errors and warnings (file:line:col, 1-based; code; message); a warning does not fail the check, an error does. A class it calls unknown that the project declares is registered through the editor and rechecked. Without a server, runs godot --headless --check-only: parse errors only, no warnings. A script using a class missing from .godot/global_script_class_cache.cfg fails the check (runs cannot find it until godot_resave_resources or the editor registers it).",
             json!({
                 "script_path": {
                     "type": "string",
-                    "description": "Path to the .gd script file (res:// paths need a project)."
+                    "description": ".gd path (res:// needs a project)."
                 },
                 "project_path": {
                     "type": "string",
-                    "description": "Optional project root path for class resolution. For res:// paths it defaults to the editor's project, else the project the server was started in."
+                    "description": "For class resolution. Default: editor's, else server's project."
                 }
             }),
             &["script_path"],
-        ),
+        ).read_only(),
         tool(
             "godot_run_script",
-            "Runs a GDScript that extends SceneTree with the configured Godot binary: godot --headless --path <project> -s <script> [-- user_args]. Captures stdout and stderr (they never touch this server's stdout). script_errors lists each SCRIPT ERROR with its file and line. The leak reports Godot prints while it shuts down (leaked instance dependencies, RID allocations, ObjectDB instances, resources still in use and PagedAllocator pages leaked at exit) stay in stdout and stderr, but a report printed many times is shown once, where it first appeared, with ×N after it; exit_leaks counts them by kind (null when there are none) and hint says what causes them: Nodes the script made and never freed (not in the tree, or removed from it) must be free()d before quit(), and --verbose lists them. Every other line is kept as it was. Returns the exit code. fixed_fps adds Godot's --fixed-fps: frames stop waiting for the clock, so a script that waits on physics_frame or process_frame runs as fast as the CPU allows, and the answer repeats the value. Game time stays exact: _process gets a delta of 1/fixed_fps, physics still ticks at the project's physics_ticks_per_second with its usual delta, and timers, tweens and animations follow game time, so the same script counts the same physics frames. 60 gives one physics tick per frame on a project at the default rate, and process_frame then comes fixed_fps times per game second, where in real time its count depends on the machine; a lower value runs several ticks per frame, and timers fire only between frames. Whatever reads the wall clock no longer matches game time: Time.get_ticks_msec, Time.get_ticks_usec and Time.get_unix_time_from_system barely move between frames, OS.delay_msec still sleeps for real, and threads and background loads (ResourceLoader.load_threaded_request, WorkerThreadPool) take the same real time while many more frames pass, so wait for their status, not for a frame count. timeout_seconds defaults to 120 and cannot exceed 3600; an MCP client's own request timeout can end the call sooner. On timeout the process tree is killed and stdout and stderr hold what it printed up to then; the summary quotes the last lines. Godot writes each print() line as it is made and the server reads it at once, so a script that prints only at the end has nothing to return when killed: print each result as it is made. The exception is a project with application/run/flush_stdout_on_print.debug=false: Godot holds print() lines in a buffer, a kill loses them, no command-line flag forces a flush, stdout_buffered is true and printerr() still arrives. The answer holds the last 64 KiB of each stream; stdout_bytes and stderr_bytes count all of it, and a stream that outgrew that is kept whole (up to 256 MiB) in the project's .godot/godot-mcp folder, named by stdout_log or stderr_log until a later run replaces it (runs at the same time each write their own files: script-run.stdout.log for the first, script-run-2.stdout.log for a second one, and so on). When the client sends _meta.progressToken with the call, notifications/progress carry the newest output line while the script runs (at most four a second, so a fast script's lines are skipped there but never in the answer), with progress in seconds since the start, and a heartbeat every 5 seconds without output. A SCRIPT ERROR that leaves the main loop idle (the process stays up, as a script error in _init does) stops the run as soon as that idle is seen, and the answer says so, instead of waiting out the timeout. A script that does not extend SceneTree or MainLoop (directly, through a base script, or through a class_name in the global class cache) is refused before Godot starts. When Godot could not load the script anyway (a parse error, a wrong base, a file it could not open; Godot 4.8 exits with code 0 then), the call is an error, load_error holds Godot's message, script_errors lists it and the summary says the script did not run. Paths outside the project are refused. Headless Godot does not import, so load() of a .glb, image or other imported file returns the .godot/imported cache as it is. Before the script starts, files with a .import sidecar are compared with that cache. When the editor bridge is connected to this project, stale imports are reimported first, the same way godot_resave_resources does. Otherwise the script still runs, import_warning lists the res:// paths and names godot_resave_resources, and its result was built from the old import. stale_imports holds the first 20 paths, their total and whether they were reimported. Headless Godot has no editor file system and no renderer, so it saves a scene or resource without any uid:// (its own and each ext_resource's) and with shader_parameter/<name> = null for each uniform the script never set. Afterwards the server writes back into each rewritten .tscn/.tres what the editor would have: the file's uid (the one its header had before the run, else the one the project's uid cache gives its path, so a file an earlier stopped or parallel run left without its uid gets that uid back; a new one only for a file with neither), each ext_resource's uid and no null shader_parameter lines. A binary .scn/.res (compressed or not) loses its header uid the same way; Godot's ResourceSaver.set_uid writes the old one back (from the header or, failing that, the uid cache; a new one for a file with neither), in a Godot process whose time grows with the number and size of the files; a pass that runs out of time keeps what it wrote, and up to three passes write the files still missing. The summary counts the repairs and names at most three files; resource_repairs lists the first 20 (path, uid, new_uid, ext_resource_uids_restored as a count, removed_null_shader_parameters) and resource_repairs_total counts them all, and binary_uid_error says how many binary files still lack their uid after the passes, why, and how to write them back. Only the editor writes the project's uid cache (.godot/uid_cache.bin), which a run loads to resolve uid:// references, so when no connected editor holds the project the server records the repaired uids there itself (uid_cache.recorded counts the added or moved entries) and the next run does not print \"invalid UID\" warnings for them; uid_cache_stale says when it could not (the project has no cache yet, the cache does not parse, or the editor did not refresh) and names godot_resave_resources. When the editor has the same project open, it refreshes every scene, resource, script and shader the script wrote, repaired or not, and reloads the ones it has loaded, so a material using a rewritten shader sees its new uniforms and defaults (editor_refresh; a list longer than 20 is cut, with <list>_total beside it). resource_damage lists what a file the server could not write still lacks. Calls sent together run at the same time, each in its own Godot process, as long as each script writes its own files: in one project, each run's repair (and its uid cache write) waits until no other Godot process of this server works there, so a run whose process ends first answers once the others have finished too, and overlapped says so (its lists may then name files another run wrote). An import or export of the project waits for the running scripts, and a script started meanwhile waits for it; other projects never wait. A client that sends calls one at a time gets them one after the other.",
+            "Runs a SceneTree or MainLoop script in headless Godot (-s <script> -- user_args); another base or a path outside the project is refused. Returns the exit code, stdout and stderr (last 64 KiB each; a longer stream is kept whole in stdout_log/stderr_log, else null, overwritten by the next run) and script_errors (file, line). An unloadable script is an error with load_error, even if Godot exits 0. A SCRIPT ERROR that leaves the main loop idle ends the run. Repeated exit leak lines are shown once with xN (exit_leaks, hint). On timeout the process tree is killed and the output so far returned, so print as you go (stdout_buffered true: unflushed print() was lost; use printerr()). Progress notifications carry the newest line. Stale imports are reimported first when the editor has this project; else the script runs on the old import data and import_warning names godot_resave_resources. Dropped uid:// references are restored (resource_repairs; binary_uid_error, resource_damage: what is still missing), uids recorded in the uid cache (uid_cache_stale if not), and an open editor reloads what was written (editor_refresh). Lists stop at 20 (<list>_total). Parallel calls each get their own Godot and must write different files (overlapped: repairs waited).",
             json!({
                 "script": {
                     "type": "string",
-                    "description": "SceneTree script: a res:// path or a path inside the project, ending in .gd."
+                    "description": "res:// or project path of the .gd script."
                 },
                 "user_args": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Arguments after --, read by OS.get_cmdline_user_args(). At most 32 strings."
+                    "description": "Arguments after --, read by OS.get_cmdline_user_args(). At most 32."
                 },
                 "timeout_seconds": {
                     "type": "integer",
-                    "description": "Kill the process tree after this many seconds. Default 120, maximum 3600.",
+                    "description": "Seconds before the process tree is killed. Default 120, max 3600; the client's timeout may end the call sooner.",
                     "minimum": 1,
                     "maximum": 3600
                 },
                 "fixed_fps": {
                     "type": "integer",
-                    "description": "Run as fast as the CPU allows at this many frames per game second (Godot's --fixed-fps), instead of in real time. Use 60 unless the script needs another step. Time that reads the wall clock no longer matches game time; the tool description says what changes. Omit to run in real time.",
+                    "description": "Run unthrottled at this many frames per game second (--fixed-fps), e.g. 60. Wall-clock time (Time.get_ticks_msec), threads and background loads no longer match game time: wait on their status, not frames. Omit for real time.",
                     "minimum": 1,
                     "maximum": 1000
                 },
                 "project_path": {
                     "type": "string",
-                    "description": "Project directory containing project.godot. Optional: defaults to the project open in the connected editor, else the project the server was started in."
+                    "description": "Default: editor's, else server's project."
                 }
             }),
             &["script"],
-        ),
+        ).destructive(),
         tool(
             "godot_resave_resources",
-            "Refreshes assets and resources after they were changed externally. With the editor connected, importable files the editor already knows are re-imported synchronously and other files are re-scanned. An open script tab without unsaved changes whose text differs from its file is reloaded (listed under reloaded_tabs); one with unsaved changes is kept and listed under unsaved_tabs. A shader, shader include or resource the editor has loaded is reloaded from its file in place, and so is a loaded script without a tab, so whatever uses it sees the new contents (listed under reloaded_resources); scenes are left to the editor. A path the editor has never scanned is updated and, if needed, scanned first; it is listed under reimported only after a .import file exists, and otherwise under not_scanned (load() would fail with no loader). Without paths, rescans the whole project in the background. wait true holds the reply until scanning and importing finish (up to 60s) and reports how many files were imported; timed_out means they may not be loadable yet. Without the editor, runs `godot --headless --path <project> --import` and lists under imported every source it imported, with its kind (the importer, such as scene or texture) and type (the resource class). Both modes list under still_stale, with a reason, each requested path whose .godot/imported data still does not match the source's bytes after the import, and then return an error: Godot's scan skips a source rewritten within the second its last scan saw, and force true makes the headless import test and reimport the given paths whatever its cache says. The headless import waits for the godot_run_script calls working in the project to finish, and runs alone there: a script started meanwhile waits for it. Other projects never wait.",
+            "Refreshes files changed outside the editor. With the editor: known importable files reimport synchronously, others are re-scanned; clean script tabs reload (reloaded_tabs), ones with unsaved changes are kept (unsaved_tabs); loaded shaders, resources and tabless scripts reload in place (reloaded_resources). A never-scanned path without a resulting .import is listed under not_scanned. Open scenes are not reloaded: use godot_open_scene reload. Without paths, rescans the whole project in the background. Without the editor, runs `godot --headless --path <project> --import` and lists imported sources. A requested path whose .godot/imported data still differs from its source is listed in still_stale with a reason and makes the call an error (force true reimports it headless). The headless import waits for godot_run_script calls in the project and runs alone.",
             json!({
                 "paths": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "res:// paths to refresh. Importable assets (images, audio, models, fonts) the editor already knows are re-imported synchronously. A path it has never scanned is scanned first and listed under not_scanned when no .import file was written. Other files (scripts, scenes, resources) are re-scanned. If omitted or empty, triggers a full project filesystem rescan instead."
+                    "description": "res:// paths to refresh. Omit or empty for a full rescan."
                 },
                 "wait": {
                     "type": "boolean",
-                    "description": "Full scan only. When true, return after the editor finishes scanning and importing, or after 60s. The result includes imported (how many files were imported) and timed_out. Default false, which returns while the scan is still running. Ignored when paths is set. Without the editor, the headless import always waits until Godot exits."
+                    "description": "Full editor scan only: return when scanning and importing finish (up to 60s), with imported (count) and timed_out. Ignored with paths. Default false. The headless import always waits."
                 },
                 "force": {
                     "type": "boolean",
-                    "description": "With paths and without the editor: make Godot reimport the given files even when its cache says they are current (it drops the .md5 Godot recorded for each and moves its .import file's time), for a source rewritten with new bytes that a previous import skipped. The forced paths are listed under forced. The editor always reimports the given files. Default false."
+                    "description": "With paths, without the editor: reimport even when Godot's cache says current; listed in forced. Default false."
                 },
                 "project_path": {
                     "type": "string",
-                    "description": "Project directory containing project.godot. Used when the editor is closed, for `godot --headless --path <project> --import`. Optional: defaults to the project the server was started in. If the editor has a different project open, the import runs headless on this path."
+                    "description": "Project for the headless import (when the editor is closed or has another project). Default: the server's project."
                 }
             }),
             &[],
-        ),
+        ).additive_idempotent(),
     ];
-    tools.extend(authoring::catalog());
-    tools.extend(resource_props::catalog());
-    tools.extend(input_map::catalog());
-    tools.extend(files::catalog());
-    tools.extend(file_move::catalog());
-    tools.extend(scripts::catalog());
-    tools.extend(shaders::catalog());
-    tools.extend(addon_update::catalog());
-    tools.extend(game::catalog());
-    tools.extend(code::catalog());
-    tools.extend(export::catalog());
-    tools.extend(pack_run::catalog());
-    tools.extend(import_params::catalog());
-    tools.extend(review::catalog());
-    tools.extend(world_map::catalog());
-    tools.extend(feedback::catalog(feedback_mode));
-    tools
+    vec![
+        (Module::Manager, tools),
+        (Module::Authoring, authoring::catalog()),
+        (Module::ResourceProps, resource_props::catalog()),
+        (Module::InputMap, input_map::catalog()),
+        (Module::Files, files::catalog()),
+        (Module::FileMove, file_move::catalog()),
+        (Module::Scripts, scripts::catalog()),
+        (Module::Shaders, shaders::catalog()),
+        (Module::AddonUpdate, addon_update::catalog()),
+        (Module::Game, game::catalog()),
+        (Module::Code, code::catalog()),
+        (Module::Export, export::catalog()),
+        (Module::PackRun, pack_run::catalog()),
+        (Module::ImportParams, import_params::catalog()),
+        (Module::Review, review::catalog()),
+        (Module::WorldMap, world_map::catalog()),
+        (Module::Manager, feedback::catalog(feedback_mode)),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every listed tool is routed to the module that declared it, whatever the feedback mode.
+    #[test]
+    fn every_listed_tool_has_one_owner_that_handles_it() {
+        // These modules' `call` ignores the tool name, so each may declare one tool only.
+        let single = [
+            Module::Files,
+            Module::FileMove,
+            Module::PackRun,
+            Module::AddonUpdate,
+            Module::Review,
+            Module::ResourceProps,
+            Module::WorldMap,
+        ];
+        for mode in [FeedbackMode::Off, FeedbackMode::Draft, FeedbackMode::Full] {
+            let catalog = build_catalog(mode);
+            let declared: Vec<(Module, String)> = catalog
+                .iter()
+                .flat_map(|(module, tools)| tools.iter().map(|tool| (*module, tool.name.clone())))
+                .collect();
+            for module in single {
+                let count = declared
+                    .iter()
+                    .filter(|(owner, _)| *owner == module)
+                    .count();
+                assert_eq!(count, 1, "{module:?} declares {count} tools in {mode:?}");
+            }
+            let registry = Registry::new(catalog);
+            assert_eq!(
+                registry.owners.len(),
+                registry.tools.len(),
+                "two tools share a name in {mode:?}"
+            );
+            for (index, (module, name)) in declared.iter().enumerate() {
+                let (tool, owner) = registry
+                    .find(name)
+                    .unwrap_or_else(|| panic!("{name} is listed but not found"));
+                assert_eq!(&tool.name, name);
+                assert_eq!(owner, *module, "{name} is routed to another module");
+                assert_eq!(registry.tools[index].name, *name, "listing order changed");
+                assert!(tool.annotations.is_some(), "{name} has no hints");
+            }
+        }
+    }
 }

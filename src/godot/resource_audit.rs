@@ -99,33 +99,31 @@ pub struct ResourceRepair {
 }
 
 impl TextResourceSnapshot {
-    /// Reads the header and the `[ext_resource]` lines of every text scene and resource.
+    /// Reads the header and the `[ext_resource]` lines of every text scene and resource, the
+    /// header uid of every binary one, and the size and time of every script and shader, in one
+    /// walk of the project.
     pub fn take(project: &Path) -> Self {
         let mut files = BTreeMap::new();
-        walk(project, project, is_text_resource, &mut |res, file| {
+        let mut loaded = BTreeMap::new();
+        let mut binaries = BTreeMap::new();
+        walk_project(project, is_audited, &mut |res, file, name| {
             let Ok(meta) = fs::metadata(file) else {
                 return;
             };
-            let (uid, ext_uids) = read_head(file).unwrap_or_default();
-            files.insert(
-                res,
-                Before {
-                    len: meta.len(),
-                    modified: meta.modified().ok(),
-                    uid,
-                    ext_uids,
-                },
-            );
-        });
-        let mut loaded = BTreeMap::new();
-        walk(project, project, is_loaded_text, &mut |res, file| {
-            if let Ok(meta) = fs::metadata(file) {
+            if is_text_resource(name) {
+                let (uid, ext_uids) = read_head(file).unwrap_or_default();
+                files.insert(
+                    res,
+                    Before {
+                        len: meta.len(),
+                        modified: meta.modified().ok(),
+                        uid,
+                        ext_uids,
+                    },
+                );
+            } else if is_loaded_text(name) {
                 loaded.insert(res, (meta.len(), meta.modified().ok()));
-            }
-        });
-        let mut binaries = BTreeMap::new();
-        walk(project, project, is_binary_resource, &mut |res, file| {
-            if let Ok(meta) = fs::metadata(file) {
+            } else {
                 binaries.insert(
                     res,
                     BinaryBefore {
@@ -145,6 +143,51 @@ impl TextResourceSnapshot {
         }
     }
 
+    /// The files written or created since the snapshot, found in one walk of the project. Only
+    /// sizes and times are read here; [`ProjectChanges::read_texts`] reads the text files.
+    pub fn changes_since(&self, project: &Path) -> ProjectChanges {
+        self.changes_among(project, is_audited)
+    }
+
+    /// [`TextResourceSnapshot::changes_since`] among the files whose name is `wanted`.
+    fn changes_among(&self, project: &Path, wanted: fn(&str) -> bool) -> ProjectChanges {
+        let mut changes = ProjectChanges::default();
+        walk_project(project, wanted, &mut |res, file, name| {
+            let Ok(meta) = fs::metadata(file) else {
+                return;
+            };
+            let same = |len: u64, modified: Option<SystemTime>| {
+                len == meta.len() && modified.is_some() && modified == meta.modified().ok()
+            };
+            if is_text_resource(name) {
+                let unchanged = self
+                    .files
+                    .get(&res)
+                    .is_some_and(|old| same(old.len, old.modified));
+                if !unchanged && meta.len() <= MAX_READ {
+                    changes.text.push((res, file.to_path_buf()));
+                }
+            } else if is_loaded_text(name) {
+                let unchanged = self
+                    .loaded
+                    .get(&res)
+                    .is_some_and(|(len, modified)| same(*len, *modified));
+                if !unchanged {
+                    changes.loaded.push(res);
+                }
+            } else {
+                let unchanged = self
+                    .binaries
+                    .get(&res)
+                    .is_some_and(|old| same(old.len, old.modified));
+                if !unchanged {
+                    changes.binaries.push((res, file.to_path_buf()));
+                }
+            }
+        });
+        changes
+    }
+
     /// The uid `res` had before the run: its header's, or the uid cache's when the header had
     /// none (or the file did not exist).
     fn uid_before(&self, res: &str) -> Option<String> {
@@ -156,51 +199,37 @@ impl TextResourceSnapshot {
         header.or_else(|| self.cached.get(res).cloned())
     }
 
-    /// The binary scenes and resources written or created since the snapshot, with their files.
-    fn binaries_changed_since(&self, project: &Path) -> Vec<(String, PathBuf)> {
-        let mut changed = Vec::new();
-        walk(project, project, is_binary_resource, &mut |res, file| {
-            let Ok(meta) = fs::metadata(file) else {
-                return;
-            };
-            let unchanged = self.binaries.get(&res).is_some_and(|old| {
-                old.len == meta.len()
-                    && old.modified.is_some()
-                    && old.modified == meta.modified().ok()
-            });
-            if !unchanged {
-                changed.push((res, file.to_path_buf()));
-            }
-        });
-        changed
-    }
-
     /// The uid each binary scene or resource rewritten since the snapshot needs back: the one its
     /// header had, when the rewrite dropped or changed it, or a new one for a file without any.
     /// A header this server cannot read is left alone. Sorted by path.
     pub fn binary_uid_plan(&self, project: &Path) -> Vec<BinaryUidFix> {
+        self.binary_uid_plan_of(&self.changes_since(project))
+    }
+
+    /// [`TextResourceSnapshot::binary_uid_plan`] for changes already found.
+    pub fn binary_uid_plan_of(&self, changes: &ProjectChanges) -> Vec<BinaryUidFix> {
         let mut plan = Vec::new();
-        for (res, file) in self.binaries_changed_since(project) {
-            let now = binary_uid(&file);
+        for (res, file) in &changes.binaries {
+            let now = binary_uid(file);
             if now == BinaryUid::Unreadable {
                 continue;
             }
             if self
                 .binaries
-                .get(&res)
+                .get(res)
                 .is_some_and(|old| old.uid == BinaryUid::Unreadable)
             {
                 continue;
             }
-            let fix = match self.uid_before(&res) {
+            let fix = match self.uid_before(res) {
                 Some(old) if now != BinaryUid::Uid(old.clone()) => BinaryUidFix {
-                    path: res,
+                    path: res.clone(),
                     uid: old,
                     new_uid: false,
                 },
                 Some(_) => continue,
                 None if now == BinaryUid::Missing => BinaryUidFix {
-                    path: res,
+                    path: res.clone(),
                     uid: new_uid(),
                     new_uid: true,
                 },
@@ -233,42 +262,25 @@ impl TextResourceSnapshot {
     /// [`TextResourceSnapshot::take`]: the files an editor holding the project must refresh, and
     /// reload where it has them loaded. Sorted by path.
     pub fn written_since(&self, project: &Path) -> Vec<String> {
-        let mut written: Vec<String> = self
-            .changed_since(project)
-            .into_iter()
-            .map(|(res, _, _)| res)
-            .collect();
-        written.extend(
-            self.binaries_changed_since(project)
-                .into_iter()
-                .map(|(res, _)| res),
-        );
-        walk(project, project, is_loaded_text, &mut |res, file| {
-            let Ok(meta) = fs::metadata(file) else {
-                return;
-            };
-            let unchanged = self.loaded.get(&res).is_some_and(|(len, modified)| {
-                *len == meta.len() && modified.is_some() && *modified == meta.modified().ok()
-            });
-            if !unchanged {
-                written.push(res);
-            }
-        });
-        written.sort();
-        written
+        let changes = self.changes_since(project);
+        written_in(&changes, &changes.read_texts())
     }
 
     /// Text scenes and resources written since [`TextResourceSnapshot::take`] that lost a uid or
     /// gained a `null` shader parameter. Sorted by path.
     pub fn damage_since(&self, project: &Path) -> Vec<ResourceDamage> {
+        // Scripts and shaders carry no uid, so they are not looked at.
+        let changes = self.changes_among(project, |name| {
+            is_text_resource(name) || is_binary_resource(name)
+        });
         let mut found = Vec::new();
-        for (res, _, text) in self.changed_since(project) {
+        for (res, _, text) in changes.read_texts() {
             let uid = self.uid_before(&res);
             if let Some(damage) = inspect(project, &res, &text, self.files.get(&res), uid) {
                 found.push(damage);
             }
         }
-        for (res, file) in self.binaries_changed_since(project) {
+        for (res, file) in changes.binaries {
             if self
                 .binaries
                 .get(&res)
@@ -299,11 +311,16 @@ impl TextResourceSnapshot {
     /// written is left as it is, so [`TextResourceSnapshot::damage_since`] still reports it.
     /// Sorted by path.
     pub fn repair_since(&self, project: &Path) -> Vec<ResourceRepair> {
-        let changed = self.changed_since(project);
+        self.repair_texts(project, &self.changes_since(project).read_texts())
+    }
+
+    /// [`TextResourceSnapshot::repair_since`] for the changed text files already read, as
+    /// [`ProjectChanges::read_texts`] returns them.
+    pub fn repair_texts(&self, project: &Path, changed: &[ChangedText]) -> Vec<ResourceRepair> {
         // Every header uid first, so a scene that references another rewritten file gets that
         // file's uid even though its header on disk has none yet.
         let mut own: BTreeMap<String, (String, bool)> = BTreeMap::new();
-        for (res, _, text) in &changed {
+        for (res, _, text) in changed {
             let header = text.lines().next().unwrap_or("");
             if !is_resource_header(header) || attribute(header, "uid").is_some() {
                 continue;
@@ -315,7 +332,7 @@ impl TextResourceSnapshot {
             own.insert(res.clone(), entry);
         }
         let mut repairs = Vec::new();
-        for (res, file, text) in &changed {
+        for (res, file, text) in changed {
             let before = self.files.get(res);
             let mut repair = ResourceRepair {
                 path: res.clone(),
@@ -367,32 +384,45 @@ impl TextResourceSnapshot {
         repairs.sort_by(|a, b| a.path.cmp(&b.path));
         repairs
     }
+}
 
-    /// `(res path, file, text)` of each text scene and resource whose size or modification time
-    /// changed since the snapshot, or that is new. Files over [`MAX_READ`] are skipped.
-    fn changed_since(&self, project: &Path) -> Vec<(String, PathBuf, String)> {
-        let mut changed = Vec::new();
-        walk(project, project, is_text_resource, &mut |res, file| {
-            let Ok(meta) = fs::metadata(file) else {
-                return;
-            };
-            if self.files.get(&res).is_some_and(|old| {
-                old.len == meta.len()
-                    && old.modified.is_some()
-                    && old.modified == meta.modified().ok()
-            }) {
-                return;
-            }
-            if meta.len() > MAX_READ {
-                return;
-            }
-            let Ok(text) = fs::read_to_string(file) else {
-                return;
-            };
-            changed.push((res, file.to_path_buf(), text));
-        });
-        changed
+/// `(res path, file, text)` of a changed text scene or resource.
+pub type ChangedText = (String, PathBuf, String);
+
+/// The scenes, resources, scripts and shaders whose size or modification time differs from the
+/// snapshot, or that are new, as [`TextResourceSnapshot::changes_since`] found them in one walk.
+#[derive(Debug, Clone, Default)]
+pub struct ProjectChanges {
+    /// Text scenes and resources, with their files. Files over [`MAX_READ`] are left out.
+    text: Vec<(String, PathBuf)>,
+    /// Binary scenes and resources, with their files.
+    binaries: Vec<(String, PathBuf)>,
+    /// Scripts and shaders.
+    loaded: Vec<String>,
+}
+
+impl ProjectChanges {
+    /// The changed text scenes and resources with their text, each read once. A file that
+    /// cannot be read as text is left out.
+    pub fn read_texts(&self) -> Vec<ChangedText> {
+        self.text
+            .iter()
+            .filter_map(|(res, file)| {
+                let text = fs::read_to_string(file).ok()?;
+                Some((res.clone(), file.clone(), text))
+            })
+            .collect()
     }
+}
+
+/// Every text scene, resource, script and shader among `changes`, the text files as `texts`
+/// (from [`ProjectChanges::read_texts`]) has them. Sorted by path.
+pub fn written_in(changes: &ProjectChanges, texts: &[ChangedText]) -> Vec<String> {
+    let mut written: Vec<String> = texts.iter().map(|(res, _, _)| res.clone()).collect();
+    written.extend(changes.binaries.iter().map(|(res, _)| res.clone()));
+    written.extend(changes.loaded.iter().cloned());
+    written.sort();
+    written
 }
 
 fn inspect(
@@ -606,11 +636,34 @@ fn is_loaded_text(name: &str) -> bool {
         .any(|extension| name.ends_with(extension))
 }
 
+/// The scenes, resources, scripts and shaders the audit looks at.
+fn is_audited(name: &str) -> bool {
+    is_text_resource(name) || is_binary_resource(name) || is_loaded_text(name)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Walks of a project started on this thread, so tests can pin how often one is walked.
+    static WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Calls `visit` with the `res://` path, the file and the file name of every file under
+/// `project` whose name is `wanted`, as Godot's scan sees the project.
+fn walk_project(
+    project: &Path,
+    wanted: fn(&str) -> bool,
+    visit: &mut dyn FnMut(String, &Path, &str),
+) {
+    #[cfg(test)]
+    WALKS.with(|walks| walks.set(walks.get() + 1));
+    walk(project, project, wanted, visit);
+}
+
 fn walk(
     project: &Path,
     dir: &Path,
     wanted: fn(&str) -> bool,
-    visit: &mut dyn FnMut(String, &Path),
+    visit: &mut dyn FnMut(String, &Path, &str),
 ) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
@@ -642,7 +695,11 @@ fn walk(
         let Some(relative) = relative.to_str() else {
             continue;
         };
-        visit(format!("res://{}", relative.replace('\\', "/")), &path);
+        visit(
+            format!("res://{}", relative.replace('\\', "/")),
+            &path,
+            name,
+        );
     }
 }
 
@@ -1040,6 +1097,235 @@ shader_parameter/speed = 3.0
         assert_ne!(repairs[0].uid.as_deref(), Some("uid://cpond"));
     }
 
+    fn walks() -> usize {
+        WALKS.with(|walks| walks.get())
+    }
+
+    /// A project with every kind of file the audit looks at, and files it does not.
+    fn mixed_project(root: &Path) {
+        use super::super::binary_resource::tests::{rscc, rsrc};
+        fs::create_dir_all(root.join("art/deep")).expect("dirs");
+        fs::create_dir_all(root.join(".godot")).expect(".godot");
+        fs::write(root.join("pond.tscn"), EDITOR_SAVED).expect("scene");
+        fs::write(
+            root.join("art/frog.tscn"),
+            "[gd_scene format=3 uid=\"uid://bfrog\"]\n",
+        )
+        .expect("frog");
+        fs::write(root.join("art/deep/mat.tres"), "[gd_resource format=3]\n").expect("mat");
+        fs::write(root.join("art/water.gdshader"), "shader_type spatial;\n").expect("shader");
+        fs::write(root.join("art/foam.gdshaderinc"), "// foam\n").expect("include");
+        fs::write(root.join("main.gd"), "extends Node\n").expect("script");
+        fs::write(root.join("art/gate.scn"), rscc(&rsrc(Some(77)))).expect("gate");
+        fs::write(root.join("art/deep/bare.res"), rsrc(None)).expect("bare");
+        fs::write(root.join("art/deep/text.res"), "[gd_resource]\n").expect("text res");
+        fs::write(root.join("art/rock.png"), [0_u8; 8]).expect("png");
+        fs::write(root.join(".godot/hidden.tscn"), EDITOR_SAVED).expect("hidden");
+    }
+
+    /// What one kind of file looks like to a walk of its own, as the audit walked them before.
+    fn walk_kind(root: &Path, wanted: fn(&str) -> bool) -> Vec<String> {
+        let mut found = Vec::new();
+        walk(root, root, wanted, &mut |res, _, _| found.push(res));
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn one_walk_takes_the_snapshot_and_one_finds_what_a_run_changed() {
+        use super::super::binary_resource::tests::rsrc;
+        let project = tempfile::tempdir().expect("project");
+        let root = project.path();
+        mixed_project(root);
+        let start = walks();
+        let snapshot = TextResourceSnapshot::take(root);
+        assert_eq!(walks() - start, 1, "the snapshot walks the project once");
+
+        fs::write(root.join("pond.tscn"), HEADLESS_SAVED).expect("rewrite");
+        fs::write(root.join("main.gd"), "extends Node3D\n").expect("script");
+        fs::write(
+            root.join("art/deep/bare.res"),
+            [rsrc(None), vec![1; 9]].concat(),
+        )
+        .expect("bare");
+        let start = walks();
+        let changes = snapshot.changes_since(root);
+        let plan = snapshot.binary_uid_plan_of(&changes);
+        let texts = changes.read_texts();
+        let repairs = snapshot.repair_texts(root, &texts);
+        let written = written_in(&changes, &texts);
+        assert_eq!(
+            walks() - start,
+            1,
+            "the post-run audit walks the project once"
+        );
+        assert_eq!(
+            plan.iter().map(|fix| fix.path.as_str()).collect::<Vec<_>>(),
+            ["res://art/deep/bare.res"]
+        );
+        assert_eq!(
+            repairs
+                .iter()
+                .map(|item| item.path.as_str())
+                .collect::<Vec<_>>(),
+            ["res://pond.tscn"]
+        );
+        assert_eq!(
+            written,
+            [
+                "res://art/deep/bare.res",
+                "res://main.gd",
+                "res://pond.tscn"
+            ]
+        );
+        let start = walks();
+        let damage = snapshot.damage_since(root);
+        assert_eq!(
+            walks() - start,
+            1,
+            "the damage check walks the project once"
+        );
+        // bare.res never had a uid, so only the plan names it; the text repair took.
+        assert!(damage.is_empty(), "{damage:?}");
+    }
+
+    #[test]
+    fn the_single_walk_finds_what_a_walk_per_kind_found() {
+        let project = tempfile::tempdir().expect("project");
+        let root = project.path();
+        mixed_project(root);
+        let snapshot = TextResourceSnapshot::take(root);
+        assert_eq!(
+            snapshot.files.keys().cloned().collect::<Vec<_>>(),
+            walk_kind(root, is_text_resource)
+        );
+        assert_eq!(
+            snapshot.loaded.keys().cloned().collect::<Vec<_>>(),
+            walk_kind(root, is_loaded_text)
+        );
+        assert_eq!(
+            snapshot.binaries.keys().cloned().collect::<Vec<_>>(),
+            walk_kind(root, is_binary_resource)
+        );
+        assert_eq!(
+            snapshot.files.len() + snapshot.loaded.len() + snapshot.binaries.len(),
+            9
+        );
+        assert_eq!(
+            snapshot.files["res://art/frog.tscn"].uid.as_deref(),
+            Some("uid://bfrog")
+        );
+        assert_eq!(
+            snapshot.files["res://pond.tscn"].ext_uids["res://water.gdshader"],
+            "uid://dshader"
+        );
+        assert_eq!(
+            snapshot.binaries["res://art/gate.scn"].uid,
+            BinaryUid::Uid(uid_text(77))
+        );
+        assert_eq!(
+            snapshot.binaries["res://art/deep/bare.res"].uid,
+            BinaryUid::Missing
+        );
+        assert_eq!(
+            snapshot.binaries["res://art/deep/text.res"].uid,
+            BinaryUid::Unreadable
+        );
+
+        // Every file of every kind is new to an empty snapshot.
+        let changes = TextResourceSnapshot::default().changes_since(root);
+        let mut text: Vec<String> = changes.text.iter().map(|(res, _)| res.clone()).collect();
+        text.sort();
+        let mut binaries: Vec<String> = changes
+            .binaries
+            .iter()
+            .map(|(res, _)| res.clone())
+            .collect();
+        binaries.sort();
+        let mut loaded = changes.loaded.clone();
+        loaded.sort();
+        assert_eq!(text, walk_kind(root, is_text_resource));
+        assert_eq!(binaries, walk_kind(root, is_binary_resource));
+        assert_eq!(loaded, walk_kind(root, is_loaded_text));
+        assert!(snapshot.changes_since(root).text.is_empty());
+    }
+
+    /// Writes a synthetic project of `count` files: text scenes and resources, scripts, shaders,
+    /// binary resources (half of them compressed) and imported assets, in folders of 200.
+    fn synthetic_project(root: &Path, count: usize) {
+        use super::super::binary_resource::tests::{rscc, rsrc};
+        for index in 0..count {
+            let dir = root.join(format!("d{}", index / 200));
+            if index % 200 == 0 {
+                fs::create_dir_all(&dir).expect("dir");
+            }
+            let (name, bytes): (String, Vec<u8>) = match index % 10 {
+                0 | 1 => (
+                    format!("s{index}.tscn"),
+                    EDITOR_SAVED.replace("uid://cpond", &uid_text(index as u64)).into_bytes(),
+                ),
+                2 => (
+                    format!("r{index}.tres"),
+                    format!("[gd_resource type=\"Resource\" format=3 uid=\"{}\"]\n\n[resource]\nvalue = 1\n{}", uid_text(index as u64), "# padding\n".repeat(50)).into_bytes(),
+                ),
+                3 | 4 => (
+                    format!("c{index}.gd"),
+                    format!("extends Node\nclass_name C{index}\n\n{}", "func f() -> int:\n\treturn 1\n".repeat(40)).into_bytes(),
+                ),
+                5 => (format!("h{index}.gdshader"), b"shader_type spatial;\n".to_vec()),
+                6 if index % 20 == 6 => (format!("b{index}.res"), rsrc(Some(index as i64))),
+                6 => (
+                    format!("b{index}.scn"),
+                    rscc(&[rsrc(Some(index as i64)), vec![3; 9000]].concat()),
+                ),
+                _ => (format!("t{index}.png"), vec![0; 256]),
+            };
+            fs::write(dir.join(name), bytes).expect("file");
+        }
+    }
+
+    /// How long the snapshot and the post-run audit of a large project take:
+    /// GODOT_MCP_BENCH_FILES=<file count, default 20000>.
+    #[test]
+    #[ignore = "timing probe on a synthetic project"]
+    fn audit_time_of_a_synthetic_project() {
+        let count = std::env::var("GODOT_MCP_BENCH_FILES")
+            .ok()
+            .and_then(|text| text.parse().ok())
+            .unwrap_or(20_000);
+        let project = tempfile::tempdir().expect("project");
+        let root = project.path();
+        synthetic_project(root, count);
+        // The least time of several rounds, so other work on the machine counts less.
+        let (mut take, mut audit, mut damage_time) = (None, None, None);
+        let least = |best: &mut Option<std::time::Duration>, time| {
+            *best = Some(best.map_or(time, |old: std::time::Duration| old.min(time)));
+        };
+        let mut counts = (0, 0, 0, 0);
+        for _ in 0..7 {
+            let started = std::time::Instant::now();
+            let snapshot = TextResourceSnapshot::take(root);
+            least(&mut take, started.elapsed());
+            // The run rewrites a few files the way a headless save does.
+            fs::write(root.join("d0/s0.tscn"), HEADLESS_SAVED).expect("rewrite");
+            fs::write(root.join("d0/s1.tscn"), HEADLESS_SAVED).expect("rewrite");
+            fs::write(root.join("d0/c3.gd"), "extends Node\n").expect("rewrite");
+            fs::write(root.join("d1/new.tscn"), HEADLESS_SAVED).expect("new");
+            let started = std::time::Instant::now();
+            let (plan, repairs, written) = post_run_audit(&snapshot, root);
+            least(&mut audit, started.elapsed());
+            let started = std::time::Instant::now();
+            let damage = snapshot.damage_since(root);
+            least(&mut damage_time, started.elapsed());
+            counts = (plan.len(), repairs.len(), written.len(), damage.len());
+            fs::remove_file(root.join("d1/new.tscn")).expect("remove");
+        }
+        eprintln!(
+            "{count} files, least of 7: take {take:?}; repair, plan and written {audit:?} ({} planned, {} repaired, {} written); damage {damage_time:?} ({} damaged)",
+            counts.0, counts.1, counts.2, counts.3
+        );
+    }
+
     /// How long a snapshot of a large project takes: GODOT_MCP_TIME_SNAPSHOT=<project dir>.
     #[test]
     #[ignore = "timing probe for a real project"]
@@ -1060,5 +1346,17 @@ shader_parameter/speed = 3.0
             snapshot.files.len(),
             started.elapsed()
         );
+    }
+
+    /// What `repair_files` does after a run, without the Godot pass for binary files.
+    fn post_run_audit(
+        snapshot: &TextResourceSnapshot,
+        root: &Path,
+    ) -> (Vec<BinaryUidFix>, Vec<ResourceRepair>, Vec<String>) {
+        let changes = snapshot.changes_since(root);
+        let plan = snapshot.binary_uid_plan_of(&changes);
+        let texts = changes.read_texts();
+        let repairs = snapshot.repair_texts(root, &texts);
+        (plan, repairs, written_in(&changes, &texts))
     }
 }

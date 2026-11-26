@@ -68,6 +68,14 @@ pub struct ToolResult {
     pub content: Vec<ToolContent>,
     #[serde(rename = "isError", skip_serializing_if = "std::ops::Not::not")]
     pub is_error: bool,
+    /// Machine-readable form of the result. Errors with a known code carry
+    /// `{"error": {"code", "message"}}` here; the text content stays as it is.
+    #[serde(
+        rename = "structuredContent",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub structured_content: Option<Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -90,6 +98,7 @@ impl ToolResult {
                 text: content.into(),
             }],
             is_error: false,
+            structured_content: None,
         }
     }
 
@@ -100,6 +109,7 @@ impl ToolResult {
                 mime_type: mime_type.into(),
             }],
             is_error: false,
+            structured_content: None,
         }
     }
 
@@ -118,6 +128,7 @@ impl ToolResult {
                 },
             ],
             is_error: false,
+            structured_content: None,
         }
     }
 
@@ -132,6 +143,29 @@ impl ToolResult {
         Self {
             content: vec![ToolContent::Text { text }],
             is_error: true,
+            structured_content: None,
         }
+    }
+
+    /// Attaches the error code to an error result as `structuredContent.error`, so clients can
+    /// act on the kind of failure without reading the English message. Extra fields (such as a
+    /// running game's `data`) go next to `code` and `message`.
+    pub fn with_error_code(mut self, code: &str, message: &str, extra: Option<Value>) -> Self {
+        let mut error = serde_json::json!({"code": code, "message": message});
+        if let (Some(Value::Object(fields)), Some(target)) = (extra, error.as_object_mut()) {
+            for (key, value) in fields {
+                target.entry(key).or_insert(value);
+            }
+        }
+        self.structured_content = Some(serde_json::json!({ "error": error }));
+        self
+    }
+
+    /// The `code` in `structuredContent.error`, if this result has one.
+    pub fn error_code(&self) -> Option<&str> {
+        self.structured_content
+            .as_ref()?
+            .pointer("/error/code")?
+            .as_str()
     }
 }

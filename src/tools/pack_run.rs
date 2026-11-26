@@ -31,24 +31,20 @@ const MISSING_PHRASES: &[&str] = &[
 /// How many missing files an answer names.
 const MAX_LISTED_MISSING: usize = 200;
 
-pub fn handles(name: &str) -> bool {
-    name == RUN_PACK
-}
-
 pub fn catalog() -> Vec<Tool> {
     vec![super::tool(
         RUN_PACK,
-        "Smoke-runs an exported pack (.pck or .zip, as godot_export_project writes it) with the configured Godot binary: godot --main-pack <pack>, headless by default, from an empty temporary folder, and stops it after seconds (default 10). Use it to check a trimmed export (export_filter resources or scenes) for files the game loads by a path no scene names, which the pack then lacks. Returns ok, ran_full_time (true when the game was still running and was stopped), the exit code, the duration, missing_resources (the res:// or uid:// paths of failed loads such as \"Resource file not found\" and \"Can't open file from path\", each once), the ERROR and WARNING lines, and the last part of stdout and stderr. ok is false, and the answer an error, when a file was missing, Godot logged an error, or the game quit early with a non-zero exit code or crashed. A game that quits on its own with exit code 0 before seconds is ok. The game's user:// folder is the one its project settings name, as for any run of the game. Not a managed run: godot_get_run_status does not list it, and it cannot be inspected while it runs; use godot_run_project for that. It runs alongside other calls; it starts once an export running in the same project has finished.",
+        "Smoke-runs an exported .pck/.zip with godot --main-pack (headless by default) from an empty temp folder for seconds, to find files a trimmed export lacks. Returns ok, ran_full_time, exit code, duration, missing_resources (failed res:// or uid:// loads), ERROR/WARNING lines and the output tail. ok is false (an error answer) on a missing file, a logged error, or an early non-zero exit or crash. An early exit 0 is ok. Uses the game's real user:// folder. Not a managed run: godot_get_run_status does not list it. Waits for an export running in the same project.",
         json!({
-            "pack_path": {"type": "string", "description": "The pack to run, inside the project, as a res:// path or relative to the project, such as build/game.pck. Must end in .pck or .zip."},
-            "scene": {"type": "string", "description": "res:// path of a scene in the pack to start instead of the main scene (--scene)."},
-            "headless": {"type": "boolean", "description": "Run with --headless (no window, a dummy renderer: resources still load). Default true. false opens a window, which also compiles shaders."},
-            "seconds": {"type": "integer", "minimum": 1, "maximum": MAX_SECONDS, "description": "How long the game runs before it is stopped (its process tree is killed). Default 10."},
-            "user_args": {"type": "array", "items": {"type": "string"}, "description": "Game arguments, placed after --, so the game reads them with OS.get_cmdline_user_args() and Godot never treats them as engine options."},
-            "project_path": {"type": "string", "description": "Project directory containing project.godot, which pack_path is relative to. Optional: defaults to the project open in the connected editor, else the project the server was started in."}
+            "pack_path": {"type": "string", "description": "res:// or project-relative .pck or .zip inside the project."},
+            "scene": {"type": "string", "description": "Scene to start instead of the main one."},
+            "headless": {"type": "boolean", "description": "Default true; false opens a window (compiles shaders)."},
+            "seconds": {"type": "integer", "minimum": 1, "maximum": MAX_SECONDS, "description": "Default 10."},
+            "user_args": {"type": "array", "items": {"type": "string"}, "description": "Game arguments, after --."},
+            "project_path": {"type": "string", "description": "Default: editor's, else server's project."}
         }),
         &["pack_path"],
-    )]
+    ).additive()]
 }
 
 pub async fn call(tools: &ToolManager, args: Value) -> ToolResult {

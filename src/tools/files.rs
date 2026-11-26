@@ -10,6 +10,7 @@
 
 use super::reference_kind::{Kind, classify_script};
 use super::{EditorChoice, ToolManager};
+use crate::bridge_protocol::for_editor;
 use crate::error::McpError;
 use crate::paths::{res_display, resolve_in_project};
 use crate::protocol::{Tool, ToolResult};
@@ -42,28 +43,24 @@ const MAX_LISTED_REFERENCES: usize = 50;
 const BRIDGE_ADDON: &str = "res://addons/godot_mcp/";
 const IMPORTED_PREFIX: &str = "res://.godot/imported/";
 
-pub fn handles(name: &str) -> bool {
-    name == DELETE
-}
-
 pub fn catalog() -> Vec<Tool> {
     vec![super::tool(
         DELETE,
-        "Deletes files of a Godot project (scripts, scenes, resources, imported assets, any project file) together with their companions: the .uid file, the .import file and the imported data in .godot/imported. Before deleting it searches the project's text files (.tscn, .tres, .gd, shaders, project.godot, .cfg, .import, .cs, .json; with the editor also binary .scn/.res) for the file's res:// path and uid:// and refuses a file that is still used unless force is true. Each reference has a kind: \"written\" when a .gd script only writes the file (ResourceSaver.save, FileAccess.open for writing, DirAccess removal, Image.save_png; directly or through a constant or variable), so the script can create it again and the reference does not refuse the deletion; \"used\" for every other reference, and for any the analysis cannot follow. Refuses project.godot, anything in .godot/, the Godot MCP addon itself, a .uid or .import file whose own file exists, and directories (an empty one only with allow_empty_dir). All or nothing: while any path is refused nothing is deleted, and the answer lists each refusal with its reason. With the editor connected the files are deleted through it: open scene and script tabs of them are closed (one with unsaved changes is refused), the FileSystem dock is updated, and the files go to the system trash unless trash is false. Without an editor they are deleted permanently on disk and the answer says the editor needs a rescan (godot_resave_resources). dry_run reports what would be deleted and the references without deleting. Mentions by class_name or a path built at run time are not found.",
+        "Deletes project files with their .uid, .import and .godot/imported data. Refuses a file still referenced by res:// path or uid:// unless force; each reference has kind used, or written (a .gd only writes the file: does not refuse). Refuses project.godot, .godot/, the MCP addon, a .uid/.import whose file exists, and directories (empty ones with allow_empty_dir); all or nothing. With the editor, its tabs close (unsaved ones refuse) and files go to the trash unless trash is false. Without it deletion is permanent and the editor needs a rescan. dry_run previews. class_name and run-time paths are not searched; without the editor, neither are binary .scn/.res.",
         json!({
             "paths": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "res:// paths of the files to delete, at most 64."
+                "description": "At most 64."
             },
-            "force": {"type": "boolean", "description": "Delete files that are still used, leaving those references broken. Default false."},
-            "allow_empty_dir": {"type": "boolean", "description": "Allow deleting a directory that is empty. Default false."},
-            "dry_run": {"type": "boolean", "description": "Only report what would be deleted, the references and the refusals. Default false."},
-            "trash": {"type": "boolean", "description": "With the editor connected, move the files to the system trash (default true); false deletes them permanently. Without an editor files are always deleted permanently."},
-            "project_path": {"type": "string", "description": "Project directory. Optional: defaults to the project open in the editor, else the one the server was started in."}
+            "force": {"type": "boolean", "description": "Delete despite references. Default false."},
+            "allow_empty_dir": {"type": "boolean", "description": "Default false."},
+            "dry_run": {"type": "boolean", "description": "Default false."},
+            "trash": {"type": "boolean", "description": "Editor only; default true. false deletes permanently."},
+            "project_path": {"type": "string", "description": "Default: editor's, else server's project."}
         }),
         &["paths"],
-    )]
+    ).destructive_idempotent()]
 }
 
 pub async fn call(tools: &ToolManager, args: Value) -> ToolResult {
@@ -85,12 +82,11 @@ pub async fn call(tools: &ToolManager, args: Value) -> ToolResult {
     if matches!(choice, EditorChoice::Host) {
         return delete_on_host(tools, &args, paths).await;
     }
-    let mut params = args.clone();
-    if let Value::Object(map) = &mut params {
-        map.remove("project_path");
-    }
     let bridge = tools.bridge.clone().with_timeout(EDITOR_WAIT);
-    match bridge.send_command("delete_files", params).await {
+    match bridge
+        .send_command("delete_files", for_editor(&args, &[]))
+        .await
+    {
         Ok(report) => answer(choice.name_project(report)),
         Err(McpError::BridgeUnavailable(_)) => delete_on_host(tools, &args, paths).await,
         Err(error) => super::bridge_error_result(&error),

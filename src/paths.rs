@@ -110,7 +110,11 @@ pub fn same_directory(a: &Path, b: &Path) -> bool {
         };
         let mut text = host_text(&resolved);
         if let Some(rest) = text.strip_prefix("//?/") {
-            text = rest.to_string();
+            // `\\?\UNC\host\share` is another spelling of `\\host\share`.
+            text = match rest.get(..4) {
+                Some(head) if head.eq_ignore_ascii_case("UNC/") => format!("//{}", &rest[4..]),
+                _ => rest.to_string(),
+            };
         }
         while text.len() > 1 && text.ends_with('/') {
             text.pop();
@@ -226,6 +230,12 @@ fn absolute_link_target(
     Some((resolved, below))
 }
 
+/// Whether `path` is a network path outside the project by its spelling. A project may itself lie
+/// on a share the user chose (a WSL folder, a company share); every other share is foreign.
+fn is_foreign_network_path(path: &Path, root: &Path, project: &Path) -> bool {
+    is_network_path(path) && components_below(path, &[root, project]).is_none()
+}
+
 /// How many symbolic links one path may pass through before it is refused, as on Linux.
 const MAX_LINKS: usize = 40;
 
@@ -233,7 +243,8 @@ const MAX_LINKS: usize = 40;
 /// `root`) the way the operating system would when the path is opened or created, and says
 /// whether it stays inside `root`. A link is read, never followed blindly: its target is checked
 /// by spelling before anything at it is looked at, so a link that points outside the project,
-/// or at a network share, is refused whether or not its target exists.
+/// or at a network share the project does not lie on, is refused whether or not its target
+/// exists.
 fn stays_inside(
     root: &Path,
     project: &Path,
@@ -284,7 +295,7 @@ fn stays_inside(
                 .components()
                 .any(|component| matches!(component, Component::Prefix(_)));
         let mut expanded: Vec<OsString> = if absolute {
-            if is_network_path(&target) {
+            if is_foreign_network_path(&target, root, project) {
                 return Err("a link points at a network path");
             }
             let (start, below) = absolute_link_target(&target, root, project)
@@ -313,9 +324,9 @@ fn stays_inside(
 ///
 /// Rejects `..` segments (a name merely containing two dots is fine) and anything that lands
 /// outside the project, including through symlinks, whether their target exists or not. A
-/// network path is refused by its spelling, before anything at it is looked at; a local path
-/// spelled otherwise than the project (another case, a link to it) is compared by the folder on
-/// disk it names.
+/// network path outside the project is refused by its spelling, before anything at it is looked
+/// at; a local path spelled otherwise than the project (another case, a link to it) is compared
+/// by the folder on disk it names.
 pub fn resolve_in_project(project: &Path, requested: &str) -> Result<PathBuf, String> {
     let trimmed = requested.trim();
     if trimmed.is_empty() {
@@ -323,7 +334,13 @@ pub fn resolve_in_project(project: &Path, requested: &str) -> Result<PathBuf, St
     }
 
     let relative = trimmed.strip_prefix(RES_PREFIX).unwrap_or(trimmed);
-    let normalized = relative.replace('\\', "/");
+    let slashed = relative.replace('\\', "/");
+    // A verbatim Windows path (`\\?\...`) knows only `\` as a separator: it is read as written.
+    let normalized = if cfg!(windows) && relative.starts_with(r"\\?\") {
+        relative.to_string()
+    } else {
+        slashed.clone()
+    };
     let path = Path::new(&normalized);
     let outside = || {
         format!(
@@ -331,7 +348,7 @@ pub fn resolve_in_project(project: &Path, requested: &str) -> Result<PathBuf, St
             project.display()
         )
     };
-    if trimmed.starts_with(RES_PREFIX) && normalized.starts_with("//") {
+    if trimmed.starts_with(RES_PREFIX) && slashed.starts_with("//") {
         return Err(outside());
     }
 
@@ -364,8 +381,8 @@ pub fn resolve_in_project(project: &Path, requested: &str) -> Result<PathBuf, St
             project.display()
         )
     })?;
-    // A network path is refused by its spelling, before anything at it is looked at.
-    if is_network_path(&resolved) {
+    // A foreign network path is refused by its spelling, before anything at it is looked at.
+    if is_foreign_network_path(&resolved, &project_root, project) {
         return Err(outside());
     }
     let (start, below) =
@@ -705,6 +722,57 @@ mod tests {
             cfg!(windows)
         );
         assert!(!is_network_path(Path::new("\\\\?\\C:\\proj")));
+    }
+
+    /// A new project folder that is reached by a network path: inside the writable share named
+    /// by `GODOT_MCP_TEST_SHARE` (for example a WSL folder), otherwise a local temporary folder
+    /// spelled through the administrative share of its drive. `None` when neither can be used.
+    #[cfg(windows)]
+    fn shared_project() -> Option<(tempfile::TempDir, PathBuf)> {
+        if let Some(share) = std::env::var_os("GODOT_MCP_TEST_SHARE") {
+            let dir = tempfile::tempdir_in(share).expect("a folder in GODOT_MCP_TEST_SHARE");
+            let path = dir.path().to_path_buf();
+            return Some((dir, path));
+        }
+        let dir = project();
+        let local = dir.path().canonicalize().expect("canonical project");
+        let text = local.to_string_lossy();
+        let text = text.strip_prefix(r"\\?\").unwrap_or(&text);
+        let (drive, rest) = text.split_once(":\\")?;
+        let shared = PathBuf::from(format!(r"\\localhost\{drive}$\{rest}"));
+        shared.is_dir().then_some((dir, shared))
+    }
+
+    /// A project may itself lie on a network share (a WSL folder, a company share): the user
+    /// chose that place, so its own files resolve, while any other share stays refused.
+    #[cfg(windows)]
+    #[test]
+    fn a_project_opened_by_a_network_path_keeps_its_own_files() {
+        let Some((_keep, shared)) = shared_project() else {
+            eprintln!("skipped: no network path to a writable folder");
+            return;
+        };
+        let canonical = shared.canonicalize().expect("canonical share");
+        for root in [&shared, &canonical] {
+            for requested in [
+                "res://a.gd".to_string(),
+                "sub/a.gd".to_string(),
+                root.join("a.gd").to_string_lossy().into_owned(),
+            ] {
+                let resolved = resolve_in_project(root, &requested)
+                    .unwrap_or_else(|why| panic!("{}: {requested}: {why}", root.display()));
+                assert!(resolved.ends_with("a.gd"), "{}", resolved.display());
+            }
+            for other in [
+                "//other-host/share/x.gd",
+                "res:////other-host/share/x.gd",
+                "\\\\other-host\\share\\x.gd",
+            ] {
+                assert!(resolve_in_project(root, other).is_err(), "{other}");
+            }
+        }
+        // The editor reports the project by one spelling, the server may hold the other.
+        assert!(same_directory(&shared, &canonical));
     }
 
     #[test]

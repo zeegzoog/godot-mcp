@@ -30,7 +30,6 @@ dotenvy = "0.15.7"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 thiserror = "2.0.21"
-anyhow = "1.0.105"
 uuid = { version = "1.29.3", features = ["v4"] }
 ruzstd = { version = "0.9.1", default-features = false, features = ["std"] }
 md-5 = "0.11.0"

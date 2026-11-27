@@ -206,7 +206,7 @@ mod tests {
 
     #[test]
     fn an_action_name_is_data_but_not_one_the_editor_refuses() {
-        for good in ["jump", "move left", "ui_accept", "прыжок"] {
+        for good in ["jump", "move left", "ui_accept", "άλμα"] {
             assert!(check_action_name(good).is_ok(), "{good}");
         }
         for bad in ["", "  ", "a/b", "a:b", "a=b", "a\\b", "a\"b", "a\nb"] {

@@ -887,7 +887,7 @@ mod tests {
 
     #[test]
     fn a_preset_name_cannot_become_an_engine_option() {
-        for good in ["Linux", "webOS TV", "Web (threads)", "Пресет"] {
+        for good in ["Linux", "webOS TV", "Web (threads)", "Προεπιλογή"] {
             assert!(check_name(good).is_ok(), "{good}");
         }
         for bad in ["", "  ", "-s", "--script", "a\nb"] {

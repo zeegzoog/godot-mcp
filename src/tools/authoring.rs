@@ -1222,7 +1222,7 @@ mod tests {
         assert_eq!(godot_string("a\"b\\c"), r#""a\"b\\c""#);
         assert_eq!(godot_string("one\ntwo\r\t"), r#""one\ntwo\r\t""#);
         assert_eq!(godot_string("bell\u{7}"), r#""bell\u0007""#);
-        assert_eq!(godot_string("мир"), "\"мир\"");
+        assert_eq!(godot_string("κόσμος"), "\"κόσμος\"");
     }
 
     #[test]

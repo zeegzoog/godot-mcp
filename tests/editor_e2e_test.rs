@@ -4156,7 +4156,8 @@ void fragment() {
         )
         .await;
     assert!(!deleted.is_error, "{}", tool_text(&deleted));
-    // Saving the scene also saves what the editor's plugins hold, shader tabs included.
+    // A save writes only tabs with unsaved text; the tab check below is what proves nothing
+    // can write the file back.
     send("save_scene", json!({})).await;
     sleep(Duration::from_secs(1)).await;
     let after = send("__shader_tabs", json!({})).await;

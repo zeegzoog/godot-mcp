@@ -155,6 +155,9 @@ func delete(bridge: Object, params: Dictionary) -> Dictionary:
                 _refuse(report, res_path, "is open in the editor with unsaved changes. Save or close the scene first")
             else:
                 scene_tabs.append(res_path)
+        var shader_problem: String = _unsaved_shader(bridge, res_path)
+        if not shader_problem.is_empty():
+            _refuse(report, res_path, shader_problem)
         if res_path.get_extension() == "gd":
             var tab: Dictionary = _tab_state(bridge, res_path)
             if bool(tab.get("dirty", false)):
@@ -613,6 +616,32 @@ func mentions(text: String, needle: String) -> bool:
         at = text.find(needle, at + 1)
     return false
 
+## Why the shader tab of res_path forbids changing the file, or "" (see shader_ops).
+func _unsaved_shader(bridge: Object, res_path: String) -> String:
+    var ops: Object = bridge.call("_shader_ops")
+    return str(ops.call("unsaved_problem", res_path))
+
+## The error for the first of paths that is not a res:// path inside the project, or "".
+func _outside_project(bridge: Object, paths: Array[String]) -> String:
+    for path: String in paths:
+        if not path.begins_with("res://") or str(bridge.call("to_res_path", path)).is_empty():
+            return "Not a res:// path inside the project: '%s'. Name files by their res:// path, without '..'." % path
+    return ""
+
+## Every path the parameters of a move command name: the strings under the keys of lists, and the
+## fields named in pairs_of_fields of the dictionaries under their key.
+func _named_paths(params: Dictionary, lists: Array[String], dictionaries: Dictionary) -> Array[String]:
+    var paths: Array[String] = []
+    for key: String in lists:
+        for item: Variant in params.get(key, []):
+            paths.append(str(item))
+    for key: String in dictionaries:
+        for item: Variant in params.get(key, []):
+            var entry: Dictionary = item as Dictionary if item is Dictionary else {}
+            for field: String in dictionaries[key]:
+                paths.append(str(entry.get(field, "")))
+    return paths
+
 ## The script tab state script_ops reports for res_path.
 func _tab_state(bridge: Object, res_path: String) -> Dictionary:
     var ops: Object = bridge.call("_script_ops")
@@ -646,6 +675,9 @@ func _listing(targets: Array[Dictionary]) -> Array:
 ## params: files (Array of {from, to}), rewrite and binary (Arrays of res:// paths).
 func move_check(bridge: Object, params: Dictionary) -> Dictionary:
     var report: Dictionary = {"refused": [], "warnings": []}
+    var outside: String = _outside_project(bridge, _named_paths(params, ["rewrite", "binary"], {"files": ["from", "to"]}))
+    if not outside.is_empty():
+        return {"error": outside}
     if bool(bridge.call("is_import_running", EditorInterface.get_resource_filesystem())):
         return {"error": "A resource import is running in the editor. Retry the move once it finishes."}
     var paths: Array[String] = []
@@ -658,9 +690,12 @@ func move_check(bridge: Object, params: Dictionary) -> Dictionary:
     var open_scenes: PackedStringArray = EditorInterface.get_open_scenes()
     var seen: Dictionary = {}
     for res_path: String in paths:
-        if not res_path.begins_with("res://") or seen.has(res_path):
+        if seen.has(res_path):
             continue
         seen[res_path] = true
+        var shader_problem: String = _unsaved_shader(bridge, res_path)
+        if not shader_problem.is_empty():
+            _refuse(report, res_path, "%s: the move changes it" % shader_problem)
         if open_scenes.has(res_path) and bool(bridge.call("_has_unsaved_changes", res_path)):
             _refuse(report, res_path, "is open in the editor with unsaved changes, and the move changes it. Save or close the scene first")
         if res_path.get_extension() == "gd":
@@ -681,6 +716,9 @@ func move_check(bridge: Object, params: Dictionary) -> Dictionary:
 ## (Arrays of res:// paths after the move), pairs (Array of {old, new, prefix}, longest first).
 func move_apply(bridge: Object, params: Dictionary) -> Dictionary:
     var report: Dictionary = {"resaved": [], "reloaded_scenes": [], "reloaded_scripts": [], "project_settings": [], "warnings": []}
+    var outside: String = _outside_project(bridge, _named_paths(params, ["rewritten", "binary"], {"files": ["from", "to"], "folders": ["from", "to"], "pairs": ["old", "new"]}))
+    if not outside.is_empty():
+        return {"error": outside}
     var pairs: Array[Dictionary] = []
     for item: Variant in params.get("pairs", []):
         if item is Dictionary and str((item as Dictionary).get("old", "")).begins_with("res://"):
@@ -751,6 +789,11 @@ func move_apply(bridge: Object, params: Dictionary) -> Dictionary:
             var tab: Dictionary = ops.call("tab_state", res_path, true)
             if bool(tab.get("reloaded", false)):
                 report["reloaded_scripts"].append(res_path)
+        elif res_path.get_extension().to_lower() in ["gdshader", "gdshaderinc"]:
+            var shaders: Object = bridge.call("_shader_ops")
+            var behind: String = str(shaders.call("follow_file", res_path))
+            if not behind.is_empty():
+                report["warnings"].append("The shader editor may show the old text: %s" % behind)
     for scene_path: String in to_reload:
         EditorInterface.reload_scene_from_path(scene_path)
         report["reloaded_scenes"].append(scene_path)

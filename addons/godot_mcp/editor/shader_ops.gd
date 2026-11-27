@@ -197,6 +197,43 @@ func edit(res_path: String, old_text: String, new_text: String, version: String)
         answer["bom_removed"] = not _file_starts_with_bom(res_path)
     return answer
 
+## Why a command must not move, rewrite or delete the file of a shader given its tab, or "": a tab
+## with unsaved changes, or tabs that cannot be matched to the file and so may hold some.
+func unsaved_problem(res_path: String) -> String:
+    if not EXTENSIONS.has(res_path.get_extension().to_lower()):
+        return ""
+    var pair: Dictionary = _pair_editor(res_path)
+    match str(pair["state"]):
+        "unknown":
+            return "may have unsaved changes in the shader editor, whose tabs cannot be matched to it (%s). Close its extra tabs in the shader editor first" % str(pair["reason"])
+        "found":
+            if _is_dirty(pair["editor"]):
+                return "has unsaved changes in the shader editor. Save or discard them first"
+    return ""
+
+## Gives the editor's shader and its saved tab the text of the file, after another step rewrote
+## it, so a later save does not write the old text back. Returns why it could not, or ""; a shader
+## the editor has not loaded needs nothing.
+func follow_file(res_path: String) -> String:
+    if not ResourceLoader.has_cached(res_path):
+        return ""
+    var loaded: Dictionary = _file_text(res_path)
+    if loaded.has("error"):
+        return str(loaded["error"])
+    var shader: Resource = load(res_path)
+    if shader == null or not ("code" in shader):
+        return ""
+    if not unsaved_problem(res_path).is_empty():
+        # Typed after the check: saving that tab now would bring the old text back.
+        return "%s was rewritten, but its shader tab holds unsaved or unmatched text and was not updated. Do not save that tab over the file: copy what was typed, reload the file from disk, then add it again." % res_path
+    var text: String = str(loaded["text"])
+    var pair: Dictionary = _pair_editor(res_path)
+    if str(pair["state"]) == "found":
+        # The tab applies its own text to the shader when the code changes, so it goes first.
+        _reload_tab(_buffer(pair["editor"]), text)
+    shader.set("code", text)
+    return ""
+
 ## Gives an unmodified tab the new text and marks it saved, keeping the caret and scroll.
 func _reload_tab(base: CodeEdit, text: String) -> void:
     var caret_line: int = base.get_caret_line()
@@ -278,7 +315,7 @@ func _file_starts_with_bom(res_path: String) -> bool:
 ## {"text": file text with "\n" line endings, "bom": whether it starts with a byte order mark} or
 ## {"error": ...}.
 func _file_text(res_path: String) -> Dictionary:
-    if not EXTENSIONS.has(res_path.get_extension()):
+    if not EXTENSIONS.has(res_path.get_extension().to_lower()):
         return {"error": "Only .gdshader and .gdshaderinc files are handled by the shader tools: " + res_path}
     if not FileAccess.file_exists(res_path):
         return {"error": "Shader file does not exist: %s. Create it with godot_create_shader." % res_path}

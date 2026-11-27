@@ -3901,6 +3901,188 @@ async fn files_and_folders_are_moved_through_the_editor_with_references_and_tabs
     assert!(project.join("dirty.tscn").is_file());
 }
 
+/// Moving or deleting files through the editor never loses what a person typed in the shader
+/// editor and did not save: the call is refused and nothing changes. A saved shader tab whose file
+/// a move rewrites shows the new text. The move commands refuse a path that leaves the project.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn moves_and_deletes_respect_the_shader_editor_and_stay_in_the_project() {
+    use godot_mcp::cli_runner::CliRunner;
+    use godot_mcp::tools::ToolManager;
+    use std::sync::Arc;
+
+    let include = "float wave(float x) {
+	return sin(x);
+}
+";
+    let water = "shader_type canvas_item;
+
+#include \"res://fx/common.gdshaderinc\"
+
+void fragment() {
+	COLOR = vec4(wave(1.0));
+}
+";
+    let typed = "shader_type canvas_item;
+
+void fragment() {
+	COLOR = vec4(1.0);
+}
+";
+    let outer = "#include \"res://fx/common.gdshaderinc\"
+
+float twice(float x) {
+	return wave(x) * 2.0;
+}
+";
+    let editor = start_editor_with(
+        Some(SHADER_PROBE_HOOK),
+        "",
+        &[
+            ("fx/common.gdshaderinc", include),
+            ("fx/outer.gdshaderinc", outer),
+            ("water.gdshader", water),
+            ("typed.gdshader", typed),
+        ],
+        "",
+    )
+    .await;
+    let project = editor.project.clone();
+    let (godot, _) = godot_binaries();
+    let tools = Arc::new(
+        ToolManager::new(BridgeClient::new(editor.port), CliRunner::new(godot))
+            .with_working_dir(project.clone()),
+    );
+    let call = |tool: &'static str, args: Value| {
+        let tools = Arc::clone(&tools);
+        async move { tools.call_tool(tool, args).await }
+    };
+    let send = |command: &'static str, params: Value| {
+        let bridge = editor.bridge.clone();
+        async move { bridge.send_command(command, params).await }
+    };
+    let read = |name: &str| std::fs::read_to_string(project.join(name)).expect("readable file");
+
+    // An edit opens each shader in the shader editor; one of them then gets unsaved typing.
+    for (path, old, new) in [
+        ("res://fx/outer.gdshaderinc", "* 2.0", "* 3.0"),
+        ("res://water.gdshader", "wave(1.0)", "wave(2.0)"),
+        ("res://typed.gdshader", "vec4(1.0)", "vec4(0.5)"),
+    ] {
+        send(
+            "edit_shader",
+            json!({"shader_path": path, "old_text": old, "new_text": new}),
+        )
+        .await
+        .expect("open the shader by editing it");
+    }
+    send(
+        "__shader_type",
+        json!({"path": "res://typed.gdshader", "text": "// typed
+"}),
+    )
+    .await
+    .expect("type");
+    let saved = read("typed.gdshader");
+
+    let moved = call(
+        "godot_move_file",
+        json!({"moves": [{"from": "res://typed.gdshader", "to": "res://fx/typed.gdshader"}]}),
+    )
+    .await;
+    assert!(moved.is_error, "{}", tool_text(&moved));
+    assert!(
+        tool_text(&moved).contains("unsaved changes in the shader editor"),
+        "{}",
+        tool_text(&moved)
+    );
+    let deleted = call(
+        "godot_delete_file",
+        json!({"paths": ["res://typed.gdshader"], "trash": false}),
+    )
+    .await;
+    assert!(deleted.is_error, "{}", tool_text(&deleted));
+    assert!(
+        tool_text(&deleted).contains("unsaved changes in the shader editor"),
+        "{}",
+        tool_text(&deleted)
+    );
+    assert_eq!(read("typed.gdshader"), saved, "nothing moved or deleted");
+    assert!(!project.join("fx/typed.gdshader").exists());
+
+    // Unsaved typing in a file the move would only rewrite, a shader or an include, refuses too.
+    let include_move = json!({"moves": [{"from": "res://fx/common.gdshaderinc", "to": "res://lib/common.gdshaderinc"}]});
+    for path in ["res://water.gdshader", "res://fx/outer.gdshaderinc"] {
+        send(
+            "__shader_type",
+            json!({"path": path, "text": "// typed
+"}),
+        )
+        .await
+        .expect("type into a file the move rewrites");
+        let refused = call("godot_move_file", include_move.clone()).await;
+        assert!(refused.is_error, "{path}: {}", tool_text(&refused));
+        assert!(
+            tool_text(&refused).contains("unsaved changes in the shader editor"),
+            "{path}: {}",
+            tool_text(&refused)
+        );
+        assert!(
+            project.join("fx/common.gdshaderinc").is_file(),
+            "nothing moved"
+        );
+        send("__shader_undo", json!({"path": path}))
+            .await
+            .expect("undo the typing");
+    }
+
+    // Moving the include rewrites the saved files that name it, and their tabs follow.
+    let moved = call("godot_move_file", include_move.clone()).await;
+    assert!(!moved.is_error, "{}", tool_text(&moved));
+    let rewritten = read("water.gdshader");
+    assert!(
+        rewritten.contains("res://lib/common.gdshaderinc"),
+        "{rewritten}"
+    );
+    let shown = send("__shader_state", json!({"path": "res://water.gdshader"}))
+        .await
+        .expect("water state");
+    assert_eq!(shown["text"], rewritten, "{shown}");
+    assert_eq!(shown["memory_code"], rewritten, "{shown}");
+    assert_eq!(shown["dirty"], false, "{shown}");
+    let included = read("fx/outer.gdshaderinc");
+    assert!(
+        included.contains("res://lib/common.gdshaderinc"),
+        "{included}"
+    );
+    let shown = send(
+        "__shader_state",
+        json!({"path": "res://fx/outer.gdshaderinc"}),
+    )
+    .await
+    .expect("outer state");
+    assert_eq!(shown["text"], included, "{shown}");
+    assert_eq!(shown["dirty"], false, "{shown}");
+
+    let outside = json!([{"from": "res://../outside.txt", "to": "res://inside.txt"}]);
+    expect_error(
+        send(
+            "move_files_check",
+            json!({"files": outside, "rewrite": [], "binary": []}),
+        )
+        .await,
+        "inside the project",
+    );
+    expect_error(
+        send(
+            "move_files_apply",
+            json!({"files": [], "folders": [], "rewritten": [], "binary": ["res://a/../../outside.res"], "pairs": []}),
+        )
+        .await,
+        "inside the project",
+    );
+}
+
 #[tokio::test]
 #[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
 async fn set_node_properties_adds_metadata_the_way_the_inspector_does() {

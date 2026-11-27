@@ -1,7 +1,7 @@
 //! Path and identifier checks shared by the tools that touch the file system.
 
 use std::collections::VecDeque;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf, Prefix};
 
@@ -236,6 +236,19 @@ fn is_foreign_network_path(path: &Path, root: &Path, project: &Path) -> bool {
     is_network_path(path) && components_below(path, &[root, project]).is_none()
 }
 
+/// Whether a failed look at the entry `part` shows that nothing is there: it is missing, or its
+/// name is one the system cannot give any entry (so it is no link either). A name that holds a
+/// separator of this system is not judged: it is not one entry.
+fn nothing_exists_at(part: &OsStr, kind: ErrorKind) -> bool {
+    match kind {
+        ErrorKind::NotFound | ErrorKind::NotADirectory => true,
+        ErrorKind::InvalidFilename | ErrorKind::InvalidInput => {
+            !part.to_string_lossy().chars().any(std::path::is_separator)
+        }
+        _ => false,
+    }
+}
+
 /// How many symbolic links one path may pass through before it is refused, as on Linux.
 const MAX_LINKS: usize = 40;
 
@@ -267,9 +280,7 @@ fn stays_inside(
         let next = current.join(&part);
         let meta = match std::fs::symlink_metadata(&next) {
             Ok(meta) => meta,
-            Err(error)
-                if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) =>
-            {
+            Err(error) if nothing_exists_at(&part, error.kind()) => {
                 // Nothing exists here: the rest is created under `current`, unless it climbs
                 // back.
                 return if pending.iter().any(|rest| rest == "..") {
@@ -667,10 +678,10 @@ mod tests {
             resolve_in_project(dir.path(), &requested.to_string_lossy()).expect("other case");
         assert_eq!(resolved, requested);
 
-        let outside = tempfile::tempdir().expect("outside");
         std::fs::create_dir(root.join("sub")).expect("mkdir");
         #[cfg(unix)]
         {
+            let outside = tempfile::tempdir().expect("outside");
             std::os::unix::fs::symlink(outside.path(), root.join("sub/out")).expect("symlink");
             let through = shouted.join("sub/out/x.gd");
             assert!(resolve_in_project(dir.path(), &through.to_string_lossy()).is_err());
@@ -695,6 +706,23 @@ mod tests {
             .is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
         {
             assert!(result.is_err(), "{result:?}");
+        }
+    }
+
+    /// A name the system cannot give a file (a NUL; on Windows a quote or a line break) cannot be
+    /// a link either: the path resolves, and the tool that takes the name judges it.
+    #[test]
+    fn a_name_the_system_cannot_have_is_not_taken_for_a_link() {
+        let dir = project();
+        for requested in [
+            "res://b\".gd",
+            "res://b\n.gd",
+            "res://b?.gd",
+            "res://b\u{0}.gd",
+            "res://dir\u{1}/b.gd",
+        ] {
+            let resolved = resolve_in_project(dir.path(), requested);
+            assert!(resolved.is_ok(), "{requested:?}: {resolved:?}");
         }
     }
 

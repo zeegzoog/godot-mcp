@@ -1947,6 +1947,7 @@ impl CliRunner {
 /// this user may enter it: the temporary directory is shared, and the folder holds the call's
 /// request and answer (project paths, screenshots).
 fn create_scratch_dir(purpose: &str) -> Result<PathBuf> {
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
@@ -2411,7 +2412,7 @@ fn strip_banner(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{binary_uid_limit, create_scratch_dir, script_errors_in, strip_banner};
+    use super::{binary_uid_limit, script_errors_in, strip_banner};
     use std::time::Duration;
 
     /// A scratch folder holds the request and the answer of one engine call (scene paths,
@@ -2420,7 +2421,7 @@ mod tests {
     #[test]
     fn a_scratch_folder_is_private_to_this_user() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = create_scratch_dir("mode-test").expect("scratch dir");
+        let dir = super::create_scratch_dir("mode-test").expect("scratch dir");
         let mode = std::fs::metadata(&dir)
             .expect("metadata")
             .permissions()

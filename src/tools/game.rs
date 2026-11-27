@@ -37,20 +37,28 @@ const DENY_METHODS: &[&str] = &[
     "call",
     "callv",
     "call_deferred",
+    "call_thread_safe",
+    "call_deferred_thread_group",
     "call_group",
     "call_group_flags",
     "propagate_call",
     "rpc",
     "rpc_id",
+    "rpc_config",
     "set",
     "set_deferred",
+    "set_thread_safe",
+    "set_deferred_thread_group",
     "set_indexed",
     "emit_signal",
     "notification",
     "propagate_notification",
+    "notify_thread_safe",
+    "notify_deferred_thread_group",
     "free",
     "queue_free",
     "replace_by",
+    "create_instance",
 ];
 
 pub async fn call(tools: &ToolManager, name: &str, args: Value) -> ToolResult {
@@ -299,7 +307,7 @@ mod tests {
         server.sort();
         assert_eq!(server, runtime_deny_list(), "the two refusal lists differ");
         // RO-6: quit, evaluate, call by name (directly, on a group, through a signal or a
-        // notification), set by name, free or replace a node.
+        // notification, on another thread), set by name, free or replace a node.
         for name in [
             "quit",
             "set_script",
@@ -320,6 +328,16 @@ mod tests {
             "free",
             "queue_free",
             "replace_by",
+            // The thread-safe and thread-group variants of call, set and notification, the RPC
+            // setup of a method by name, and an InstancePlaceholder replacing itself.
+            "call_thread_safe",
+            "call_deferred_thread_group",
+            "set_thread_safe",
+            "set_deferred_thread_group",
+            "notify_thread_safe",
+            "notify_deferred_thread_group",
+            "rpc_config",
+            "create_instance",
         ] {
             assert!(
                 server.iter().any(|item| item == name),

@@ -32,7 +32,7 @@ pub fn catalog() -> Vec<Tool> {
         ).destructive_idempotent(),
         tool(
             "godot_game_call",
-            "Calls one method on a live node. The method must be listed in permit; refused if it can quit, evaluate code, call a method by name (call, callv, call_group, propagate_call, rpc, emit_signal, notification), set a property by name (set, set_deferred, set_indexed) or free or replace a node (free, queue_free, replace_by). JSON strings become StringName or NodePath where the method takes one. If the node leaves the tree (scene change), the answer has left_tree true.",
+            "Calls one method on a live node. The method must be listed in permit; refused if it can quit, evaluate code, call a method by name (call, callv, call_group, propagate_call, rpc, emit_signal, notification), set a property by name (set, set_deferred, set_indexed and their thread-safe and thread-group variants) or free or replace a node (free, queue_free, replace_by, create_instance); the godot-mcp runtime node is never called. JSON strings become StringName or NodePath where the method takes one. If the node leaves the tree (scene change), the answer has left_tree true.",
             json!({"run_id": s(""), "path": s(""), "method": s(""), "args": {"type": "array"}, "permit": {"type": "array", "items": {"type": "string"}, "description": "Methods this call is allowed to invoke. Must include method."}}),
             &["method", "permit"],
         ).destructive(),

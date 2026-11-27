@@ -3563,6 +3563,186 @@ async fn game_call_refuses_what_could_take_the_game_apart_and_converts_argument_
     assert!(!stopped.is_error, "{}", text_of(&stopped));
 }
 
+/// RO-6: the runtime refuses by itself (not only because the server does) the thread-safe and
+/// thread-group variants of call, set and notification, and any engine method whose arguments name
+/// a method or a property to write; and it refuses to write to, or call methods on, its own node,
+/// which would let a caller stop it answering or forge its replies.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn game_call_and_set_refuse_by_name_variants_and_the_runtime_node_itself() {
+    let project = project();
+    std::fs::create_dir_all(project.path().join("tests")).unwrap();
+    // Straight to the runtime's own method, past the server's list: what the runtime itself refuses.
+    std::fs::write(
+        project.path().join("tests/direct.gd"),
+        r#"extends Node
+func run() -> Dictionary:
+	var rt := get_node("/root/GodotMcpRuntime")
+	var live: GDScript = load(rt.get_script().resource_path.get_base_dir().path_join("ops/rt_live.gd"))
+	var out := {}
+	for method: String in ["call_thread_safe", "call_deferred_thread_group", "set_thread_safe", "set_deferred_thread_group", "notify_thread_safe", "notify_deferred_thread_group", "rpc_config", "create_instance"]:
+		var args: Array = ["queue_free"] if method.begins_with("call") else []
+		var answer: Dictionary = live.call("call_method", rt, {"path": "Mark", "method": method, "permit": [method], "args": args})
+		out[method] = answer.get("error", {}).get("code", "ran")
+	# A future engine method that names a method or a property to write is refused by its
+	# signature; one that only names an animation is not.
+	out["by_signature"] = live.call("names_a_target", {"name": "future_call", "args": [{"name": "method", "type": TYPE_STRING_NAME}]})
+	out["by_property"] = live.call("names_a_target", {"name": "future_set", "args": [{"name": "property", "type": TYPE_STRING_NAME}, {"name": "value", "type": TYPE_NIL}]})
+	out["getter"] = live.call("names_a_target", {"name": "get_indexed", "args": [{"name": "property_path", "type": TYPE_NODE_PATH}]})
+	out["animation"] = live.call("names_a_target", {"name": "play", "args": [{"name": "name", "type": TYPE_STRING_NAME}]})
+	# Editor-only metadata (a name starting with "_") is refused, other metadata is not.
+	for key: String in ["_edit_lock_", "score"]:
+		var meta: Dictionary = live.call("call_method", rt, {"path": "Mark", "method": "set_meta", "permit": ["set_meta"], "args": [key, 1]})
+		out["meta" + key] = meta.get("error", {}).get("code", "ran")
+	out["mark_alive"] = get_tree().current_scene.has_node("Mark")
+	out["recovered_id"] = rt.call("recovered_id", "{\"id\": 42, \"method\": \"game.tree\", \"params\": {")
+	out["no_id"] = rt.call("recovered_id", "not json at all")
+	return out
+"#,
+    )
+    .unwrap();
+    let tools = manager(project.path());
+    let started = call(
+        &tools,
+        "godot_run_project",
+        json!({"project_path": project.path(), "mode": "process", "headless": true}),
+    )
+    .await;
+    assert!(!started.is_error, "{}", text_of(&started));
+    let run_id = run_id_of(&started);
+
+    let direct = call(
+        &tools,
+        "godot_game_run_script",
+        json!({"run_id": run_id, "script": "res://tests/direct.gd"}),
+    )
+    .await;
+    assert!(!direct.is_error, "{}", text_of(&direct));
+    let value = &json_of(&direct)["value"];
+    for method in [
+        "call_thread_safe",
+        "call_deferred_thread_group",
+        "set_thread_safe",
+        "set_deferred_thread_group",
+        "notify_thread_safe",
+        "notify_deferred_thread_group",
+        "rpc_config",
+        "create_instance",
+    ] {
+        assert_eq!(value[method], "DENIED", "{method}: {value}");
+    }
+    assert_eq!(value["meta_edit_lock_"], "DENIED", "{value}");
+    assert_eq!(value["metascore"], "ran", "{value}");
+    assert_eq!(value["by_signature"], true, "{value}");
+    assert_eq!(value["by_property"], true, "{value}");
+    assert_eq!(value["getter"], false, "{value}");
+    assert_eq!(value["animation"], false, "{value}");
+    assert_eq!(value["mark_alive"], true, "{value}");
+    assert_eq!(value["recovered_id"], 42, "{value}");
+    assert_eq!(value["no_id"], Value::Null, "{value}");
+
+    // The runtime node, by an absolute path and by a path relative to the scene.
+    for path in ["/root/GodotMcpRuntime", "../GodotMcpRuntime"] {
+        let refused = call(
+            &tools,
+            "godot_game_call",
+            json!({"run_id": run_id, "path": path, "method": "set_process",
+                   "permit": ["set_process"], "args": [false]}),
+        )
+        .await;
+        assert!(refused.is_error, "{path}: {}", text_of(&refused));
+        assert!(
+            text_of(&refused).contains("DENIED"),
+            "{path}: {}",
+            text_of(&refused)
+        );
+        let written = call(
+            &tools,
+            "godot_game_set",
+            json!({"run_id": run_id, "path": path, "properties": {"process_mode": 4}}),
+        )
+        .await;
+        assert!(written.is_error, "{path}: {}", text_of(&written));
+        assert!(
+            text_of(&written).contains("DENIED"),
+            "{path}: {}",
+            text_of(&written)
+        );
+    }
+    // The runtime still answers.
+    let tree = call(&tools, "godot_game_tree", json!({"run_id": run_id})).await;
+    assert!(!tree.is_error, "{}", text_of(&tree));
+
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+}
+
+/// A parameter of the wrong JSON type is a BAD_PARAMS answer, not a script error in the game that
+/// sends no reply and leaves the call waiting for its timeout. The server's schemas already refuse
+/// these values, so the script asks the runtime's own checks, which every request passes.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn a_wrongly_typed_runtime_parameter_is_answered_at_once() {
+    let project = project();
+    std::fs::create_dir_all(project.path().join("tests")).unwrap();
+    std::fs::write(
+        project.path().join("tests/typed.gd"),
+        r#"extends Node
+func run() -> Dictionary:
+	var rt := get_node("/root/GodotMcpRuntime")
+	var inputs: GDScript = load(rt.get_script().resource_path.get_base_dir().path_join("ops/rt_input.gd"))
+	var out := {}
+	out["tree"] = rt.call("mistyped_param", "game.tree", {"max_nodes": [1]})
+	out["get"] = rt.call("mistyped_param", "game.get", {"methods": {"yes": true}})
+	out["wait"] = rt.call("mistyped_param", "input.wait", {"frames": {"n": 1}})
+	out["screenshot"] = rt.call("mistyped_param", "game.screenshot", {"every": [2]})
+	out["output"] = rt.call("mistyped_param", "rt.output", {"limit": "many"})
+	var nulled := {"signals": null, "max_nodes": 3}
+	out["null_is_left_out"] = rt.call("mistyped_param", "game.get", nulled)
+	out["null_erased"] = not nulled.has("signals")
+	out["number_ok"] = rt.call("mistyped_param", "game.tree", {"max_nodes": 3, "depth": 2.0})
+	var step: Dictionary = inputs.call("parse_steps", {"steps": [{"type": "mouse_button", "x": [1], "y": 2}]})
+	out["step"] = step.get("error", {}).get("code", "parsed")
+	var point: Dictionary = inputs.call("parse_steps", {"steps": [{"type": "path", "points": [["a", 1], [2, 3]]}]})
+	out["point"] = point.get("error", {}).get("code", "parsed")
+	return out
+"#,
+    )
+    .unwrap();
+    let tools = manager(project.path());
+    let started = call(
+        &tools,
+        "godot_run_project",
+        json!({"project_path": project.path(), "mode": "process", "headless": true}),
+    )
+    .await;
+    assert!(!started.is_error, "{}", text_of(&started));
+    let run_id = run_id_of(&started);
+
+    let typed = call(
+        &tools,
+        "godot_game_run_script",
+        json!({"run_id": run_id, "script": "res://tests/typed.gd"}),
+    )
+    .await;
+    assert!(!typed.is_error, "{}", text_of(&typed));
+    let value = &json_of(&typed)["value"];
+    for key in ["tree", "get", "wait", "screenshot", "output"] {
+        let problem = value[key].as_str().unwrap_or_default();
+        assert!(problem.contains("must be"), "{key}: {value}");
+    }
+    assert_eq!(value["null_is_left_out"], "", "{value}");
+    assert_eq!(value["null_erased"], true, "{value}");
+    assert_eq!(value["number_ok"], "", "{value}");
+    assert_eq!(value["step"], "BAD_PARAMS", "{value}");
+    assert_eq!(value["point"], "BAD_PARAMS", "{value}");
+    let tree = call(&tools, "godot_game_tree", json!({"run_id": run_id})).await;
+    assert!(!tree.is_error, "{}", text_of(&tree));
+
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+}
+
 /// RO-11: a pointer step is delivered, and when its point lies outside the viewport (a game
 /// without a window has one of 64 x 64 pixels) the answer says controls there do not react.
 #[tokio::test]

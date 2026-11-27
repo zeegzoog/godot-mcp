@@ -3,7 +3,10 @@ extends RefCounted
 ## `script` cannot be set, and a method runs only when the caller lists it in `permit`
 ## and it is not on the denylist: no eval, no quit, no calling another method by name, no setting
 ## a property or the script by name, no emitting a signal or sending a notification, and nothing
-## that frees or replaces a node. The list must equal DENY_METHODS in src/tools/game.rs.
+## that frees or replaces a node. The list must equal DENY_METHODS in src/tools/game.rs. An engine
+## method the list does not name is refused too when it names a method, a property or a
+## notification to act on (names_a_target), and neither game.set nor game.call acts on the
+## runtime's own node.
 
 const R := preload("rt_result.gd")
 const Hold := preload("rt_hold.gd")
@@ -14,21 +17,38 @@ const DENY: Array[String] = [
     "call",
     "callv",
     "call_deferred",
+    "call_thread_safe",
+    "call_deferred_thread_group",
     "call_group",
     "call_group_flags",
     "propagate_call",
     "rpc",
     "rpc_id",
+    "rpc_config",
     "set",
     "set_deferred",
+    "set_thread_safe",
+    "set_deferred_thread_group",
     "set_indexed",
     "emit_signal",
     "notification",
     "propagate_notification",
+    "notify_thread_safe",
+    "notify_deferred_thread_group",
     "free",
     "queue_free",
     "replace_by",
+    "create_instance",
 ]
+## Argument names by which an engine method names what it acts on: another method to call, a
+## property to write, a notification to send.
+const TARGET_ARGS: Array[String] = ["method", "property", "property_path", "what"]
+## Engine methods with such an argument that only read (get, get_indexed, has_method,
+## property_can_revert, property_get_revert): they stay allowed.
+const READ_PREFIXES: Array[String] = ["get", "has_", "property_"]
+## Metadata the methods below change, under a name that starts with `_`, is the editor's own
+## (`_edit_lock_`, `_edit_group_`): Godot documents it as editor-only, not to be edited.
+const META_WRITERS: Array[String] = ["set_meta", "remove_meta"]
 const MAX_NODES := 400
 const MAX_DEPTH := 32
 
@@ -178,6 +198,8 @@ static func set_props(rt: Node, params: Dictionary) -> Dictionary:
     var node := _need(rt, params)
     if node == null:
         return R.err(R.NOT_FOUND, "Node not found at '%s'." % str(params.get("path", ".")))
+    if rt.is_own(node):
+        return _refused_own(node)
     var properties: Variant = params.get("properties", {})
     if not properties is Dictionary or (properties as Dictionary).is_empty():
         return R.err(R.BAD_PARAMS, "game.set: 'properties' must be a non-empty object.")
@@ -449,6 +471,8 @@ static func call_method(rt: Node, params: Dictionary) -> Dictionary:
     var permit: Variant = params.get("permit", [])
     if not permit is Array or not (permit as Array).has(method):
         return R.err(R.DENIED, "Method '%s' was not explicitly permitted. Pass permit: [\"%s\"]." % [method, method])
+    if rt.is_own(node):
+        return _refused_own(node)
     if not node.has_method(method):
         return R.err(R.NOT_FOUND, "Node '%s' has no method '%s'." % [rt.path_of(node), method])
     var raw: Variant = params.get("args", [])
@@ -456,16 +480,23 @@ static func call_method(rt: Node, params: Dictionary) -> Dictionary:
         raw = []
     if not raw is Array:
         return R.err(R.BAD_PARAMS, "game.call: 'args' must be an array.")
-    var arg_types: Array = []
+    var method_info: Dictionary = {}
     for info: Dictionary in node.get_method_list():
         if str(info.get("name", "")) == method:
-            for arg_info: Dictionary in info.get("args", []):
-                arg_types.append(int(arg_info.get("type", TYPE_NIL)))
+            method_info = info
             break
+    # Only an engine method is judged by its signature: a script's own method is the project's.
+    if ClassDB.class_has_method(node.get_class(), method) and names_a_target(method_info):
+        return R.err(R.DENIED, "Method '%s' is not allowed: it names another method, a property or a notification to act on. Call the method or set the property itself (godot_game_set)." % method)
+    var arg_types: Array = []
+    for arg_info: Dictionary in method_info.get("args", []):
+        arg_types.append(int(arg_info.get("type", TYPE_NIL)))
     var converted := convert_args(raw, arg_types, method)
     if R.is_err(converted):
         return converted
     var args: Array = converted["args"]
+    if method in META_WRITERS and not args.is_empty() and str(args[0]).begins_with("_"):
+        return R.err(R.DENIED, "Metadata '%s' starts with '_': Godot keeps such names for the editor. Use a name that does not start with '_'." % str(args[0]))
     # The path is taken before the call: a method that reloads or changes the scene takes the
     # node out of the tree, and it has no path afterwards.
     var path: String = rt.path_of(node)
@@ -475,6 +506,37 @@ static func call_method(rt: Node, params: Dictionary) -> Dictionary:
         answer["left_tree"] = true
         answer["note"] = "The node left the scene tree during the call (for example the scene was reloaded or changed); path is where it was before the call. Wait for the new scene with godot_game_wait scene_generation before reading it."
     return R.ok(answer)
+
+
+## Whether an engine method, described as get_method_list() does, names another method, a property
+## or a notification to act on by an argument (TARGET_ARGS) and is not one that only reads
+## (READ_PREFIXES). "method", "property" and "property_path" count only as a name (String,
+## StringName or NodePath): HTTPRequest.request takes an int method. Covers what DENY lists and
+## what a later Godot adds.
+static func names_a_target(info: Dictionary) -> bool:
+    var name := str(info.get("name", ""))
+    for prefix: String in READ_PREFIXES:
+        if name.begins_with(prefix):
+            return false
+    var args: Variant = info.get("args", [])
+    if not args is Array:
+        return false
+    for arg: Variant in args:
+        if not arg is Dictionary:
+            continue
+        var arg_name := str((arg as Dictionary).get("name", ""))
+        var arg_type := int((arg as Dictionary).get("type", TYPE_NIL))
+        if arg_name == "what":
+            return true
+        if arg_name in TARGET_ARGS and arg_type in [TYPE_NIL, TYPE_STRING, TYPE_STRING_NAME, TYPE_NODE_PATH]:
+            return true
+    return false
+
+
+## The runtime's own node and what is under it answer the server: writing to it or calling it
+## could stop it answering or make it send a forged reply.
+static func _refused_own(node: Node) -> Dictionary:
+    return R.err(R.DENIED, "'%s' is the godot-mcp runtime, which answers these tools; it cannot be changed or called. Pass a node of the game." % String(node.name))
 
 
 ## JSON values converted to the types a method declares: `{args}`, or an error naming the argument

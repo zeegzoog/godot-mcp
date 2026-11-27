@@ -8,6 +8,27 @@ Releases 0.5.1 to 0.15.0 were built once per Godot version, from the branches `g
 
 ## [Unreleased]
 
+## [0.16.1] - 2026-11-27
+
+A security release: update the server and the addon together (`godot_update_addon`, `restart_editor: true` while the editor has the project open). Every earlier release is affected. The problems were reported and fixed by theromis.
+
+If your MCP client relied on `GODOT_PATH` or another program or secret setting in a `.env` file of your project, move it first: see "Changed".
+
+### Security
+
+- The editor bridge sent the events of a game started with Play, including its output and screenshots, to connections that had never sent the bridge token, so a web page open in your browser or another user of the machine could read them. Only a connection that sent the token gets events now; one that sends a wrong token, or none within 5 seconds, is closed, and the editor keeps at most 8 connections. The token's folder is readable by your user only before the token is written.
+- Text given as a value to the editor, the running game or the headless runner could build an Object or load a resource with a script, also inside an array or behind a `;` comment. Such text is refused; built-in values, JSON and `res://` paths work as before.
+- `godot_game_call` could still call a method or set a property by name through the thread-safe and thread-group variants, and could act on the godot-mcp runtime itself. Both are refused, as is every engine method whose arguments name a method, a property or a notification. A wrongly typed runtime parameter is answered at once.
+- A write could leave the project through a symbolic link whose target did not exist yet, through a link beside a world map, or through a linked `addons` folder, and on Windows a network path in a request was contacted before it was refused. Links and paths are checked before anything is touched. On Unix the temporary folders of engine calls are readable by your user only.
+- A `.env` file in your project, or in any folder above it, could choose the program the server runs, set environment variables of the processes it starts, or set the bridge token.
+- `godot_move_file` wrote a destination name holding a quote or a line break into scenes and `project.godot` as it was, which could add lines to those files.
+
+### Changed
+
+- The server reads your own settings file, `godot-mcp/.env` in your configuration folder (`%APPDATA%` on Windows, `~/Library/Application Support` on macOS, `~/.config` on Linux), for every setting. A `.env` file in the working directory is read from that folder only and may set only `GODOT_DEBUG_PORT`, `GODOT_MCP_FEEDBACK` and `GODOT_MCP_LSP_PORT`; the server names any other key in a warning and ignores it. See [docs/configuration.md](docs/configuration.md#settings-files).
+- `godot_validate_script` checks only scripts inside a project.
+- `godot_move_file` refuses a destination name that Godot does not accept in a file name.
+
 ## [0.16.0] - 2026-11-27
 
 One release serves every Godot version from 4.5 to 4.8 again. A running game can be waited on in game seconds and photographed as a sheet from an aim camera, errors carry a code, the editor bridge refuses what an older addon cannot do, and the tool list costs a third less context.
@@ -459,7 +480,8 @@ part of every release), and note the behaviour changes below.
   property operations, viewport capture), headless CLI fallback for version, script validation
   and launching the editor.
 
-[Unreleased]: https://github.com/zeegzoog/godot-mcp/compare/v0.16.0...master
+[Unreleased]: https://github.com/zeegzoog/godot-mcp/compare/v0.16.1...master
+[0.16.1]: https://github.com/zeegzoog/godot-mcp/compare/v0.16.0...v0.16.1
 [0.16.0]: https://github.com/zeegzoog/godot-mcp/compare/v0.15.0...v0.16.0
 [0.4.0]: https://github.com/zeegzoog/godot-mcp/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/zeegzoog/godot-mcp/compare/v0.2.0...v0.3.0

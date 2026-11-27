@@ -1,6 +1,6 @@
 # Content Authoring Tools (Realization)
 
-**Version:** 1.2.0
+**Version:** 1.3.0
 **Status:** Stable
 **Layer:** implementation
 **Implements:** l1-content-authoring.md
@@ -11,14 +11,14 @@ Where each invariant of the content authoring concept is kept: which file in the
 
 ## Related Specifications
 
-- [l1-content-authoring.md](l1-content-authoring.md) - Parent concept: CA-1 to CA-19.
+- [l1-content-authoring.md](l1-content-authoring.md) - Parent concept: CA-1 to CA-21.
 - [l2-tool-handlers.md](l2-tool-handlers.md) - The host side: script tools (§5.4), authoring fallbacks (§5.5), project creation (§5.6), shaders (§5.8), import parameters (§5.9), InputMap and deletion (§5.10).
 - [l2-godot-editor-addon.md](l2-godot-editor-addon.md) - The editor side: handler notes (§5.2), script commands (§5.3), shader, import and file commands (§5.4).
 - [l1-tool-catalog.md](l1-tool-catalog.md) - TL-4 (confined, non-destructive writes) and TL-5 (no injection), which several rows rely on.
 
 ## 1. Motivation
 
-The authoring tools are realized by two specifications written for other concepts (the Rust tool layer and the editor addon), and the concept has eighteen invariants spread over both. A change to an authoring tool needs the list of what it must keep and where each guard lives; this table is that list, so no invariant depends on someone remembering which section holds it.
+The authoring tools are realized by two specifications written for other concepts (the Rust tool layer and the editor addon), and the concept's invariants are spread over both. A change to an authoring tool needs the list of what it must keep and where each guard lives; this table is that list, so no invariant depends on someone remembering which section holds it.
 
 ## 2. Constraints & Assumptions
 
@@ -32,7 +32,7 @@ The authoring tools are realized by two specifications written for other concept
 | CA-1 No unrequested replacement | `create_new_file` (`create_new(true)`) in `src/tools/authoring.rs` for scenes, resources and `project.godot`; the editor's `create_scene` and `create_resource` refuse an existing file; shaders replace only with `overwrite` (§5.8 of the tool handlers) | `create_resource_without_an_editor_never_replaces_a_file`; `authoring_tools_create_what_they_should_and_refuse_the_rest` |
 | CA-2 One undoable action | `attach_script` and `connect_signal` in `bridge_server.gd` record one `EditorUndoRedoManager` action each | `scene_and_property_tools_behave`; `undo_and_resource_refresh_behave` |
 | CA-3 Caller text is data | `is_setting_key` and the escaped single-line value in `src/tools/authoring.rs`; fixed script templates; the fragments of an edit are matched and inserted as text (§5.4, §5.5) | `project_setting_without_an_editor_cannot_add_lines_to_project_godot`; `a_setting_key_with_a_dot_segment_is_refused_and_the_settings_answer_matches_the_editors` |
-| CA-4 A setting keeps its type | `CliRunner::setting_type` and the conversion in `src/tools/authoring.rs` (§5.5); `_coerce_setting` in `bridge_server.gd` | `project_setting_without_an_editor_stores_the_engine_type`; `project_setting_without_an_editor_refuses_a_value_of_another_type`; `project_settings_convert_the_same_text_forms_as_the_file_fallback` |
+| CA-4 A setting keeps its type | `CliRunner::setting_type` and the conversion in `src/tools/authoring.rs` (§5.5), objects, arrays, `value_text`, `remove` and `replace_type` included; `_coerce_setting` and the same inputs in `bridge_server.gd` | `project_setting_without_an_editor_stores_the_engine_type`; `project_setting_without_an_editor_refuses_a_value_of_another_type`; `project_settings_convert_the_same_text_forms_as_the_file_fallback`; `project_setting_without_an_editor_stores_arrays_and_objects_with_the_real_engine`; `project_setting_without_an_editor_reads_value_text_with_the_real_engine`; `project_settings_take_a_value_text_and_remove_like_the_file_fallback` |
 | CA-5 A link is checked first | The checks of `connect_signal` in `bridge_server.gd`, before the connection is made | `authoring_tools_create_what_they_should_and_refuse_the_rest` |
 | CA-6 Paths stay inside the project | `resolve_in_project` and the extension checks of each tool; `create_dir_all` for the folders of a new file (§5.5); `to_res_path` in the editor | `authoring_tools_create_what_they_should_and_refuse_the_rest` |
 | CA-7 Reading returns the editor's text | §5.4 of the tool handlers; `read_script` in `editor/script_ops.gd` (§5.3 of the addon); the shared version label | `read_script_without_an_editor_reads_the_file_and_labels_it`; `read_script_answers_from_the_file_or_from_unsaved_editor_text`; `the_script_label_matches_its_published_vectors` |
@@ -47,6 +47,8 @@ The authoring tools are realized by two specifications written for other concept
 | CA-17 Deleting | `src/tools/files.rs`, `src/tools/reference_kind.rs` (§5.10); `editor/file_ops.gd` and its classifier | `files_are_deleted_on_disk_with_their_companions_unless_still_referenced`; `a_file_only_written_by_a_generator_script_is_deleted_without_force`; `files_are_deleted_through_the_editor_with_companions_and_tabs`; `the_addon_classifies_script_references_like_the_server` |
 | CA-18 Created classes are known to runs | `src/godot/class_cache.rs` (`register`, `unregistered`), called from `godot_create_script` in `src/tools.rs`, from the edit fallback in `src/tools/scripts.rs` and from the syntax check in `src/tools/headless.rs` (§5.4) | `create_and_edit_without_an_editor_keep_the_class_cache_up_to_date`; `validate_script_fails_a_script_that_uses_an_unregistered_class`; `a_class_created_without_the_editor_is_known_to_the_next_run`; the unit tests of `class_cache.rs` |
 | CA-19 Saved resources | `src/tools/resource_props.rs`; `set_resource_properties` in `bridge_server.gd` (one `EditorUndoRedoManager` action over the loaded copy, saved again on undo and redo); the conversion in `core/property_values.gd`, shared with the headless run of `CliRunner::set_resource_properties` in `src/cli_runner.rs`, which reads the request from a JSON file named after `--` and writes the uids back as after `godot_run_script` | `set_resource_properties_refuses_before_starting_godot`; `resource_file_properties_are_set_saved_and_undone_through_the_editor` (`tests/editor_e2e_test.rs`); `set_resource_properties_without_an_editor_keeps_uids_and_unset_uniforms_out` (`tests/runtime_e2e_test.rs`) |
+| CA-20 Moving keeps references | `src/tools/file_move.rs` (§5.16); `move_files_check` and `move_files_apply` in `bridge_server.gd` and `editor/file_ops.gd` | `files_and_folders_are_moved_on_disk_with_their_references_rewritten`; `files_and_folders_are_moved_through_the_editor_with_references_and_tabs` |
+| CA-21 Honest creation | The headless path of `godot_create_resource` in `src/tools/authoring.rs` and the load check in `src/cli_runner.rs` (§5.5) | `create_resource_without_an_editor_never_replaces_a_file`; `create_resource_without_an_editor_removes_a_file_godot_cannot_load`; `created_resource_without_an_editor_loads_and_takes_properties` (`tests/runtime_e2e_test.rs`) |
 
 ## 7. Drawbacks & Alternatives
 
@@ -62,6 +64,7 @@ The authoring tools are realized by two specifications written for other concept
 | `[IMPORT]` | `src/tools/import_params.rs` | Import parameter tools |
 | `[INPUT]` | `src/tools/input_map.rs` | InputMap tools |
 | `[FILES]` | `src/tools/files.rs` | File deletion |
+| `[FILE-MOVE]` | `src/tools/file_move.rs` | Moving and renaming files |
 | `[HOST-TESTS]` | `tests/tools_test.rs` | Host-side tests of the rows above |
 | `[E2E]` | `tests/editor_e2e_test.rs` | Real-editor tests of the rows above |
 
@@ -72,3 +75,4 @@ The authoring tools are realized by two specifications written for other concept
 | 1.0.0 | 2026-11-05 | Agent (magic.spec) | Created: `l1-content-authoring.md` had no implementation specification of its own, so a change to it reached nothing downstream. The table names, for each of CA-1 to CA-17, the file and the test that keep it; the mechanisms stay in the tool handlers and the addon. |
 | 1.1.0 | 2026-11-09 | Agent (magic.spec) | [ADDED] The row of CA-18. Source: pull requests 130 and 131. Stable → RFC → Stable after Post-Update Review. |
 | 1.2.0 | 2026-11-19 | Agent (magic.spec) | [ADDED] The row of CA-19. Source: pull request 158. Stable → RFC → Stable after Post-Update Review. |
+| 1.3.0 | 2026-11-27 | Agent (magic.spec) | [ADDED] The rows of CA-20 and CA-21. [MODIFIED] The row of CA-4 (the new setting inputs). Source: pull requests 149, 152, 157 and 178. Stable → RFC → Stable after Post-Update Review. |

@@ -13,6 +13,8 @@ extends RefCounted
 ## It also takes the editor's part of a move (godot_move_file): move_check before the server
 ## changes any file, move_apply after it moved them and rewrote their references.
 
+## Loaded where it is used, not preloaded: tests load this file on its own, outside the addon.
+const PROPERTY_VALUES_PATH: String = "res://addons/godot_mcp/core/property_values.gd"
 ## Text files whose content is searched for a path or UID of a file being deleted.
 const TEXT_EXTENSIONS: PackedStringArray = [
     "tscn", "tres", "gd", "gdshader", "gdshaderinc", "godot", "cfg", "import", "cs", "json",
@@ -817,6 +819,7 @@ func _move_project_settings(pairs: Array[Dictionary]) -> Array[String]:
     var changed: Array[String] = []
     if pairs.is_empty():
         return changed
+    var property_values: GDScript = load(PROPERTY_VALUES_PATH) as GDScript
     for property: Dictionary in ProjectSettings.get_property_list():
         var name: String = str(property.get("name", ""))
         if name.is_empty() or not ProjectSettings.has_setting(name):
@@ -841,6 +844,10 @@ func _move_project_settings(pairs: Array[Dictionary]) -> Array[String]:
                     continue
                 var rewritten: String = rewrite_paths(text, pairs)
                 if rewritten == text:
+                    continue
+                # The new path is spliced into the text as it is: never parse a text that would
+                # then build an Object or load a Resource.
+                if property_values == null or not bool(property_values.call("text_builds_no_object", rewritten)):
                     continue
                 moved = str_to_var(rewritten)
                 if typeof(moved) != typeof(value):

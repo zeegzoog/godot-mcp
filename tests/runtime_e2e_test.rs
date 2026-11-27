@@ -3997,6 +3997,176 @@ async fn game_set_parses_a_godot_literal_and_refuses_a_wrong_type_quietly() {
     assert!(!stopped.is_error, "{}", text_of(&stopped));
 }
 
+/// A game whose root holds an Array, a Dictionary and a Vector3, with methods that take them and
+/// one that counts the nodes outside the tree.
+fn container_project() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("project");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("scenes")).unwrap();
+    std::fs::write(
+        root.join("project.godot"),
+        "config_version=5\n\n[application]\n\nconfig/name=\"ContainerProbe\"\nrun/main_scene=\"res://scenes/main.tscn\"\nconfig/features=PackedStringArray(\"4.5\")\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("scenes/holder.gd"),
+        r#"extends Node
+var items: Array = [1]
+var table: Dictionary = {"a": 1}
+var spot := Vector3.ZERO
+
+func count_items(list: Array) -> int:
+    return list.size()
+
+func count_keys(entries: Dictionary) -> int:
+    return entries.size()
+
+func orphans() -> int:
+    return int(Performance.get_monitor(Performance.OBJECT_ORPHAN_NODE_COUNT))
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("scenes/main.tscn"),
+        "[gd_scene load_steps=2 format=3]\n\n[ext_resource type=\"Script\" path=\"res://scenes/holder.gd\" id=\"1\"]\n\n[node name=\"Holder\" type=\"Node\"]\nscript = ExtResource(\"1\")\n",
+    )
+    .unwrap();
+    dir
+}
+
+/// Text that str_to_var would turn into an Object, or that loads a Resource, is refused for an
+/// Array or a Dictionary property or argument too (the parsed value would pass the type check
+/// with a live Node inside), and no node is created. Built-in literals still parse, also when a
+/// string inside them reads like a constructor.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn game_set_and_call_build_no_object_from_text() {
+    let _ = IGNORE;
+    let project = container_project();
+    let tools = manager(project.path());
+    let started = call(
+        &tools,
+        "godot_run_project",
+        json!({
+            "project_path": project.path(),
+            "scene": "res://scenes/main.tscn",
+            "mode": "process",
+            "headless": true
+        }),
+    )
+    .await;
+    assert!(!started.is_error, "{}", text_of(&started));
+    let run_id = run_id_of(&started);
+    let orphans = || async {
+        let counted = call(
+            &tools,
+            "godot_game_call",
+            json!({"run_id": run_id, "path": ".", "method": "orphans", "permit": ["orphans"], "args": []}),
+        )
+        .await;
+        assert!(!counted.is_error, "{}", text_of(&counted));
+        json_of(&counted)["value"].as_i64().expect("orphan count")
+    };
+    let before = orphans().await;
+
+    for (property, text) in [
+        ("items", r#"[Object(Node,"name":"Planted")]"#),
+        ("items", r#"[Resource("res://scenes/holder.gd")]"#),
+        ("table", r#"{"a": Object(Node,"name":"Planted")}"#),
+        ("spot", r#"Object(Node,"name":"Planted")"#),
+        // Godot reads ; outside a string as a comment: the quote after it opens no string.
+        ("items", "[;\"\nObject(Node,\"name\":\"Planted\")\n;\"\n]"),
+        (
+            "table",
+            "{;\"\n\"a\": Object(Node,\"name\":\"Planted\")\n;\"\n}",
+        ),
+    ] {
+        let refused = call(
+            &tools,
+            "godot_game_set",
+            json!({"run_id": run_id, "path": ".", "properties": {property: text}}),
+        )
+        .await;
+        assert!(
+            refused.is_error,
+            "{property} = {text}: {}",
+            text_of(&refused)
+        );
+        assert!(
+            text_of(&refused).contains("not a built-in type"),
+            "{property} = {text}: {}",
+            text_of(&refused)
+        );
+    }
+    for (method, text) in [
+        ("count_items", r#"[Object(Node,"name":"Planted")]"#),
+        ("count_keys", r#"{"a": Object(Node,"name":"Planted")}"#),
+        (
+            "count_items",
+            "[;\"\nObject(Node,\"name\":\"Planted\")\n;\"\n]",
+        ),
+    ] {
+        let refused = call(
+            &tools,
+            "godot_game_call",
+            json!({"run_id": run_id, "path": ".", "method": method, "permit": [method], "args": [text]}),
+        )
+        .await;
+        assert!(refused.is_error, "{method}({text}): {}", text_of(&refused));
+        assert!(
+            text_of(&refused).contains("not a built-in type"),
+            "{method}({text}): {}",
+            text_of(&refused)
+        );
+    }
+    assert_eq!(orphans().await, before, "a refused text created a node");
+    let read = call(
+        &tools,
+        "godot_game_get",
+        json!({"run_id": run_id, "path": ".", "properties": ["items", "table"]}),
+    )
+    .await;
+    let props = &json_of(&read)["properties"];
+    assert_eq!(props["items"], json!([1]), "{props}");
+    assert_eq!(props["table"], json!({"a": 1}), "{props}");
+
+    let written = call(
+        &tools,
+        "godot_game_set",
+        json!({"run_id": run_id, "path": ".", "properties": {
+            "items": r#"[1, 2, "Object(Node)"]"#,
+            "table": r#"{"b": Vector2(1, 2)}"#,
+            "spot": "Vector3(1, 2, 3)"
+        }}),
+    )
+    .await;
+    assert!(!written.is_error, "{}", text_of(&written));
+    let read = call(
+        &tools,
+        "godot_game_get",
+        json!({"run_id": run_id, "path": ".", "properties": ["items", "spot"]}),
+    )
+    .await;
+    let props = &json_of(&read)["properties"];
+    assert_eq!(props["items"], json!([1, 2, "Object(Node)"]), "{props}");
+    let spot: Vec<f64> = (0..3)
+        .map(|axis| json_number(&props["spot"][axis]))
+        .collect();
+    assert_eq!(spot, [1.0, 2.0, 3.0], "{props}");
+    let counted = call(
+        &tools,
+        "godot_game_call",
+        json!({"run_id": run_id, "path": ".", "method": "count_items", "permit": ["count_items"],
+               "args": ["[1, 2, 3]"]}),
+    )
+    .await;
+    assert!(!counted.is_error, "{}", text_of(&counted));
+    assert_eq!(json_of(&counted)["value"], 3, "{}", text_of(&counted));
+
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+}
+
 /// A 3D scene whose sun is turned a quarter around Y, so an identity basis is visible.
 fn sun_project() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("project");
@@ -5053,6 +5223,19 @@ async fn set_resource_properties_without_an_editor_keeps_uids_and_unset_uniforms
         (json!({"shader_parameter/flow": [1, 2, 3]}), "Vector2"),
         (json!({"resource_path": "res://elsewhere.tres"}), "Refusing"),
         (json!({"shader": "res://pond_water.tres"}), "not a Shader"),
+        // No Object is built from text, and a res:// path stays inside the project.
+        (
+            json!({"shader": "Object(Shader,\"code\":\"shader_type spatial;\")"}),
+            "not a built-in type",
+        ),
+        (
+            json!({"shader": "res://../water.gdshader"}),
+            "not a path inside the project",
+        ),
+        (
+            json!({"shader": ";\"\nObject(Shader,\"code\":\"shader_type spatial;\")\n;\""}),
+            "not a built-in type",
+        ),
     ] {
         let refused = set(properties.clone()).await;
         let answer = text_of(&refused);

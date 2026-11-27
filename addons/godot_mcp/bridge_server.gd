@@ -2463,7 +2463,7 @@ func _setting_from_value(value: Variant, type: int) -> Variant:
             return StringName(value)
         TYPE_NODE_PATH:
             return NodePath(value)
-    if type == TYPE_OBJECT or not _setting_text_opens_as(text, type) or not _setting_text_builds_no_object(text):
+    if type == TYPE_OBJECT or not _setting_text_opens_as(text, type) or not PropertyValues.text_builds_no_object(text):
         return null
     var parsed: Variant = str_to_var(text)
     if typeof(parsed) == type:
@@ -2477,44 +2477,6 @@ func _setting_text_opens_as(text: String, type: int) -> bool:
     if type == TYPE_ARRAY:
         return text.begins_with("[") or text.begins_with("Array[")
     return text.begins_with(type_string(type) + "(")
-
-## Whether every constructor in a value text, outside its strings, is a built-in type other than
-## Object, so parsing it creates no Object and loads no Resource.
-func _setting_text_builds_no_object(text: String) -> bool:
-    var in_string: bool = false
-    var escaped: bool = false
-    var word: String = ""
-    var last_word: String = ""
-    for character: String in text:
-        if in_string:
-            if escaped:
-                escaped = false
-            elif character == "\\":
-                escaped = true
-            elif character == "\"":
-                in_string = false
-            continue
-        if character == "_" or (character >= "a" and character <= "z") or (character >= "A" and character <= "Z") or (character >= "0" and character <= "9"):
-            word += character
-            continue
-        if not word.is_empty():
-            last_word = word
-            word = ""
-        if character == "\"":
-            in_string = true
-        elif character == "(":
-            if last_word.is_empty() or last_word == "Object" or not _is_builtin_type_name(last_word):
-                return false
-            last_word = ""
-        elif character != " " and character != "\t" and character != "\n" and character != "\r" and character != "[" and character != "]":
-            last_word = ""
-    return not in_string
-
-func _is_builtin_type_name(type_name: String) -> bool:
-    for type: int in range(TYPE_NIL + 1, TYPE_MAX):
-        if type != TYPE_OBJECT and type_string(type) == type_name:
-            return true
-    return false
 
 ## A JSON value as a setting holds it: a whole number becomes an int (JSON does not tell 3 from
 ## 3.0, as with new metadata in set_node_properties), arrays and objects are converted entry by
@@ -2590,8 +2552,8 @@ func _setting_from_text(raw: String) -> Dictionary:
     var text: String = raw.strip_edges()
     if text.is_empty():
         return {"error": "value_text is empty: give a value as project.godot stores it, such as Vector2i(1152, 648) or {\"key\": 1}"}
-    if text.begins_with("Object(") or not _setting_text_builds_no_object(text):
-        return {"error": "value_text uses a constructor that is not a built-in type (an Object or a Resource); only built-in types such as Vector4(0, 1, 0, 0) or Color(1, 1, 1, 1) are parsed"}
+    if text.begins_with("Object(") or not PropertyValues.text_builds_no_object(text):
+        return {"error": "value_text uses a constructor that is not a built-in type (an Object or a Resource) or a ; comment; only built-in types such as Vector4(0, 1, 0, 0) or Color(1, 1, 1, 1) are parsed"}
     var parsed: Variant = str_to_var(text)
     if parsed == null:
         return {"error": "value_text is not a value Godot can read: give it as project.godot stores it, such as Vector2i(1152, 648), \"text\" or {\"key\": Vector4(0, 1, 0, 0)}; to remove the setting pass remove: true"}

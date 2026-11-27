@@ -279,3 +279,43 @@ fn development_version_is_newer_than_the_last_release() {
         newest.2
     );
 }
+
+/// The text of `static func NAME(` in a GDScript file, up to the next line that is neither
+/// indented nor empty, without trailing blank lines.
+fn gdscript_function(source: &str, name: &str) -> String {
+    let head = format!("static func {name}(");
+    let mut lines = source.lines().skip_while(|line| !line.starts_with(&head));
+    let mut body: Vec<&str> = match lines.next() {
+        Some(first) => vec![first],
+        None => panic!("no `{head}` found"),
+    };
+    body.extend(lines.take_while(|line| line.is_empty() || line.starts_with([' ', '\t'])));
+    while body.last().is_some_and(|line| line.trim().is_empty()) {
+        body.pop();
+    }
+    body.join("\n")
+}
+
+/// The running game cannot load `core/property_values.gd`, so `runtime/ops/rt_live.gd` keeps a
+/// copy of the check that refuses value text building an Object or loading a Resource before
+/// `str_to_var` reads it, and so does the project setting script of the headless runner
+/// (`SETTING_TYPE_SCRIPT` in `src/cli_runner.rs`, indented with tabs). The copies must stay equal.
+#[test]
+fn the_game_refuses_object_text_as_the_editor_does() {
+    let editor = read("addons/godot_mcp/core/property_values.gd");
+    let game = read("addons/godot_mcp/runtime/ops/rt_live.gd");
+    let headless = read("src/cli_runner.rs");
+    for name in ["text_builds_no_object", "is_builtin_type_name"] {
+        let wanted = gdscript_function(&editor, name);
+        assert_eq!(
+            gdscript_function(&game, name),
+            wanted,
+            "{name} differs between runtime/ops/rt_live.gd and core/property_values.gd"
+        );
+        assert_eq!(
+            gdscript_function(&headless, name).replace('\t', "    "),
+            wanted,
+            "{name} differs between src/cli_runner.rs and core/property_values.gd"
+        );
+    }
+}

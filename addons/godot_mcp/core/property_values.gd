@@ -257,6 +257,8 @@ static func convert_property_value(info: Dictionary, raw: Variant) -> Dictionary
             if raw == null:
                 return {"value": null}
             if raw is String and raw.begins_with("res://"):
+                if not res_path_inside(raw):
+                    return {"error": "%s is not a path inside the project: pass the res:// path of a saved resource, without .. segments" % raw}
                 if not ResourceLoader.exists(raw):
                     return {"error": "Resource not found: " + raw}
                 return {"value": load(raw)}
@@ -267,7 +269,10 @@ static func convert_property_value(info: Dictionary, raw: Variant) -> Dictionary
             if not element.is_empty():
                 # A typed array keeps only elements of its type, so assigning a mismatched array
                 # leaves it empty without an error; convert every element or refuse.
-                var items: Variant = str_to_var(raw) if raw is String else raw
+                var parsed_items: Dictionary = parse_value_text(raw) if raw is String else {"value": raw}
+                if parsed_items.has("error"):
+                    return parsed_items
+                var items: Variant = parsed_items["value"]
                 if not items is Array:
                     return {"error": "expected %s (a JSON array) but got %s (%s)" % [property_type_name(info), type_string(typeof(raw)), describe_value(raw)]}
                 return typed_array_from(element, items)
@@ -278,7 +283,10 @@ static func convert_property_value(info: Dictionary, raw: Variant) -> Dictionary
             if entries.has("error"):
                 return entries
             if not entries.is_empty():
-                var items: Variant = str_to_var(raw) if raw is String else raw
+                var parsed_entries: Dictionary = parse_value_text(raw) if raw is String else {"value": raw}
+                if parsed_entries.has("error"):
+                    return parsed_entries
+                var items: Variant = parsed_entries["value"]
                 if not items is Dictionary:
                     return {"error": "expected %s (a JSON object) but got %s (%s)" % [property_type_name(info), type_string(typeof(raw)), describe_value(raw)]}
                 return typed_dictionary_from(entries["key"], entries["value"], items)
@@ -295,11 +303,75 @@ static func convert_property_value(info: Dictionary, raw: Variant) -> Dictionary
 
     # Anything else may be a Godot literal such as "Transform2D(...)".
     if raw is String:
-        var parsed: Variant = str_to_var(raw)
+        var parsed_text: Dictionary = parse_value_text(raw)
+        if parsed_text.has("error"):
+            return parsed_text
+        var parsed: Variant = parsed_text["value"]
         if parsed != null and typeof(parsed) == expected:
             return {"value": parsed}
 
     return {"error": "expected %s but got %s (%s)" % [property_type_name(info), type_string(typeof(raw)), describe_value(raw)]}
+
+## A value text parsed with str_to_var: {"value"}, or {"error"} when the text uses a constructor
+## that is not a built-in type. Parsing Object(...) creates an Object and Resource(...) loads a
+## resource (which may carry a script), even inside an array or a dictionary, so such text is
+## refused before it is parsed.
+static func parse_value_text(raw: String) -> Dictionary:
+    if not text_builds_no_object(raw):
+        return {"error": "the text %s uses a constructor that is not a built-in type (such as Object(...) or Resource(...)) or a ; comment; no Object is built from text. Pass built-in literals such as Vector3(0, 1, 0), JSON arrays and objects, and res:// paths for resources" % describe_value(raw)}
+    return {"value": str_to_var(raw)}
+
+## Whether every constructor in a value text, outside its strings, is a built-in type other than
+## Object, so parsing it creates no Object and loads no Resource. The running game keeps a copy in
+## runtime/ops/rt_live.gd; tests/version_sync_test.rs checks that the two stay equal.
+static func text_builds_no_object(text: String) -> bool:
+    var in_string: bool = false
+    var escaped: bool = false
+    var word: String = ""
+    var last_word: String = ""
+    for character: String in text:
+        if in_string:
+            if escaped:
+                escaped = false
+            elif character == "\\":
+                escaped = true
+            elif character == "\"":
+                in_string = false
+            continue
+        if character == "_" or (character >= "a" and character <= "z") or (character >= "A" and character <= "Z") or (character >= "0" and character <= "9"):
+            word += character
+            continue
+        if not word.is_empty():
+            last_word = word
+            word = ""
+        if character == "\"":
+            in_string = true
+        elif character == ";":
+            # The parser reads ; outside a string as a comment to the end of the line, and a quote
+            # in it would make this scan see a string the parser skips. Godot never writes one.
+            return false
+        elif character == "(":
+            if last_word.is_empty() or last_word == "Object" or not is_builtin_type_name(last_word):
+                return false
+            last_word = ""
+        elif character != " " and character != "\t" and character != "\n" and character != "\r" and character != "[" and character != "]":
+            last_word = ""
+    return not in_string
+
+## Whether a name is a built-in Variant type other than Object.
+static func is_builtin_type_name(type_name: String) -> bool:
+    for type: int in range(TYPE_NIL + 1, TYPE_MAX):
+        if type != TYPE_OBJECT and type_string(type) == type_name:
+            return true
+    return false
+
+## Whether a res:// path stays inside the project: no empty path and no .. segment.
+static func res_path_inside(path: String) -> bool:
+    var normalized: String = path.strip_edges().replace("\\", "/")
+    if not normalized.begins_with("res://"):
+        return false
+    var relative: String = normalized.trim_prefix("res://")
+    return not relative.is_empty() and not ".." in relative.split("/")
 
 ## Types whose components are floats, compared with their own is_equal_approx.
 const APPROX_TYPES: Array[int] = [

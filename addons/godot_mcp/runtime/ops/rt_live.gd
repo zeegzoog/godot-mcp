@@ -231,6 +231,9 @@ static func _prepare_leaf(name: String, looked: Dictionary, raw: Variant) -> Dic
         if R.is_err(loaded):
             return loaded
         return {"name": name, "container": container, "leaf": leaf, "current": current, "value": loaded["value"]}
+    var refused := _refused_text(raw, expected, "Property '%s'" % name)
+    if not refused.is_empty():
+        return refused
     var decoded: Variant = _coerce(raw, expected)
     if declared == TYPE_NIL and current != null and not container is Dictionary:
         declared = expected
@@ -483,6 +486,9 @@ static func convert_args(raw: Array, arg_types: Array, method: String) -> Dictio
         var expected: int = TYPE_NIL
         if index < arg_types.size():
             expected = int(arg_types[index])
+        var refused := _refused_text(item, expected, "Argument %d for '%s'" % [index, method])
+        if not refused.is_empty():
+            return refused
         var coerced: Variant = _coerce(item, expected)
         if expected != TYPE_NIL and typeof(coerced) != expected and not _type_compatible(coerced, expected):
             return R.err(R.BAD_PARAMS, "Argument %d for '%s' is %s; expected %s." % [index, method, type_string(typeof(coerced)), type_string(expected)])
@@ -820,8 +826,11 @@ static func _coerce(value: Variant, expected: int) -> Variant:
     if value is String and expected == TYPE_NODE_PATH:
         return NodePath(value)
     # Any other typed value may be a Godot literal such as "Transform3D(...)", as in the editor tool.
-    # An Object is never built from text: an Object(...) literal would create one in the game.
+    # An Object is never built from text: an Object(...) literal would create one in the game, even
+    # inside an array, so such text stays a String and the caller refuses it (_refused_text).
     if value is String and expected != TYPE_NIL and expected != TYPE_STRING and expected != TYPE_OBJECT:
+        if not text_builds_no_object(value):
+            return value
         var parsed: Variant = str_to_var(value)
         if typeof(parsed) == expected:
             return parsed
@@ -829,6 +838,63 @@ static func _coerce(value: Variant, expected: int) -> Variant:
         if built != null:
             return built
     return value
+
+
+## The refusal for a value text _coerce would parse that builds an Object or loads a Resource
+## (Object(...), Resource(...) and other constructors that are not built-in types), or {} when
+## the value is not such a text.
+static func _refused_text(value: Variant, expected: int, what: String) -> Dictionary:
+    if not value is String or expected == TYPE_NIL or expected == TYPE_STRING or expected == TYPE_OBJECT:
+        return {}
+    if expected == TYPE_STRING_NAME or expected == TYPE_NODE_PATH or text_builds_no_object(value):
+        return {}
+    return R.err(R.BAD_PARAMS, "%s: the text uses a constructor that is not a built-in type (such as Object(...) or Resource(...)) or a ; comment, and no Object is built from text. Nothing was changed. Pass built-in literals such as Vector3(0, 1, 0), JSON arrays and objects, or a res:// path for a resource property." % what)
+
+
+## Whether every constructor in a value text, outside its strings, is a built-in type other than
+## Object, so parsing it creates no Object and loads no Resource. A copy of the function in
+## core/property_values.gd (the game cannot load that file); tests/version_sync_test.rs checks
+## that the two stay equal.
+static func text_builds_no_object(text: String) -> bool:
+    var in_string: bool = false
+    var escaped: bool = false
+    var word: String = ""
+    var last_word: String = ""
+    for character: String in text:
+        if in_string:
+            if escaped:
+                escaped = false
+            elif character == "\\":
+                escaped = true
+            elif character == "\"":
+                in_string = false
+            continue
+        if character == "_" or (character >= "a" and character <= "z") or (character >= "A" and character <= "Z") or (character >= "0" and character <= "9"):
+            word += character
+            continue
+        if not word.is_empty():
+            last_word = word
+            word = ""
+        if character == "\"":
+            in_string = true
+        elif character == ";":
+            # The parser reads ; outside a string as a comment to the end of the line, and a quote
+            # in it would make this scan see a string the parser skips. Godot never writes one.
+            return false
+        elif character == "(":
+            if last_word.is_empty() or last_word == "Object" or not is_builtin_type_name(last_word):
+                return false
+            last_word = ""
+        elif character != " " and character != "\t" and character != "\n" and character != "\r" and character != "[" and character != "]":
+            last_word = ""
+    return not in_string
+
+## Whether a name is a built-in Variant type other than Object.
+static func is_builtin_type_name(type_name: String) -> bool:
+    for type: int in range(TYPE_NIL + 1, TYPE_MAX):
+        if type != TYPE_OBJECT and type_string(type) == type_name:
+            return true
+    return false
 
 
 ## Basis(Vector3, Vector3, Vector3), Transform3D(Vector3 x 4) and Transform2D(Vector2 x 3), as

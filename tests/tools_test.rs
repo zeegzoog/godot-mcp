@@ -8505,6 +8505,11 @@ async fn project_setting_without_an_editor_reads_value_text_with_the_real_engine
             json!({"key": key, "value_text": "{\"a\": Object(Node)}"}),
             "built-in",
         ),
+        // Godot reads ; outside a string as a comment: the quote after it opens no string.
+        (
+            json!({"key": key, "value_text": "{;\"\n\"a\": Object(RefCounted,\"a\":1)\n;\"\n}"}),
+            "not a built-in type",
+        ),
         (
             json!({"key": key, "value_text": "Resource(\"res://x.tres\")"}),
             "built-in",

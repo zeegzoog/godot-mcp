@@ -567,7 +567,7 @@ func _answer() -> Dictionary:
 	var type: int = TYPE_NIL
 	if request.has("stored"):
 		var stored: String = str(request["stored"]).strip_edges()
-		if stored.begins_with("Object(") or not _builds_no_object(stored):
+		if stored.begins_with("Object(") or not text_builds_no_object(stored):
 			return {"type": "Object"}
 		var current: Variant = str_to_var(stored)
 		if current == null:
@@ -611,8 +611,8 @@ func _parse_text(raw: String) -> Dictionary:
 	var text: String = raw.strip_edges()
 	if text.is_empty():
 		return {"error": "value_text is empty: give a value as project.godot stores it, such as Vector2i(1152, 648) or {\"key\": 1}"}
-	if text.begins_with("Object(") or not _builds_no_object(text):
-		return {"error": "value_text uses a constructor that is not a built-in type (an Object or a Resource); only built-in types such as Vector4(0, 1, 0, 0) or Color(1, 1, 1, 1) are parsed"}
+	if text.begins_with("Object(") or not text_builds_no_object(text):
+		return {"error": "value_text uses a constructor that is not a built-in type (an Object or a Resource) or a ; comment; only built-in types such as Vector4(0, 1, 0, 0) or Color(1, 1, 1, 1) are parsed"}
 	var parsed: Variant = str_to_var(text)
 	if parsed == null:
 		return {"error": "value_text is not a value Godot can read: give it as project.godot stores it, such as Vector2i(1152, 648), \"text\" or {\"key\": Vector4(0, 1, 0, 0)}; to remove the setting pass remove: true"}
@@ -652,7 +652,7 @@ func _convert(value: Variant, type: int) -> Variant:
 			return StringName(value)
 		TYPE_NODE_PATH:
 			return NodePath(value)
-	if type == TYPE_OBJECT or not _opens_as(text, type) or not _builds_no_object(text):
+	if type == TYPE_OBJECT or not _opens_as(text, type) or not text_builds_no_object(text):
 		return null
 	var parsed: Variant = str_to_var(text)
 	if typeof(parsed) == type:
@@ -670,8 +670,9 @@ func _opens_as(text: String, type: int) -> bool:
 
 
 ## Whether every constructor in a value text, outside its strings, is a built-in type other than
-## Object, so parsing it creates no Object and loads no Resource.
-func _builds_no_object(text: String) -> bool:
+## Object, so parsing it creates no Object and loads no Resource. A copy of the function in
+## addons/godot_mcp/core/property_values.gd; tests/version_sync_test.rs checks that they stay equal.
+static func text_builds_no_object(text: String) -> bool:
 	var in_string: bool = false
 	var escaped: bool = false
 	var word: String = ""
@@ -693,8 +694,12 @@ func _builds_no_object(text: String) -> bool:
 			word = ""
 		if character == "\"":
 			in_string = true
+		elif character == ";":
+			# The parser reads ; outside a string as a comment to the end of the line, and a quote
+			# in it would make this scan see a string the parser skips. Godot never writes one.
+			return false
 		elif character == "(":
-			if last_word.is_empty() or last_word == "Object" or not _is_builtin_type(last_word):
+			if last_word.is_empty() or last_word == "Object" or not is_builtin_type_name(last_word):
 				return false
 			last_word = ""
 		elif character != " " and character != "\t" and character != "\n" and character != "\r" and character != "[" and character != "]":
@@ -702,7 +707,8 @@ func _builds_no_object(text: String) -> bool:
 	return not in_string
 
 
-func _is_builtin_type(type_name: String) -> bool:
+## Whether a name is a built-in Variant type other than Object.
+static func is_builtin_type_name(type_name: String) -> bool:
 	for type: int in range(TYPE_NIL + 1, TYPE_MAX):
 		if type != TYPE_OBJECT and type_string(type) == type_name:
 			return true

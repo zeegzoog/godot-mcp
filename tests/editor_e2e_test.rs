@@ -1961,6 +1961,11 @@ async fn project_settings_take_a_value_text_and_remove_like_the_file_fallback() 
             json!({"key": key, "value_text": "{\"a\": Object(Node)}"}),
             "built-in",
         ),
+        // Godot reads ; outside a string as a comment: the quote after it opens no string.
+        (
+            json!({"key": key, "value_text": "{;\"\n\"a\": Object(RefCounted,\"a\":1)\n;\"\n}"}),
+            "not a built-in type",
+        ),
         (
             json!({"key": key, "value_text": "Vector4(0, "}),
             "not a value",
@@ -4897,6 +4902,33 @@ async fn typed_container_properties_convert_each_element_or_refuse() {
             json!("Array[NodePath]([NodePath(\"a\")])"),
             "names: element 0: expected String",
         ),
+        // Text is never parsed into an Object or a loaded Resource, even inside an array whose
+        // elements would then pass the class check.
+        (
+            "nodes",
+            json!("[Object(Node,\"name\":\"Planted\")]"),
+            "not a built-in type",
+        ),
+        (
+            "mats",
+            json!("[Resource(\"res://mat.tres\")]"),
+            "not a built-in type",
+        ),
+        (
+            "weights",
+            json!("{\"a\": Object(Node,\"name\":\"Planted\")}"),
+            "not a built-in type",
+        ),
+        (
+            "mats",
+            json!(["res://../mat.tres"]),
+            "not a path inside the project",
+        ),
+        (
+            "nodes",
+            json!("[;\"\nObject(Node,\"name\":\"Planted\")\n;\"\n]"),
+            "not a built-in type",
+        ),
     ] {
         expect_error(
             call(
@@ -4907,8 +4939,17 @@ async fn typed_container_properties_convert_each_element_or_refuse() {
             needle,
         );
     }
+    expect_error(
+        call(
+            "set_node_properties",
+            json!({"node_path": "Lists", "properties": {"loose": "[Object(Node,\"name\":\"Planted\")]"}}),
+        )
+        .await,
+        "not a built-in type",
+    );
     let read = props().await;
     assert_eq!(read["loose"]["value"], "[\"x\", 1.0]", "{read}");
+    assert_eq!(read["nodes"]["value"], "Array[Node]([])", "{read}");
     assert_eq!(
         read["paths"]["value"],
         "Array[NodePath]([NodePath(\"../UI\")])"

@@ -1,6 +1,6 @@
 # Content Authoring Tools (Realization)
 
-**Version:** 1.3.0
+**Version:** 1.4.0
 **Status:** Stable
 **Layer:** implementation
 **Implements:** l1-content-authoring.md
@@ -44,10 +44,10 @@ The authoring tools are realized by two specifications written for other concept
 | CA-14 Shaders | `src/tools/shaders.rs` (§5.8); `editor/shader_ops.gd` (§5.4 of the addon) | `shader_tools_refuse_what_they_should_with_a_fix`; `edit_shader_without_an_editor_replaces_one_fragment`; `shader_commands_keep_the_shader_editor_in_step` |
 | CA-15 Import parameters | `src/tools/import_params.rs` (§5.9); `editor/import_ops.gd`, shared with the headless path | `import_params_go_through_the_editor_that_has_the_project_and_name_dropped_options`; `import_params_are_read_set_copied_and_reimported_headless` (`tests/export_e2e_test.rs`) |
 | CA-16 InputMap actions | `src/tools/input_map.rs` (§5.10); `get_input_map` and `edit_input_action` in `bridge_server.gd` | `input_action_edits_are_checked_first_and_never_write_project_godot`; `input_actions_are_edited_saved_and_undone_through_the_editor` |
-| CA-17 Deleting | `src/tools/files.rs`, `src/tools/reference_kind.rs` (§5.10); `editor/file_ops.gd` and its classifier | `files_are_deleted_on_disk_with_their_companions_unless_still_referenced`; `a_file_only_written_by_a_generator_script_is_deleted_without_force`; `files_are_deleted_through_the_editor_with_companions_and_tabs`; `the_addon_classifies_script_references_like_the_server` |
+| CA-17 Deleting | `src/tools/files.rs`, `src/tools/reference_kind.rs` (§5.10); `editor/file_ops.gd` and its classifier; `editor/shader_ops.gd` (unsaved shader typing) | `files_are_deleted_on_disk_with_their_companions_unless_still_referenced`; `a_file_only_written_by_a_generator_script_is_deleted_without_force`; `files_are_deleted_through_the_editor_with_companions_and_tabs`; `the_addon_classifies_script_references_like_the_server`; `moves_and_deletes_respect_the_shader_editor_and_stay_in_the_project` |
 | CA-18 Created classes are known to runs | `src/godot/class_cache.rs` (`register`, `unregistered`), called from `godot_create_script` in `src/tools.rs`, from the edit fallback in `src/tools/scripts.rs` and from the syntax check in `src/tools/headless.rs` (§5.4) | `create_and_edit_without_an_editor_keep_the_class_cache_up_to_date`; `validate_script_fails_a_script_that_uses_an_unregistered_class`; `a_class_created_without_the_editor_is_known_to_the_next_run`; the unit tests of `class_cache.rs` |
 | CA-19 Saved resources | `src/tools/resource_props.rs`; `set_resource_properties` in `bridge_server.gd` (one `EditorUndoRedoManager` action over the loaded copy, saved again on undo and redo); the conversion in `core/property_values.gd`, shared with the headless run of `CliRunner::set_resource_properties` in `src/cli_runner.rs`, which reads the request from a JSON file named after `--` and writes the uids back as after `godot_run_script` | `set_resource_properties_refuses_before_starting_godot`; `resource_file_properties_are_set_saved_and_undone_through_the_editor` (`tests/editor_e2e_test.rs`); `set_resource_properties_without_an_editor_keeps_uids_and_unset_uniforms_out` (`tests/runtime_e2e_test.rs`) |
-| CA-20 Moving keeps references | `src/tools/file_move.rs` (§5.16); `move_files_check` and `move_files_apply` in `bridge_server.gd` and `editor/file_ops.gd` | `files_and_folders_are_moved_on_disk_with_their_references_rewritten`; `files_and_folders_are_moved_through_the_editor_with_references_and_tabs` |
+| CA-20 Moving keeps references | `src/tools/file_move.rs` (§5.16); `move_files_check` and `move_files_apply` in `bridge_server.gd` and `editor/file_ops.gd`; `editor/shader_ops.gd` (the shader tab check and follow) | `files_and_folders_are_moved_on_disk_with_their_references_rewritten`; `files_and_folders_are_moved_through_the_editor_with_references_and_tabs`; `moves_and_deletes_respect_the_shader_editor_and_stay_in_the_project` |
 | CA-21 Honest creation | The headless path of `godot_create_resource` in `src/tools/authoring.rs` and the load check in `src/cli_runner.rs` (§5.5) | `create_resource_without_an_editor_never_replaces_a_file`; `create_resource_without_an_editor_removes_a_file_godot_cannot_load`; `created_resource_without_an_editor_loads_and_takes_properties` (`tests/runtime_e2e_test.rs`) |
 
 ## 7. Drawbacks & Alternatives
@@ -76,3 +76,4 @@ The authoring tools are realized by two specifications written for other concept
 | 1.1.0 | 2026-11-09 | Agent (magic.spec) | [ADDED] The row of CA-18. Source: pull requests 130 and 131. Stable → RFC → Stable after Post-Update Review. |
 | 1.2.0 | 2026-11-19 | Agent (magic.spec) | [ADDED] The row of CA-19. Source: pull request 158. Stable → RFC → Stable after Post-Update Review. |
 | 1.3.0 | 2026-11-27 | Agent (magic.spec) | [ADDED] The rows of CA-20 and CA-21. [MODIFIED] The row of CA-4 (the new setting inputs). Source: pull requests 149, 152, 157 and 178. Stable → RFC → Stable after Post-Update Review. |
+| 1.4.0 | 2026-11-27 | Agent (magic.spec) | [MODIFIED] The CA-17 and CA-20 rows: the shader tab guard and its test. Source: pull request 203. Stable → RFC → Stable after Post-Update Review. |

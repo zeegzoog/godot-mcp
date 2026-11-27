@@ -3262,7 +3262,8 @@ const CLASH_SCENE: &str = "[gd_scene load_steps=2 format=3]\n\n[ext_resource typ
 #[tokio::test]
 #[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
 async fn open_scene_returns_what_the_load_errors_dialog_shows() {
-    // The test reads the dialog's English text, whatever language this machine's editor uses.
+    // `--language` sets the editor's language from Godot 4.6; a 4.5 editor keeps the language
+    // of this machine's settings, so only the parts no translation changes are checked there.
     let editor = start_editor_with_args(
         None,
         "",
@@ -3272,6 +3273,11 @@ async fn open_scene_returns_what_the_load_errors_dialog_shows() {
     )
     .await;
     let bridge = &editor.bridge;
+    let version = bridge
+        .send_command("get_version", json!({}))
+        .await
+        .expect("version");
+    let english = version["minor"].as_u64().expect("minor") >= 6;
 
     let clean = bridge
         .send_command("open_scene", json!({"scene_path": "res://main.tscn"}))
@@ -3295,15 +3301,20 @@ async fn open_scene_returns_what_the_load_errors_dialog_shows() {
     let errors = clash["load_errors"].as_array().expect("load_errors");
     assert_eq!(errors.len(), 1, "{clash}");
     let message = errors[0].as_str().expect("message");
-    assert!(
-        message.starts_with("An incoming node's name clashes with Sub/A"),
-        "{clash}"
-    );
-    assert!(
-        message.ends_with("Please fix and re-save the scene."),
-        "{clash}"
-    );
-    assert_eq!(clash["dialog"], "Load Errors", "{clash}");
+    assert!(message.contains("Sub/A"), "{clash}");
+    let title = clash["dialog"].as_str().expect("dialog title");
+    assert!(!title.is_empty(), "{clash}");
+    if english {
+        assert!(
+            message.starts_with("An incoming node's name clashes with Sub/A"),
+            "{clash}"
+        );
+        assert!(
+            message.ends_with("Please fix and re-save the scene."),
+            "{clash}"
+        );
+        assert_eq!(title, "Load Errors", "{clash}");
+    }
     assert!(
         clash
             .get("unsaved")
@@ -3346,7 +3357,7 @@ async fn open_scene_returns_what_the_load_errors_dialog_shows() {
         Some(1),
         "{reloaded}"
     );
-    assert_eq!(reloaded["dialog"], "Load Errors", "{reloaded}");
+    assert_eq!(reloaded["dialog"], clash["dialog"], "{reloaded}");
 }
 
 /// Turns on the script editor's rewrites on save, the way a person's editor settings may have

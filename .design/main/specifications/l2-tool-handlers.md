@@ -1,6 +1,6 @@
 # Tool Handlers (Rust)
 
-**Version:** 1.21.0
+**Version:** 1.22.0
 **Status:** Stable
 **Layer:** implementation
 **Implements:** l1-tool-catalog.md
@@ -204,7 +204,7 @@ Answers that a fixed script prints after a marker line, like every engine reply,
 
 ### 5.16 Moving Files
 
-`tools/file_move.rs` realizes CA-20 for `godot_move_file`: up to 64 `{from, to}` pairs, a `to` that ends in `/` keeping the name. The whole plan is checked first (a missing source, `project.godot`, `.godot/`, the addon, a companion on its own, a destination that exists or lies in `.godot/`, a folder into itself, overlapping moves); `dry_run` answers the plan. Each file moves with its `.uid` and `.import`, and its imported data is renamed for the new path. Every `res://` mention of an old path in text files is rewritten in one pass, whole paths for files and prefixes for folders; the imported folder is read once and the replacements are indexed, so planning stays linear in the project. A failed rename undoes the moves made. With an editor, `move_files_check` refuses unsaved scene and GDScript tabs the move would touch (not shader tabs) and `move_files_apply` makes the editor follow ([l2-godot-editor-addon.md](l2-godot-editor-addon.md) §5.2). Without one, the uid and global-class caches are updated, `binary_references` names binary files that still hold an old path, and `rescan_needed` is true. Relative paths and paths built at run time are not rewritten.
+`tools/file_move.rs` realizes CA-20 for `godot_move_file`: up to 64 `{from, to}` pairs, a `to` that ends in `/` keeping the name. The whole plan is checked first (a missing source, `project.godot`, `.godot/`, the addon, a companion on its own, a destination that exists or lies in `.godot/`, a folder into itself, overlapping moves); `dry_run` answers the plan. Each file moves with its `.uid` and `.import`, and its imported data is renamed for the new path. Every `res://` mention of an old path in text files is rewritten in one pass, whole paths for files and prefixes for folders; the imported folder is read once and the replacements are indexed, so planning stays linear in the project. A failed rename undoes the moves made. With an editor, `move_files_check` refuses unsaved scene, GDScript and shader tabs the move would touch and `move_files_apply` makes the editor follow ([l2-godot-editor-addon.md](l2-godot-editor-addon.md) §5.2). Without one, the uid and global-class caches are updated, `binary_references` names binary files that still hold an old path, and `rescan_needed` is true. Relative paths and paths built at run time are not rewritten.
 
 ### 5.17 Calls at the Same Time
 
@@ -286,3 +286,4 @@ Answers that a fixed script prints after a marker line, like every engine reply,
 | 1.19.0 | 2026-11-09 | Agent (magic.spec) | [MODIFIED] TL-11: `recently_ended` and the ended-run fields of the stop and status answers. §5.4: class registration without the editor and the unregistered-class check of `godot_validate_script` (CA-18). Source: pull requests 130 and 131. Stable → RFC → Stable after Post-Update Review. |
 | 1.20.0 | 2026-11-27 | Agent (magic.spec) | [ADDED] §5.15 (pack runs), §5.16 (moving files), §5.17 (overlapping calls), the TL-15, TL-16 and CA-20, CA-21 rows, setting inputs and the load check of a new resource in §5.5, export filters in §5.12. [MODIFIED] Error codes (TL-7), the class check (one cached class list instead of a call per name), the root-name rule, the snapshot and repair of §5.11, the file map and §5.2. Source: pull requests 149 to 153, 157, 178, 181 to 185, 188 to 194. Stable → RFC → Stable after Post-Update Review. |
 | 1.21.0 | 2026-11-27 | Agent (magic.spec) | [MODIFIED] §5.11 steps 3 and 5: cached uids in the snapshot, and the scaled, repeated passes of the binary uid writes. Source: pull requests 147 and 148. Stable → RFC → Stable after Post-Update Review. |
+| 1.22.0 | 2026-11-27 | Agent (magic.spec) | [MODIFIED] §5.16: the move check covers shader tabs. Source: pull request 203. Stable → RFC → Stable after Post-Update Review. |

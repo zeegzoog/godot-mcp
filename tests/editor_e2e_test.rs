@@ -523,6 +523,19 @@ async fn bridge_is_loopback_only_and_requires_the_token() {
             "token file {} has mode {mode:o}",
             path.display()
         );
+        // Nor list or open anything in its folder, even while the file is being written.
+        let folder = path.parent().expect("token folder");
+        let folder_mode = std::fs::metadata(folder)
+            .expect("token folder")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            folder_mode,
+            0o700,
+            "token folder {} has mode {folder_mode:o}",
+            folder.display()
+        );
     }
 
     // Not reachable through any non-loopback address of this host.
@@ -544,6 +557,331 @@ async fn bridge_is_loopback_only_and_requires_the_token() {
             !matches!(attempt, Ok(Ok(_))),
             "bridge accepted a connection on {ip}"
         );
+    }
+}
+
+type RawPeer =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Test-only command that sends an event to the bridge's peers.
+const BROADCAST_HOOK: &str = r#"        "__test_broadcast":
+            broadcast_event("test.event", {"n": 1})
+            send_success(peer, cmd_id, {"sent": true})
+        "ping":
+"#;
+
+/// Opens a WebSocket to the bridge without sending anything.
+async fn raw_peer(port: u16) -> RawPeer {
+    let url = format!("ws://127.0.0.1:{port}");
+    let (ws, _) = timeout(
+        Duration::from_secs(5),
+        tokio_tungstenite::connect_async(&url),
+    )
+    .await
+    .expect("handshake in time")
+    .expect("loopback handshake");
+    ws
+}
+
+/// Sends one command and returns the editor's reply to it (events are skipped).
+async fn raw_command(ws: &mut RawPeer, command: Value) -> Value {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+    ws.send(Message::Text(command.to_string().into()))
+        .await
+        .expect("send");
+    raw_reply(ws).await
+}
+
+/// The next reply the editor sends (events are skipped).
+async fn raw_reply(ws: &mut RawPeer) -> Value {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+    loop {
+        let frame = timeout(Duration::from_secs(10), ws.next())
+            .await
+            .expect("reply in time")
+            .expect("stream open")
+            .expect("frame");
+        let Message::Text(text) = frame else {
+            panic!("expected a text reply, got {frame:?}");
+        };
+        let reply: Value = serde_json::from_str(&text).expect("json");
+        if reply["type"] != "event" {
+            return reply;
+        }
+    }
+}
+
+/// A peer that has sent a command with the token.
+async fn authenticated_peer(editor: &Editor) -> RawPeer {
+    let mut ws = raw_peer(editor.port).await;
+    let token = editor.bridge.secret().expect("bridge token");
+    let reply = raw_command(
+        &mut ws,
+        json!({"commandId": "auth", "type": "ping", "params": {}, "token": token}),
+    )
+    .await;
+    assert_eq!(reply["status"], "success", "{reply}");
+    ws
+}
+
+/// Waits for the editor to close the connection; panics on any other frame or after `within`.
+async fn assert_closed(ws: &mut RawPeer, within: Duration, what: &str) {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let deadline = Instant::now() + within;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match timeout(left, ws.next()).await {
+            Err(_) => panic!("{what}: the editor did not close the connection within {within:?}"),
+            Ok(None) | Ok(Some(Err(_))) | Ok(Some(Ok(Message::Close(_)))) => return,
+            Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => continue,
+            Ok(Some(Ok(frame))) => panic!("{what}: unexpected frame {frame:?}"),
+        }
+    }
+}
+
+/// Game output reaches only peers that sent the token: any web page can open a WebSocket to
+/// 127.0.0.1, since browsers do not apply CORS to it.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn bridge_sends_events_only_to_peers_that_sent_the_token() {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let editor = start_editor_with(Some(BROADCAST_HOOK), "", &[], "").await;
+    let mut events = editor.bridge.subscribe_events();
+    let mut stranger = raw_peer(editor.port).await;
+    let mut member = authenticated_peer(&editor).await;
+
+    let sent = editor
+        .bridge
+        .send_command("__test_broadcast", json!({}))
+        .await
+        .expect("broadcast");
+    assert_eq!(sent["sent"], true, "{sent}");
+
+    let event = timeout(Duration::from_secs(5), events.recv())
+        .await
+        .expect("event in time")
+        .expect("event channel");
+    assert_eq!(event["event"], "test.event", "{event}");
+    let frame = timeout(Duration::from_secs(5), member.next())
+        .await
+        .expect("event in time")
+        .expect("stream open")
+        .expect("frame");
+    let Message::Text(text) = frame else {
+        panic!("expected an event, got {frame:?}");
+    };
+    let event: Value = serde_json::from_str(&text).expect("json");
+    assert_eq!(event["event"], "test.event", "{event}");
+
+    match timeout(Duration::from_secs(1), stranger.next()).await {
+        Err(_) => {}
+        Ok(frame) => panic!("a peer without the token received {frame:?}"),
+    }
+}
+
+/// A peer that sends a wrong token, no token, or nothing at all is closed: before, it stayed
+/// connected for as long as it liked.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn bridge_closes_peers_that_do_not_authenticate() {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let editor = start_editor(false).await;
+
+    for token in [None, Some("wrong-token")] {
+        let mut ws = raw_peer(editor.port).await;
+        let mut command = json!({"commandId": "t", "type": "ping", "params": {}});
+        if let Some(token) = token {
+            command["token"] = json!(token);
+        }
+        let reply = raw_command(&mut ws, command).await;
+        assert!(
+            reply["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Unauthorized"),
+            "{reply}"
+        );
+        assert_closed(&mut ws, Duration::from_secs(5), "wrong token").await;
+    }
+
+    // An authenticated peer that later sends a wrong token is closed too.
+    let mut member = authenticated_peer(&editor).await;
+    let reply = raw_command(
+        &mut member,
+        json!({"commandId": "t", "type": "ping", "params": {}, "token": "wrong"}),
+    )
+    .await;
+    assert_eq!(reply["status"], "error", "{reply}");
+    assert_closed(&mut member, Duration::from_secs(5), "later wrong token").await;
+
+    // Garbage before the token.
+    let mut garbage = raw_peer(editor.port).await;
+    garbage
+        .send(Message::Text("not json".into()))
+        .await
+        .expect("send");
+    let reply = raw_reply(&mut garbage).await;
+    assert_eq!(reply["status"], "error", "{reply}");
+    assert_closed(&mut garbage, Duration::from_secs(5), "invalid JSON").await;
+
+    // Silence.
+    let mut silent = raw_peer(editor.port).await;
+    assert_closed(&mut silent, Duration::from_secs(15), "no command").await;
+
+    // The server's own connection is untouched.
+    editor
+        .bridge
+        .send_command("ping", json!({}))
+        .await
+        .expect("authorized call");
+}
+
+/// The bridge holds at most 8 connections. Peers that have not sent the token make room for
+/// new ones; when all have, a new connection is refused.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn bridge_caps_its_connections() {
+    let editor = start_editor(false).await;
+    // editor.bridge holds one connection already.
+    let mut members = Vec::new();
+    for _ in 0..7 {
+        members.push(authenticated_peer(&editor).await);
+    }
+
+    let url = format!("ws://127.0.0.1:{}", editor.port);
+    let refused = timeout(
+        Duration::from_secs(5),
+        tokio_tungstenite::connect_async(&url),
+    )
+    .await
+    .expect("answer in time");
+    if let Ok((mut ws, _)) = refused {
+        assert_closed(&mut ws, Duration::from_secs(5), "a ninth connection").await;
+    }
+
+    // Free one place and take it without authenticating.
+    let mut leaving = members.pop().expect("a member");
+    leaving.close(None).await.expect("close");
+    drop(leaving);
+    let mut stranger = None;
+    for _ in 0..50 {
+        sleep(Duration::from_millis(100)).await;
+        let Ok(Ok((mut ws, _))) = timeout(
+            Duration::from_secs(5),
+            tokio_tungstenite::connect_async(&url),
+        )
+        .await
+        else {
+            continue;
+        };
+        // A refused connection is closed right away; an accepted one stays open.
+        if timeout(
+            Duration::from_millis(300),
+            futures_util::StreamExt::next(&mut ws),
+        )
+        .await
+        .is_err()
+        {
+            stranger = Some(ws);
+            break;
+        }
+    }
+    let mut stranger = stranger.expect("the freed place was not taken");
+
+    // A client with the token gets the stranger's place once the stranger's grace period is over.
+    sleep(Duration::from_millis(1200)).await;
+    let mut newcomer = authenticated_peer(&editor).await;
+    assert_closed(&mut stranger, Duration::from_secs(5), "the stranger").await;
+    let token = editor.bridge.secret().expect("bridge token");
+    let reply = raw_command(
+        &mut newcomer,
+        json!({"commandId": "again", "type": "ping", "params": {}, "token": token}),
+    )
+    .await;
+    assert_eq!(reply["status"], "success", "{reply}");
+    editor
+        .bridge
+        .send_command("ping", json!({}))
+        .await
+        .expect("the server's own connection still works");
+}
+
+/// A flood of connections from another local process does not push out a client that has just
+/// connected and not yet sent its first command, and a client connecting during the flood still
+/// gets in.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn a_flood_of_connections_does_not_push_out_a_new_client() {
+    let editor = start_editor(false).await;
+    let url = format!("ws://127.0.0.1:{}", editor.port);
+    let mut client = raw_peer(editor.port).await;
+    let mut flood = Vec::new();
+    for _ in 0..12 {
+        if let Ok(Ok((ws, _))) = timeout(
+            Duration::from_secs(2),
+            tokio_tungstenite::connect_async(&url),
+        )
+        .await
+        {
+            flood.push(ws);
+        }
+    }
+    let token = editor.bridge.secret().expect("bridge token");
+    let reply = raw_command(
+        &mut client,
+        json!({"commandId": "late", "type": "ping", "params": {}, "token": token}),
+    )
+    .await;
+    assert_eq!(reply["status"], "success", "{reply}");
+
+    // A server connecting while the flood holds every free place gets in once the flood's
+    // connections are past their grace period.
+    let newcomer = BridgeClient::new(editor.port);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if newcomer.send_command("ping", json!({})).await.is_ok() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a new client could not connect during the flood"
+        );
+        sleep(Duration::from_millis(200)).await;
+    }
+    drop(flood);
+}
+
+/// game_send forwards only the runtime's request channel, so a client cannot send the game
+/// other debugger messages, and wrongly typed parameters get an answer instead of a script error.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn game_send_forwards_only_runtime_requests() {
+    let editor = start_editor(false).await;
+    let refused = editor
+        .bridge
+        .send_command("game_send", json!({"command": "mcp:other", "data": []}))
+        .await
+        .expect_err("another message name")
+        .to_string();
+    assert!(refused.contains("mcp:request"), "{refused}");
+    for (params, key) in [
+        (json!({"command": "mcp:request", "session": "x"}), "session"),
+        (json!({"command": "mcp:request", "data": "x"}), "data"),
+    ] {
+        let error = editor
+            .bridge
+            .send_command("game_send", params)
+            .await
+            .expect_err("wrong type")
+            .to_string();
+        assert!(error.contains(&format!("'{key}'")), "{error}");
     }
 }
 

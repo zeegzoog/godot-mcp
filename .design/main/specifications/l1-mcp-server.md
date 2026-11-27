@@ -1,6 +1,6 @@
 # MCP Server Core
 
-**Version:** 1.5.0
+**Version:** 1.6.0
 **Status:** Stable
 **Layer:** concept
 
@@ -34,7 +34,7 @@ An MCP client (Claude Code, Claude Desktop, Cursor, VS Code, Antigravity) treats
 - **MCP-2 One answer per request.** Every request with a valid id receives exactly one response — except a request the client cancelled, which receives none. Notifications never receive a response.
 - **MCP-3 No head-of-line blocking.** A slow or stalled tool call never delays `initialize`, `ping`, `tools/list`, or any other tool call. Tool calls run independently of the request reader.
 - **MCP-4 Cancellation.** A `notifications/cancelled` for an in-flight request stops its work and suppresses its response.
-- **MCP-5 Error contract.** Malformed input is answered with the standard JSON-RPC codes (parse error, invalid request, method not found, invalid params), preserving the request id when it is valid. A tool that fails returns a normal result flagged as an error whose text states what failed and lists at least one actionable recovery step.
+- **MCP-5 Error contract.** Malformed input is answered with the standard JSON-RPC codes (parse error, invalid request, method not found, invalid params), preserving the request id when it is valid. A tool that fails returns a normal result flagged as an error whose text states what failed and lists at least one actionable recovery step. When the kind of failure is known, the same result also carries it as structured data, a stable code and the message, so a client can act without reading the text; a code is part of the public interface and its meaning does not change when a message is reworded.
 - **MCP-6 Version negotiation.** `initialize` echoes the client's protocol revision when supported, otherwise answers with the newest supported revision.
 - **MCP-7 Forgiving configuration.** An empty configuration value means "not set" (copied templates with blank placeholders must start the server). A configuration file that exists but cannot be parsed is reported on the diagnostics channel and ignored; it never stops the server. Removed settings left in the environment are ignored.
 - **MCP-8 No crash paths.** Production code paths never abort the process on recoverable conditions; failures are typed errors converted into protocol errors or tool errors. Shared state survives a panicking task.
@@ -120,3 +120,4 @@ sequenceDiagram
 | 1.4.0 | 2026-11-02 | Agent (magic.spec) | [REMOVED] The configuration key for an external exporter program, with the tool that used it. Stable → RFC → Stable after Post-Update Review. |
 | 1.4.1 | 2026-11-05 | Agent (magic.spec) | Removed the `[ADDED]` and `[MODIFIED]` markers from the body: the history rows carry what changed. No requirement changed. |
 | 1.5.0 | 2026-11-19 | Agent (magic.spec) | [ADDED] `GODOT_MCP_MOVIE_DIR` in the configuration table. Source: pull request 160. Stable → RFC → Stable after Post-Update Review. |
+| 1.6.0 | 2026-11-27 | Agent (magic.spec) | [MODIFIED] MCP-5: a known kind of failure is also a structured code. Source: pull request 190. Stable → RFC → Stable after Post-Update Review. |

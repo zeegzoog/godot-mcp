@@ -1,12 +1,12 @@
 # Project Export
 
-**Version:** 1.0.1
+**Version:** 1.1.0
 **Status:** Stable
 **Layer:** concept
 
 ## Overview
 
-Tools that list and change a Godot project's export presets and export the project headless with one of them: a data pack that needs no export template, or a release or debug build that does. They store presets the way the editor's Export dialog does and never write an export over a project file.
+Tools that list and change a Godot project's export presets and export the project headless with one of them: a data pack that needs no export template, or a release or debug build that does. They store presets the way the editor's Export dialog does and never write an export over a project file. A written pack can be run for a short time to find what the game loads and the pack lacks.
 
 ## Related Specifications
 
@@ -22,7 +22,7 @@ Before these tools an agent could build and run a game but not ship it: presets 
 
 ## 2. Constraints & Assumptions
 
-- The tools are `godot_list_export_presets`, `godot_set_export_preset` and `godot_export_project`. They run the Godot executable named by `GODOT_PATH`, which must be an editor build: export templates and `--export-*` exist only there.
+- The tools are `godot_list_export_presets`, `godot_set_export_preset`, `godot_export_project` and `godot_run_pack`. They run the Godot executable named by `GODOT_PATH`, which must be an editor build: export templates and `--export-*` exist only there.
 - `export_presets.cfg` is Godot's file. It is read and written by Godot's own configuration reader and writer, never by text editing, so a preset made here equals one made in Project > Export.
 - A running editor keeps the presets in memory and writes them back when its Export dialog changes one; a preset changed on disk while the editor has the project open would be lost at that moment.
 - A pack (`.pck` or `.zip`) holds the project data only and needs no export template; it runs with an engine binary of the same version. A release or debug build needs the export templates of that exact Godot version, or the preset's own template options.
@@ -31,13 +31,14 @@ Before these tools an agent could build and run a game but not ship it: presets 
 
 ## 3. Core Invariants
 
-- **EX-1 Presets through Godot.** Presets are read and written by Godot's configuration reader and writer, in the layout the Export dialog uses. Only the fields and options the caller gives change; an option keeps the type it already has; a new preset exports all resources and leaves every option it does not store to the platform's default.
+- **EX-1 Presets through Godot.** Presets are read and written by Godot's configuration reader and writer, in the layout the Export dialog uses. Only the fields and options the caller gives change; an option keeps the type it already has; a new preset exports all resources unless the caller chooses another resource filter and file list (checked against Godot's filter names and the project's paths, with listed files the project lacks named), and leaves every option it does not store to the platform's default.
 - **EX-2 No lost preset edit.** A preset is not changed while an editor has the project open: the call is refused with the reason and the fix (close the editor first).
 - **EX-3 Ignored options are visible.** Godot ignores an option its platform does not have, so a change reports the option names that were not stored before; a listing shows every stored option and says that an absent one takes the platform's default.
 - **EX-4 Confined output.** The output file resolves inside the project, outside Godot's own cache directory, is a file and not a folder, and never has the extension of a project file (scripts, scenes, resources, shaders, project and import configuration, uid files); a pack ends in `.pck` or `.zip`. Its folder is created. An existing build file there is replaced, as the decision in §2 says.
 - **EX-5 Imported before exported.** The project is imported headless before the export, so the pack holds current imports; the caller can skip it, and it is skipped while an editor has the project open, since that editor keeps the imports current.
 - **EX-6 Honest result.** The answer says whether the export worked, with the output path, its size, the exit code, the duration, Godot's error and warning lines and the end of its log. A missing preset, a missing export template, a failed import, an export that wrote no file, or a run that hit its time limit is an error that carries that log.
 - **EX-7 Bounded and injection-free.** The import and the export each have a time limit the caller can set, and a run that exceeds it is killed with its process tree. No caller string reaches the engine command line as an option or the source of a generated script: a preset request reaches the engine only as data, and an output path only as an absolute path.
+- **EX-8 A pack can be checked before it ships.** An exported pack is run with the engine for a bounded time, from an empty folder so that no project file stands in for a missing one, and the answer names each resource the game failed to load and the errors it logged. A trimmed export leaves out what a game loads by a path built at run time; this is how the caller finds it. The run ends with its process tree and is not a run the other tools manage.
 
 ## 7. Drawbacks & Alternatives
 
@@ -50,6 +51,7 @@ Before these tools an agent could build and run a game but not ship it: presets 
 | Alias | Path | Purpose |
 | --- | --- | --- |
 | `[TOOLS]` | `src/tools/export.rs` | The three tools: schemas, preset requests, output checks, answers |
+| `[PACK-RUN]` | `src/tools/pack_run.rs` | The pack smoke run (EX-8) |
 | `[ENGINE]` | `src/cli_runner.rs` | The headless import and export runs and the preset script |
 | `[E2E]` | `tests/export_e2e_test.rs` | A preset created, changed and used for a pack export on a real engine; an unusable template |
 | `[DOCS]` | `README.md` | The Exporting section |
@@ -60,3 +62,4 @@ Before these tools an agent could build and run a game but not ship it: presets 
 | --- | --- | --- | --- |
 | 1.0.0 | 2026-11-02 | Agent (magic.spec) | Reality sync after ventilation: written from the export tools as merged in pull request 89, which no specification covered. The two decisions record what the code does (confined output, an existing build file replaced). Promoted to Stable after Post-Update Review. |
 | 1.0.1 | 2026-11-05 | Agent (magic.spec) | The realization specification is in Related Specifications. No requirement changed. |
+| 1.1.0 | 2026-11-27 | Agent (magic.spec) | [ADDED] EX-8 (a smoke run of an exported pack). [MODIFIED] EX-1: a preset's resource filter and file list. Source: pull requests 150 and 151. Stable → RFC → Stable after Post-Update Review. |

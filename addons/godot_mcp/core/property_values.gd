@@ -390,9 +390,13 @@ static func unknown_resource_property(resource: Resource, name: String) -> Strin
 
 ## Plans setting properties of the resource saved at resource_path (a res:// path of a .tres or
 ## .res file), without changing anything: loads it (the copy already loaded, when there is one),
-## converts every value to the property's current type, then sets each value, reads it back and
-## puts the old one back. Returns {"resource": Resource, "values": Dictionary, "before":
-## Dictionary} or {"error": String} naming every refused property.
+## converts every value to the property's current type and sets them on a copy of it, reading each
+## one back. A property that adds properties (streams_count adds stream_<n>/stream, any setter that
+## calls notify_property_list_changed) is set first, and the names the resource did not have are
+## checked again against the copy's refreshed list, so one call sets a count and the entries it
+## adds. Returns {"resource": Resource, "values": Dictionary in the order to set them, "before":
+## Dictionary that puts the resource back when set in its order} or {"error": String} naming every
+## refused property.
 static func plan_resource_change(resource_path: String, properties: Dictionary) -> Dictionary:
     if not (resource_path.ends_with(".tres") or resource_path.ends_with(".res")):
         return {"error": "resource_path must name a .tres or .res file: %s" % resource_path}
@@ -403,50 +407,78 @@ static func plan_resource_change(resource_path: String, properties: Dictionary) 
     var resource: Resource = load(resource_path) as Resource
     if resource == null:
         return {"error": "Godot could not load %s as a resource" % resource_path}
-    var known: Dictionary = {}
-    for prop: Dictionary in resource.get_property_list():
-        known[prop["name"]] = prop
+    # The values are tried on a copy, so a refused call never touches the loaded resource (setting
+    # a smaller count and back would drop the entries it removed).
+    var trial: Resource = resource.duplicate()
+    if trial == null:
+        return {"error": "Godot could not copy %s to try the values on" % resource_path}
+    var original_names: Dictionary = property_infos(resource)
     var values: Dictionary = {}
     var problems: PackedStringArray = []
+    var pending: Array = []
     for key: Variant in properties.keys():
         var name: String = str(key)
         if name.contains(":"):
             problems.append("'%s': ':' steps are not supported here; name a property of %s itself" % [name, resource_path])
-            continue
-        if REFUSED_RESOURCE_PROPERTIES.has(name) or name.begins_with("_"):
+        elif REFUSED_RESOURCE_PROPERTIES.has(name) or name.begins_with("_"):
             problems.append("Refusing to set '%s': it is not part of the resource's data" % name)
-            continue
-        if not known.has(name):
-            problems.append(unknown_resource_property(resource, name))
-            continue
-        var info: Dictionary = known[name]
-        var result: Dictionary = convert_property_value(info, properties[key])
-        if result.has("error"):
-            problems.append("%s: %s" % [name, result["error"]])
-            continue
-        var misfit: String = resource_fits_hint(info, result["value"])
-        if not misfit.is_empty():
-            problems.append("%s: %s" % [name, misfit])
-            continue
-        values[name] = result["value"]
+        else:
+            pending.append(key)
+    # Each round sets the names the copy has now; a round that sets none ends the search.
+    while not pending.is_empty():
+        var known: Dictionary = property_infos(trial)
+        var waiting: Array = []
+        var progressed: bool = false
+        for key: Variant in pending:
+            var name: String = str(key)
+            if not known.has(name):
+                waiting.append(key)
+                continue
+            progressed = true
+            var info: Dictionary = known[name]
+            var result: Dictionary = convert_property_value(info, properties[key])
+            if result.has("error"):
+                problems.append("%s: %s" % [name, result["error"]])
+                continue
+            var misfit: String = resource_fits_hint(info, result["value"])
+            if not misfit.is_empty():
+                problems.append("%s: %s" % [name, misfit])
+                continue
+            values[name] = result["value"]
+            trial.set(name, result["value"])
+        if not progressed:
+            for key: Variant in waiting:
+                problems.append(unknown_resource_property(trial, str(key)))
+            break
+        pending = waiting
     if not problems.is_empty():
         return {"error": "No properties were changed. " + "; ".join(problems)}
-    var before: Dictionary = {}
-    for name: String in values:
-        before[name] = resource.get(name)
     var kept: PackedStringArray = []
     for name: String in values:
-        resource.set(name, values[name])
-    for name: String in values:
-        var read: Variant = resource.get(name)
+        var read: Variant = trial.get(name)
         if not same_value(read, values[name]):
             kept.append("%s reads back %s after being set to %s: Godot's setter clamped, rounded or refused it" % [name, describe_value(read), describe_value(values[name])])
-    var names: Array = values.keys()
-    for index: int in range(names.size() - 1, -1, -1):
-        resource.set(names[index], before[names[index]])
     if not kept.is_empty():
         return {"error": "No properties were changed. " + "; ".join(kept)}
+    var before: Dictionary = {}
+    if property_infos(trial).keys() != original_names.keys():
+        # The change adds or removes properties: putting back only the changed names would lose the
+        # entries a smaller count removes, so keep every property, in the order Godot loads them.
+        for name: String in original_names:
+            var usage: int = int(original_names[name].get("usage", 0))
+            if usage & (PROPERTY_USAGE_STORAGE | PROPERTY_USAGE_EDITOR) and not REFUSED_RESOURCE_PROPERTIES.has(name):
+                before[name] = resource.get(name)
+    for name: String in values:
+        if not before.has(name):
+            before[name] = resource.get(name) if original_names.has(name) else null
     return {"resource": resource, "values": values, "before": before}
+
+## Each property of an object by name, in the order of its property list.
+static func property_infos(object: Object) -> Dictionary:
+    var infos: Dictionary = {}
+    for prop: Dictionary in object.get_property_list():
+        infos[prop["name"]] = prop
+    return infos
 
 ## Sets the values on the resource and saves it to its own file. On a failed save the old values
 ## are put back. Returns the save's error.

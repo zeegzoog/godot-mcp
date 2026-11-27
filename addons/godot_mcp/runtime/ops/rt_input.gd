@@ -22,6 +22,11 @@ const R := preload("rt_result.gd")
 
 ## The most frames one path or circle step may take; the same bound as a wait step.
 const MAX_PATH_FRAMES := 600
+## The most game seconds one wait may last when it is given in seconds.
+const MAX_WAIT_SECONDS := 60.0
+## Real seconds after which a wait in game seconds gives up: its clock stops while time_scale is
+## 0 or the tree is paused, and the server stops waiting for the answer a little later.
+const WAIT_WALL_SECONDS := 120.0
 ## The spaces a caller may give pointer positions in. viewport is the default.
 const COORDINATE_SPACES: Array[String] = ["viewport", "window"]
 
@@ -235,6 +240,9 @@ static func wait_frames(rt: Node, params: Dictionary) -> Dictionary:
     if R.is_err(scaled):
         return scaled
     var note: Dictionary = scaled["note"]
+    var clock := _wait_clock(params)
+    if R.is_err(clock):
+        return clock
     var node_path := str(params.get("node", "")).strip_edges()
     var sig := str(params.get("signal", "")).strip_edges()
     var property := str(params.get("property", "")).strip_edges()
@@ -242,7 +250,7 @@ static func wait_frames(rt: Node, params: Dictionary) -> Dictionary:
     if not sig.is_empty() and (not property.is_empty() or has_generation):
         return R.err(R.BAD_PARAMS, "Wait for a signal on its own. A property or scene_generation wait cannot include a signal.")
     if not property.is_empty() or has_generation:
-        return _begin_condition(rt, params, node_path, property, has_generation, note)
+        return _begin_condition(rt, params, node_path, property, has_generation, note, clock)
     if not sig.is_empty() and node_path.is_empty():
         return R.err(R.BAD_PARAMS, "input.wait: a signal needs a node path.")
     if not node_path.is_empty() or not sig.is_empty():
@@ -254,15 +262,26 @@ static func wait_frames(rt: Node, params: Dictionary) -> Dictionary:
             "index": 0,
             "mode": "until",
             "tool_wait": true,
+            "clock": clock,
         }
         return {"_pending": true, "_tick": func() -> bool: return _tick_until(rt, until_state)}
     var frames := clampi(int(params.get("frames", 1)), 0, 600)
-    var state := {"left": frames, "start": Engine.get_process_frames(), "note": note}
+    var state := {"left": frames, "start": Engine.get_process_frames(), "note": note, "clock": clock}
     return {"_pending": true, "_tick": func() -> bool:
-        if int(state["left"]) > 0:
+        var timing: Dictionary = state["clock"]
+        if _by_seconds(timing):
+            _tick_clock(rt, timing)
+            if not _clock_spent(timing):
+                return true
+            if not _clock_reached(timing):
+                rt.finish_job(R.err(R.UNSUPPORTED, _stalled_message(timing), _clock_report(timing)))
+                return false
+        elif int(state["left"]) > 0:
             state["left"] = int(state["left"]) - 1
+            _tick_clock(rt, timing)
             return true
         var body := {"frames": Engine.get_process_frames() - int(state["start"])}
+        body.merge(_clock_report(timing))
         body.merge(state["note"])
         rt.finish_job(R.ok(body))
         return false
@@ -538,10 +557,61 @@ static func _set_time_scale(scale: float) -> Dictionary:
     return {"previous_time_scale": previous, "time_scale": scale}
 
 
+## The clock of a wait: the game seconds it has seen, and its limit in game seconds when the call
+## gave seconds (-1 when it counts frames). seconds cannot go with frames or timeout, and is
+## refused while time_scale is 0, when no game time passes.
+static func _wait_clock(params: Dictionary) -> Dictionary:
+    var limit := -1.0
+    if params.has("seconds"):
+        if params.has("frames") or params.has("timeout"):
+            return R.err(R.BAD_PARAMS, "Give seconds or frames and timeout, not both: seconds waits in game seconds, and with node, signal, property or scene_generation it is the timeout.")
+        var raw: Variant = params.get("seconds")
+        if not (raw is float or raw is int) or float(raw) <= 0.0 or float(raw) > MAX_WAIT_SECONDS:
+            return R.err(R.BAD_PARAMS, "seconds must be a number above 0 and at most %d." % int(MAX_WAIT_SECONDS))
+        if is_zero_approx(Engine.time_scale):
+            return R.err(R.BAD_PARAMS, "Engine.time_scale is 0, so no game time passes and a wait in seconds would never end. Pass time_scale above 0, or wait in frames.")
+        limit = float(raw)
+    return {"game": 0.0, "limit": limit, "wall_end": Time.get_ticks_msec() + int(WAIT_WALL_SECONDS * 1000.0)}
+
+
+static func _by_seconds(clock: Dictionary) -> bool:
+    return float(clock.get("limit", -1.0)) >= 0.0
+
+
+## Counts one process frame of game time: its delta, which Engine.time_scale already scales. A
+## frame while the tree is paused is no game time.
+static func _tick_clock(rt: Node, clock: Dictionary) -> void:
+    if clock.is_empty() or rt.get_tree().paused:
+        return
+    clock["game"] = float(clock["game"]) + rt.get_process_delta_time()
+
+
+## Whether a wait in game seconds has seen its seconds.
+static func _clock_reached(clock: Dictionary) -> bool:
+    return float(clock["game"]) >= float(clock["limit"])
+
+
+## Whether a wait in game seconds is over: its seconds passed, or the real-time cap did.
+static func _clock_spent(clock: Dictionary) -> bool:
+    return _clock_reached(clock) or Time.get_ticks_msec() >= int(clock["wall_end"])
+
+
+static func _clock_report(clock: Dictionary) -> Dictionary:
+    if clock.is_empty():
+        return {}
+    return {"seconds": snappedf(float(clock["game"]), 0.0001)}
+
+
+static func _stalled_message(clock: Dictionary) -> String:
+    return "Only %.3f of %s game seconds passed in %d real seconds (time_scale %s, tree paused %s), so the wait gave up." % [
+        float(clock["game"]), str(clock["limit"]), int(WAIT_WALL_SECONDS), str(Engine.time_scale), str((Engine.get_main_loop() as SceneTree).paused),
+    ]
+
+
 const _WAIT_OPS: Array[String] = ["eq", "ne", "lt", "lte", "gt", "gte", "exists"]
 
 
-static func _begin_condition(rt: Node, params: Dictionary, node_path: String, property: String, has_generation: bool, note: Dictionary) -> Dictionary:
+static func _begin_condition(rt: Node, params: Dictionary, node_path: String, property: String, has_generation: bool, note: Dictionary, clock: Dictionary) -> Dictionary:
     if not property.is_empty() and node_path.is_empty():
         return R.err(R.BAD_PARAMS, "input.wait: a property needs a node path.")
     var op := ""
@@ -569,6 +639,7 @@ static func _begin_condition(rt: Node, params: Dictionary, node_path: String, pr
         "left": timeout,
         "start": Engine.get_process_frames(),
         "note": note,
+        "clock": clock,
     }
     return {"_pending": true, "_tick": func() -> bool: return _tick_condition(rt, state)}
 
@@ -615,20 +686,22 @@ static func _tick_condition(rt: Node, state: Dictionary) -> bool:
             body["observed"] = rt.encode(observed)
         if bool(state["has_generation"]):
             body["scene_generation"] = int(scene.get("scene_generation", 0))
+        body.merge(_clock_report(state["clock"]), true)
         body.merge(state.get("note", {}), true)
         rt.finish_job(R.ok(body))
         return false
-    state["left"] = int(state["left"]) - 1
-    if int(state["left"]) > 0:
-        return true
-    var what := str(state["property"]) if bool(state["has_property"]) else "scene generation newer than %d" % int(state["generation"])
-    return _fail_condition(rt, R.err(R.NOT_FOUND, "Timed out waiting for '%s'." % what, {
-        "observed": rt.encode(observed) if exists else null,
-        "exists": exists,
-        "property": str(state["property"]),
-        "op": str(state["op"]),
-        "scene": scene,
-    }))
+    if not _budget_left(rt, state, state["clock"]):
+        var what := str(state["property"]) if bool(state["has_property"]) else "scene generation newer than %d" % int(state["generation"])
+        var data := {
+            "observed": rt.encode(observed) if exists else null,
+            "exists": exists,
+            "property": str(state["property"]),
+            "op": str(state["op"]),
+            "scene": scene,
+        }
+        data.merge(_clock_report(state["clock"]), true)
+        return _fail_condition(rt, R.err(R.NOT_FOUND, _timed_out(what, state["clock"]), data))
+    return true
 
 
 ## Parses the condition of a held step: the property triple of a wait, checked before any tick runs.
@@ -931,17 +1004,34 @@ static func _tick_until(rt: Node, state: Dictionary) -> bool:
             return _finish_until(rt, state, sig, path)
     elif node != null:
         return _finish_until(rt, state, "", path)
-    watching["left"] = int(watching["left"]) - 1
-    if int(watching["left"]) > 0:
+    var clock: Dictionary = state.get("clock", {})
+    if _budget_left(rt, watching, clock):
         return true
     var found := node != null and is_instance_valid(node)
     var was_connected := bool(watching.get("connected", false))
     _disconnect_wait(watching)
     var what := sig if not sig.is_empty() else path
-    return _fail(rt, state, R.err(R.NOT_FOUND, "Timed out waiting for '%s'." % what, {
-        "connected": was_connected,
-        "found": found,
-    }))
+    var data := {"connected": was_connected, "found": found}
+    data.merge(_clock_report(clock), true)
+    return _fail(rt, state, R.err(R.NOT_FOUND, _timed_out(what, clock), data))
+
+
+## Spends one process frame of a waiting condition: a frame of its left count, or of game time
+## when its clock counts seconds. False once the budget is used up.
+static func _budget_left(rt: Node, counter: Dictionary, clock: Dictionary) -> bool:
+    _tick_clock(rt, clock)
+    if not clock.is_empty() and _by_seconds(clock):
+        return not _clock_spent(clock)
+    counter["left"] = int(counter["left"]) - 1
+    return int(counter["left"]) > 0
+
+
+static func _timed_out(what: String, clock: Dictionary) -> String:
+    if clock.is_empty() or not _by_seconds(clock):
+        return "Timed out waiting for '%s'." % what
+    if _clock_reached(clock):
+        return "Timed out waiting for '%s' after %s game seconds." % [what, str(clock["limit"])]
+    return "Timed out waiting for '%s'. %s" % [what, _stalled_message(clock)]
 
 
 static func _finish_until(rt: Node, state: Dictionary, sig: String, path: String) -> bool:
@@ -952,6 +1042,7 @@ static func _finish_until(rt: Node, state: Dictionary, sig: String, path: String
     if not sig.is_empty():
         body["signal"] = sig
     if bool(state.get("tool_wait", false)):
+        body.merge(_clock_report(state.get("clock", {})))
         body.merge(state.get("note", {}))
         rt.finish_job(R.ok(body))
         return false

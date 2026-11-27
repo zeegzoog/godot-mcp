@@ -5,6 +5,9 @@ use crate::protocol::ToolResult;
 use crate::tools::{ToolManager, str_arg};
 use serde_json::Value;
 
+/// What a runtime from before aimed sheets answers to aim with frames above 1.
+const OLD_AIM_REFUSAL: &str = "aim takes one picture";
+
 pub(super) async fn screenshot(tools: &ToolManager, args: &Value) -> ToolResult {
     let mut value = match tools
         .runtime_call(
@@ -15,6 +18,15 @@ pub(super) async fn screenshot(tools: &ToolManager, args: &Value) -> ToolResult 
         .await
     {
         Ok(value) => value,
+        Err(error) if error.to_string().contains(OLD_AIM_REFUSAL) => {
+            return ToolResult::error(
+                format!("The game's MCP runtime is older than aimed sheets: {error}"),
+                &[
+                    "Update the project's addon with godot_update_addon (restart_editor: true while the editor has the project open), then start the game again",
+                    "Or take one aimed picture at a time (frames 1)",
+                ],
+            );
+        }
         Err(error) => return runtime_error(&error),
     };
     // The image moves on to the answer; it is the largest part of it and is not copied.

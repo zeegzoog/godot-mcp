@@ -390,7 +390,7 @@ async fn validate(tools: &ToolManager, args: &Value) -> ToolResult {
             );
         }
     };
-    let check: ShaderCheck = match serde_json::from_str(&answer) {
+    let check: ShaderCheck = match crate::godot::json_text::parse(&answer) {
         Ok(check) => check,
         Err(error) => {
             return ToolResult::error(

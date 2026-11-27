@@ -1,6 +1,6 @@
 # Rust Stdio Server
 
-**Version:** 1.6.0
+**Version:** 1.7.0
 **Status:** Stable
 **Layer:** implementation
 **Implements:** l1-mcp-server.md
@@ -34,7 +34,7 @@ Records how the concept's guarantees map onto this crate so a change to the sess
 | MCP-2 One answer per request | Requests other than `tools/call` are answered inline; each `tools/call` task sends exactly one response on completion; notifications are never answered. |
 | MCP-3 No head-of-line blocking | `tools/call` runs in a `JoinSet` task; the reader loop keeps reading and answering while tasks run. |
 | MCP-4 Cancellation | In-flight tasks are registered in a map keyed by the JSON text of the request id (registration happens under the lock before the task can finish); `notifications/cancelled` removes the entry and aborts the task, so no response is sent. |
-| MCP-5 Error contract | `parse_message` maps input to parse error (-32700), invalid request (-32600), method not found (-32601) and invalid params (-32602); tool failures are `ToolResult::error(message, hints)` with an "Actionable recovery suggestions" list and `isError: true`. |
+| MCP-5 Error contract | `parse_message` maps input to parse error (-32700), invalid request (-32600), method not found (-32601) and invalid params (-32602); tool failures are `ToolResult::error(message, hints)` with an "Actionable recovery suggestions" list and `isError: true`; a failure with a known code also sets `structuredContent.error` (`code`, `message`, and the game's `data`) through `ToolResult` in `protocol.rs`. |
 | MCP-6 Version negotiation | `SUPPORTED_PROTOCOL_VERSIONS` (newest first); the requested version is echoed when present in the list, else the first entry. |
 | MCP-7 Forgiving configuration | Path flags use an infallible parser (empty means unset), and so does the port parser : with `--debug-port` and `GODOT_DEBUG_PORT` unset or empty, `Config::resolve_bridge_port` derives the port from the project `find_project` finds from the working directory (`bridge_port.rs`, BR-13), and uses `LEGACY_DEBUG_PORT` (9333) only when it finds none; the origin of the port (option, variable, project path, default) is kept for the bridge's unavailable message; `.env` parse errors are logged as a warning with the single-quote hint and otherwise ignored; the removed `--mcp-url` flag is rejected while a stale `GODOT_MCP_URL` variable is ignored. `GODOT_MCP_FEEDBACK` accepts `off`, `draft` and `full` in any case, and an unknown value logs a warning and selects `draft` (FB-10); `GODOT_MCP_GH_PATH` is parsed like the other path settings. |
 | MCP-8 No crash paths | All fallible operations return `McpError`; `util::lock` recovers poisoned mutexes; serialization failures of a tool result become an internal-error tool result. |
@@ -57,7 +57,7 @@ src/
 ├── feedback.rs    scrubber, fingerprint, link builder of the agent feedback channel (see l2-agent-feedback-rust.md)
 ├── journal.rs     agent feedback journal and report builder (see l2-agent-feedback-rust.md)
 ├── issues.rs      GitHub client runner for feedback submission (see l2-agent-feedback-rust.md)
-├── error.rs       McpError: BridgeUnavailable, Bridge, Process, Protocol, ToolExecution, Validation, Io, Json
+├── error.rs       McpError: BridgeUnavailable, Bridge, Process, RunEnded, Protocol, ToolExecution, CodedToolExecution, Validation, Io, Json
 └── util.rs        poison-tolerant mutex lock
 ```
 
@@ -74,6 +74,7 @@ src/
 | `BridgeUnavailable` | Connect/handshake to the editor fails | Launch the editor, enable the plugin, check the port |
 | `Bridge` | Connection closed or reply timed out | Editor busy or restarting; retry; check Output panel |
 | `ToolExecution` | Editor replied with `status: error` | Depends on message (unauthorized, no active scene, not found) |
+| `CodedToolExecution` | Editor replied with `status: error` and a `code` | Chosen by the code |
 | `Process` | Engine binary failed, timed out or could not spawn | Check `GODOT_PATH` |
 | `Validation` | Script check reported problems | Fix the reported lines |
 | `Protocol`, `Io`, `Json` | Framing or I/O failures | — |
@@ -117,3 +118,4 @@ src/
 | 1.5.0 | 2026-11-05 | Agent (magic.spec) | The module map gains `progress.rs`, and MCP-1 names notifications among the frames the one writer owns: a call with a progress token gets `notifications/progress` while a script runs. Source: pull request 128. Stable → RFC → Stable after Post-Update Review. |
 | 1.5.1 | 2026-11-19 | Agent (magic.spec) | Minimum toolchain 1.89 after the uuid update. No requirement changed. |
 | 1.6.0 | 2026-11-19 | Agent (magic.spec) | [MODIFIED] `config.rs` also reads the folder for Movie Maker recordings (`--movie-dir`, `GODOT_MCP_MOVIE_DIR`). Source: pull request 160. Stable → RFC → Stable after Post-Update Review. |
+| 1.7.0 | 2026-11-27 | Agent (magic.spec) | [MODIFIED] MCP-5: `structuredContent.error`. Source: pull request 190. Stable → RFC → Stable after Post-Update Review. |

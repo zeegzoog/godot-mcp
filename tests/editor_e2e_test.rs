@@ -3262,14 +3262,22 @@ const CLASH_SCENE: &str = "[gd_scene load_steps=2 format=3]\n\n[ext_resource typ
 #[tokio::test]
 #[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
 async fn open_scene_returns_what_the_load_errors_dialog_shows() {
-    let editor = start_editor_with(
+    // `--language` sets the editor's language from Godot 4.6; a 4.5 editor keeps the language
+    // of this machine's settings, so only the parts no translation changes are checked there.
+    let editor = start_editor_with_args(
         None,
         "",
         &[("sub.tscn", CLASH_SUB), ("clash.tscn", CLASH_SCENE)],
         "",
+        &["--language", "en"],
     )
     .await;
     let bridge = &editor.bridge;
+    let version = bridge
+        .send_command("get_version", json!({}))
+        .await
+        .expect("version");
+    let english = version["minor"].as_u64().expect("minor") >= 6;
 
     let clean = bridge
         .send_command("open_scene", json!({"scene_path": "res://main.tscn"}))
@@ -3293,15 +3301,20 @@ async fn open_scene_returns_what_the_load_errors_dialog_shows() {
     let errors = clash["load_errors"].as_array().expect("load_errors");
     assert_eq!(errors.len(), 1, "{clash}");
     let message = errors[0].as_str().expect("message");
-    assert!(
-        message.starts_with("An incoming node's name clashes with Sub/A"),
-        "{clash}"
-    );
-    assert!(
-        message.ends_with("Please fix and re-save the scene."),
-        "{clash}"
-    );
-    assert_eq!(clash["dialog"], "Load Errors", "{clash}");
+    assert!(message.contains("Sub/A"), "{clash}");
+    let title = clash["dialog"].as_str().expect("dialog title");
+    assert!(!title.is_empty(), "{clash}");
+    if english {
+        assert!(
+            message.starts_with("An incoming node's name clashes with Sub/A"),
+            "{clash}"
+        );
+        assert!(
+            message.ends_with("Please fix and re-save the scene."),
+            "{clash}"
+        );
+        assert_eq!(title, "Load Errors", "{clash}");
+    }
     assert!(
         clash
             .get("unsaved")
@@ -3344,7 +3357,7 @@ async fn open_scene_returns_what_the_load_errors_dialog_shows() {
         Some(1),
         "{reloaded}"
     );
-    assert_eq!(reloaded["dialog"], "Load Errors", "{reloaded}");
+    assert_eq!(reloaded["dialog"], clash["dialog"], "{reloaded}");
 }
 
 /// Turns on the script editor's rewrites on save, the way a person's editor settings may have
@@ -3710,7 +3723,7 @@ async fn the_editor_refuses_the_destination_names_the_server_refuses() {
     let editor = start_editor(false).await;
     let cases = [
         ("res://a.gd", "res://b.gd"),
-        ("res://a.gd", "res://Сцены и скрипты/my script.gd"),
+        ("res://a.gd", "res://Σκηνές και κώδικας/my script.gd"),
         ("res://a.gd", "res://b\".gd"),
         (
             "res://a.gd",
@@ -3962,6 +3975,278 @@ async fn files_and_folders_are_moved_through_the_editor_with_references_and_tabs
         );
     }
     assert!(project.join("dirty.tscn").is_file());
+}
+
+/// Moving or deleting files through the editor never loses what a person typed in the shader
+/// editor and did not save: the call is refused and nothing changes. A saved shader tab whose file
+/// a move rewrites shows the new text. The move commands refuse a path that leaves the project.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn moves_and_deletes_respect_the_shader_editor_and_stay_in_the_project() {
+    use godot_mcp::cli_runner::CliRunner;
+    use godot_mcp::tools::ToolManager;
+    use std::sync::Arc;
+
+    let include = "float wave(float x) {
+	return sin(x);
+}
+";
+    let water = "shader_type canvas_item;
+
+#include \"res://fx/common.gdshaderinc\"
+
+void fragment() {
+	COLOR = vec4(wave(1.0));
+}
+";
+    let typed = "shader_type canvas_item;
+
+void fragment() {
+	COLOR = vec4(1.0);
+}
+";
+    let outer = "#include \"res://fx/common.gdshaderinc\"
+
+float twice(float x) {
+	return wave(x) * 2.0;
+}
+";
+    let editor = start_editor_with(
+        Some(SHADER_PROBE_HOOK),
+        "",
+        &[
+            ("fx/common.gdshaderinc", include),
+            ("fx/outer.gdshaderinc", outer),
+            ("water.gdshader", water),
+            ("typed.gdshader", typed),
+        ],
+        "",
+    )
+    .await;
+    let project = editor.project.clone();
+    let (godot, _) = godot_binaries();
+    let tools = Arc::new(
+        ToolManager::new(BridgeClient::new(editor.port), CliRunner::new(godot))
+            .with_working_dir(project.clone()),
+    );
+    let call = |tool: &'static str, args: Value| {
+        let tools = Arc::clone(&tools);
+        async move { tools.call_tool(tool, args).await }
+    };
+    let send = |command: &'static str, params: Value| {
+        let bridge = editor.bridge.clone();
+        async move { bridge.send_command(command, params).await }
+    };
+    let read = |name: &str| std::fs::read_to_string(project.join(name)).expect("readable file");
+
+    // An edit opens each shader in the shader editor; one of them then gets unsaved typing.
+    for (path, old, new) in [
+        ("res://fx/outer.gdshaderinc", "* 2.0", "* 3.0"),
+        ("res://water.gdshader", "wave(1.0)", "wave(2.0)"),
+        ("res://typed.gdshader", "vec4(1.0)", "vec4(0.5)"),
+    ] {
+        send(
+            "edit_shader",
+            json!({"shader_path": path, "old_text": old, "new_text": new}),
+        )
+        .await
+        .expect("open the shader by editing it");
+    }
+    send(
+        "__shader_type",
+        json!({"path": "res://typed.gdshader", "text": "// typed
+"}),
+    )
+    .await
+    .expect("type");
+    let saved = read("typed.gdshader");
+
+    let moved = call(
+        "godot_move_file",
+        json!({"moves": [{"from": "res://typed.gdshader", "to": "res://fx/typed.gdshader"}]}),
+    )
+    .await;
+    assert!(moved.is_error, "{}", tool_text(&moved));
+    assert!(
+        tool_text(&moved).contains("unsaved changes in the shader editor"),
+        "{}",
+        tool_text(&moved)
+    );
+    let deleted = call(
+        "godot_delete_file",
+        json!({"paths": ["res://typed.gdshader"], "trash": false}),
+    )
+    .await;
+    assert!(deleted.is_error, "{}", tool_text(&deleted));
+    assert!(
+        tool_text(&deleted).contains("unsaved changes in the shader editor"),
+        "{}",
+        tool_text(&deleted)
+    );
+    assert_eq!(read("typed.gdshader"), saved, "nothing moved or deleted");
+    assert!(!project.join("fx/typed.gdshader").exists());
+
+    // Unsaved typing in a file the move would only rewrite, a shader or an include, refuses too.
+    let include_move = json!({"moves": [{"from": "res://fx/common.gdshaderinc", "to": "res://lib/common.gdshaderinc"}]});
+    for path in ["res://water.gdshader", "res://fx/outer.gdshaderinc"] {
+        send(
+            "__shader_type",
+            json!({"path": path, "text": "// typed
+"}),
+        )
+        .await
+        .expect("type into a file the move rewrites");
+        let refused = call("godot_move_file", include_move.clone()).await;
+        assert!(refused.is_error, "{path}: {}", tool_text(&refused));
+        assert!(
+            tool_text(&refused).contains("unsaved changes in the shader editor"),
+            "{path}: {}",
+            tool_text(&refused)
+        );
+        assert!(
+            project.join("fx/common.gdshaderinc").is_file(),
+            "nothing moved"
+        );
+        send("__shader_undo", json!({"path": path}))
+            .await
+            .expect("undo the typing");
+    }
+
+    // Moving the include rewrites the saved files that name it, and their tabs follow.
+    let moved = call("godot_move_file", include_move.clone()).await;
+    assert!(!moved.is_error, "{}", tool_text(&moved));
+    let rewritten = read("water.gdshader");
+    assert!(
+        rewritten.contains("res://lib/common.gdshaderinc"),
+        "{rewritten}"
+    );
+    let shown = send("__shader_state", json!({"path": "res://water.gdshader"}))
+        .await
+        .expect("water state");
+    assert_eq!(shown["text"], rewritten, "{shown}");
+    assert_eq!(shown["memory_code"], rewritten, "{shown}");
+    assert_eq!(shown["dirty"], false, "{shown}");
+    let included = read("fx/outer.gdshaderinc");
+    assert!(
+        included.contains("res://lib/common.gdshaderinc"),
+        "{included}"
+    );
+    let shown = send(
+        "__shader_state",
+        json!({"path": "res://fx/outer.gdshaderinc"}),
+    )
+    .await
+    .expect("outer state");
+    assert_eq!(shown["text"], included, "{shown}");
+    assert_eq!(shown["dirty"], false, "{shown}");
+
+    let outside = json!([{"from": "res://../outside.txt", "to": "res://inside.txt"}]);
+    expect_error(
+        send(
+            "move_files_check",
+            json!({"files": outside, "rewrite": [], "binary": []}),
+        )
+        .await,
+        "inside the project",
+    );
+    expect_error(
+        send(
+            "move_files_apply",
+            json!({"files": [], "folders": [], "rewritten": [], "binary": ["res://a/../../outside.res"], "pairs": []}),
+        )
+        .await,
+        "inside the project",
+    );
+}
+
+/// Test-only command that lists the text of every shader tab the editor holds.
+const SHADER_TABS_HOOK: &str = r#"        "__shader_tabs":
+            var texts: Array = []
+            for tab: Node in EditorInterface.get_base_control().find_children("*", "ShaderTextEditor", true, false):
+                if not tab.is_queued_for_deletion():
+                    texts.append(_shader_ops()._buffer(tab).text)
+            send_success(peer, cmd_id, {"texts": texts})
+        "ping":
+"#;
+
+/// A shader deleted through the editor leaves no tab behind that a later save could write the
+/// file back from, and the tab of another shader stays.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn deleting_an_open_shader_closes_its_tab() {
+    use godot_mcp::cli_runner::CliRunner;
+    use godot_mcp::tools::ToolManager;
+
+    let gone = "shader_type canvas_item;
+
+void fragment() {
+	COLOR = vec4(0.1);
+}
+";
+    let kept = "shader_type canvas_item;
+
+void fragment() {
+	COLOR = vec4(0.2);
+}
+";
+    let editor = start_editor_with(
+        Some(SHADER_TABS_HOOK),
+        "",
+        &[("gone.gdshader", gone), ("kept.gdshader", kept)],
+        "",
+    )
+    .await;
+    let project = editor.project.clone();
+    let (godot, _) = godot_binaries();
+    let tools = std::sync::Arc::new(
+        ToolManager::new(BridgeClient::new(editor.port), CliRunner::new(godot))
+            .with_working_dir(project.clone()),
+    );
+    let send = |command: &'static str, params: Value| {
+        let bridge = editor.bridge.clone();
+        async move { bridge.send_command(command, params).await.expect(command) }
+    };
+
+    send("open_scene", json!({"scene_path": "res://main.tscn"})).await;
+    for (path, old, new) in [
+        ("res://kept.gdshader", "vec4(0.2)", "vec4(0.4)"),
+        ("res://gone.gdshader", "vec4(0.1)", "vec4(0.3)"),
+    ] {
+        send(
+            "edit_shader",
+            json!({"shader_path": path, "old_text": old, "new_text": new}),
+        )
+        .await;
+    }
+    let before = send("__shader_tabs", json!({})).await;
+    assert_eq!(
+        before["texts"].as_array().map(Vec::len),
+        Some(2),
+        "{before}"
+    );
+
+    let deleted = tools
+        .call_tool(
+            "godot_delete_file",
+            json!({"paths": ["res://gone.gdshader"], "trash": false}),
+        )
+        .await;
+    assert!(!deleted.is_error, "{}", tool_text(&deleted));
+    // A save writes only tabs with unsaved text; the tab check below is what proves nothing
+    // can write the file back.
+    send("save_scene", json!({})).await;
+    sleep(Duration::from_secs(1)).await;
+    let after = send("__shader_tabs", json!({})).await;
+    assert!(
+        !project.join("gone.gdshader").exists(),
+        "a save wrote the deleted shader back: {after}"
+    );
+    let texts = after["texts"].to_string();
+    assert!(
+        !texts.contains("vec4(0.3)"),
+        "its tab is still open: {after}"
+    );
+    assert!(texts.contains("vec4(0.4)"), "the other tab stays: {after}");
 }
 
 #[tokio::test]
@@ -5130,6 +5415,85 @@ async fn resource_file_properties_are_set_saved_and_undone_through_the_editor() 
     );
 }
 
+/// One call sets a count and the entries it adds (streams_count, then stream_<n>/stream), and a
+/// truly unknown name still changes nothing. Undoing a smaller count brings back the entries it
+/// removed.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn resource_count_and_the_entries_it_adds_are_set_in_one_call() {
+    let editor = start_editor_with(
+        Some(UNDO_HOOK),
+        "",
+        &[
+            ("croak.tres", "[gd_resource type=\"AudioStreamRandomizer\" format=3]\n\n[resource]\n"),
+            ("beep.tres", "[gd_resource type=\"AudioStreamGenerator\" format=3]\n\n[resource]\n"),
+            ("chirp.tres", "[gd_resource type=\"AudioStreamGenerator\" format=3]\n\n[resource]\nmix_rate = 22050.0\n"),
+        ],
+        "",
+    )
+    .await;
+    let bridge = &editor.bridge;
+    let set = |properties: Value| async move {
+        bridge
+            .send_command(
+                "set_resource_properties",
+                json!({"resource_path": "res://croak.tres", "properties": properties}),
+            )
+            .await
+    };
+    let file = || std::fs::read_to_string(editor.project.join("croak.tres")).expect("tres");
+    let original = file();
+
+    expect_error(
+        set(json!({"streams_count": 1, "stream_0/stream": "res://beep.tres", "stream_9/stream": "res://beep.tres"})).await,
+        "Unknown property 'stream_9/stream' on AudioStreamRandomizer",
+    );
+    assert_eq!(file(), original, "a refused call changed the file");
+
+    let set_both = set(json!({
+        "streams_count": 2,
+        "stream_0/stream": "res://beep.tres",
+        "stream_1/stream": "res://chirp.tres",
+        "random_pitch": 1.08
+    }))
+    .await
+    .expect("set the count and its streams in one call");
+    assert_eq!(
+        set_both["changed"]["streams_count"],
+        json!({"before": "0", "after": "2"}),
+        "{set_both}"
+    );
+    assert_eq!(
+        set_both["changed"]["stream_1/stream"]["before"], "null",
+        "{set_both}"
+    );
+    let saved = file();
+    assert!(
+        saved.contains("streams_count = 2")
+            && saved.contains("res://beep.tres")
+            && saved.contains("res://chirp.tres")
+            && saved.contains("random_pitch = 1.08"),
+        "{saved}"
+    );
+
+    set(json!({"streams_count": 1}))
+        .await
+        .expect("shrink the count");
+    assert!(!file().contains("res://chirp.tres"), "{}", file());
+    bridge
+        .send_command(
+            "__test_undo_resource",
+            json!({"resource_path": "res://croak.tres"}),
+        )
+        .await
+        .expect("undo");
+    let restored = file();
+    assert!(
+        restored.contains("streams_count = 2") && restored.contains("res://chirp.tres"),
+        "undo did not bring back the stream a smaller count removed:\n{restored}"
+    );
+}
+
 /// A class_name script written to disk while the editor is open is not in the editor's class
 /// list until the editor rescans, so its language server calls the class unknown. Validation
 /// registers the declaring script through the editor and asks again.
@@ -5631,12 +5995,26 @@ fn result_text(result: &godot_mcp::protocol::ToolResult) -> String {
     format!("{:?}", result.content)
 }
 
+/// Test-only command that answers the editor's process id.
+const PID_HOOK: &str = r#"        "__editor_pid":
+            send_success(peer, cmd_id, {"pid": OS.get_process_id()})
+        "ping":
+"#;
+
 /// godot_close_editor quits the editor through its bridge and answers once the process is gone.
 #[tokio::test]
 #[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
 async fn close_editor_quits_the_editor_and_its_process_exits() {
-    let mut editor = start_editor(false).await;
-    let pid = editor._child.id().expect("editor pid");
+    let mut editor = start_editor_with(Some(PID_HOOK), "", &[], "").await;
+    // The editor says which process it is: a launcher such as the Windows console build starts
+    // it as a child, so the process this test spawned may have another id.
+    let pid = editor
+        .bridge
+        .send_command("__editor_pid", json!({}))
+        .await
+        .expect("editor pid")["pid"]
+        .as_u64()
+        .expect("a process id");
     let tools = tools_for(&editor);
 
     // This test is the editor's parent, so it reaps the process; until then the editor would

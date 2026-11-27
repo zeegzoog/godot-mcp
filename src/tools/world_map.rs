@@ -110,7 +110,7 @@ pub async fn call(tools: &ToolManager, args: Value) -> ToolResult {
     let run = outcome.run;
     let answer = outcome
         .answer
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+        .and_then(|text| crate::godot::json_text::parse::<Value>(&text).ok());
     let Some(mut answer) = answer else {
         let detail = if run.timed_out {
             format!("Godot did not finish the map within {timeout_seconds}s")

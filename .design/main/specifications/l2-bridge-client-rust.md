@@ -1,6 +1,6 @@
 # Bridge Client (Rust)
 
-**Version:** 1.1.1
+**Version:** 1.2.0
 **Status:** Stable
 **Layer:** implementation
 **Implements:** l1-editor-bridge.md
@@ -33,18 +33,20 @@ Captures the timing constants and the connection state machine, which are easy t
 | L1 Invariant | Implementation |
 | --- | --- |
 | BR-1 Loopback only | The client only ever dials `127.0.0.1`; the listening side is enforced by the addon. |
-| BR-2 Shared secret | Every `BridgeCommand` carries `token` from `read_token(port)`; the editor's "Unauthorized" reply surfaces as `ToolExecution` and gets token-specific hints in the tool layer. |
-| BR-3 Exactly one reply | A `oneshot` reply slot per command; a guard removes the slot when the caller stops waiting (timeout or cancellation); on connection loss every pending slot receives a connection-closed error. |
-| BR-4 Correlated commands | `commandId` is a UUID v4; a reader task delivers each reply to the slot with the same id and ignores unknown ids and malformed frames (logged). |
+| BR-2 Shared secret | Every `BridgeCommand` carries `token` from `read_token(port)`; the editor's "Unauthorized" reply surfaces as an editor-reported error and gets token-specific hints in the tool layer. |
+| BR-3 Exactly one reply | A `oneshot` reply slot per command; a guard removes the slot when the caller stops waiting (timeout or cancellation); on connection loss every pending slot receives a connection error (closed, or the read error that ended the connection). |
+| BR-4 Correlated commands | `commandId` is a UUID v4; a reader task delivers each reply to the slot with the same id and ignores unknown ids and logs malformed frames (one that still names its `commandId` fails that command, BR-15). |
 | BR-5 Undoable mutations | Enforced editor-side; the client sends mutations as ordinary commands. |
 | BR-6 Scene confinement | Enforced editor-side. |
 | BR-7 All-or-nothing updates | Enforced editor-side; the reply's `applied` map is passed through unchanged. |
-| BR-8 Fast, classified failures | Connect/handshake failures → `BridgeUnavailable` and a 500 ms cooldown that fails further attempts immediately; broken connection or reply timeout → `Bridge`; `status: error` → `ToolExecution`. A dead connection is detected via an `alive` flag and replaced on the next command. The unavailable message names the port and where it came from, and says that an addon without a configured port listens on the port derived from its own project path, so a server started in that project's directory finds it, and which settings set one port on both sides. |
+| BR-8 Fast, classified failures | Connect/handshake failures → `BridgeUnavailable` and a 500 ms cooldown that fails further attempts immediately; broken connection or reply timeout → `Bridge`; `status: error` → `ToolExecution`, or `CodedToolExecution` when the reply carries a `code`. A connection that ends on a read error (a message over the limit) ends the waiting calls with that reason and a recovery step. A dead connection is detected via an `alive` flag and replaced on the next command. The unavailable message names the port and where it came from, and says that an addon without a configured port listens on the port derived from its own project path, so a server started in that project's directory finds it, and which settings set one port on both sides. |
 | BR-9 Version gate | Enforced editor-side. |
 | BR-10 Editor-only | Not applicable to the server binary. |
 | BR-11 Project-confined paths | Enforced editor-side; host-side paths are confined by the tool layer. |
 | BR-12 Saved edits only | Enforced editor-side; `make_editable` is passed through as an ordinary parameter. |
 | BR-13 One port per project | `bridge_port::derived_port` as in §2; the unit test `the_shared_vectors_hold_for_the_port_formula` runs the shared cases through the server's function, and `the_addon_derives_the_same_bridge_port_as_the_server` (editor end-to-end) runs them through the addon's; `an_editor_without_a_port_setting_is_found_on_the_derived_port` checks the pair end to end. |
+| BR-14 Nothing silently ignored | `bridge_protocol.rs`: `get_version` is read once per connection (2 s at most, no lock held); for an addon that lists its commands, a parameter not listed for a listed command is refused before it is sent, in the addon's words; an addon without `protocol` is sent everything, and so is a command it does not list. Host-only keys (`project_path`, `force` of a resave) are removed before sending. `BRIDGE_PROTOCOL` is 2; unit tests parse the addon's `PARAM_TYPES` and command dispatch and check that they agree with each other and cover everything the server sends. A failed call to an editor that runs another build of the server's addon version gets a note with the update call; the editor's `addon_build` is read once per open connection and never opens one. |
+| BR-15 Bounded, readable replies | Messages and frames are limited to `MAX_EDITOR_MESSAGE` (32 MiB), the addon's outbound buffer. Each message is parsed once, through `godot/json_text.rs`; one that still cannot be parsed but names its `commandId` fails that command at once (`replies_with_raw_control_characters_reach_the_caller`, `an_unreadable_reply_fails_its_command_at_once`). |
 
 ## 5. Detailed Design
 
@@ -75,6 +77,7 @@ graph LR
 | Alias | Path | Purpose |
 | --- | --- | --- |
 | `[CLIENT]` | `src/bridge.rs` | Client, connection task, token path |
+| `[PROTOCOL]` | `src/bridge_protocol.rs` | Protocol numbers, the addon's command surface, the sync tests |
 | `[TESTS]` | `tests/bridge_client_test.rs` | Multiplexing, reconnection, timeout and error-class tests |
 | `[PORT]` | `src/bridge_port.rs` | Port derived from the project path |
 | `[PORT-CASES]` | `tests/bridge-port-vectors.json` | Path-to-port cases shared with the addon |
@@ -87,3 +90,4 @@ graph LR
 | 1.0.0 | 2026-10-16 | Agent (magic.analyze first-time) | Reverse-engineered from the code at 94e4540. |
 | 1.1.0 | 2026-11-02 | Agent (magic.spec) | Reality sync after ventilation. [ADDED] The derived port and its shared cases (BR-13, pull request 75), the port given to a launched editor, the BR-12 row; [MODIFIED] the unavailable message. Stable → RFC → Stable after Post-Update Review. |
 | 1.1.1 | 2026-11-05 | Agent (magic.spec) | Removed the `[ADDED]` and `[MODIFIED]` markers from the body: the history rows carry what changed. No requirement changed. |
+| 1.2.0 | 2026-11-27 | Agent (magic.spec) | [ADDED] The BR-14 and BR-15 rows. [MODIFIED] Coded editor errors and the read-error report. Source: pull requests 156, 181, 182, 186, 189 and 190. Stable → RFC → Stable after Post-Update Review. |

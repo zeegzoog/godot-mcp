@@ -8,6 +8,11 @@
 //! finds them after the run, writes back what the editor would have written, and reports what is
 //! still lost.
 //!
+//! Some data cannot be written back at all: a `MultiMesh` keeps its instance transforms and
+//! colors only in the rendering server, which a headless Godot replaces with a dummy, so the
+//! saver writes its `instance_count` and no `buffer`. Such a file loads with every instance at
+//! the origin, scaled to zero. [`ResourceDamage::multimeshes_without_buffer`] names them.
+//!
 //! The binary saver (`.scn`, `.res`) drops the uid the same way. Its header is read here (see
 //! `binary_resource`), and the uid is written back by Godot itself through `ResourceSaver.set_uid`,
 //! so a compressed file stays compressed: [`TextResourceSnapshot::binary_uid_plan`] says which
@@ -80,6 +85,9 @@ pub struct ResourceDamage {
     pub ext_resources_without_uid: Vec<(String, String)>,
     /// Shader parameters written as `null`.
     pub null_shader_parameters: Vec<String>,
+    /// `(id, instance_count)` of each `MultiMesh` written with instances but without their
+    /// `buffer`: the `[sub_resource]` id, or `resource` for the file's own `[resource]`.
+    pub multimeshes_without_buffer: Vec<(String, u64)>,
 }
 
 /// What a repair wrote back into one rewritten file.
@@ -266,8 +274,9 @@ impl TextResourceSnapshot {
         written_in(&changes, &changes.read_texts())
     }
 
-    /// Text scenes and resources written since [`TextResourceSnapshot::take`] that lost a uid or
-    /// gained a `null` shader parameter. Sorted by path.
+    /// Text scenes and resources written since [`TextResourceSnapshot::take`] that lost a uid,
+    /// gained a `null` shader parameter or hold a `MultiMesh` saved without its instance data,
+    /// and binary ones that lost their uid. Sorted by path.
     pub fn damage_since(&self, project: &Path) -> Vec<ResourceDamage> {
         // Scripts and shaders carry no uid, so they are not looked at.
         let changes = self.changes_among(project, |name| {
@@ -297,6 +306,7 @@ impl TextResourceSnapshot {
                     lost_uid: Some(old.clone()),
                     ext_resources_without_uid: Vec::new(),
                     null_shader_parameters: Vec::new(),
+                    multimeshes_without_buffer: Vec::new(),
                 });
             }
         }
@@ -454,9 +464,11 @@ fn inspect(
             null_shader_parameters.push(name);
         }
     }
+    let multimeshes_without_buffer = multimeshes_without_buffer(text);
     if lost_uid.is_none()
         && ext_resources_without_uid.is_empty()
         && null_shader_parameters.is_empty()
+        && multimeshes_without_buffer.is_empty()
     {
         return None;
     }
@@ -465,7 +477,72 @@ fn inspect(
         lost_uid,
         ext_resources_without_uid,
         null_shader_parameters,
+        multimeshes_without_buffer,
     })
+}
+
+/// `(id, instance_count)` of each `MultiMesh` in a text scene or resource that has instances and
+/// no instance data: no `buffer` line, or an empty one. The id is the `[sub_resource]`'s, or
+/// `resource` for the file's own `[resource]` section.
+fn multimeshes_without_buffer(text: &str) -> Vec<(String, u64)> {
+    let mut lines = text.lines();
+    let header = lines.next().unwrap_or("");
+    let own_is_multimesh =
+        is_resource_header(header) && attribute(header, "type").as_deref() == Some("MultiMesh");
+    let mut found = Vec::new();
+    // (id, instance_count, has instance data) of the MultiMesh section being read.
+    let mut current: Option<(String, u64, bool)> = None;
+    let mut close = |current: &mut Option<(String, u64, bool)>| {
+        if let Some((id, count, buffer)) = current.take()
+            && count > 0
+            && !buffer
+        {
+            found.push((id, count));
+        }
+    };
+    for line in lines {
+        if is_section_line(line) {
+            close(&mut current);
+            current = if line.starts_with("[sub_resource")
+                && attribute(line, "type").as_deref() == Some("MultiMesh")
+            {
+                Some((attribute(line, "id").unwrap_or_default(), 0, false))
+            } else if own_is_multimesh && line.trim_end() == "[resource]" {
+                Some(("resource".into(), 0, false))
+            } else {
+                None
+            };
+            continue;
+        }
+        let Some((_, count, buffer)) = current.as_mut() else {
+            continue;
+        };
+        if let Some((key, value)) = line.split_once('=') {
+            let value = value.trim();
+            match key.trim() {
+                "instance_count" => *count = value.parse().unwrap_or(0),
+                "buffer" => *buffer = value != "PackedFloat32Array()",
+                _ => {}
+            }
+        }
+    }
+    close(&mut current);
+    found
+}
+
+/// A section header of a text scene or resource. A line of a multi-line value never starts with
+/// one of these.
+fn is_section_line(line: &str) -> bool {
+    [
+        "[sub_resource ",
+        "[ext_resource ",
+        "[resource]",
+        "[node ",
+        "[connection ",
+        "[editable ",
+    ]
+    .iter()
+    .any(|start| line.starts_with(start))
 }
 
 /// The uid Godot keeps for `target`: its `.uid` sidecar, the `uid=` of its `.import` file, or the
@@ -644,6 +721,8 @@ fn is_audited(name: &str) -> bool {
 #[cfg(test)]
 thread_local! {
     /// Walks of a project started on this thread, so tests can pin how often one is walked.
+    // Clippy 1.100 asks for `const` here on windows-gnu although the initializer is one.
+    #[allow(clippy::missing_const_for_thread_local)]
     static WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -760,7 +839,59 @@ shader_parameter/speed = 3.0
                     ("res://frog.tscn".into(), "uid://bfrog".into()),
                 ],
                 null_shader_parameters: vec!["tint".into()],
+                multimeshes_without_buffer: Vec::new(),
             }]
+        );
+    }
+
+    #[test]
+    fn a_multimesh_saved_without_its_instance_data_is_damage() {
+        let dir = tempfile::tempdir().expect("project");
+        let root = dir.path();
+        let snapshot = TextResourceSnapshot::take(root);
+        // What a headless ResourceSaver.save writes for a MultiMesh of 12 instances: the
+        // dummy rendering server holds no buffer, so none is written.
+        fs::write(
+            root.join("grass.tres"),
+            "[gd_resource type=\"MultiMesh\" format=3]\n\n[resource]\ntransform_format = 1\nuse_colors = true\ninstance_count = 12\n",
+        )
+        .expect("grass");
+        fs::write(
+            root.join("field.tscn"),
+            concat!(
+                "[gd_scene format=3]\n\n",
+                "[sub_resource type=\"MultiMesh\" id=\"MultiMesh_lost\"]\n",
+                "transform_format = 1\ninstance_count = 3\nbuffer = PackedFloat32Array()\n\n",
+                "[sub_resource type=\"MultiMesh\" id=\"MultiMesh_kept\"]\n",
+                "instance_count = 1\nbuffer = PackedFloat32Array(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0)\n\n",
+                "[sub_resource type=\"MultiMesh\" id=\"MultiMesh_empty\"]\n",
+                "instance_count = 0\n\n",
+                "[node name=\"Field\" type=\"MultiMeshInstance3D\"]\n",
+                "multimesh = SubResource(\"MultiMesh_lost\")\ninstance_count = 9\n",
+            ),
+        )
+        .expect("field");
+        fs::write(
+            root.join("other.tres"),
+            "[gd_resource type=\"Resource\" format=3]\n\n[resource]\ninstance_count = 4\n",
+        )
+        .expect("other");
+        let damage = snapshot.damage_since(root);
+        let lost: Vec<(&str, &[(String, u64)])> = damage
+            .iter()
+            .map(|item| {
+                (
+                    item.path.as_str(),
+                    item.multimeshes_without_buffer.as_slice(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            lost,
+            vec![
+                ("res://field.tscn", &[("MultiMesh_lost".to_string(), 3)][..]),
+                ("res://grass.tres", &[("resource".to_string(), 12)][..]),
+            ]
         );
     }
 

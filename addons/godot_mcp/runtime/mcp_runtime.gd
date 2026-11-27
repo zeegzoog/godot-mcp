@@ -36,9 +36,6 @@ var _scene_generation := 0
 var _scene_instance_id := 0
 var _scene_script := {"path": "", "sha256": null, "basis": "unavailable"}
 
-const SCRIPT_HASH_NOTE := "script_sha256 is the SHA-256 of the root script source Godot had loaded when this scene instance became current. It is not a later read of the file on disk, and it does not describe a different scene instance."
-
-
 func _enter_tree() -> void:
     if not EngineDebugger.is_active():
         set_process(false)
@@ -255,7 +252,6 @@ func scene_context() -> Dictionary:
         "script_path": str(_scene_script.get("path", "")),
         "script_sha256": _scene_script.get("sha256", null),
         "script_sha256_basis": str(_scene_script.get("basis", "unavailable")),
-        "script_sha256_note": SCRIPT_HASH_NOTE,
     }
 
 

@@ -30,6 +30,11 @@ impl ToolManager {
             editor_runtime(self, method, params, RECORD_WAIT)
                 .await
                 .map_err(record_timeout)
+        } else if waits_in_seconds(method, &params) {
+            editor_runtime(self, method, params, SECONDS_WAIT).await
+        } else if method == SCREENSHOT_METHOD {
+            let wait = screenshot_wait(&params);
+            editor_runtime(self, method, params, wait).await
         } else {
             editor_runtime(self, method, params, Duration::from_secs(20)).await
         };
@@ -67,6 +72,35 @@ const RECORD_WAIT: Duration = Duration::from_secs(120);
 
 const SCRIPT_METHOD: &str = "game.run_script";
 
+/// How long the server waits for a `godot_game_wait` in game seconds: the game gives up after 120
+/// real seconds when its clock does not advance, and answers then.
+const SECONDS_WAIT: Duration = Duration::from_secs(135);
+
+/// Whether the call is a wait in game seconds, which may take far longer than a frame wait.
+fn waits_in_seconds(method: &str, params: &Value) -> bool {
+    method == "input.wait"
+        && params
+            .get("seconds")
+            .is_some_and(|seconds| !seconds.is_null())
+}
+
+const SCREENSHOT_METHOD: &str = "game.screenshot";
+
+/// A sheet waits `every` process frames between its shots, up to 8 x 240 frames. The server
+/// waits for that at 30 frames a second, on top of the usual wait.
+fn screenshot_wait(params: &Value) -> Duration {
+    let count = |key: &str| {
+        params
+            .get(key)
+            .and_then(Value::as_u64)
+            .unwrap_or(1)
+            .min(240)
+    };
+    let frames = count("frames").min(8);
+    let every = count("every");
+    Duration::from_secs(20 + frames.saturating_sub(1) * every / 30)
+}
+
 /// The game ends a function at its own timeout and then answers, so the server waits a little
 /// longer than that. A function that never awaits cannot be ended, and that is what this catches.
 fn script_wait(params: &Value) -> Duration {
@@ -94,6 +128,10 @@ async fn held_aware_call(
         script_wait(&params)
     } else if recording {
         RECORD_WAIT
+    } else if waits_in_seconds(method, &params) {
+        SECONDS_WAIT
+    } else if method == SCREENSHOT_METHOD {
+        screenshot_wait(&params)
     } else if was_held {
         HELD_STEP_WAIT
     } else {
@@ -179,7 +217,7 @@ async fn ready_editor_session(tools: &ToolManager) -> Result<i64, McpError> {
                     .and_then(Value::as_i64)
                     .filter(|id| *id >= 0)
             {
-                let hello = serde_json::from_str::<Value>(hello).unwrap_or(Value::Null);
+                let hello = crate::godot::json_text::parse::<Value>(hello).unwrap_or(Value::Null);
                 check_runtime_hello(&hello).map_err(McpError::Process)?;
                 return Ok(id);
             }
@@ -262,6 +300,28 @@ mod tests {
         assert_eq!(
             held_step_timeout(true, other()).to_string(),
             other().to_string()
+        );
+    }
+
+    #[test]
+    fn a_wait_in_game_seconds_gets_the_long_wait() {
+        assert!(waits_in_seconds("input.wait", &json!({"seconds": 30})));
+        assert!(!waits_in_seconds("input.wait", &json!({"seconds": null})));
+        assert!(!waits_in_seconds("input.wait", &json!({"frames": 600})));
+        assert!(!waits_in_seconds("game.tree", &json!({"seconds": 30})));
+        assert!(SECONDS_WAIT > Duration::from_secs(120));
+    }
+
+    #[test]
+    fn a_long_sheet_gets_time_for_its_pauses() {
+        assert_eq!(screenshot_wait(&json!({})), Duration::from_secs(20));
+        assert_eq!(
+            screenshot_wait(&json!({"frames": 8, "every": 240})),
+            Duration::from_secs(20 + 7 * 240 / 30)
+        );
+        assert_eq!(
+            screenshot_wait(&json!({"frames": 4, "every": 1})),
+            Duration::from_secs(20)
         );
     }
 

@@ -1,4 +1,5 @@
 use crate::error::{McpError, Result};
+use crate::godot::json_text;
 use crate::progress::{self, ProgressSink};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -970,16 +971,12 @@ impl CliRunner {
                 ))
             })?;
         let stdout = String::from_utf8_lossy(&output.stdout);
-        stdout
-            .lines()
-            .find_map(|line| line.trim().strip_prefix(CLASS_LIST_MARKER))
-            .and_then(|answer| serde_json::from_str(answer.trim()).ok())
-            .ok_or_else(|| {
-                McpError::Process(format!(
-                    "Godot gave no answer to the class check (exit {})",
-                    output.status
-                ))
-            })
+        json_text::marked(&stdout, CLASS_LIST_MARKER).ok_or_else(|| {
+            McpError::Process(format!(
+                "Godot gave no answer to the class check (exit {})",
+                output.status
+            ))
+        })
     }
 
     /// The type a project setting has, and `value` converted to it when it is not a string,
@@ -1054,11 +1051,7 @@ impl CliRunner {
         let output = strip_banner(&format!("{}\n{}", run.stdout.trim(), run.stderr.trim()))
             .trim()
             .to_string();
-        let answer: serde_json::Value = run
-            .stdout
-            .lines()
-            .find_map(|line| line.trim().strip_prefix(RESOURCE_LOAD_MARKER))
-            .and_then(|answer| serde_json::from_str(answer).ok())
+        let answer: serde_json::Value = json_text::marked(&run.stdout, RESOURCE_LOAD_MARKER)
             .ok_or_else(|| {
                 McpError::Process(if run.timed_out {
                     format!(
@@ -1123,10 +1116,7 @@ impl CliRunner {
                 ))
             })?;
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let answer: serde_json::Value = stdout
-            .lines()
-            .find_map(|line| line.trim().strip_prefix("GODOT_MCP_SETTING="))
-            .and_then(|answer| serde_json::from_str(answer).ok())
+        let answer: serde_json::Value = json_text::marked(&stdout, "GODOT_MCP_SETTING=")
             .ok_or_else(|| {
                 McpError::Process(format!(
                     "Godot gave no answer to the setting type check (exit {}): {}",
@@ -1667,17 +1657,13 @@ impl CliRunner {
                 ))
             })?;
         let stdout = String::from_utf8_lossy(&output.stdout);
-        stdout
-            .lines()
-            .find_map(|line| line.trim().strip_prefix(marker))
-            .and_then(|answer| serde_json::from_str(answer).ok())
-            .ok_or_else(|| {
-                McpError::Process(format!(
-                    "Godot gave no answer about {what} (exit {}): {}",
-                    output.status,
-                    strip_banner(&String::from_utf8_lossy(&output.stderr))
-                ))
-            })
+        json_text::marked(&stdout, marker).ok_or_else(|| {
+            McpError::Process(format!(
+                "Godot gave no answer about {what} (exit {}): {}",
+                output.status,
+                strip_banner(&String::from_utf8_lossy(&output.stderr))
+            ))
+        })
     }
 
     /// Writes each `(res path, uid://)` pair into the header of that binary scene or resource of

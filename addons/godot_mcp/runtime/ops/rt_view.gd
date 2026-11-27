@@ -8,6 +8,8 @@ const Hold := preload("rt_hold.gd")
 const DEFAULT_MAX := 768
 const MAX_MAX := 4096
 const MAX_FRAMES := 8
+## Most process frames between the shots of a sheet.
+const MAX_EVERY := 240
 const MAX_BASELINES := 8
 const MAX_BASELINE_PIXELS := 512 * 512
 ## Pixels a comparison looks at one by one, on the game's main thread (about 10 ms).
@@ -47,8 +49,8 @@ static func screenshot(rt: Node, params: Dictionary) -> Dictionary:
     if frames < 1 or frames > MAX_FRAMES:
         return R.err(R.BAD_PARAMS, "frames must be from 1 to %d." % MAX_FRAMES)
     var every := int(params.get("every", 1))
-    if every < 1 or every > 60:
-        return R.err(R.BAD_PARAMS, "every must be from 1 to 60.")
+    if every < 1 or every > MAX_EVERY:
+        return R.err(R.BAD_PARAMS, "every must be from 1 to %d." % MAX_EVERY)
     var request := _baseline_request(params)
     if R.is_err(request):
         return request
@@ -90,8 +92,15 @@ static func screenshot(rt: Node, params: Dictionary) -> Dictionary:
         "forced": 0,
         "waited": 0,
     }
-    if Hold.is_held() or state.get("aim_viewport") != null:
+    if Hold.is_held() or (state.get("aim_viewport") != null and frames == 1):
         return _capture_now(state)
+    if state.get("aim_viewport") != null:
+        # A sheet from the aim camera: its viewport is drawn with every engine frame from now on,
+        # so the shots follow the game like a window sheet. Compatibility can omit
+        # instance-shaded meshes on a fresh viewport's first draw, so that draw happens here.
+        if RenderingServer.get_current_rendering_method() == "gl_compatibility":
+            RenderingServer.force_draw(false, 0.0)
+        state["drawn_mark"] = Engine.get_frames_drawn()
     return {"_pending": true, "_tick": func() -> bool: return _tick_shot(rt, state)}
 
 
@@ -651,7 +660,8 @@ static func _pick(rt: Node, params: Dictionary) -> Dictionary:
 ## transform. The new camera copies the game camera's projection and environment and is either
 ## moved so `at` is in the centre (same direction, same distance as the game camera) or placed at
 ## `position` looking at `look_at`. Only the 3D world is drawn: the game's HUD and other 2D canvas
-## items are not in the picture. Both nodes are freed after the capture.
+## items are not in the picture. Both nodes are freed after the capture, or after the last shot of
+## a sheet; the camera stays where it was placed for every shot.
 static func _aim(rt: Node, params: Dictionary) -> Dictionary:
     var raw: Variant = params.get("aim")
     if not raw is Dictionary:
@@ -660,8 +670,6 @@ static func _aim(rt: Node, params: Dictionary) -> Dictionary:
     for key: String in aim.keys():
         if not key in ["at", "distance", "position", "look_at", "up", "size", "fov"]:
             return R.err(R.BAD_PARAMS, "aim has no '%s'. It takes at and distance, or position, look_at and up, and size or fov for the lens." % key)
-    if int(params.get("frames", 1)) != 1:
-        return R.err(R.BAD_PARAMS, "aim takes one picture: leave frames at 1.")
     if not str(params.get("node", "")).strip_edges().is_empty():
         return R.err(R.BAD_PARAMS, "aim and node do not go together: aim draws its own viewport.")
     var at: Variant = _vector3(aim.get("at"))

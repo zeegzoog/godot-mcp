@@ -142,11 +142,7 @@ pub async fn call(tools: &ToolManager, args: Value) -> ToolResult {
             );
         }
     };
-    let answer = run
-        .stdout
-        .lines()
-        .find_map(|line| line.trim().strip_prefix(MARKER))
-        .and_then(|text| serde_json::from_str::<Value>(text).ok());
+    let answer: Option<Value> = crate::godot::json_text::marked(&run.stdout, MARKER);
     let Some(mut answer) = answer else {
         let detail = if run.timed_out {
             format!("Godot did not finish the review within {timeout_seconds}s")

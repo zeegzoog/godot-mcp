@@ -447,7 +447,7 @@ impl GameHub {
         let mut stopped = Vec::with_capacity(alive.len());
         for run in alive {
             run.kill().await;
-            stopped.push(run.summary());
+            stopped.push(run.ended_summary());
         }
         stopped
     }
@@ -476,7 +476,7 @@ impl GameHub {
             McpError::ToolExecution("No managed Godot process is running.".into())
         })?;
         run.kill().await;
-        Ok(run.summary())
+        Ok(run.ended_summary())
     }
 
     pub fn select(&self, run_id: Option<&str>) -> Result<Option<Arc<Run>>> {
@@ -590,10 +590,7 @@ impl Run {
             "running": self.is_alive(),
             "held": self.is_held(),
             "debugger_connected": self.session.is_connected(),
-            "adapter": lock(&self.hello)
-                .as_ref()
-                .and_then(|hello| hello.get("adapter"))
-                .cloned(),
+            "adapter": self.adapter_status(),
             "exit_code": ended.map(|ended| ended.code.unwrap_or(-1)),
             "signal": ended.and_then(|ended| ended.signal),
             "ended_by": ended.map(|ended| ended.by),
@@ -609,19 +606,41 @@ impl Run {
         })
     }
 
-    /// What `godot_stop_project` lists about a run that had ended before it was called.
+    /// What `godot_stop_project` lists about a run it stopped or that had ended before: which run,
+    /// how it ended and its last stderr. The adapter is left out: a stopped game has no commands
+    /// to run, and `godot_get_run_status` shows it while the game runs.
     fn ended_summary(&self) -> Value {
         let ended = *lock(&self.ended);
-        json!({
+        let mut summary = json!({
             "run_id": self.id,
+            "scene": self.scene,
             "exit_code": ended.map(|ended| ended.code.unwrap_or(-1)),
             "signal": ended.and_then(|ended| ended.signal),
             "ended_by": ended.map(|ended| ended.by),
             "ended_at": ended.map(|ended| ended.at),
             "how_ended": ended.map(|ended| ended.describe()),
             "last_stderr": self.last_stderr(),
-            "movie": self.movie_report(),
-        })
+        });
+        let movie = self.movie_report();
+        if !movie.is_null() {
+            summary["movie"] = movie;
+        }
+        summary
+    }
+
+    /// The adapter the game announced. A run that has ended keeps whether it loaded and why it
+    /// was refused, but not its commands and states, which it can no longer serve.
+    fn adapter_status(&self) -> Value {
+        let adapter = lock(&self.hello)
+            .as_ref()
+            .and_then(|hello| hello.get("adapter"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        if self.is_alive() {
+            adapter
+        } else {
+            without_registrations(adapter)
+        }
     }
 
     /// What the Movie Maker recording holds now; null for a run without one.
@@ -1486,11 +1505,21 @@ impl Drop for GameHub {
     }
 }
 
+/// An adapter status without the commands and states it registered.
+fn without_registrations(mut adapter: Value) -> Value {
+    if let Value::Object(map) = &mut adapter {
+        map.remove("commands");
+        map.remove("states");
+    }
+    adapter
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         LOCK_FILE, MAX_LINE_CHARS, RUNTIME_FILES, TRUNCATED_MARK, clip_line, ensure_runtime,
         inject_override, lock_override, physics_tick_rate, read_capped_line, restore_override,
+        without_registrations,
     };
     use std::path::Path;
     use std::time::{Duration, SystemTime};
@@ -1505,6 +1534,31 @@ mod tests {
     fn write(path: &Path, text: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn an_ended_runs_adapter_keeps_its_status_but_not_its_registrations() {
+        let adapter = serde_json::json!({
+            "configured": true,
+            "loaded": true,
+            "path": "res://adapter.gd",
+            "states": ["level"],
+            "commands": {"grant": "Grants {name}."},
+            "refused": [{"name": "takes_argument", "error": "no"}],
+        });
+        assert_eq!(
+            without_registrations(adapter),
+            serde_json::json!({
+                "configured": true,
+                "loaded": true,
+                "path": "res://adapter.gd",
+                "refused": [{"name": "takes_argument", "error": "no"}],
+            })
+        );
+        assert_eq!(
+            without_registrations(serde_json::Value::Null),
+            serde_json::Value::Null
+        );
     }
 
     #[test]

@@ -8,13 +8,35 @@ Releases 0.5.1 to 0.15.0 were built once per Godot version, from the branches `g
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-11-27
+
+One release serves every Godot version from 4.5 to 4.8 again. A running game can be waited on in game seconds and photographed as a sheet from an aim camera, errors carry a code, the editor bridge refuses what an older addon cannot do, and the tool list costs a third less context.
+
+### Added
+
+- `godot_game_wait` waits in game seconds: `seconds` (up to 60) is the sum of the frames' time, so `Engine.time_scale` counts and a paused tree adds nothing. With `node`, `signal`, `property` or `scene_generation` it is the timeout. A frame count means a different time at every frame rate. Every wait answer says the game seconds waited. A wait in seconds is refused while `time_scale` is 0.
+- `godot_game_screenshot` with `aim` takes a frame sheet: `frames` above 1 keeps the temporary camera while the game runs, `every` process frames apart (now up to 240). A held game still takes one aimed picture at a time.
+- A failed call whose kind is known carries a code in `structuredContent.error` (`NOT_FOUND`, `BAD_PARAMS`, `EXISTS` and others, listed in [docs/tools.md](docs/tools.md#error-codes)), and the recovery suggestions follow the code instead of the words of the message.
+
 ### Changed
 
 - **One build for every Godot version again.** Releases 0.5.1 to 0.15.0 were built once per Godot version, with files ending in `-godot4.5`, `-godot4.6` or `-godot4.7`. A release is now made from `master` alone: one server archive per platform (`godot-mcp-<target>.zip` or `.tar.gz`) and one addon archive (`godot-mcp-addon.zip`), which serve Godot 4.5 to 4.8; CI runs the editor, running-game, scenario, export and addon-export suites on 4.5, 4.6, 4.7 and 4.8. The version no longer carries `+godot.M.N`, and a release tag is `vX.Y.Z` only. The addon refuses an editor older than 4.5 as before, and warns on one newer than 4.8 instead of asking for a release for that version. Releases up to 0.15.0 stay available; the branches `godot-v4.5`, `godot-v4.6` and `godot-v4.7` are kept as they are and get no further fixes: update to the latest release.
+- Update the addon together with the server (`godot_update_addon`, `restart_editor: true` while the editor has the project open). The editor bridge now has a protocol version, and an addon of this release refuses a parameter it does not know instead of ignoring it and answering success. A server talking to such an addon refuses the parameter before sending it and names the update.
+- `godot_stop_project` lists each stopped run briefly (how it ended and its last error output) instead of its full status, an ended run's status no longer repeats the project adapter's commands and states, and each scene stamp of a game answer no longer repeats `script_sha256_note`.
+- The tool list is 38% smaller: shorter tool and parameter descriptions, with the longer explanations in the documentation.
+- Screenshot comparison counts every changed pixel for a small change and samples a large one (`exact: false`), instead of looping over every pixel and stalling the game.
+- Faster and lighter: large screenshots are copied less, recorded frames are written off the game's main thread, the output log no longer slows a game that prints much, class checks without an editor start Godot once per executable, planning a large folder move takes a fraction of the time, and project audits no longer block other calls.
 
 ### Fixed
 
+- `godot_move_file` and `godot_delete_file` with the editor no longer touch a shader or shader include that holds unsaved changes in the shader editor: the call is refused and nothing changes. A saved shader tab whose file a move rewrites now shows the new text, so saving it does not bring the old paths back.
+- `godot_run_script` and a headless `godot_set_resource_properties` reported success for a `MultiMesh` saved without its instances: headless Godot keeps instance transforms and colors only in its dummy rendering server, so the saved `.tres`/`.tscn` holds `instance_count` and no `buffer`, and every instance is invisible in the game. The answer now starts with a warning and names each such MultiMesh in `headless_data_loss` (file, `id`, `instance_count`), with what to do instead: save it with the editor open, fill it at run time, or place the instances as nodes.
 - `godot_create_resource` without an editor wrote only the `[gd_resource ...]` header, a file Godot could not load ("Parse Error: Unexpected end of file"), so `godot_set_resource_properties` and every scene using it failed on it. It now writes what Godot itself saves for a new resource with default values: a header with a uid (also recorded in `.godot/uid_cache.bin` when the project has one) and an empty `[resource]` section. The server then loads the file in a headless Godot and says so in the answer; a file Godot cannot load is removed again, and the error quotes Godot's message.
+- `godot_set_resource_properties` sets a count and the entries it adds in one call (`streams_count` with `stream_0/stream`, curve and gradient points). The new names were refused as unknown.
+- `godot_create_scene` without an editor escapes the root node's name. A name ending in a backslash wrote a file Godot could not load.
+- Editor, game and headless answers that echo a control character are read. Godot leaves some of them unescaped in JSON, so the call hung until its timeout or reported that Godot gave no answer.
+- A game screenshot or sheet too large for Godot's debugger channel fails at once with its size and how to ask for less, instead of timing out; a packet that cannot be read no longer ends the game session.
+- A game that prints very long lines no longer grows the server's memory (a stored line is cut and marked), an editor reply between 16 and 32 MiB no longer breaks the bridge connection, and waiting for another server's `override.cfg` lock no longer stalls other calls.
 
 ## [0.15.0] - 2026-11-19
 
@@ -437,7 +459,8 @@ part of every release), and note the behaviour changes below.
   property operations, viewport capture), headless CLI fallback for version, script validation
   and launching the editor.
 
-[Unreleased]: https://github.com/zeegzoog/godot-mcp/compare/v0.15.0...master
+[Unreleased]: https://github.com/zeegzoog/godot-mcp/compare/v0.16.0...master
+[0.16.0]: https://github.com/zeegzoog/godot-mcp/compare/v0.15.0...v0.16.0
 [0.4.0]: https://github.com/zeegzoog/godot-mcp/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/zeegzoog/godot-mcp/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/zeegzoog/godot-mcp/compare/v0.1.0...v0.2.0

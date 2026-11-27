@@ -67,7 +67,7 @@ pub async fn call(tools: &ToolManager, name: &str, args: Value) -> ToolResult {
         "godot_game_command" => project::command(tools, &args).await,
         "godot_game_input" => game_input(tools, &args).await,
         "godot_game_input_release" => runtime(tools, &args, "input.release_all").await,
-        "godot_game_wait" => runtime(tools, &args, "input.wait").await,
+        "godot_game_wait" => wait(tools, &args).await,
         "godot_game_physics" => runtime(tools, &args, "game.physics").await,
         "godot_game_scenario" => crate::tools::scenario::call(tools, &args).await,
         "godot_game_run_script" => run_script(tools, &args).await,
@@ -95,6 +95,32 @@ async fn runtime(tools: &ToolManager, args: &Value, method: &str) -> ToolResult 
         .runtime_call(str_arg(args, "run_id"), method, params_without_run(args))
         .await
     {
+        Ok(value) => ToolResult::text(serde_json::to_string_pretty(&value).unwrap_or_default()),
+        Err(error) => runtime_error(&error),
+    }
+}
+
+/// A wait. A runtime older than `seconds` ignores it and waits one frame; its answer then has no
+/// `seconds`, and that is told instead of a wait that did not happen.
+async fn wait(tools: &ToolManager, args: &Value) -> ToolResult {
+    let in_seconds = args
+        .get("seconds")
+        .is_some_and(|seconds| !seconds.is_null());
+    match tools
+        .runtime_call(
+            str_arg(args, "run_id"),
+            "input.wait",
+            params_without_run(args),
+        )
+        .await
+    {
+        Ok(value) if in_seconds && value.get("seconds").is_none() => ToolResult::error(
+            "The game's MCP runtime is older than seconds in godot_game_wait: it waited frames instead (default 1), not the game seconds asked for.",
+            &[
+                "Update the project's addon with godot_update_addon (restart_editor: true while the editor has the project open), then start the game again",
+                "Or wait in frames with frames and timeout",
+            ],
+        ),
         Ok(value) => ToolResult::text(serde_json::to_string_pretty(&value).unwrap_or_default()),
         Err(error) => runtime_error(&error),
     }

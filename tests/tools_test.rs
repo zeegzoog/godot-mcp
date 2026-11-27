@@ -1044,6 +1044,38 @@ async fn project_setting_without_an_editor_stores_the_engine_type() {
     );
 }
 
+// `JSON.stringify` leaves a control character other than `\b \t \n \f \r` raw inside a string,
+// so the engine's answer about a text holding one is not strict JSON and must still be read.
+// The stand-in is a shell script: a raw control character does not pass through a batch file.
+#[cfg(unix)]
+#[tokio::test]
+async fn project_setting_without_an_editor_reads_an_answer_with_a_raw_control_character() {
+    let project = project_dir();
+    let project_file = project.path().join("project.godot");
+    std::fs::write(&project_file, FROG_PROJECT).expect("project.godot");
+    let engine = tempfile::tempdir().expect("engine dir");
+    let (godot, _) = common::setting_godot(
+        engine.path(),
+        "{\"type\":\"String\",\"text\":\"\\\"bell\u{7}\\\"\"}",
+    );
+
+    let result = set_with_engine(
+        godot,
+        json!({"key": "application/config/description", "value": "bell\u{7}",
+               "project_path": project.path()}),
+    )
+    .await;
+
+    assert!(!result.is_error, "{}", text(&result));
+    assert_eq!(
+        std::fs::read_to_string(&project_file).expect("project.godot"),
+        FROG_PROJECT.replace(
+            "run/main_scene=\"res://main.tscn\"\n",
+            "run/main_scene=\"res://main.tscn\"\nconfig/description=\"bell\\u0007\"\n",
+        )
+    );
+}
+
 #[tokio::test]
 async fn project_setting_without_an_editor_asks_about_a_stored_structured_value() {
     let project = project_dir();
@@ -1963,6 +1995,10 @@ async fn probe_is_listed_read_only_and_checks_its_size_before_reaching_a_game() 
     assert_eq!(aim["properties"]["fov"]["minimum"], 1, "{aim}");
     assert_eq!(aim["properties"]["fov"]["maximum"], 179, "{aim}");
     assert_eq!(aim["additionalProperties"], false, "{aim}");
+    assert_eq!(
+        shot["inputSchema"]["properties"]["every"]["maximum"], 240,
+        "{shot}"
+    );
 }
 
 #[tokio::test]
@@ -2904,6 +2940,31 @@ async fn stop_without_a_run_id_stops_every_run_and_says_what_it_stopped() {
         ids.contains(&first.as_str()) && ids.contains(&second.as_str()),
         "{answer}"
     );
+    // A stop answer names the run and how it ended, nothing more: no adapter, process details
+    // or debugger state, which godot_get_run_status has.
+    for run in answer["stopped"]["runs"].as_array().expect("runs") {
+        let mut keys: Vec<&str> = run
+            .as_object()
+            .expect("run")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "ended_at",
+                "ended_by",
+                "exit_code",
+                "how_ended",
+                "last_stderr",
+                "run_id",
+                "scene",
+                "signal"
+            ],
+            "{run}"
+        );
+    }
     let status = status_of(&manager).await;
     for id in [&first, &second] {
         assert_eq!(run_in(&status, id)["running"], false, "{status}");
@@ -4372,8 +4433,58 @@ async fn run_script_names_the_uids_and_null_shader_parameters_it_could_not_repai
     );
 }
 
+#[tokio::test]
+async fn run_script_warns_that_a_headless_multimesh_save_lost_its_instances() {
+    let project = pond_project();
+    let root = project.path();
+    // What headless Godot writes for a MultiMesh of 12 instances: no buffer.
+    std::fs::write(
+        root.join("multimesh.txt"),
+        "[gd_resource type=\"MultiMesh\" format=3]\n\n[resource]\ntransform_format = 1\nuse_colors = true\ninstance_count = 12\n",
+    )
+    .expect("headless output");
+    write_script(root, "multimesh.gd", b"extends SceneTree\n");
+    let tools = manager_in(root, saving_godot(root));
+
+    let quiet = call_with(&tools, json!({"script": "quiet.gd", "project_path": root})).await;
+    let quiet_text = text(&quiet);
+    assert_eq!(
+        answer_body(&quiet_text)["headless_data_loss"],
+        Value::Null,
+        "{quiet_text}"
+    );
+
+    let saved = call_with(
+        &tools,
+        json!({"script": "multimesh.gd", "project_path": root}),
+    )
+    .await;
+    let saved_text = text(&saved);
+    assert!(
+        saved_text.starts_with("WARNING") && saved_text.contains("res://grass.tres"),
+        "{saved_text}"
+    );
+    let body = answer_body(&saved_text);
+    assert_eq!(
+        body["headless_data_loss"],
+        json!([{
+            "path": "res://grass.tres",
+            "multimeshes_without_buffer": [{"id": "resource", "instance_count": 12}],
+        }]),
+        "{saved_text}"
+    );
+    assert_eq!(body["resource_damage"], json!([]), "{saved_text}");
+    assert!(
+        body["summary"]
+            .as_str()
+            .is_some_and(|summary| summary.contains("no buffer")),
+        "{saved_text}"
+    );
+}
+
 /// A Godot stand-in that, for edit.gd and lock.gd, overwrites pond.tscn with headless.txt; lock.gd
-/// then makes it read-only. For shader.gd it overwrites water.gdshader with shader.txt, and for
+/// then makes it read-only. For shader.gd it overwrites water.gdshader with shader.txt, for
+/// multimesh.gd it writes multimesh.txt to grass.tres, and for
 /// many.gd it writes headless.txt to many/pond_01.tscn .. many/pond_25.tscn.
 fn saving_godot(dir: &Path) -> PathBuf {
     #[cfg(unix)]
@@ -4395,6 +4506,7 @@ case "$*" in
   *edit.gd*) cp "$proj/headless.txt" "$proj/pond.tscn" ;;
   *lock.gd*) cp "$proj/headless.txt" "$proj/pond.tscn"; chmod a-w "$proj/pond.tscn" ;;
   *shader.gd*) cp "$proj/shader.txt" "$proj/water.gdshader" ;;
+  *multimesh.gd*) cp "$proj/multimesh.txt" "$proj/grass.tres" ;;
   *many.gd*) mkdir -p "$proj/many"; for i in $(seq -w 1 25); do cp "$proj/headless.txt" "$proj/many/pond_$i.tscn"; done ;;
 esac
 exit 0
@@ -4409,7 +4521,7 @@ exit 0
         let path = dir.join("saving_godot.bat");
         std::fs::write(
             &path,
-            "@echo off\r\nsetlocal enabledelayedexpansion\r\nset PREV=\r\nset PROJ=\r\nfor %%A in (%*) do (\r\n  if \"!PREV!\"==\"--path\" set PROJ=%%~A\r\n  set PREV=%%A\r\n)\r\necho %* | findstr edit.gd >nul\r\nif %errorlevel%==0 copy /Y \"%PROJ%\\headless.txt\" \"%PROJ%\\pond.tscn\" >nul\r\necho %* | findstr lock.gd >nul\r\nif %errorlevel%==0 (\r\n  copy /Y \"%PROJ%\\headless.txt\" \"%PROJ%\\pond.tscn\" >nul\r\n  attrib +r \"%PROJ%\\pond.tscn\"\r\n)\r\necho %* | findstr shader.gd >nul\r\nif %errorlevel%==0 copy /Y \"%PROJ%\\shader.txt\" \"%PROJ%\\water.gdshader\" >nul\r\necho %* | findstr many.gd >nul\r\nif %errorlevel%==0 (\r\n  mkdir \"%PROJ%\\many\" 2>nul\r\n  for /L %%I in (101,1,125) do (\r\n    set N=%%I\r\n    copy /Y \"%PROJ%\\headless.txt\" \"%PROJ%\\many\\pond_!N:~1!.tscn\" >nul\r\n  )\r\n)\r\nexit /b 0\r\n",
+            "@echo off\r\nsetlocal enabledelayedexpansion\r\nset PREV=\r\nset PROJ=\r\nfor %%A in (%*) do (\r\n  if \"!PREV!\"==\"--path\" set PROJ=%%~A\r\n  set PREV=%%A\r\n)\r\necho %* | findstr edit.gd >nul\r\nif %errorlevel%==0 copy /Y \"%PROJ%\\headless.txt\" \"%PROJ%\\pond.tscn\" >nul\r\necho %* | findstr lock.gd >nul\r\nif %errorlevel%==0 (\r\n  copy /Y \"%PROJ%\\headless.txt\" \"%PROJ%\\pond.tscn\" >nul\r\n  attrib +r \"%PROJ%\\pond.tscn\"\r\n)\r\necho %* | findstr shader.gd >nul\r\nif %errorlevel%==0 copy /Y \"%PROJ%\\shader.txt\" \"%PROJ%\\water.gdshader\" >nul\r\necho %* | findstr multimesh.gd >nul\r\nif %errorlevel%==0 copy /Y \"%PROJ%\\multimesh.txt\" \"%PROJ%\\grass.tres\" >nul\r\necho %* | findstr many.gd >nul\r\nif %errorlevel%==0 (\r\n  mkdir \"%PROJ%\\many\" 2>nul\r\n  for /L %%I in (101,1,125) do (\r\n    set N=%%I\r\n    copy /Y \"%PROJ%\\headless.txt\" \"%PROJ%\\many\\pond_!N:~1!.tscn\" >nul\r\n  )\r\n)\r\nexit /b 0\r\n",
         )
         .expect("write saving godot");
         path
@@ -8711,11 +8823,129 @@ async fn a_destination_name_godot_cannot_store_is_refused() {
         assert!(snapshot() == before, "{to:?}: a refused move changed files");
     }
 
-    let moved = mv("res://Сцены и скрипты/my script.gd").await;
+    let moved = mv("res://Σκηνές και κώδικας/my script.gd").await;
     assert!(!moved.is_error, "{}", text(&moved));
     let main = std::fs::read_to_string(root.join("main.tscn")).expect("main.tscn");
     assert!(
-        main.contains("path=\"res://Сцены и скрипты/my script.gd\""),
+        main.contains("path=\"res://Σκηνές και κώδικας/my script.gd\""),
         "{main}"
     );
+}
+
+/// A runtime from before aimed sheets refuses aim with frames; the tool says to update the addon.
+#[tokio::test]
+async fn an_aimed_sheet_on_an_older_runtime_names_the_update() {
+    use common::{MockBridge, Reply};
+    let bridge = MockBridge::start(move |command| {
+        match command["type"].as_str().unwrap_or_default() {
+            "get_run_status" => Reply::Ok(json!({"running": true})),
+            "game_status" => Reply::Ok(json!({"sessions": [{"session": 7, "hello": "{}"}]})),
+            "game_send" => {
+                let request: Value = serde_json::from_str(command["params"]["data"][0].as_str().expect("request")).expect("JSON");
+                Reply::OkWithEvent(json!({"sent": true}), json!({
+                    "type": "event", "event": "game.message", "data": {
+                        "session": 7, "message": "mcp:reply",
+                        "data": [json!({"id": request["id"], "error": {"code": "BAD_PARAMS", "message": "aim takes one picture: leave frames at 1."}}).to_string()]
+                    }
+                }))
+            }
+            _ => Reply::Err("unexpected command".into())
+        }
+    })
+    .await;
+    let manager = Arc::new(ToolManager::new(
+        BridgeClient::new(bridge.port),
+        CliRunner::new(PathBuf::from("unused-godot")),
+    ));
+    let refused = manager
+        .call_tool(
+            "godot_game_screenshot",
+            json!({"run_id": "editor", "aim": {"at": [0, 0, 0]}, "frames": 4}),
+        )
+        .await;
+    assert!(refused.is_error, "{}", text(&refused));
+    assert!(
+        text(&refused).contains("godot_update_addon"),
+        "{}",
+        text(&refused)
+    );
+}
+
+/// An editor game whose runtime answers every `input.wait` with `answer`, and the tool manager
+/// that reaches it.
+async fn editor_game_answering_waits(answer: Value) -> (common::MockBridge, Arc<ToolManager>) {
+    use common::{MockBridge, Reply};
+    let bridge =
+        MockBridge::start(
+            move |command| match command["type"].as_str().unwrap_or_default() {
+                "get_run_status" => Reply::Ok(json!({"running": true})),
+                "game_status" => Reply::Ok(json!({"sessions": [{"session": 7, "hello": "{}"}]})),
+                "game_send" => {
+                    let request: Value = serde_json::from_str(
+                        command["params"]["data"][0].as_str().expect("request"),
+                    )
+                    .expect("JSON");
+                    Reply::OkWithEvent(
+                        json!({"sent": true}),
+                        json!({
+                            "type": "event", "event": "game.message", "data": {
+                                "session": 7, "message": "mcp:reply",
+                                "data": [json!({"id": request["id"], "result": answer}).to_string()]
+                            }
+                        }),
+                    )
+                }
+                _ => Reply::Err("unexpected command".into()),
+            },
+        )
+        .await;
+    let manager = Arc::new(ToolManager::new(
+        BridgeClient::new(bridge.port),
+        CliRunner::new(PathBuf::from("unused-godot")),
+    ));
+    (bridge, manager)
+}
+
+/// A runtime older than `seconds` ignores it and waits one frame. Its answer has no `seconds`,
+/// and the tool says the wait did not happen instead of reporting it as done.
+#[tokio::test]
+async fn a_wait_in_seconds_on_a_runtime_without_seconds_is_an_error_that_names_the_update() {
+    let (_old_bridge, old) = editor_game_answering_waits(json!({"frames": 1})).await;
+    let refused = old
+        .clone()
+        .call_tool("godot_game_wait", json!({"run_id": "editor", "seconds": 2}))
+        .await;
+    assert!(refused.is_error, "{}", text(&refused));
+    assert!(
+        text(&refused).contains("godot_update_addon"),
+        "{}",
+        text(&refused)
+    );
+    // A frame wait on the same runtime is answered as before.
+    let frames = old
+        .clone()
+        .call_tool("godot_game_wait", json!({"run_id": "editor", "frames": 1}))
+        .await;
+    assert!(!frames.is_error, "{}", text(&frames));
+
+    let (_bridge, current) =
+        editor_game_answering_waits(json!({"frames": 290, "seconds": 2.0034})).await;
+    let waited = current
+        .clone()
+        .call_tool("godot_game_wait", json!({"run_id": "editor", "seconds": 2}))
+        .await;
+    assert!(!waited.is_error, "{}", text(&waited));
+    assert!(text(&waited).contains("2.0034"), "{}", text(&waited));
+}
+
+#[test]
+fn the_wait_tool_offers_game_seconds_next_to_frames() {
+    let wait = ToolManager::list_tools()
+        .into_iter()
+        .find(|tool| tool.name == "godot_game_wait")
+        .expect("godot_game_wait");
+    let wait = serde_json::to_value(&wait).expect("tool");
+    let seconds = &wait["inputSchema"]["properties"]["seconds"];
+    assert_eq!(seconds["type"], "number", "{seconds}");
+    assert_eq!(seconds["maximum"], 60, "{seconds}");
 }

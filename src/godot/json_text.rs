@@ -51,6 +51,16 @@ pub fn parse<T: DeserializeOwned>(text: &str) -> serde_json::Result<T> {
     serde_json::from_str(&repair(text))
 }
 
+/// The JSON after `marker` on the first line of `output` that starts with it, as a headless
+/// script prints its answer, read with [`parse`]. `None` when no line has the marker or its
+/// text is not JSON even after [`repair`].
+pub fn marked<T: DeserializeOwned>(output: &str, marker: &str) -> Option<T> {
+    output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(marker))
+        .and_then(|answer| parse(answer.trim()).ok())
+}
+
 /// The first characters of a message, for a log line.
 pub fn head(text: &str) -> String {
     const LIMIT: usize = 120;
@@ -65,6 +75,15 @@ pub fn head(text: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::Value;
+
+    #[test]
+    fn a_marked_answer_is_read_from_its_line() {
+        let output = "Godot Engine v4.8\nGODOT_MCP_X= {\"text\":\"a\u{7}b\"}\nGODOT_MCP_X={}\n";
+        let answer: Value = marked(output, "GODOT_MCP_X=").expect("answer");
+        assert_eq!(answer["text"], "a\u{7}b");
+        assert!(marked::<Value>("GODOT_MCP_X={", "GODOT_MCP_X=").is_none());
+        assert!(marked::<Value>("no answer\n", "GODOT_MCP_X=").is_none());
+    }
 
     #[test]
     fn clean_text_is_not_copied() {

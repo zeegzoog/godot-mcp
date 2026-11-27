@@ -280,7 +280,7 @@ mod tests {
         for valid in [
             "a.gd",
             "my script.gd",
-            "Сцены",
+            "Σκηνές",
             "a#b;c[d]'e=f",
             "..x",
             "a~1",
@@ -303,7 +303,7 @@ mod tests {
             problem("res://a.gd", "res://x\ny/a.gd"),
             Some("x\ny".into())
         );
-        assert_eq!(problem("res://a.gd", "res://Сцены/my a.gd"), None);
+        assert_eq!(problem("res://a.gd", "res://Σκηνές/my a.gd"), None);
         assert_eq!(problem("res://odd%dir/a.gd", "res://odd%dir/b.gd"), None);
         assert_eq!(
             problem("res://in/odd%name.gd", "res://out/odd%name.gd"),

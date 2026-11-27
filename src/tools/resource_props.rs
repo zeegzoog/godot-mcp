@@ -18,7 +18,7 @@ pub const NAME: &str = "godot_set_resource_properties";
 pub fn catalog() -> Vec<Tool> {
     vec![super::tool(
         NAME,
-        "Sets properties of a resource in its own .tres/.res and saves it; use it for a shared .tres that godot_set_node_properties refuses. Values convert as there; a ShaderMaterial uniform is shader_parameter/<uniform> and must exist in the shader. All or nothing: unknown properties, unconvertible values, ':' steps, resource_path, script, private names or values that read back differently change nothing. changed lists values before and after. With the editor: one undoable action (mode editor). Without: saved headless (mode headless) with uids restored (resource_repairs; resource_damage: what could not be).",
+        "Sets properties of a resource in its own .tres/.res and saves it; use it for a shared .tres that godot_set_node_properties refuses. Values convert as there; a ShaderMaterial uniform is shader_parameter/<uniform> and must exist in the shader. A count is set first, so the entries it adds go in the same call ({\"streams_count\": 1, \"stream_0/stream\": ...}). All or nothing: unknown properties, unconvertible values, ':' steps, resource_path, script, private names or values that read back differently change nothing. changed lists values before and after. With the editor: one undoable action (mode editor). Without: saved headless (mode headless) with uids restored (resource_repairs; resource_damage: what could not be; headless_data_loss: a MultiMesh whose instance data headless Godot dropped).",
         json!({
             "resource_path": {
                 "type": "string",

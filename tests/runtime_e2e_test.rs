@@ -982,13 +982,8 @@ async fn headless_game_waits_for_a_value_a_new_scene_and_real_physics_ticks() {
             .ends_with("observe.gd"),
         "{snap_json}"
     );
-    assert!(
-        snap_json["script_sha256_note"]
-            .as_str()
-            .unwrap_or("")
-            .contains("not a later read"),
-        "{snap_json}"
-    );
+    // The meaning of the hash is in the tool description and the docs, not in every answer.
+    assert!(snap_json.get("script_sha256_note").is_none(), "{snap_json}");
     let loaded_hash = snap_json["script_sha256"].as_str().unwrap().to_string();
     let scene_path = snap_json["scene"].as_str().unwrap_or("").to_string();
 
@@ -3644,10 +3639,11 @@ async fn pointer_input_in_a_game_without_a_window_warns_when_it_lands_outside_th
     assert!(!stopped.is_error, "{}", text_of(&stopped));
 }
 
-/// The long explanation of `script_sha256` is in an output answer once, not on every line.
+/// An output answer stamps each line with the script hash and its basis, and explains neither: the
+/// explanation is in the docs, not in every answer.
 #[tokio::test]
 #[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
-async fn an_output_answer_explains_the_script_hash_once() {
+async fn an_output_answer_stamps_the_script_hash_without_explaining_it() {
     let project = project();
     let tools = manager(project.path());
     let started = call(
@@ -3673,21 +3669,18 @@ async fn an_output_answer_explains_the_script_hash_once() {
     }
     let lines = answer["lines"].as_array().expect("lines");
     assert!(lines.len() >= 2, "{answer}");
-    let note = answer["script_sha256_note"]
-        .as_str()
-        .expect("one note per answer");
-    assert!(note.contains("not a later read"), "{note}");
-    assert_eq!(
-        text_of(&call(&tools, "godot_run_output", json!({"run_id": run_id})).await)
-            .matches("not a later read")
-            .count(),
-        1,
-        "the explanation is repeated"
-    );
+    assert!(answer.get("script_sha256_note").is_none(), "{answer}");
     for line in lines {
         assert!(line["scene"].get("script_sha256_note").is_none(), "{line}");
         assert!(line["scene"].get("script_sha256_basis").is_some(), "{line}");
     }
+    let snapshot = call(&tools, "godot_game_snapshot", json!({"run_id": run_id})).await;
+    assert!(!snapshot.is_error, "{}", text_of(&snapshot));
+    assert!(
+        !text_of(&snapshot).contains("not a later read"),
+        "{}",
+        text_of(&snapshot)
+    );
     let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
     assert!(!stopped.is_error, "{}", text_of(&stopped));
 }
@@ -5114,6 +5107,77 @@ async fn set_resource_properties_without_an_editor_keeps_uids_and_unset_uniforms
     );
 }
 
+/// godot_set_resource_properties without an editor sets a count and the entry it adds in one
+/// call (an AudioStreamRandomizer's streams_count and stream_0/stream), and a name no property in
+/// the call adds is still refused with the file left as it was.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn set_resource_properties_without_an_editor_sets_a_count_and_its_entries_in_one_call() {
+    let _ = IGNORE;
+    let project = project_dir_with_scripts();
+    let root = project.path();
+    let original = "[gd_resource type=\"AudioStreamRandomizer\" format=3]\n\n[resource]\n";
+    std::fs::write(root.join("croak.tres"), original).unwrap();
+    std::fs::write(
+        root.join("beep.tres"),
+        "[gd_resource type=\"AudioStreamGenerator\" format=3]\n\n[resource]\n",
+    )
+    .unwrap();
+    let tools = manager(root);
+    let set = |properties: Value| {
+        let tools = Arc::clone(&tools);
+        async move {
+            call(
+                &tools,
+                "godot_set_resource_properties",
+                json!({"resource_path": "res://croak.tres", "properties": properties, "project_path": root}),
+            )
+            .await
+        }
+    };
+
+    let refused = set(json!({"streams_count": 1, "stream_1/stream": "res://beep.tres"})).await;
+    let refused_text = text_of(&refused);
+    assert!(refused.is_error, "{refused_text}");
+    assert!(
+        refused_text.contains("Unknown property 'stream_1/stream' on AudioStreamRandomizer"),
+        "{refused_text}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("croak.tres")).unwrap(),
+        original,
+        "a refused call changed the file"
+    );
+
+    let result = set(json!({
+        "streams_count": 1,
+        "stream_0/stream": "res://beep.tres",
+        "random_pitch": 1.08
+    }))
+    .await;
+    let answer_text = text_of(&result);
+    assert!(!result.is_error, "{answer_text}");
+    let answer: Value = serde_json::from_str(&answer_text).expect("json answer");
+    assert_eq!(
+        answer["changed"]["streams_count"],
+        json!({"before": "0", "after": "1"}),
+        "{answer}"
+    );
+    assert_eq!(
+        answer["changed"]["stream_0/stream"],
+        json!({"before": "null", "after": "Resource(\"res://beep.tres\")"}),
+        "{answer}"
+    );
+    let saved = std::fs::read_to_string(root.join("croak.tres")).unwrap();
+    assert!(
+        saved.contains("streams_count = 1")
+            && saved.contains("path=\"res://beep.tres\"")
+            && saved.contains("stream_0/stream = ExtResource(")
+            && saved.contains("random_pitch = 1.08"),
+        "the count, its stream or the pitch was not saved:\n{saved}\n{answer}"
+    );
+}
+
 /// godot_create_resource without an editor writes a file Godot loads as the class it was asked
 /// for, and godot_set_resource_properties can change that file right after.
 #[tokio::test]
@@ -6455,6 +6519,20 @@ async fn adapter_status(tools: &Arc<ToolManager>, run_id: &str) -> Value {
         .unwrap_or_else(|| panic!("no run {run_id} in {body}"))
 }
 
+/// The adapter status of a run that has ended, as the run status shows it.
+async fn adapter_status_after_end(tools: &Arc<ToolManager>, run_id: &str) -> Value {
+    let status = call(tools, "godot_get_run_status", json!({})).await;
+    assert!(!status.is_error, "{}", text_of(&status));
+    let body = json_of(&status);
+    let run = body["process_runs"]
+        .as_array()
+        .and_then(|runs| runs.iter().find(|run| run["run_id"] == run_id))
+        .unwrap_or_else(|| panic!("no run {run_id} in {body}"))
+        .clone();
+    assert_eq!(run["running"], false, "{run}");
+    run["adapter"].clone()
+}
+
 #[tokio::test]
 #[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
 async fn a_game_without_an_adapter_setting_announces_none() {
@@ -6495,6 +6573,15 @@ async fn an_adapter_named_by_path_or_by_uid_registers_what_it_offers() {
     assert_eq!(status["path"], "res://adapter.gd", "{status}");
     let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
     assert!(!stopped.is_error, "{}", text_of(&stopped));
+    // A stop answer says how the run ended; the adapter's commands are not repeated there, and
+    // the run status of the ended run keeps only whether the adapter loaded.
+    let stop_answer = json_of(&stopped);
+    assert!(stop_answer.get("adapter").is_none(), "{stop_answer}");
+    assert_eq!(stop_answer["run_id"], run_id.as_str(), "{stop_answer}");
+    let ended = adapter_status_after_end(&tools, &run_id).await;
+    assert_eq!(ended["loaded"], true, "{ended}");
+    assert!(ended.get("commands").is_none(), "{ended}");
+    assert!(ended.get("states").is_none(), "{ended}");
 
     // Project Settings stores a uid when the script is picked with the file chooser. An import
     // makes the engine write the script's uid file and register it.
@@ -6921,6 +7008,46 @@ fn copy_tree(from: &Path, to: &Path) {
             std::fs::copy(entry.path(), target).unwrap();
         }
     }
+}
+
+/// A tool script that fills a MultiMesh and saves it headless: the dummy rendering server keeps
+/// no instance data, so the file has no buffer, and the answer says so.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn run_script_names_a_multimesh_saved_without_its_instances() {
+    let dir = tempfile::tempdir().expect("project dir");
+    let root = dir.path();
+    std::fs::write(
+        root.join("project.godot"),
+        "config_version=5\n\n[application]\n\nconfig/name=\"MultiMesh loss\"\n",
+    )
+    .expect("project.godot");
+    std::fs::write(
+        root.join("grass.gd"),
+        "extends SceneTree\n\nfunc _init() -> void:\n\tvar mm := MultiMesh.new()\n\tmm.transform_format = MultiMesh.TRANSFORM_3D\n\tmm.use_colors = true\n\tmm.instance_count = 12\n\tfor i in 12:\n\t\tmm.set_instance_transform(i, Transform3D(Basis(), Vector3(i, 0, 0)))\n\t\tmm.set_instance_color(i, Color.RED)\n\tResourceSaver.save(mm, \"res://grass.tres\")\n\tquit()\n",
+    )
+    .expect("script");
+    let tools = manager(root);
+    let result = call(
+        &tools,
+        "godot_run_script",
+        json!({"script": "res://grass.gd", "project_path": root, "timeout_seconds": 60}),
+    )
+    .await;
+    let text = text_of(&result);
+    let saved = std::fs::read_to_string(root.join("grass.tres")).expect("grass.tres");
+    assert!(saved.contains("instance_count = 12"), "{saved}");
+    assert!(!saved.contains("buffer"), "{saved}");
+    assert!(text.starts_with("WARNING"), "{text}");
+    let body: Value = serde_json::from_str(&text[text.find('{').expect("json")..]).expect("JSON");
+    assert_eq!(
+        body["headless_data_loss"],
+        json!([{
+            "path": "res://grass.tres",
+            "multimeshes_without_buffer": [{"id": "resource", "instance_count": 12}],
+        }]),
+        "{text}"
+    );
 }
 
 /// A tool script that re-saves an existing compressed binary scene, as a level builder does.
@@ -7551,6 +7678,19 @@ async fn an_aimed_screenshot_looks_at_a_point_and_leaves_the_game_camera_alone()
     let both = shot(json!({"aim": {"at": [1, 2, 3], "look_at": [0, 0, 0]}})).await;
     assert!(both.is_error, "{}", text_of(&both));
 
+    // A sheet from the aim camera: the camera stays put while the game runs between the shots.
+    let sheet = shot(json!({"aim": {"at": [30, 2, 0]}, "frames": 4, "every": 2})).await;
+    assert!(!sheet.is_error, "{}", text_of(&sheet));
+    let sheet_note = text_of(&sheet);
+    assert!(sheet_note.contains("4 frames, 2 columns"), "{sheet_note}");
+    assert!(sheet_note.contains("(aim camera)"), "{sheet_note}");
+    assert_eq!(aim_of(&sheet_note)["mode"], "at", "{sheet_note}");
+    let slow = shot(json!({"aim": {"at": [30, 2, 0]}, "frames": 2, "every": 240})).await;
+    assert!(!slow.is_error, "{}", text_of(&slow));
+    let too_slow = shot(json!({"frames": 2, "every": 241})).await;
+    assert!(too_slow.is_error, "{}", text_of(&too_slow));
+    assert!(text_of(&too_slow).contains("240"), "{}", text_of(&too_slow));
+
     // The game camera is still current and where it was, and the temporary nodes are gone.
     let camera = json_of(
         &call(
@@ -7601,6 +7741,12 @@ async fn an_aimed_screenshot_looks_at_a_point_and_leaves_the_game_camera_alone()
     assert!(
         switch.is_error,
         "a camera switch is still refused while held"
+    );
+    let held_sheet = shot(json!({"aim": {"at": [30, 2, 0]}, "frames": 2})).await;
+    assert!(
+        held_sheet.is_error,
+        "a sheet needs frames to be drawn, aimed or not: {}",
+        text_of(&held_sheet)
     );
 
     let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
@@ -9385,6 +9531,119 @@ async fn a_screenshot_too_large_for_the_debugger_is_refused_with_the_reason() {
         text_of(&small)
     );
 
+    let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
+    assert!(!stopped.is_error, "{}", text_of(&stopped));
+}
+
+/// A wait in game seconds lasts that much game time at any frame rate: scaled by
+/// Engine.time_scale, and as the timeout of a condition. It refuses frames with it and a
+/// time_scale of 0, when no game time passes.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn a_wait_in_game_seconds_follows_the_game_clock() {
+    let project = project();
+    let tools = manager(project.path());
+    let started = call(
+        &tools,
+        "godot_run_project",
+        json!({"project_path": project.path(), "mode": "process", "headless": true}),
+    )
+    .await;
+    assert!(!started.is_error, "{}", text_of(&started));
+    let run_id = run_id_of(&started);
+
+    let begun = std::time::Instant::now();
+    let plain = call(
+        &tools,
+        "godot_game_wait",
+        json!({"run_id": run_id, "seconds": 0.5, "time_scale": 1}),
+    )
+    .await;
+    let real = begun.elapsed().as_secs_f64();
+    assert!(!plain.is_error, "{}", text_of(&plain));
+    let plain = json_of(&plain);
+    let game = plain["seconds"].as_f64().expect("seconds");
+    assert!((0.5..0.75).contains(&game), "{plain}");
+    assert!(
+        plain["frames"].as_u64().is_some_and(|frames| frames > 0),
+        "{plain}"
+    );
+    assert!(
+        real >= 0.45,
+        "a half-second wait returned after {real} s: {plain}"
+    );
+
+    // Four times faster: two game seconds pass in about half a real second.
+    let begun = std::time::Instant::now();
+    let fast = call(
+        &tools,
+        "godot_game_wait",
+        json!({"run_id": run_id, "seconds": 2, "time_scale": 4}),
+    )
+    .await;
+    let real = begun.elapsed().as_secs_f64();
+    assert!(!fast.is_error, "{}", text_of(&fast));
+    let fast = json_of(&fast);
+    assert!(fast["seconds"].as_f64().is_some_and(|s| s >= 2.0), "{fast}");
+    assert!(
+        real < 1.8,
+        "two game seconds at time_scale 4 took {real} s: {fast}"
+    );
+
+    // As the timeout of a condition.
+    let missing = call(
+        &tools,
+        "godot_game_wait",
+        json!({"run_id": run_id, "node": "Nope", "seconds": 0.3, "time_scale": 1}),
+    )
+    .await;
+    assert!(missing.is_error, "{}", text_of(&missing));
+    assert!(
+        text_of(&missing).contains("after 0.3 game seconds"),
+        "{}",
+        text_of(&missing)
+    );
+    let found = call(
+        &tools,
+        "godot_game_wait",
+        json!({"run_id": run_id, "node": ".", "seconds": 1}),
+    )
+    .await;
+    assert!(!found.is_error, "{}", text_of(&found));
+    assert!(
+        json_of(&found)["seconds"].is_number(),
+        "{}",
+        text_of(&found)
+    );
+
+    let both = call(
+        &tools,
+        "godot_game_wait",
+        json!({"run_id": run_id, "seconds": 1, "frames": 10}),
+    )
+    .await;
+    assert!(both.is_error, "{}", text_of(&both));
+    assert!(text_of(&both).contains("not both"), "{}", text_of(&both));
+    let frozen = call(
+        &tools,
+        "godot_game_wait",
+        json!({"run_id": run_id, "seconds": 1, "time_scale": 0}),
+    )
+    .await;
+    assert!(frozen.is_error, "{}", text_of(&frozen));
+    assert!(
+        text_of(&frozen).contains("time_scale"),
+        "{}",
+        text_of(&frozen)
+    );
+
+    let restored = call(
+        &tools,
+        "godot_game_wait",
+        json!({"run_id": run_id, "frames": 0, "time_scale": 1}),
+    )
+    .await;
+    assert!(!restored.is_error, "{}", text_of(&restored));
     let stopped = call(&tools, "godot_stop_project", json!({"run_id": run_id})).await;
     assert!(!stopped.is_error, "{}", text_of(&stopped));
 }

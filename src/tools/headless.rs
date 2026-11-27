@@ -121,9 +121,35 @@ where
     ))
 }
 
-/// The `resource_damage` entries of a run's answer and a sentence for its summary.
-fn damage_report(damage: &[ResourceDamage]) -> (Vec<Value>, Option<String>) {
-    let entries = damage
+/// What a headless save lost, as the run's answer reports it.
+struct DamageReport {
+    /// `resource_damage`: the uids and null shader parameters the repair could not fix.
+    entries: Vec<Value>,
+    /// `headless_data_loss`: data a headless Godot cannot save at all.
+    data_loss: Vec<Value>,
+    /// The warning that leads the answer, when either list is not empty.
+    warning: Option<String>,
+}
+
+/// What a headless Godot cannot save: a `MultiMesh` keeps its instances in the rendering server.
+const MULTIMESH_DATA_LOSS: &str = "A MultiMesh keeps its instance transforms, colors and custom data in the rendering server, which headless Godot replaces with a dummy, so the file holds instance_count but no buffer and every instance loads invisible (zero transform). godot_run_script is always headless: save the MultiMesh with the editor open (godot_set_resource_properties in editor mode), fill it at run time from a script, or place the instances as nodes";
+
+/// The `resource_damage` and `headless_data_loss` entries of a run's answer and a sentence for
+/// its summary.
+fn damage_report(damage: &[ResourceDamage]) -> DamageReport {
+    let unrepaired: Vec<&ResourceDamage> = damage
+        .iter()
+        .filter(|item| {
+            item.lost_uid.is_some()
+                || !item.ext_resources_without_uid.is_empty()
+                || !item.null_shader_parameters.is_empty()
+        })
+        .collect();
+    let lost: Vec<&ResourceDamage> = damage
+        .iter()
+        .filter(|item| !item.multimeshes_without_buffer.is_empty())
+        .collect();
+    let entries = unrepaired
         .iter()
         .map(|item| {
             json!({
@@ -137,14 +163,36 @@ fn damage_report(damage: &[ResourceDamage]) -> (Vec<Value>, Option<String>) {
             })
         })
         .collect::<Vec<_>>();
-    if damage.is_empty() {
-        return (entries, None);
+    let data_loss = lost
+        .iter()
+        .map(|item| {
+            json!({
+                "path": item.path,
+                "multimeshes_without_buffer": item.multimeshes_without_buffer.iter().map(|(id, count)| json!({
+                    "id": id,
+                    "instance_count": count,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut warnings = Vec::new();
+    if !unrepaired.is_empty() {
+        let paths = path_examples(unrepaired.iter().map(|item| item.path.as_str()));
+        warnings.push(format!(
+            "WARNING: the script rewrote {paths} without the editor, and the server could not repair them: resource_damage lists the uid:// references still missing and the shader parameters still written as null. Restore the files from version control, or put the listed uid=\"...\" back (for a .scn or .res, with ResourceSaver.set_uid in a godot_run_script) and delete the null shader_parameter lines; make sure the files are writable."
+        ));
     }
-    let paths = path_examples(damage.iter().map(|item| item.path.as_str()));
-    let warning = format!(
-        "WARNING: the script rewrote {paths} without the editor, and the server could not repair them: resource_damage lists the uid:// references still missing and the shader parameters still written as null. Restore the files from version control, or put the listed uid=\"...\" back (for a .scn or .res, with ResourceSaver.set_uid in a godot_run_script) and delete the null shader_parameter lines; make sure the files are writable."
-    );
-    (entries, Some(warning))
+    if !lost.is_empty() {
+        let paths = path_examples(lost.iter().map(|item| item.path.as_str()));
+        warnings.push(format!(
+            "WARNING: {paths} saved a MultiMesh with instances but without their data (headless_data_loss). {MULTIMESH_DATA_LOSS}."
+        ));
+    }
+    DamageReport {
+        entries,
+        data_loss,
+        warning: (!warnings.is_empty()).then(|| warnings.join(" ")),
+    }
 }
 
 /// What the run's answer says about the files the server repaired after the script.
@@ -421,7 +469,11 @@ fn script_run_result(
         Some(sentence) => format!("{summary}\n{sentence}"),
         None => summary,
     };
-    let (resource_damage, warning) = damage_report(damage);
+    let DamageReport {
+        entries: resource_damage,
+        data_loss,
+        warning,
+    } = damage_report(damage);
     let summary = match repair.sentence() {
         Some(sentence) => format!("{summary} {sentence}"),
         None => summary,
@@ -468,6 +520,7 @@ fn script_run_result(
         "uid_cache": repair.uid_cache(),
         "uid_cache_stale": repair.uid_cache_stale,
         "resource_damage": resource_damage,
+        "headless_data_loss": (!data_loss.is_empty()).then_some(&data_loss),
         "stale_imports": imports.map(|stale| json!({
             "paths": stale.paths.iter().take(REPAIR_LIST_LIMIT).collect::<Vec<_>>(),
             "total": stale.paths.len(),
@@ -1314,11 +1367,8 @@ impl ToolManager {
             let _alone = turn.exclusive().await;
             damage_since(turn.snapshot(), project).await
         };
-        let answer = run
-            .stdout
-            .lines()
-            .find_map(|line| line.trim().strip_prefix(SET_RESOURCE_MARKER))
-            .and_then(|text| serde_json::from_str::<Value>(text).ok());
+        let answer: Option<Value> =
+            crate::godot::json_text::marked(&run.stdout, SET_RESOURCE_MARKER);
         let Some(mut answer) = answer else {
             let tail = last_output_lines(&run.stdout, &run.stderr, 20)
                 .unwrap_or_else(|| "(no output)".to_string());
@@ -1343,7 +1393,11 @@ impl ToolManager {
                 ],
             );
         }
-        let (damage_entries, warning) = damage_report(&damage);
+        let DamageReport {
+            entries: damage_entries,
+            data_loss,
+            warning,
+        } = damage_report(&damage);
         if let Some(fields) = answer.as_object_mut() {
             fields.insert("mode".into(), json!("headless"));
             fields.insert("undoable".into(), json!(false));
@@ -1372,12 +1426,19 @@ impl ToolManager {
             if !damage_entries.is_empty() {
                 fields.insert("resource_damage".into(), json!(damage_entries));
             }
+            if !data_loss.is_empty() {
+                fields.insert("headless_data_loss".into(), json!(data_loss));
+            }
         }
         let text = serde_json::to_string_pretty(&answer).unwrap_or_default();
         match warning {
             Some(warning) => ToolResult::error(
                 format!("{text}\n{warning}"),
-                &["Restore the file from version control, or put the listed uids back"],
+                &[if data_loss.is_empty() {
+                    "Restore the file from version control, or put the listed uids back"
+                } else {
+                    "Open the project in the editor with the Godot MCP Bridge plugin and set the MultiMesh there, or place the instances as nodes"
+                }],
             ),
             None => ToolResult::text(text),
         }

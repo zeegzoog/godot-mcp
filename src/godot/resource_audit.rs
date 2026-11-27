@@ -721,6 +721,8 @@ fn is_audited(name: &str) -> bool {
 #[cfg(test)]
 thread_local! {
     /// Walks of a project started on this thread, so tests can pin how often one is walked.
+    // Clippy 1.100 asks for `const` here on windows-gnu although the initializer is one.
+    #[allow(clippy::missing_const_for_thread_local)]
     static WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 

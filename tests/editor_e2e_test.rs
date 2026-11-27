@@ -3262,11 +3262,13 @@ const CLASH_SCENE: &str = "[gd_scene load_steps=2 format=3]\n\n[ext_resource typ
 #[tokio::test]
 #[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
 async fn open_scene_returns_what_the_load_errors_dialog_shows() {
-    let editor = start_editor_with(
+    // The test reads the dialog's English text, whatever language this machine's editor uses.
+    let editor = start_editor_with_args(
         None,
         "",
         &[("sub.tscn", CLASH_SUB), ("clash.tscn", CLASH_SCENE)],
         "",
+        &["--language", "en"],
     )
     .await;
     let bridge = &editor.bridge;
@@ -5829,12 +5831,26 @@ fn result_text(result: &godot_mcp::protocol::ToolResult) -> String {
     format!("{:?}", result.content)
 }
 
+/// Test-only command that answers the editor's process id.
+const PID_HOOK: &str = r#"        "__editor_pid":
+            send_success(peer, cmd_id, {"pid": OS.get_process_id()})
+        "ping":
+"#;
+
 /// godot_close_editor quits the editor through its bridge and answers once the process is gone.
 #[tokio::test]
 #[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
 async fn close_editor_quits_the_editor_and_its_process_exits() {
-    let mut editor = start_editor(false).await;
-    let pid = editor._child.id().expect("editor pid");
+    let mut editor = start_editor_with(Some(PID_HOOK), "", &[], "").await;
+    // The editor says which process it is: a launcher such as the Windows console build starts
+    // it as a child, so the process this test spawned may have another id.
+    let pid = editor
+        .bridge
+        .send_command("__editor_pid", json!({}))
+        .await
+        .expect("editor pid")["pid"]
+        .as_u64()
+        .expect("a process id");
     let tools = tools_for(&editor);
 
     // This test is the editor's parent, so it reaps the process; until then the editor would

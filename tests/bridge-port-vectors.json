@@ -22,8 +22,8 @@
       "port": 20006
     },
     {
-      "path": "/home/dev/игра/проект",
-      "port": 14059
+      "path": "/home/dev/παιχνίδι/έργο",
+      "port": 23994
     },
     {
       "path": "c:/users/dev/documents/godot/project",
@@ -75,9 +75,9 @@
       "canonical": "c:/users/dev/game"
     },
     {
-      "input": "D:/Игры/Ägypten",
+      "input": "D:/Παιχνίδια/Ägypten",
       "windows": true,
-      "canonical": "d:/Игры/Ägypten"
+      "canonical": "d:/Παιχνίδια/Ägypten"
     },
     {
       "input": "C:/",

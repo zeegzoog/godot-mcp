@@ -7,3 +7,4 @@ build.rs      @teratron
 /SECURITY.md  @teratron
 /LICENSE      @teratron
 /.env.example @teratron
+/CODEOWNERS   @teratron

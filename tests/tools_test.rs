@@ -8815,8 +8815,14 @@ async fn a_destination_name_godot_cannot_store_is_refused() {
             "{to:?}: {}",
             text(&refused)
         );
+        // Windows reads `b:c.gd` as a path on the drive B, which is outside the project.
+        let reason = if cfg!(windows) && to == "res://b:c.gd" {
+            "outside the project"
+        } else {
+            "cannot be used in a file name"
+        };
         assert!(
-            text(&refused).contains("cannot be used in a file name"),
+            text(&refused).contains(reason),
             "{to:?}: {}",
             text(&refused)
         );

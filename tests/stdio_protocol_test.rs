@@ -2,7 +2,10 @@
 
 mod common;
 
-use common::{MockBridge, Reply, Session, fake_godot, free_port, is_tool_error, project_dir};
+use common::{
+    MockBridge, Reply, Session, env_printing_godot, fake_godot, free_port, is_tool_error,
+    project_dir, tool_text,
+};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -370,6 +373,151 @@ async fn unparsable_dotenv_is_ignored_instead_of_stopping_the_server() {
 
     let reply = session.request("ping", json!({}), FAST).await;
     assert!(reply["result"].is_object());
+}
+
+/// Settings that name an `env_printing_godot` as Godot, a free bridge port and a variable the
+/// server does not read.
+fn settings_with_unlisted_variable(godot: &std::path::Path) -> String {
+    format!(
+        "GODOT_PATH='{}'\nGODOT_DEBUG_PORT={}\nGODOT_MCP_TEST_UNLISTED=leaked\n",
+        godot.display(),
+        free_port()
+    )
+}
+
+#[tokio::test]
+async fn the_user_settings_file_sets_godot_but_no_other_variable_reaches_it() {
+    let bin = tempfile::tempdir().expect("fake godot dir");
+    let godot = env_printing_godot(bin.path(), "GODOT_MCP_TEST_UNLISTED");
+    let mut session = Session::start_with_settings(
+        &settings_with_unlisted_variable(&godot),
+        "GODOT_MCP_TEST_UNLISTED=leaked\n",
+    )
+    .await;
+
+    let reply = session
+        .call_tool("godot_get_version", json!({}), FAST)
+        .await;
+    let text = tool_text(&reply);
+    // GODOT_PATH came from the user's settings file: the stand-in answered.
+    assert!(text.contains("4.5.stable"), "{text}");
+    // The unlisted variable, in either file, was not put into the environment Godot inherits.
+    assert!(!text.contains("[leaked]"), "{text}");
+}
+
+#[tokio::test]
+async fn a_project_dotenv_file_cannot_choose_the_godot_the_server_runs() {
+    let bin = tempfile::tempdir().expect("fake godot dir");
+    let godot = env_printing_godot(bin.path(), "GODOT_MCP_TEST_UNLISTED");
+    let mut session = Session::start_with_dotenv(&settings_with_unlisted_variable(&godot)).await;
+
+    let reply = session
+        .call_tool("godot_get_version", json!({}), FAST)
+        .await;
+    let text = tool_text(&reply);
+    assert!(!text.contains("GODOT_MCP_TEST_UNLISTED="), "{text}");
+}
+
+#[tokio::test]
+async fn a_dotenv_file_in_a_parent_directory_is_not_read() {
+    let bin = tempfile::tempdir().expect("fake godot dir");
+    let godot = env_printing_godot(bin.path(), "GODOT_MCP_TEST_UNLISTED");
+    let mut session =
+        Session::start_with_dotenv_in_parent(&settings_with_unlisted_variable(&godot)).await;
+
+    let reply = session
+        .call_tool("godot_get_version", json!({}), FAST)
+        .await;
+    let text = tool_text(&reply);
+    assert!(!text.contains("GODOT_MCP_TEST_UNLISTED="), "{text}");
+}
+
+/// Starts the server once in a fresh folder that is also its home, with the user's settings file
+/// and the working directory's `.env` holding the given text, sends one ping and returns
+/// standard output and standard error.
+fn run_once_with_settings(user: &str, workdir: &str, env: &[(&str, &str)]) -> (String, String) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let cwd = tempfile::tempdir().expect("working directory");
+    common::write_user_settings(cwd.path(), user);
+    std::fs::write(cwd.path().join(".env"), workdir).expect("write .env");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_godot-mcp"));
+    for key in [
+        "GODOT_PATH",
+        "GODOT_CONSOLE_PATH",
+        "GODOT_DEBUG_PORT",
+        "GODOT_MCP_TOKEN",
+        "GODOT_MCP_FEEDBACK",
+        "GODOT_MCP_GH_PATH",
+        "GODOT_MCP_MOVIE_DIR",
+        "GODOT_MCP_LSP_PORT",
+        "RUST_LOG",
+    ] {
+        command.env_remove(key);
+    }
+    common::hermetic_home(&mut command, cwd.path());
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let mut child = command
+        .current_dir(cwd.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start the server");
+    let mut stdin = child.stdin.take().expect("server stdin");
+    writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"ping"}}"#).expect("send ping");
+    drop(stdin);
+    let output = child.wait_with_output().expect("server output");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(stdout.contains(r#""id":1"#), "{stdout}");
+    (stdout, String::from_utf8_lossy(&output.stderr).into_owned())
+}
+
+#[test]
+fn variables_a_dotenv_file_may_not_set_are_named_in_a_warning_on_stderr() {
+    let (stdout, stderr) = run_once_with_settings(
+        "",
+        "GODOT_MCP_TEST_UNLISTED=leaked\nDYLD_INSERT_LIBRARIES=/nonexistent/inject.dylib\n\
+         GODOT_PATH=./tools/evil\nGODOT_MCP_TOKEN=known\n",
+        &[],
+    );
+    assert!(
+        stderr.contains("GODOT_MCP_TEST_UNLISTED") && stderr.contains("DYLD_INSERT_LIBRARIES"),
+        "{stderr}"
+    );
+    // The keys only the user may set are named together with the file to put them in.
+    assert!(
+        stderr.contains("GODOT_PATH, GODOT_MCP_TOKEN") && stderr.contains("godot-mcp"),
+        "{stderr}"
+    );
+    assert!(!stdout.contains("DYLD_INSERT_LIBRARIES"), "{stdout}");
+}
+
+#[test]
+fn the_environment_wins_over_the_user_settings_file_which_wins_over_the_project() {
+    let (user_port, project_port, exported_port) = (free_port(), free_port(), free_port());
+    let user = format!("GODOT_DEBUG_PORT={user_port}\n");
+    let project = format!("GODOT_DEBUG_PORT={project_port}\n");
+
+    let (_, stderr) = run_once_with_settings(&user, &project, &[]);
+    assert!(stderr.contains(&format!("port {user_port} ")), "{stderr}");
+
+    let (_, stderr) = run_once_with_settings("", &project, &[]);
+    assert!(
+        stderr.contains(&format!("port {project_port} ")),
+        "{stderr}"
+    );
+
+    let exported = exported_port.to_string();
+    let (_, stderr) =
+        run_once_with_settings(&user, &project, &[("GODOT_DEBUG_PORT", exported.as_str())]);
+    assert!(
+        stderr.contains(&format!("port {exported_port} ")),
+        "{stderr}"
+    );
 }
 
 #[test]

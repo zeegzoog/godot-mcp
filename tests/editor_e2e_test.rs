@@ -55,7 +55,8 @@ impl Editor {
 }
 
 fn godot_binaries() -> (PathBuf, PathBuf) {
-    let _ = dotenvy::dotenv();
+    // The repository's own .env only, never one in a parent directory.
+    let _ = dotenvy::from_path(concat!(env!("CARGO_MANIFEST_DIR"), "/.env"));
     let godot = std::env::var("GODOT_PATH")
         .ok()
         .filter(|value| !value.is_empty())

@@ -92,6 +92,62 @@ pub fn recording_godot(dir: &Path) -> (PathBuf, PathBuf) {
     }
 }
 
+/// A stand-in for the Godot executable that answers `--version` with a version followed by
+/// `<variable>=[<value>]`, the value of `variable` in its environment (empty when unset).
+pub fn env_printing_godot(dir: &Path, variable: &str) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let path = dir.join("env_printing_godot.bat");
+        std::fs::write(
+            &path,
+            format!("@echo off\r\necho 4.5.stable {variable}=[%{variable}%]\r\n"),
+        )
+        .expect("write env printing godot");
+        path
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("env_printing_godot.sh");
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\necho \"4.5.stable {variable}=[${variable}]\"\n"),
+        )
+        .expect("write env printing godot");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod env printing godot");
+        path
+    }
+}
+
+/// Where the server looks for the user's settings file when `APPDATA`, `HOME` and
+/// `XDG_CONFIG_HOME` all point at `home`, as `Session` and `hermetic_home` set them.
+pub fn user_settings_file(home: &Path) -> PathBuf {
+    let config_dir = if cfg!(target_os = "macos") {
+        home.join("Library/Application Support")
+    } else {
+        home.to_path_buf()
+    };
+    config_dir.join("godot-mcp").join(".env")
+}
+
+/// Writes the user's settings file under `home` (see `user_settings_file`).
+pub fn write_user_settings(home: &Path, contents: &str) {
+    let path = user_settings_file(home);
+    std::fs::create_dir_all(path.parent().expect("settings folder"))
+        .expect("create settings folder");
+    std::fs::write(path, contents).expect("write user settings");
+}
+
+/// Points every user folder the server reads (settings, bridge token) at `home`.
+pub fn hermetic_home(command: &mut std::process::Command, home: &Path) {
+    command
+        .env("APPDATA", home)
+        .env("HOME", home)
+        .env("XDG_DATA_HOME", home)
+        .env("XDG_CONFIG_HOME", home);
+}
+
 /// Waits for a file a stand-in process writes, then returns what it holds.
 pub async fn wait_for_file(path: &Path) -> String {
     for _ in 0..100 {
@@ -376,7 +432,35 @@ impl Session {
         Self::spawn(cwd, |_| {}).await
     }
 
+    /// Starts the server with no GODOT_* variables in its environment, the user's settings
+    /// file (`user_settings_file`) holding `user`, and a `.env` file in its working directory
+    /// holding `workdir`.
+    pub async fn start_with_settings(user: &str, workdir: &str) -> Self {
+        let cwd = tempfile::tempdir().expect("session cwd");
+        write_user_settings(cwd.path(), user);
+        std::fs::write(cwd.path().join(".env"), workdir).expect("write .env");
+        Self::spawn(cwd, |_| {}).await
+    }
+
+    /// Like `start_with_dotenv`, but the `.env` file is in the parent of the working directory.
+    pub async fn start_with_dotenv_in_parent(contents: &str) -> Self {
+        let parent = tempfile::tempdir().expect("session parent");
+        std::fs::write(parent.path().join(".env"), contents).expect("write .env");
+        let workdir = parent.path().join("work");
+        std::fs::create_dir(&workdir).expect("create working directory");
+        Self::spawn_in(parent, &workdir, |_| {}).await
+    }
+
     async fn spawn(cwd: tempfile::TempDir, configure: impl FnOnce(&mut Command)) -> Self {
+        let workdir = cwd.path().to_path_buf();
+        Self::spawn_in(cwd, &workdir, configure).await
+    }
+
+    async fn spawn_in(
+        cwd: tempfile::TempDir,
+        workdir: &Path,
+        configure: impl FnOnce(&mut Command),
+    ) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_godot-mcp"));
         for key in [
             "GODOT_PATH",
@@ -392,10 +476,11 @@ impl Session {
         command
             .env("APPDATA", cwd.path())
             .env("HOME", cwd.path())
-            .env("XDG_DATA_HOME", cwd.path());
+            .env("XDG_DATA_HOME", cwd.path())
+            .env("XDG_CONFIG_HOME", cwd.path());
         configure(&mut command);
         command
-            .current_dir(cwd.path())
+            .current_dir(workdir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

@@ -43,8 +43,9 @@ Thank you for helping. This guide takes you from a first question to a merged ch
    cargo build
    ```
 
-4. Tell the tests where Godot is: export `GODOT_PATH` (and on Windows `GODOT_CONSOLE_PATH`, so a failing editor test shows the editor log), or copy `.env.example` to `.env` and fill it in.
+4. Tell the tests where Godot is: export `GODOT_PATH` (and on Windows `GODOT_CONSOLE_PATH`, so a failing editor test shows the editor log), or copy `.env.example` to `.env` in the repository root and fill it in (a `.env` in a parent folder is not read).
    - Exported variables win over `.env`; export both when you test a specific Godot version.
+   - The test suites read this file themselves. The server does not take `GODOT_PATH` from a `.env` in its working directory; for your own MCP client setup, use your settings file (see [Settings files](docs/configuration.md#settings-files)).
    - In `.env`, put Windows paths in single quotes. A double-quoted Windows path stops the whole file from loading.
 
 ## Technology Scope

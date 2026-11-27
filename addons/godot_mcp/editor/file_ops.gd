@@ -789,11 +789,11 @@ func move_apply(bridge: Object, params: Dictionary) -> Dictionary:
             var tab: Dictionary = ops.call("tab_state", res_path, true)
             if bool(tab.get("reloaded", false)):
                 report["reloaded_scripts"].append(res_path)
-        elif res_path.get_extension() == "gdshader" or res_path.get_extension() == "gdshaderinc":
+        elif res_path.get_extension().to_lower() in ["gdshader", "gdshaderinc"]:
             var shaders: Object = bridge.call("_shader_ops")
             var behind: String = str(shaders.call("follow_file", res_path))
             if not behind.is_empty():
-                report["warnings"].append("The shader editor may show the old text and save it back: %s" % behind)
+                report["warnings"].append("The shader editor may show the old text: %s" % behind)
     for scene_path: String in to_reload:
         EditorInterface.reload_scene_from_path(scene_path)
         report["reloaded_scenes"].append(scene_path)

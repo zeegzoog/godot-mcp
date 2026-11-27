@@ -200,7 +200,7 @@ func edit(res_path: String, old_text: String, new_text: String, version: String)
 ## Why a command must not move, rewrite or delete the file of a shader given its tab, or "": a tab
 ## with unsaved changes, or tabs that cannot be matched to the file and so may hold some.
 func unsaved_problem(res_path: String) -> String:
-    if not EXTENSIONS.has(res_path.get_extension()):
+    if not EXTENSIONS.has(res_path.get_extension().to_lower()):
         return ""
     var pair: Dictionary = _pair_editor(res_path)
     match str(pair["state"]):
@@ -223,9 +223,9 @@ func follow_file(res_path: String) -> String:
     var shader: Resource = load(res_path)
     if shader == null or not ("code" in shader):
         return ""
-    var problem: String = unsaved_problem(res_path)
-    if not problem.is_empty():
-        return "%s %s" % [res_path, problem]
+    if not unsaved_problem(res_path).is_empty():
+        # Typed after the check: saving that tab now would bring the old text back.
+        return "%s was rewritten, but its shader tab holds unsaved or unmatched text and was not updated. Do not save that tab over the file: copy what was typed, reload the file from disk, then add it again." % res_path
     var text: String = str(loaded["text"])
     var pair: Dictionary = _pair_editor(res_path)
     if str(pair["state"]) == "found":
@@ -315,7 +315,7 @@ func _file_starts_with_bom(res_path: String) -> bool:
 ## {"text": file text with "\n" line endings, "bom": whether it starts with a byte order mark} or
 ## {"error": ...}.
 func _file_text(res_path: String) -> Dictionary:
-    if not EXTENSIONS.has(res_path.get_extension()):
+    if not EXTENSIONS.has(res_path.get_extension().to_lower()):
         return {"error": "Only .gdshader and .gdshaderinc files are handled by the shader tools: " + res_path}
     if not FileAccess.file_exists(res_path):
         return {"error": "Shader file does not exist: %s. Create it with godot_create_shader." % res_path}

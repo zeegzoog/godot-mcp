@@ -1,6 +1,6 @@
 # Live Editor Bridge
 
-**Version:** 1.2.1
+**Version:** 1.3.0
 **Status:** Stable
 **Layer:** concept
 
@@ -35,7 +35,7 @@ The editor is a live, stateful environment shared with a human. Anything an AI a
 - **BR-2 Shared secret on every command.** Each command carries a secret that the editor generates per session and port and publishes in a per-user location readable only by its owner. An explicit override value, set identically for both processes, replaces the published secret. A missing or wrong secret yields an explicit "unauthorized" error naming the recovery steps; no code path skips the check.
 - **BR-3 Exactly one reply per command.** Every command — including malformed JSON, wrongly typed parameters, unknown command types, and replies too large to send — receives one reply, success or error. Parameters are validated before a handler runs so a type mismatch can never abort the handler without a reply.
 - **BR-4 Correlated, multiplexed commands.** Each command carries a unique id; replies are matched by id, so many commands can be in flight on one connection and a late reply can never be delivered to the wrong caller.
-- **BR-5 Undoable mutations.** Every editor mutation (add, remove, set properties) is recorded as a single action in the editor's undo history, and undo restores the previous state exactly — including node order and ownership of the removed subtree. The same holds for script and shader edits and InputMap changes. File operations — saving, reimporting, deleting — are not undo actions; a deletion moves the files to the system trash unless the caller declines (CA-17 of [l1-content-authoring.md](l1-content-authoring.md)).
+- **BR-5 Undoable mutations.** Every editor mutation (add, remove, set properties) is recorded as a single action in the editor's undo history, and undo restores the previous state exactly — including node order and ownership of the removed subtree. The same holds for script and shader edits and InputMap changes. File operations — saving, reimporting, deleting, moving — are not undo actions; a deletion moves the files to the system trash unless the caller declines (CA-17 of [l1-content-authoring.md](l1-content-authoring.md)).
 - **BR-6 Scene confinement.** Node paths are relative to the edited scene root and resolve only to nodes inside that scene; a path that leaves it is "not found". The scene root cannot be removed.
 - **BR-7 All-or-nothing property updates.** A property update either applies every requested value or none. Values are converted to the target property's type; unknown properties and unconvertible values reject the whole call. The reply reports the values read back after applying. A value the property does not keep (its setter stored another one, as an audio bus the editor does not know reads back as `Master`) also rejects the whole call, naming the property and both values, and leaves nothing changed; floating-point values compare approximately, and a node name, which Godot adjusts on purpose, is not compared.
 - **BR-8 Fast, classified failures.** An unreachable editor is detected in well under a second and reported as "bridge unavailable"; a broken or stalled connection is reported as a connection error; an editor that answered with an error is reported with its own message. These three classes are never conflated. After an editor restart the next command reconnects without operator action.
@@ -44,6 +44,8 @@ The editor is a live, stateful environment shared with a human. Anything an AI a
 - **BR-11 Project-confined paths.** File paths accepted by editor-side commands resolve to `res://` paths inside the project; absolute paths inside the project are converted, anything else (including parent segments) is rejected.
 - **BR-12 Saved edits only.** An edit Godot would not save — a change to a node inside an instanced scene whose children are not editable — is refused with the instance and its scene named, unless the caller asks to make that instance's children editable, which then joins the same undoable action. A node an instanced scene brings cannot be removed.
 - **BR-13 One port per project.** Without a configured port, the editor and the server derive the port from the project's canonical path with the same function, into a range below the ephemeral ports of every supported system that does not contain the legacy port. Editors of different projects (git worktrees of one repository included) therefore never compete for one port, and a server started in a project's directory reaches that project's editor. Both implementations are checked against one shared set of path-to-port cases. While the legacy port is free, an editor on a derived port also listens there, with a secret published for that port, for servers set up before ports were derived.
+- **BR-14 Nothing silently ignored.** The channel is versioned: the editor side says which protocol it speaks and which parameters each of its commands takes. A parameter a command does not take is refused, never dropped, so a newer server talking to an older editor side learns that it must be updated instead of being told a call succeeded. An editor side from before the list is sent everything, as before.
+- **BR-15 Bounded, readable replies.** Both sides hold a reply to the same stated size. A reply that cannot be read fails its own command at once, with a recovery step, and not at the command's timeout; text the engine encodes loosely (raw control characters) is still read.
 
 ## 5. Detailed Design
 
@@ -52,15 +54,15 @@ The editor is a live, stateful environment shared with a human. Anything an AI a
 | Direction | Fields |
 | --- | --- |
 | Server → editor | `commandId` (unique string), `type` (command name), `params` (object), `token` (shared secret) |
-| Editor → server | `commandId` (echoed), `status` (`success` or `error`), `result` (object, on success), `error` (text, on error) |
+| Editor → server | `commandId` (echoed), `status` (`success` or `error`), `result` (object, on success), `error` (text, on error), `code` (stable name of the failure's kind, on errors whose kind is known) |
 
 ### 5.2 Command Set
 
 | Command | Mutates | Notes |
 | --- | --- | --- |
 | `ping` | no | Liveness check |
-| `get_version` | no | Engine version components |
-| `get_project_info` | no | Name, main scene, features, absolute project directory, and the addon version the editor loaded (an addon replaced on disk shows only after the plugin loads again) |
+| `get_version` | no | Engine version components, the bridge protocol number and every command with the parameters it takes |
+| `get_project_info` | no | Name, main scene, features, absolute project directory, and the version and build of the addon the editor loaded (an addon replaced on disk shows only after the plugin loads again) |
 | `get_open_scenes` | no | Open scene tabs and the active one |
 | `get_scene_tree` | no | Active scene, or another open tab by `scene_path` |
 | `get_node_properties` | no | Editor-visible properties as type + Godot text value (long values truncated) |
@@ -75,12 +77,13 @@ The editor is a live, stateful environment shared with a human. Anything an AI a
 | `create_scene`, `create_resource` | disk | A new scene or resource file; never replaces one |
 | `attach_script`, `connect_signal` | scene (undoable) | Attach or detach a script; a persistent signal connection |
 | `list_signals`, `get_project_settings` | no | Signals of a node and their connections; project settings |
-| `set_project_setting` | disk | One scalar setting, its type kept |
+| `set_project_setting`, `set_resource_properties` | disk (resource properties undoable) | One setting set or removed (CA-4); properties of a saved resource file (CA-19) |
 | `read_script`, `edit_script` | no / disk (undoable) | A script as the editor would save it; one fragment replaced |
 | `script_tab` | editor state | Whether a script has a tab with unsaved changes; reloads an unchanged tab that shows an older text |
 | `create_shader`, `read_shader`, `edit_shader` | disk (an edit is undoable) | Text shaders through the shader editor and the shader in memory |
 | `get_input_map`, `edit_input_action` | no / disk (undoable) | InputMap actions and their events |
 | `delete_files` | disk, editor file system | Project files with their companions, as the FileSystem dock deletes them |
+| `move_files_check`, `move_files_apply` | no / disk, editor file system | The editor's part of a move: refuse unsaved tabs, then follow the new paths (CA-20) |
 | `import_params` | disk, editor file system | A file's import parameters or importer, then a reimport |
 | `game_send`, `game_status` | running game | Relay to a game started by Play, and the games it relays to |
 | `close_editor` | process | Quits the editor after the reply; refused while scenes or scripts are unsaved unless discarded |
@@ -124,6 +127,7 @@ graph LR
 | Alias | Path | Purpose |
 | --- | --- | --- |
 | `[CLIENT]` | `src/bridge.rs` | Server-side connection, multiplexing, secret lookup |
+| `[PROTOCOL]` | `src/bridge_protocol.rs` | Protocol numbers and the parameter list (BR-14) |
 | `[EDITOR]` | `addons/godot_mcp/bridge_server.gd` | Editor-side listener, secret check, command handlers |
 | `[GATE]` | `addons/godot_mcp/plugin.gd` | Version gate and bridge start-up |
 | `[EXPORT]` | `addons/godot_mcp/export_plugin.gd` | Exclusion from game exports |
@@ -139,3 +143,4 @@ graph LR
 | 1.1.0 | 2026-11-02 | Agent (magic.spec) | Reality sync after ventilation. [MODIFIED] Port selection: without a configured port both sides derive it from the project path, the legacy port only outside a project (pull request 75; the specification still said `9333`); BR-7 refuses a value the property does not keep (pull request 88); `open_scene` activates a reloaded tab (pull request 94); `resave_resources` reloads loaded resources (pull request 87); BR-5 says which commands are undo actions and which file operations are not. [ADDED] BR-12, which the implementation specification already carried (pull request 86); BR-13 (one port per project); the command set completed with the authoring, script, shader, input, file, import, relay and close commands. Stable → RFC → Stable after Post-Update Review. |
 | 1.2.0 | 2026-11-02 | Agent (magic.spec) | [MODIFIED] `get_project_info` also answers the addon version the editor loaded, so the server can tell an addon replaced on disk from the one that runs (the update tool is in the tool catalog, TL-14). Source: pull request 102. Stable → RFC → Stable after Post-Update Review. |
 | 1.2.1 | 2026-11-05 | Agent (magic.spec) | Removed the `[ADDED]` and `[MODIFIED]` markers from the body: the history rows carry what changed. No requirement changed. |
+| 1.3.0 | 2026-11-27 | Agent (magic.spec) | [ADDED] BR-14 (a versioned channel that refuses unknown parameters), BR-15 (bounded and readable replies), the `code` of an error reply and the move commands. [MODIFIED] `get_version`, `get_project_info` and the setting row. Source: pull requests 149, 152, 156, 157, 181, 182, 189 and 190. Stable → RFC → Stable after Post-Update Review. |

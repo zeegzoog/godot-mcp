@@ -21,7 +21,7 @@ use super::files::{
 use super::{EditorChoice, ToolManager};
 use crate::error::McpError;
 use crate::godot::{md5_hex, record_uids};
-use crate::paths::{res_display, resolve_in_project, skipped_by_godot};
+use crate::paths::{move_name_problem, res_display, resolve_in_project, skipped_by_godot};
 use crate::protocol::{Tool, ToolResult};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -42,7 +42,7 @@ const CLASS_CACHE: &str = ".godot/global_script_class_cache.cfg";
 pub fn catalog() -> Vec<Tool> {
     vec![super::tool(
         MOVE,
-        "Moves or renames project files and folders like the FileSystem dock: .uid, .import and .godot/imported data move along, res:// mentions in text files are rewritten, uid:// stays valid. With the editor, files open with unsaved changes are refused, binary .scn/.res naming an old path are resaved (resaved), and it rescans. Without it, the uid and class caches are updated, binary_references lists binary files still naming an old path (they load by uid; move again with the editor or resave them), and rescan_needed is true. Refuses a missing source, project.godot, .godot/, the MCP addon, a lone .uid/.import, a destination in .godot/ or that already exists, a folder into itself, overlapping moves; all or nothing. dry_run previews. Relative and run-time-built paths are not rewritten.",
+        "Moves or renames project files and folders like the FileSystem dock: .uid, .import and .godot/imported data move along, res:// mentions in text files are rewritten, uid:// stays valid. With the editor, files open with unsaved changes are refused, binary .scn/.res naming an old path are resaved (resaved), and it rescans. Without it, the uid and class caches are updated, binary_references lists binary files still naming an old path (they load by uid; move again with the editor or resave them), and rescan_needed is true. Refuses a missing source, project.godot, .godot/, the MCP addon, a lone .uid/.import, a destination in .godot/ or that already exists, a destination name Godot refuses in file names (: \\ ? * \" | % < >, control characters, leading or trailing spaces), a folder into itself, overlapping moves; all or nothing. dry_run previews. Relative and run-time-built paths are not rewritten.",
         json!({
             "moves": {
                 "type": "array",
@@ -613,6 +613,15 @@ fn check_move(plan: &mut Plan, project: &Path, request: &Request) -> Option<Move
         }
     };
     let to_res = res_display(project, &to).trim_end_matches('/').to_string();
+    if let Some((name, problem)) = move_name_problem(&from_res, &to_res) {
+        plan.refuse(
+            &from_res,
+            format!(
+                "cannot move to {to_res:?}: the name {name:?} has {problem}, which cannot be used in a file name (Godot refuses : \\ ? * \" | % < >, control characters and leading or trailing spaces); pick another name"
+            ),
+        );
+        return None;
+    }
     if let Some(reason) = protected(&to_res).or_else(|| protected_by_identity(project, &to)) {
         plan.refuse(&from_res, format!("cannot move to {to_res}: it {reason}"));
         return None;

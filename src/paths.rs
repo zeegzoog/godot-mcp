@@ -18,6 +18,52 @@ pub fn is_valid_identifier(name: &str) -> bool {
     }
 }
 
+/// The characters Godot's `String.is_valid_filename()` refuses in a file name, besides `/`.
+const FORBIDDEN_IN_FILE_NAMES: &str = ":\\?*\"|%<>";
+
+/// Why `name`, one segment of a path, cannot be a file or folder name Godot stores in its text
+/// files, or `None` when it can. It is Godot's `String.is_valid_filename()` (no leading or
+/// trailing whitespace, none of `: \ ? * " | % < >`), and no control character anywhere, which
+/// Godot allows inside a name: a quote or a line break in a path written into a scene or
+/// project.godot would end the quoted value and turn the rest of the name into new lines of the
+/// file. The addon checks destinations the same way (`file_name_problem` in
+/// `editor/file_ops.gd`).
+pub fn file_name_problem(name: &str) -> Option<String> {
+    if name.is_empty() {
+        return Some("an empty name".into());
+    }
+    if let Some(bad) = name
+        .chars()
+        .find(|c| c.is_control() || FORBIDDEN_IN_FILE_NAMES.contains(*c))
+    {
+        return Some(format!("{bad:?}"));
+    }
+    if name.starts_with(|c: char| c <= ' ') || name.ends_with(|c: char| c <= ' ') {
+        return Some("a leading or trailing space".into());
+    }
+    None
+}
+
+/// The first name a move from `from` to `to` (both `res://` paths) introduces that
+/// `file_name_problem` refuses, with the problem. Only the names the move changes are checked: the
+/// folders both paths start with and the names both end with are already part of the old path,
+/// which the text files hold as it is, so a folder whose files have unusual names can still move.
+/// The addon applies the same rule (`move_name_problem` in `editor/file_ops.gd`).
+pub fn move_name_problem(from: &str, to: &str) -> Option<(String, String)> {
+    let old: Vec<&str> = from.trim_start_matches(RES_PREFIX).split('/').collect();
+    let new: Vec<&str> = to.trim_start_matches(RES_PREFIX).split('/').collect();
+    let start = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+    let shared_end = old[start..]
+        .iter()
+        .rev()
+        .zip(new[start..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    new[start..new.len() - shared_end]
+        .iter()
+        .find_map(|name| file_name_problem(name).map(|problem| ((*name).to_string(), problem)))
+}
+
 /// Checks that `dir` exists and is the root of a Godot project.
 pub fn ensure_project_dir(dir: &Path) -> Result<(), String> {
     if !dir.is_dir() {
@@ -459,6 +505,49 @@ mod tests {
         for invalid in ["", "2D", "Foo Bar", "Foo\nBar", "a-b", "Node;", "ä"] {
             assert!(!is_valid_identifier(invalid), "{invalid:?}");
         }
+    }
+
+    #[test]
+    fn file_names_follow_godots_rule_and_refuse_control_characters() {
+        for valid in [
+            "a.gd",
+            "my script.gd",
+            "Σκηνές",
+            "a#b;c[d]'e=f",
+            "..x",
+            "a~1",
+        ] {
+            assert_eq!(file_name_problem(valid), None, "{valid:?}");
+        }
+        for invalid in [
+            "", "a\".gd", "a\\b", "a:b", "a?b", "a*b", "a|b", "a%b", "a<b", "a>b", " a", "a ",
+            "a\nb", "a\rb", "a\tb", "a\u{0}b", "a\u{1}b", "a\u{7f}b", "a\u{85}b",
+        ] {
+            assert!(file_name_problem(invalid).is_some(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn a_move_checks_only_the_names_it_changes() {
+        let problem = |from: &str, to: &str| move_name_problem(from, to).map(|found| found.0);
+        assert_eq!(problem("res://a.gd", "res://b\".gd"), Some("b\".gd".into()));
+        assert_eq!(
+            problem("res://a.gd", "res://x\ny/a.gd"),
+            Some("x\ny".into())
+        );
+        assert_eq!(problem("res://a.gd", "res://Σκηνές/my a.gd"), None);
+        assert_eq!(problem("res://odd%dir/a.gd", "res://odd%dir/b.gd"), None);
+        assert_eq!(
+            problem("res://in/odd%name.gd", "res://out/odd%name.gd"),
+            None
+        );
+        assert_eq!(
+            problem(
+                "res://levels/lv1/odd%name.png",
+                "res://levels/lv\"2/odd%name.png"
+            ),
+            Some("lv\"2".into())
+        );
     }
 
     #[test]

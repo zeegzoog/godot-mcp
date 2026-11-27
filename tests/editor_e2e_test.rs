@@ -4096,6 +4096,96 @@ float twice(float x) {
     );
 }
 
+/// Test-only command that lists the text of every shader tab the editor holds.
+const SHADER_TABS_HOOK: &str = r#"        "__shader_tabs":
+            var texts: Array = []
+            for tab: Node in EditorInterface.get_base_control().find_children("*", "ShaderTextEditor", true, false):
+                if not tab.is_queued_for_deletion():
+                    texts.append(_shader_ops()._buffer(tab).text)
+            send_success(peer, cmd_id, {"texts": texts})
+        "ping":
+"#;
+
+/// A shader deleted through the editor leaves no tab behind that a later save could write the
+/// file back from, and the tab of another shader stays.
+#[tokio::test]
+#[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
+async fn deleting_an_open_shader_closes_its_tab() {
+    use godot_mcp::cli_runner::CliRunner;
+    use godot_mcp::tools::ToolManager;
+
+    let gone = "shader_type canvas_item;
+
+void fragment() {
+	COLOR = vec4(0.1);
+}
+";
+    let kept = "shader_type canvas_item;
+
+void fragment() {
+	COLOR = vec4(0.2);
+}
+";
+    let editor = start_editor_with(
+        Some(SHADER_TABS_HOOK),
+        "",
+        &[("gone.gdshader", gone), ("kept.gdshader", kept)],
+        "",
+    )
+    .await;
+    let project = editor.project.clone();
+    let (godot, _) = godot_binaries();
+    let tools = std::sync::Arc::new(
+        ToolManager::new(BridgeClient::new(editor.port), CliRunner::new(godot))
+            .with_working_dir(project.clone()),
+    );
+    let send = |command: &'static str, params: Value| {
+        let bridge = editor.bridge.clone();
+        async move { bridge.send_command(command, params).await.expect(command) }
+    };
+
+    send("open_scene", json!({"scene_path": "res://main.tscn"})).await;
+    for (path, old, new) in [
+        ("res://kept.gdshader", "vec4(0.2)", "vec4(0.4)"),
+        ("res://gone.gdshader", "vec4(0.1)", "vec4(0.3)"),
+    ] {
+        send(
+            "edit_shader",
+            json!({"shader_path": path, "old_text": old, "new_text": new}),
+        )
+        .await;
+    }
+    let before = send("__shader_tabs", json!({})).await;
+    assert_eq!(
+        before["texts"].as_array().map(Vec::len),
+        Some(2),
+        "{before}"
+    );
+
+    let deleted = tools
+        .call_tool(
+            "godot_delete_file",
+            json!({"paths": ["res://gone.gdshader"], "trash": false}),
+        )
+        .await;
+    assert!(!deleted.is_error, "{}", tool_text(&deleted));
+    // A save writes only tabs with unsaved text; the tab check below is what proves nothing
+    // can write the file back.
+    send("save_scene", json!({})).await;
+    sleep(Duration::from_secs(1)).await;
+    let after = send("__shader_tabs", json!({})).await;
+    assert!(
+        !project.join("gone.gdshader").exists(),
+        "a save wrote the deleted shader back: {after}"
+    );
+    let texts = after["texts"].to_string();
+    assert!(
+        !texts.contains("vec4(0.3)"),
+        "its tab is still open: {after}"
+    );
+    assert!(texts.contains("vec4(0.4)"), "the other tab stays: {after}");
+}
+
 #[tokio::test]
 #[ignore = "needs GODOT_PATH pointing at a Godot 4.5+ executable"]
 async fn set_node_properties_adds_metadata_the_way_the_inspector_does() {

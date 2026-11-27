@@ -345,11 +345,13 @@ async fn the_environment_block_comes_from_the_editor_and_the_project() {
         .await;
     assert!(is_tool_error(&failed));
     // A host path in a failure is replaced by a placeholder in the report (the server's own
-    // messages name project files by their res:// path, so a path outside res:// proves it).
+    // messages name project files by their res:// path, so a refused path outside the project,
+    // whose message names the project directory, proves it).
+    let elsewhere = tempfile::tempdir().expect("elsewhere");
     let by_path = session
         .call_tool(
             "godot_validate_script",
-            json!({"script_path": project.path().join("gone.gd").to_string_lossy()}),
+            json!({"script_path": elsewhere.path().join("gone.gd").to_string_lossy()}),
             FAST,
         )
         .await;
@@ -370,7 +372,10 @@ async fn the_environment_block_comes_from_the_editor_and_the_project() {
     );
     assert!(row(&text, "Platform").contains(std::env::consts::OS));
     assert!(text.contains("it failed in {project}"), "{text}");
-    assert!(text.contains("Script file not found: {project}"), "{text}");
+    assert!(
+        text.contains("outside the project directory {project}"),
+        "{text}"
+    );
     assert!(
         !text.contains(&project.path().to_string_lossy().into_owned()),
         "{text}"

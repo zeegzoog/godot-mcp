@@ -91,6 +91,31 @@ async fn refuses_to_overwrite_an_existing_file_unless_asked() {
     );
 }
 
+/// A link the project carries (git stores links) whose target does not exist yet must not let
+/// a write create that target outside the project.
+#[cfg(unix)]
+#[tokio::test]
+async fn create_script_does_not_write_through_a_dangling_link_out_of_the_project() {
+    let project = project_dir();
+    let outside = tempfile::tempdir().expect("outside");
+    let target = outside.path().join("evil.plist");
+    std::fs::create_dir_all(project.path().join("scripts")).expect("mkdir");
+    std::os::unix::fs::symlink(&target, project.path().join("scripts/x.gd")).expect("symlink");
+
+    let refused = call(
+        "godot_create_script",
+        json!({"file_path": "res://scripts/x.gd", "project_path": project.path(), "overwrite": true}),
+    )
+    .await;
+    assert!(refused.is_error, "{}", text(&refused));
+    assert!(
+        text(&refused).contains("outside the project"),
+        "{}",
+        text(&refused)
+    );
+    assert!(!target.exists(), "the file was created outside the project");
+}
+
 #[tokio::test]
 async fn rejects_parent_directory_segments_but_not_double_dots_in_names() {
     let project = project_dir();
@@ -540,6 +565,59 @@ async fn validate_script_reports_a_missing_file_without_spawning_godot() {
         !message.contains("spawn") && !message.contains("syntax"),
         "{message}"
     );
+}
+
+/// Without project_path, a script outside the project the server works in is refused before
+/// Godot is started, and a script inside it reaches Godot as its res:// path, never as the
+/// string the caller wrote.
+#[tokio::test]
+async fn validate_script_checks_only_scripts_inside_the_project() {
+    let project = project_dir();
+    let engine = tempfile::tempdir().expect("engine dir");
+    let outside = tempfile::tempdir().expect("outside");
+    let stray = outside.path().join("stray.gd");
+    std::fs::write(&stray, "extends Node\n").expect("stray script");
+    std::fs::write(project.path().join("ok.gd"), "extends Node\n").expect("script");
+    let (godot, record) = recording_godot(engine.path());
+    let tools = Arc::new(
+        ToolManager::new(BridgeClient::new(free_port()), CliRunner::new(godot))
+            .with_working_dir(project.path().to_path_buf())
+            .with_lsp_port(free_port()),
+    );
+
+    let refused = Arc::clone(&tools)
+        .call_tool(
+            "godot_validate_script",
+            json!({"script_path": stray.to_string_lossy()}),
+        )
+        .await;
+    assert!(refused.is_error, "{}", text(&refused));
+    assert!(
+        text(&refused).contains("outside the project"),
+        "{}",
+        text(&refused)
+    );
+    assert!(
+        !record.exists(),
+        "Godot was started for a script outside the project"
+    );
+
+    let inside = project.path().join(".").join("ok.gd");
+    let checked = tools
+        .call_tool(
+            "godot_validate_script",
+            json!({"script_path": inside.to_string_lossy()}),
+        )
+        .await;
+    assert!(!checked.is_error, "{}", text(&checked));
+    let args = wait_for_file(&record).await;
+    let args: Vec<&str> = args.split_whitespace().collect();
+    let script = args
+        .iter()
+        .position(|arg| *arg == "--script")
+        .and_then(|at| args.get(at + 1))
+        .expect("--script argument");
+    assert_eq!(*script, "res://ok.gd", "{args:?}");
 }
 
 #[tokio::test]

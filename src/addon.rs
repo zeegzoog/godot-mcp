@@ -107,11 +107,15 @@ impl Installation {
 /// What [`install`] would change in `project`, without writing anything.
 pub fn plan(project: &Path) -> io::Result<Installation> {
     let addon = project.join(ADDON_DIR);
-    if std::fs::symlink_metadata(&addon).is_ok_and(|meta| meta.file_type().is_symlink()) {
-        return Err(io::Error::other(format!(
-            "{} is a symbolic link; replace it with the addon by hand or remove the link",
-            addon.display()
-        )));
+    // The staging and retired folders sit in `addons/` too: a link there, or at the addon
+    // itself, would carry the writes, renames and removals out of the project.
+    for dir in [addon.as_path(), project.join("addons").as_path()] {
+        if std::fs::symlink_metadata(dir).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return Err(io::Error::other(format!(
+                "{} is a symbolic link; replace it with a real folder, or install the addon by hand",
+                dir.display()
+            )));
+        }
     }
     let old = read_tree(&addon)?;
     let mut installation = Installation::default();
@@ -336,5 +340,25 @@ mod tests {
         let again = install(project.path()).expect("again");
         assert!(!again.changed());
         assert_eq!(again.unchanged, FILES.len());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_install_refuses_an_addons_folder_that_is_a_link() {
+        let project = tempfile::tempdir().expect("project");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::create_dir_all(outside.path().join("godot_mcp")).expect("old addon elsewhere");
+        std::fs::write(outside.path().join("godot_mcp/keep.txt"), "keep").expect("keep");
+        std::os::unix::fs::symlink(outside.path(), project.path().join("addons")).expect("link");
+
+        let error = install(project.path()).expect_err("a linked addons folder");
+        assert!(error.to_string().contains("symbolic link"), "{error}");
+        assert!(plan(project.path()).is_err());
+        let left: Vec<_> = std::fs::read_dir(outside.path())
+            .expect("outside")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("godot_mcp")]);
+        assert!(outside.path().join("godot_mcp/keep.txt").exists());
     }
 }

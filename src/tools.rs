@@ -1293,7 +1293,7 @@ fn build_catalog(feedback_mode: FeedbackMode) -> Vec<(Module, Vec<Tool>)> {
             json!({
                 "script_path": {
                     "type": "string",
-                    "description": ".gd path (res:// needs a project)."
+                    "description": ".gd path: res:// or a path inside the project; a script outside it is refused."
                 },
                 "project_path": {
                     "type": "string",
